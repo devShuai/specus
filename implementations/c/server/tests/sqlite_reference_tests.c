@@ -112,7 +112,13 @@ static int schema_types(fixture *f)
         {"specus_http_traffic_exchange", "response_body_data", "blob"},
         {"specus_http_traffic_exchange", "request_preview_text", "text"},
         {"specus_tcp_traffic_frame", "payload_data", "blob"},
-        {"public_transfer_diagram_version", "snapshot_data", "blob"}
+        {"public_transfer_diagram_version", "snapshot_data", "blob"},
+        {"specus_websocket_ticket", "token_hash", "varchar(64)"},
+        {"specus_websocket_ticket", "scope", "varchar(40)"},
+        {"specus_websocket_ticket", "attributes_json", "text"},
+        {"specus_websocket_ticket", "remote_address_hash", "varchar(64)"},
+        {"specus_websocket_ticket", "created_at", "varchar(40)"},
+        {"specus_websocket_ticket", "expires_at", "varchar(40)"}
     };
     for (size_t i = 0; i < sizeof(columns) / sizeof(columns[0]); ++i) {
         sqlite3_stmt *stmt = NULL;
@@ -125,9 +131,16 @@ static int schema_types(fixture *f)
         sqlite3_finalize(stmt);
         CHECK(ok, "actual BLOB/TEXT column type");
     }
-    /* C holds websocket tickets in memory; there is no JDBC attributes_json CLOB column. */
-    CHECK(scalar(db, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='specus_websocket_ticket'", 0),
-          "ticket table absence is a limited schema difference, not ticket behavior acceptance");
+    /* The persistent ticket repository now supplies the Java model's six columns.
+     * Schema existence is not HTTP/WebSocket request-path acceptance. */
+    CHECK(scalar(db, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='specus_websocket_ticket'", 1)
+        && scalar(db, "SELECT count(*) FROM pragma_table_info('specus_websocket_ticket')", 6)
+        && scalar(db, "SELECT count(*) FROM pragma_table_info('specus_websocket_ticket') WHERE name='token_hash' AND pk=1 AND \"notnull\"=1", 1)
+        && scalar(db, "SELECT count(*) FROM pragma_table_info('specus_websocket_ticket') WHERE name IN('scope','attributes_json','created_at','expires_at') AND pk=0 AND \"notnull\"=1", 4)
+        && scalar(db, "SELECT count(*) FROM pragma_table_info('specus_websocket_ticket') WHERE name='remote_address_hash' AND pk=0 AND \"notnull\"=0", 1)
+        && scalar(db, "SELECT count(*) FROM pragma_index_info('idx_ws_ticket_expires')", 1)
+        && scalar(db, "SELECT count(*) FROM pragma_index_info('idx_ws_ticket_expires') WHERE name='expires_at' AND seqno=0", 1),
+          "actual six-column persistent ticket schema, key/nullability and expiry index; not request-path acceptance");
     sqlite3_close(db);
     return 0;
 }
@@ -318,7 +331,7 @@ int main(void)
         && !text_equals("{\"v\":null}", "v", "ok")
         && !text_equals("{}", "v", "ok"), "length-aware parsed string positive/NUL/null/missing calibration");
     const struct { const char *name; int (*run)(fixture *); } cases[] = {
-        {"actual BLOB/TEXT schema and bounded ticket-table difference", schema_types},
+        {"actual BLOB/TEXT and six-column persistent ticket schema", schema_types},
         {"HTTP complete binary bodies and exact captured API views", http_binary},
         {"legacy SQL NULL bodies retain exact API previews", http_legacy_null},
         {"TCP list/detail full binary payload", tcp_binary},

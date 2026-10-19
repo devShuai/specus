@@ -26,6 +26,8 @@ add_library(specus_c_core
     src/github_release.c
     src/http_client.c
     src/http_share.c
+    src/instant.c
+    src/instant_storage.c
     src/json.c
     src/login_rate_limiter.c
     src/media_capture.c
@@ -52,6 +54,7 @@ add_library(specus_c_core
     src/unicode_java21.c
     src/url_decode.c
     src/workbench.c
+    src/websocket_ticket.c
 )
 target_include_directories(specus_c_core PUBLIC src PRIVATE ${HIREDIS_INCLUDE_DIR} ${UTF8PROC_INCLUDE_DIR})
 target_link_libraries(specus_c_core PUBLIC ZLIB::ZLIB SQLite::SQLite3 OpenSSL::SSL OpenSSL::Crypto CURL::libcurl ${HIREDIS_LIBRARY} ${UTF8PROC_LIBRARY})
@@ -89,6 +92,17 @@ add_executable(specus_c_url_decode_tests tests/url_decode_tests.c)
 target_link_libraries(specus_c_url_decode_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_url_decode_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME url_decode_tests COMMAND specus_c_url_decode_tests)
+add_executable(specus_c_connectivity_lifetime_tests tests/connectivity_lifetime_tests.c)
+target_link_libraries(specus_c_connectivity_lifetime_tests PRIVATE specus_c_core pthread)
+target_link_options(specus_c_connectivity_lifetime_tests PRIVATE "-Wl,--wrap=free" "-Wl,--wrap=st_connectivity_checker_new" "-Wl,--wrap=st_connectivity_handle")
+target_compile_options(specus_c_connectivity_lifetime_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME connectivity_lifetime_tests COMMAND specus_c_connectivity_lifetime_tests)
+set_tests_properties(connectivity_lifetime_tests PROPERTIES TIMEOUT 30)
+add_executable(specus_c_connectivity_setter_tests tests/connectivity_setter_tests.c)
+target_link_libraries(specus_c_connectivity_setter_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_connectivity_setter_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME connectivity_setter_tests COMMAND specus_c_connectivity_setter_tests)
+set_tests_properties(connectivity_setter_tests PROPERTIES TIMEOUT 30)
 add_executable(specus_c_admin_http_tests tests/admin_http_tests.c)
 target_link_libraries(specus_c_admin_http_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_admin_http_tests PRIVATE -Wall -Wextra -Wpedantic)
@@ -407,6 +421,13 @@ set_tests_properties(security_rules_tests PROPERTIES TIMEOUT 120)
 
 # Java HttpWebSocketRoutingTests on a real server process: how /http/** splits WebSocket upgrades
 # from plain requests, raw query characters, and the public route runtime asset.
+add_executable(specus_c_server_harness_tests tests/server_harness_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_server_harness_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_server_harness_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(specus_c_server_harness_tests PRIVATE -Wl,--wrap=bind)
+add_test(NAME server_harness_tests COMMAND specus_c_server_harness_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(server_harness_tests PROPERTIES TIMEOUT 60)
+
 add_executable(specus_c_http_websocket_routing_tests tests/http_websocket_routing_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_http_websocket_routing_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_http_websocket_routing_tests PRIVATE -Wall -Wextra -Wpedantic)
@@ -600,3 +621,31 @@ target_link_libraries(specus_c_sqlite_reference_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_sqlite_reference_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME sqlite_reference_tests COMMAND specus_c_sqlite_reference_tests)
 set_tests_properties(sqlite_reference_tests PROPERTIES TIMEOUT 60)
+
+foreach(test_name IN ITEMS websocket_ticket_request websocket_ticket_quota websocket_ticket_account)
+    add_executable(specus_c_${test_name}_tests tests/${test_name}_tests.c)
+    target_link_libraries(specus_c_${test_name}_tests PRIVATE specus_c_core pthread)
+    target_compile_options(specus_c_${test_name}_tests PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_options(specus_c_${test_name}_tests PRIVATE -Wl,--wrap=clock_gettime)
+    add_test(NAME ${test_name}_tests COMMAND specus_c_${test_name}_tests)
+    set_tests_properties(${test_name}_tests PROPERTIES TIMEOUT 120)
+endforeach()
+
+add_executable(specus_c_registration_expiry_tests tests/registration_expiry_tests.c)
+target_link_libraries(specus_c_registration_expiry_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_registration_expiry_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(specus_c_registration_expiry_tests PRIVATE -Wl,--wrap=time -Wl,--wrap=clock_gettime)
+add_test(NAME registration_expiry_tests COMMAND specus_c_registration_expiry_tests)
+set_tests_properties(registration_expiry_tests PROPERTIES TIMEOUT 30)
+
+add_test(NAME websocket_ticket_restart_tests
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/websocket_ticket_restart_tests.py $<TARGET_FILE:specus-server-c>)
+set_tests_properties(websocket_ticket_restart_tests PROPERTIES TIMEOUT 60 ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+foreach(test_name IN ITEMS instant instant_migration connection_time_reference auth_expiry_reference websocket_ticket_storage_reference)
+    add_executable(specus_c_${test_name}_tests tests/${test_name}_tests.c)
+    target_link_libraries(specus_c_${test_name}_tests PRIVATE specus_c_core)
+    target_compile_options(specus_c_${test_name}_tests PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME ${test_name}_tests COMMAND specus_c_${test_name}_tests)
+    set_tests_properties(${test_name}_tests PROPERTIES TIMEOUT 60)
+endforeach()

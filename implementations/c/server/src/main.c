@@ -4,6 +4,7 @@
 #include "crypto.h"
 #include "elasticsearch_traffic.h"
 #include "http_share.h"
+#include "instant.h"
 #include "json.h"
 #include "media_capture.h"
 #include "object_storage.h"
@@ -913,7 +914,11 @@ static int load_config(server_config *config)
             /* Nothing is connected yet, so every online session and open connection record was
              * left behind by a previous process that never ran its disconnect handlers. */
             (void)st_storage_close_client_sessions_by_status(database_path, "NETTY_ONLINE", startup_time);
-            (void)st_storage_close_open_connections(database_path, "SERVER_RESTARTED", startup_time, NULL);
+            char record_cutoff[ST_INSTANT_CAPACITY], record_closed_at[ST_INSTANT_CAPACITY];
+            if (st_instant_now(record_cutoff) == 0
+                && st_instant_public(record_cutoff, record_closed_at, sizeof(record_closed_at)) == 0)
+                (void)st_storage_close_open_connections_before(database_path, record_cutoff,
+                                                                "SERVER_RESTARTED", record_closed_at, NULL);
         }
     }
     if (access_token_hash != NULL && *access_token_hash != '\0') {

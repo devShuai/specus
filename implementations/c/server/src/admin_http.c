@@ -32,6 +32,7 @@
 #include "upstream_browser_headers.h"
 #include "url_decode.h"
 #include "workbench.h"
+#include "websocket_ticket.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -63,9 +64,6 @@
 #define ST_ADMIN_DEFAULT_REWRITE_BODY_BYTES (10U * 1024U * 1024U)
 #define ST_ADMIN_STREAM_INITIAL_WINDOW (1024U * 1024U)
 #define ST_ADMIN_STREAM_MAX_WINDOW (16U * 1024U * 1024U)
-#define ST_ADMIN_WS_TICKET_BYTES 32U
-#define ST_ADMIN_WS_TICKET_TTL_SECONDS 45
-#define ST_ADMIN_MAX_WS_TICKETS 1024U
 #define ST_ADMIN_CLIENT_MESSAGE_MAX_CHARS (64U * 1024U)
 /* /ws/connections sets no limit, so Tomcat's default text buffer of 8 KiB characters applies. */
 #define ST_ADMIN_CONNECTIONS_MAX_CHARS (8U * 1024U)
@@ -153,18 +151,6 @@ typedef struct st_admin_ws_client {
     pthread_cond_t pending_cond;
     struct st_admin_ws_client *next;
 } st_admin_ws_client;
-
-typedef struct st_admin_ws_ticket {
-    uint8_t token_hash[ST_SHA256_LEN];
-    uint8_t remote_address_hash[ST_SHA256_LEN];
-    char username[ST_SECURITY_TOKEN_USERNAME_LEN + 1];
-    char tenant_id[ST_SECURITY_TOKEN_TENANT_LEN + 1];
-    char account_key[ST_SECURITY_TOKEN_ACCOUNT_KEY_LEN + 1];
-    char endpoint[32];
-    int admin;
-    time_t expires_at;
-    struct st_admin_ws_ticket *next;
-} st_admin_ws_ticket;
 
 /*
  * Incremental UTF-8 validation: WebSocket text may split a code point across frames, so the
@@ -261,8 +247,6 @@ static pthread_mutex_t admin_direct_ws_ref_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t admin_ws_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_ws_client *admin_ws_clients = NULL;
 static void admin_ws_revoke_identity(const char *tenant_id, const char *username, const char *reason);
-static pthread_mutex_t admin_ws_ticket_lock = PTHREAD_MUTEX_INITIALIZER;
-static st_admin_ws_ticket *admin_ws_tickets = NULL;
 static pthread_mutex_t admin_nat_control_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_nat_control_handler admin_nat_control_handler = NULL;
 static void *admin_nat_control_ctx = NULL;
@@ -374,18 +358,18 @@ void st_admin_set_connectivity_device(const st_connectivity_device *device)
 {
     st_connectivity_checker *checker = device == NULL ? NULL : st_connectivity_checker_new(device);
     pthread_mutex_lock(&admin_connectivity_lock);
-    /*
-     * A replaced checker is deliberately not freed: a check may still run on it. The server sets
-     * its device once at startup; only tests replace it.
-     */
+    st_connectivity_checker *previous = admin_connectivity_checker;
     admin_connectivity_checker = checker;
     pthread_mutex_unlock(&admin_connectivity_lock);
+    /* In-flight requests own references; retire only the publication's ownership here. */
+    st_connectivity_checker_free(previous);
 }
 
 static st_connectivity_checker *admin_current_connectivity_checker(void)
 {
     pthread_mutex_lock(&admin_connectivity_lock);
     st_connectivity_checker *checker = admin_connectivity_checker;
+    st_connectivity_checker_retain(checker);
     pthread_mutex_unlock(&admin_connectivity_lock);
     return checker;
 }
@@ -2289,68 +2273,6 @@ static void build_prefixed_token(const char *prefix, char *out, size_t out_len)
     snprintf(out, out_len, "%s%s%s", prefix == NULL ? "" : prefix, hex1, hex2);
 }
 
-static void base64url_no_padding(const uint8_t *data, size_t len, char *out, size_t out_len)
-{
-    static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    size_t written = 0;
-    for (size_t i = 0; i < len && written + 1U < out_len; i += 3U) {
-        uint32_t value = (uint32_t)data[i] << 16;
-        size_t remaining = len - i;
-        if (remaining > 1U) value |= (uint32_t)data[i + 1U] << 8;
-        if (remaining > 2U) value |= data[i + 2U];
-        if (written + 1U < out_len) out[written++] = alphabet[(value >> 18) & 63U];
-        if (written + 1U < out_len) out[written++] = alphabet[(value >> 12) & 63U];
-        if (remaining > 1U && written + 1U < out_len) out[written++] = alphabet[(value >> 6) & 63U];
-        if (remaining > 2U && written + 1U < out_len) out[written++] = alphabet[value & 63U];
-    }
-    out[written] = '\0';
-}
-
-static int admin_secure_random(uint8_t *out, size_t len)
-{
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd < 0) {
-        return -1;
-    }
-    size_t offset = 0;
-    while (offset < len) {
-        ssize_t read_len = read(fd, out + offset, len - offset);
-        if (read_len < 0 && errno == EINTR) {
-            continue;
-        }
-        if (read_len <= 0) {
-            close(fd);
-            return -1;
-        }
-        offset += (size_t)read_len;
-    }
-    close(fd);
-    return 0;
-}
-
-static void admin_hash_text(const char *value, uint8_t out[ST_SHA256_LEN])
-{
-    const char *normalized = value == NULL ? "" : value;
-    st_sha256((const uint8_t *)normalized, strlen(normalized), out);
-}
-
-static size_t admin_prune_websocket_tickets_locked(time_t now)
-{
-    size_t count = 0;
-    st_admin_ws_ticket **cursor = &admin_ws_tickets;
-    while (*cursor != NULL) {
-        st_admin_ws_ticket *ticket = *cursor;
-        if (ticket->expires_at <= now) {
-            *cursor = ticket->next;
-            free(ticket);
-            continue;
-        }
-        ++count;
-        cursor = &ticket->next;
-    }
-    return count;
-}
-
 /* A consumed ticket is a snapshot, not authority to keep an account's old privileges. */
 static int admin_ws_identity_current(const st_admin_context *ticket)
 {
@@ -2367,54 +2289,20 @@ static int admin_issue_websocket_ticket(const st_admin_context *context,
                                         const char *endpoint,
                                         const char *remote_address,
                                         char out[64],
-                                        time_t *expires_at)
+                                        char expires_at[ST_INSTANT_CAPACITY])
 {
     if (context == NULL || !context->authenticated || endpoint == NULL
         || out == NULL || expires_at == NULL) {
         return -1;
     }
-    uint8_t random_bytes[ST_ADMIN_WS_TICKET_BYTES];
-    uint8_t token_hash[ST_SHA256_LEN];
-    uint8_t remote_address_hash[ST_SHA256_LEN];
-    if (admin_secure_random(random_bytes, sizeof(random_bytes)) != 0) {
-        return -1;
-    }
-    base64url_no_padding(random_bytes, sizeof(random_bytes), out, 64U);
-    admin_hash_text(out, token_hash);
-    admin_hash_text(remote_address, remote_address_hash);
-
-    st_admin_ws_ticket *ticket = (st_admin_ws_ticket *)calloc(1, sizeof(*ticket));
-    if (ticket == NULL) {
-        return -1;
-    }
-    memcpy(ticket->token_hash, token_hash, sizeof(token_hash));
-    memcpy(ticket->remote_address_hash, remote_address_hash, sizeof(remote_address_hash));
-    snprintf(ticket->username, sizeof(ticket->username), "%s", context->username);
-    snprintf(ticket->tenant_id, sizeof(ticket->tenant_id), "%s", context->tenant_id);
-    snprintf(ticket->account_key, sizeof(ticket->account_key), "%s", context->account_key);
-    snprintf(ticket->endpoint, sizeof(ticket->endpoint), "%s", endpoint);
-    ticket->admin = context->admin;
-    ticket->expires_at = time(NULL) + ST_ADMIN_WS_TICKET_TTL_SECONDS;
-
-    pthread_mutex_lock(&admin_ws_ticket_lock);
-    size_t active_tickets = admin_prune_websocket_tickets_locked(time(NULL));
-    if (active_tickets >= ST_ADMIN_MAX_WS_TICKETS) {
-        pthread_mutex_unlock(&admin_ws_ticket_lock);
-        free(ticket);
-        return -2;
-    }
-    for (st_admin_ws_ticket *existing = admin_ws_tickets; existing != NULL; existing = existing->next) {
-        if (st_constant_time_eq(existing->token_hash, token_hash, sizeof(token_hash))) {
-            pthread_mutex_unlock(&admin_ws_ticket_lock);
-            free(ticket);
-            return -1;
-        }
-    }
-    ticket->next = admin_ws_tickets;
-    admin_ws_tickets = ticket;
-    *expires_at = ticket->expires_at;
-    pthread_mutex_unlock(&admin_ws_ticket_lock);
-    return 0;
+    char *user = st_json_escape(context->username), *tenant = st_json_escape(context->tenant_id), *uid = st_json_escape(context->account_key);
+    if (user == NULL || tenant == NULL || uid == NULL) { free(user); free(tenant); free(uid); return -1; }
+    size_t capacity = strlen(user) + strlen(tenant) + strlen(uid) + 128U;
+    char *json = malloc(capacity);
+    if (json == NULL) { free(user); free(tenant); free(uid); return -1; }
+    snprintf(json, capacity, "{\"wsUser\":\"%s\",\"tenantId\":\"%s\",\"uid\":\"%s\",\"admin\":%s}", user, tenant, uid, context->admin ? "true" : "false");
+    int rc = st_websocket_ticket_issue(endpoint, json, remote_address, out, expires_at);
+    free(json); free(user); free(tenant); free(uid); return rc;
 }
 
 static int admin_consume_websocket_ticket(const char *token,
@@ -2422,45 +2310,18 @@ static int admin_consume_websocket_ticket(const char *token,
                                           const char *remote_address,
                                           st_admin_context *context)
 {
-    if (token == NULL || endpoint == NULL
-        || strlen(token) < 32U || strlen(token) > 128U || context == NULL) {
-        return -1;
-    }
-    uint8_t token_hash[ST_SHA256_LEN];
-    uint8_t remote_address_hash[ST_SHA256_LEN];
-    admin_hash_text(token, token_hash);
-    admin_hash_text(remote_address, remote_address_hash);
-
-    pthread_mutex_lock(&admin_ws_ticket_lock);
-    admin_prune_websocket_tickets_locked(time(NULL));
-    st_admin_ws_ticket **cursor = &admin_ws_tickets;
-    while (*cursor != NULL) {
-        st_admin_ws_ticket *ticket = *cursor;
-        if (!st_constant_time_eq(ticket->token_hash, token_hash, sizeof(token_hash))) {
-            cursor = &ticket->next;
-            continue;
-        }
-        if (strcmp(ticket->endpoint, endpoint) != 0
-            || !st_constant_time_eq(ticket->remote_address_hash,
-                                 remote_address_hash,
-                                 sizeof(remote_address_hash))) {
-            pthread_mutex_unlock(&admin_ws_ticket_lock);
-            return -1;
-        }
-        *cursor = ticket->next;
-        memset(context, 0, sizeof(*context));
-        snprintf(context->username, sizeof(context->username), "%s", ticket->username);
-        snprintf(context->tenant_id, sizeof(context->tenant_id), "%s", ticket->tenant_id);
-        snprintf(context->account_key, sizeof(context->account_key), "%s", ticket->account_key);
-        snprintf(context->role, sizeof(context->role), "%s", ticket->admin ? "ADMIN" : "USER");
-        context->admin = ticket->admin;
-        context->authenticated = 1;
-        free(ticket);
-        pthread_mutex_unlock(&admin_ws_ticket_lock);
-        return 0;
-    }
-    pthread_mutex_unlock(&admin_ws_ticket_lock);
-    return -1;
+    if (context == NULL) return -1;
+    char *json = NULL;
+    if (st_websocket_ticket_consume(endpoint, token, remote_address, &json) != 0) return -1;
+    memset(context, 0, sizeof(*context));
+    int ok = st_websocket_ticket_json_string(json, "wsUser", context->username, sizeof(context->username), 1) == 0
+        && *context->username != '\0' && st_websocket_ticket_json_string(json, "tenantId", context->tenant_id, sizeof(context->tenant_id), 1) == 0
+        && *context->tenant_id != '\0' && st_websocket_ticket_json_string(json, "uid", context->account_key, sizeof(context->account_key), 0) == 0
+        && st_json_get_bool(json, "admin", &context->admin) == 0;
+    free(json);
+    if (!ok) return -1;
+    snprintf(context->role, sizeof(context->role), "%s", context->admin ? "ADMIN" : "USER");
+    context->authenticated = 1; return 0;
 }
 
 static int handle_admin_websocket_ticket(const st_admin_context *context,
@@ -2482,8 +2343,8 @@ static int handle_admin_websocket_ticket(const st_admin_context *context,
     }
 
     char token[64];
-    time_t expires_at = 0;
-    int issue_rc = admin_issue_websocket_ticket(context, endpoint, remote_address, token, &expires_at);
+    char expires_text[ST_INSTANT_CAPACITY];
+    int issue_rc = admin_issue_websocket_ticket(context, endpoint, remote_address, token, expires_text);
     free(endpoint);
     if (issue_rc == -2) {
         return write_response(out,
@@ -2500,8 +2361,6 @@ static int handle_admin_websocket_ticket(const st_admin_context *context,
                               "{\"error\":\"websocket ticket generation failed\"}");
     }
 
-    char expires_text[64];
-    admin_iso_time((long long)expires_at, expires_text);
     char response_body[256];
     int written = snprintf(response_body,
                            sizeof(response_body),
@@ -6811,8 +6670,9 @@ static const char *admin_peer_service_apply(const char *database_path,
         char normalized[256];
         refusal = st_peer_mesh_local_host_refusal(mutation->target_host, normalized);
         if (refusal == NULL) {
-            if (strlen(normalized) >= sizeof(row->target_host)) refusal = "targetHost must be a unicast IP or localhost";
-            else snprintf(row->target_host, sizeof(row->target_host), "%s", normalized);
+            size_t normalized_len = strlen(normalized);
+            if (normalized_len >= sizeof(row->target_host)) refusal = "targetHost must be a unicast IP or localhost";
+            else memcpy(row->target_host, normalized, normalized_len + 1U);
         }
     }
     static const char *const port_names[2] = {"targetPort", "publishedPort"};
@@ -9679,7 +9539,9 @@ static int handle_http_route_connectivity_check(const st_admin_context *context,
         .body_len = body == NULL ? 0U : body_len,
     };
     st_connectivity_response response;
-    if (st_connectivity_handle(checker, &request, admin_connectivity_load_route, (void *)context, &response) != 0) {
+    int handled = st_connectivity_handle(checker, &request, admin_connectivity_load_route, (void *)context, &response);
+    st_connectivity_checker_free(checker);
+    if (handled != 0) {
         st_connectivity_response_free(&response);
         return write_connectivity_response(out, out_len, 503, 1, "{\"code\":\"CHECK_UNAVAILABLE\"}");
     }
@@ -16812,18 +16674,7 @@ static void admin_ws_revoke_identity_local(const char *tenant_id, const char *us
     if (tenant_id == NULL || username == NULL) {
         return;
     }
-    pthread_mutex_lock(&admin_ws_ticket_lock);
-    st_admin_ws_ticket **cursor = &admin_ws_tickets;
-    while (*cursor != NULL) {
-        st_admin_ws_ticket *ticket = *cursor;
-        if (strcmp(ticket->tenant_id, tenant_id) == 0 && strcmp(ticket->username, username) == 0) {
-            *cursor = ticket->next;
-            free(ticket);
-        } else {
-            cursor = &ticket->next;
-        }
-    }
-    pthread_mutex_unlock(&admin_ws_ticket_lock);
+    st_websocket_ticket_revoke_memory_identity(tenant_id, username);
     pthread_mutex_lock(&admin_ws_lock);
     for (st_admin_ws_client *client = admin_ws_clients; client != NULL; client = client->next) {
         if (!client->closing && strcmp(client->tenant_id, tenant_id) == 0

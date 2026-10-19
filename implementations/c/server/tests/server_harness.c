@@ -48,8 +48,11 @@ void sleep_ms(int ms)
 /* ------------------------------------------------------------------------------------------- */
 /* Sockets                                                                                       */
 
-int pick_free_port(void)
+/* Keep this socket open while choosing other listener ports, otherwise the kernel
+ * can immediately return the same ephemeral port for the next allocation. */
+static int reserve_free_port(int *port)
 {
+    *port = -1;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         return -1;
@@ -60,10 +63,23 @@ int pick_free_port(void)
     address.sin_addr.s_addr = htonl(INADDR_ANY);
     address.sin_port = 0;
     socklen_t length = sizeof(address);
-    int port = -1;
-    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) == 0
-        && getsockname(fd, (struct sockaddr *)&address, &length) == 0) {
-        port = ntohs(address.sin_port);
+    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0
+        || getsockname(fd, (struct sockaddr *)&address, &length) != 0) {
+        int error = errno;
+        close(fd);
+        errno = error;
+        return -1;
+    }
+    *port = ntohs(address.sin_port);
+    return fd;
+}
+
+int pick_free_port(void)
+{
+    int port;
+    int fd = reserve_free_port(&port);
+    if (fd < 0) {
+        return -1;
     }
     close(fd);
     return port;
@@ -710,15 +726,26 @@ int server_prepare(test_server *server)
 
 int server_start(test_server *server)
 {
-    server->control_port = pick_free_port();
-    server->admin_port = pick_free_port();
-    if (server->control_port <= 0 || server->admin_port <= 0 || server->control_port == server->admin_port) {
+    int control_reservation = reserve_free_port(&server->control_port);
+    if (control_reservation < 0) {
+        fprintf(stderr, "cannot reserve control listener port: %s\n", strerror(errno));
         return -1;
     }
+    int admin_reservation = reserve_free_port(&server->admin_port);
+    if (admin_reservation < 0) {
+        fprintf(stderr, "cannot reserve admin listener port: %s\n", strerror(errno));
+        close(control_reservation);
+        return -1;
+    }
+    /* The child binds its own listeners; release both only after the pair has
+     * been selected, before fork so no parent copy can delay either bind. */
+    close(control_reservation);
+    close(admin_reservation);
     fflush(stdout);
     fflush(stderr);
     pid_t pid = fork();
     if (pid < 0) {
+        fprintf(stderr, "cannot fork test server: %s\n", strerror(errno));
         return -1;
     }
     if (pid == 0) {

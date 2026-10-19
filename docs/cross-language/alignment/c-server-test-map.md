@@ -8,6 +8,19 @@
 
 旧记录曾列出基线后新增的 22 类；该清单已不完整。当前提交的完整范围盘点与未完成项见下一节，下文历史表的计数仍只含原基线 79 类。
 
+## 2026-10-19 时间与 WebSocket 票据增量
+
+本增量整合 main `7401639e053c0db85f9e53b7ec1311bb354af5ae`，保留已合并的 URL 解码完整性、会话排序、IPv6 能力通告及 connectivity 生命周期修复。下方 128 类/49 类盘点仍锚定其写明的历史提交，不代表这个新 main 的完整测试清单。
+
+- `instant.c` 提供七位小数的 UTC 存储格式、100ns 截断、偏移解析及公开响应格式。`instant_storage.c` 用每批 500 行的主键分页迁移，并条件更新旧值；无效文本保留。输入范围为 C 已有的四位年份，额外接受 SQLite 历史空格时间格式，不声称接受 Java 的所有扩展年份输入。
+- 目前接入真实初始化和写入/查询的是连接记录 `connected_at`、登录 nonce、注册 challenge 及 WebSocket ticket 的 `expires_at`。`connection_time_reference_tests` 覆盖四种整秒/小数、历史/新写入组合的上下界、可见范围、公开视图、启动严格截止和关停收尾；`auth_expiry_reference_tests` 覆盖 nonce/challenge 的八种组合。它们不代表全部到期字段已对齐。
+- `registration_expiry_tests` 经过实际验证码验证和 SQLite 账号写入，固定当前时刻为半秒，分别检查到期前 100ns、恰好到期、到期后 100ns。旧实现用整秒 `time(NULL)` 比较，会接受同一秒内已过期的验证码；新实现使用高精度时钟，只有尚未到期的验证码能创建账号。
+- `websocket_ticket_storage_reference_tests` 验证三种 scope、来源绑定、严格过期清理、到期瞬间仍可消费、单次消费、跨进程争抢和失败回滚。配置 SQLite 后三个入口共用持久票据服务；未配置时保留有界内存实现。管理两种 scope 共用 1024 配额，公开互传单独 1024。
+- `websocket_ticket_request_tests` 经过真实 HTTP/WebSocket，覆盖 84 个到期边界及错误 scope/地址/含 NUL 或重复查询不消耗票据。`websocket_ticket_quota_tests` 在内存和数据库两种实现中让八个真实 HTTP 签发请求争用最后一个配额，验证恰好一次成功、消费恢复配额和过期清理。
+- `websocket_ticket_account_tests` 验证禁用/删除的事务回滚、恢复/同名重建不复活旧票据、旧账号凭据失效，以及其他身份和公开互传隔离。`websocket_ticket_restart_tests.py` 让实际 main 程序初始化新库、退出并由另一个进程重启，再核验六个存储字段、三种 scope 和重放拒绝。`createdAt` 按 Java `Instant.toString()` 的可变宽格式检查，只有 `expiresAt` 要求七位小数；API 监听器进程重启与 main 启动分别验收。
+
+这些测试已注册到 CMake 和完整 Make；精确提交的结果以 PR #290 的验证记录为准。票据账号写入失败仍遵循 C 既有 409 映射，该探针不证明 Java/Spring 存储异常分类已对齐。`SortableTimestampMigratorTests` 和 `SortableTimestampOrderingTests` 仍有附件、下载授权、Peer 会话、配对码、媒体等字段待接入和逐方法验证；`TransferExpiryOrderingTests` 仍待完整对照。旧 79 类当前断言、其余新增类及 #35 的 HA、背压和跨 NAT 要求继续保留，不能据本增量关闭 #35。
+
 ## 2026-10-18 范围盘点与后续核验清单（状态更新至2026-10-19）
 
 本次范围锚定已合并的 main `b8d6e725686b7353db98082b6082a94f5b7c8afa`；注册修复分支另锚定 `37851ae8c020fdd5a52bd0232a4ef00861f01891`。下文“当前main”均指这个锚定快照，不实时追踪分支变化。不将尚未合并的归属转移分支新增测试混入 main 的完成率。

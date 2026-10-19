@@ -4,6 +4,7 @@
 
 #include "crypto.h"
 #include "http_client.h"
+#include "instant.h"
 #include "json.h"
 #include "password_hash.h"
 #include "security.h"
@@ -723,11 +724,12 @@ int st_registration_verify(const char *database_path,
         free(registration_id); free(code);
         return -1;
     }
-    time_t now = time(NULL);
-    time_t expires = registration_parse_time(challenge.expires_at);
+    char expires[ST_INSTANT_CAPACITY], cutoff[ST_INSTANT_CAPACITY];
     char now_text[64];
-    if (now == (time_t)-1 || registration_format_time(now, now_text) != 0
-        || expires == (time_t)-1 || expires <= now || challenge.attempts_remaining <= 0) {
+    if (st_instant_now(cutoff) != 0 || st_instant_public(cutoff, now_text, sizeof(now_text)) != 0
+        || st_instant_normalize(challenge.expires_at, expires) != 0
+        || strcmp(expires, cutoff) <= 0
+        || challenge.attempts_remaining <= 0) {
         (void)st_storage_delete_registration_challenge(database_path, challenge.registration_id);
         registration_error(error, error_len, "验证码无效或已过期");
         free(registration_id); free(code);

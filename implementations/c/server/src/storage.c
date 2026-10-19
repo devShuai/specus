@@ -3,8 +3,11 @@
 #include "crypto.h"
 #include "elasticsearch_traffic.h"
 #include "http_share.h"
+#include "instant.h"
+#include "instant_storage.h"
 #include "json.h"
 #include "traffic_capture.h"
+#include "websocket_ticket.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -39,6 +42,35 @@ static int copy_text_column(sqlite3_stmt *stmt, int column, char *out, size_t ou
     }
     strcpy(out, text);
     return 0;
+}
+
+static int copy_instant_column(sqlite3_stmt *stmt, int column, char *out, size_t out_len)
+{
+    const unsigned char *value = sqlite3_column_text(stmt, column);
+    return st_instant_public(value == NULL ? "" : (const char *)value, out, out_len);
+}
+
+static int bind_stored_instant(sqlite3_stmt *stmt, int index, const char *value)
+{
+    char stored[ST_INSTANT_CAPACITY];
+    const char *text = value != NULL && st_instant_normalize(value, stored) == 0 ? stored : value;
+    return sqlite3_bind_text(stmt, index, text, -1, SQLITE_TRANSIENT);
+}
+
+/* Java trims an instant before normalization, but binds a non-instant (a bare date, for example)
+ * unchanged. Do not turn its fallback into a midnight timestamp or trim its invalid input. */
+static int bind_connection_bound(sqlite3_stmt *stmt, int index, const char *value)
+{
+    size_t len = strlen(value), start = 0U, end = len;
+    while (start < end && (unsigned char)value[start] <= 0x20U) ++start;
+    while (end > start && (unsigned char)value[end - 1U] <= 0x20U) --end;
+    char trimmed[64], stored[ST_INSTANT_CAPACITY];
+    if (end - start < sizeof(trimmed)) {
+        memcpy(trimmed, value + start, end - start); trimmed[end - start] = '\0';
+        if (st_instant_normalize(trimmed, stored) == 0)
+            return sqlite3_bind_text(stmt, index, stored, -1, SQLITE_TRANSIENT);
+    }
+    return sqlite3_bind_text(stmt, index, value, -1, SQLITE_TRANSIENT);
 }
 
 static int table_has_column(sqlite3 *db, const char *table, const char *column)
@@ -1642,6 +1674,14 @@ int st_storage_init(const char *path, int seed_demo_client)
             "CREATE INDEX IF NOT EXISTS idx_http_access_audit_at ON http_access_audit(occurred_at);"
             "CREATE INDEX IF NOT EXISTS idx_http_access_audit_route ON http_access_audit(tenant_id, route_id, id);");
     }
+    if (rc == 0) {
+        rc = exec_sql(db,
+            "CREATE TABLE IF NOT EXISTS specus_websocket_ticket ("
+            "token_hash VARCHAR(64) NOT NULL PRIMARY KEY,scope VARCHAR(40) NOT NULL,"
+            "attributes_json TEXT NOT NULL,remote_address_hash VARCHAR(64),"
+            "created_at VARCHAR(40) NOT NULL,expires_at VARCHAR(40) NOT NULL);"
+            "CREATE INDEX IF NOT EXISTS idx_ws_ticket_expires ON specus_websocket_ticket(expires_at);");
+    }
     if (rc == 0 && seed_demo_client) {
         /* Java DatabaseInitializer at startup: the default tenant, owned by the built-in administrator. */
         char tenant_id[81];
@@ -1650,6 +1690,12 @@ int st_storage_init(const char *path, int seed_demo_client)
         storage_configured_text("SPECUS_AUTH_USERNAME", "admin", owner, sizeof(owner));
         rc = seed_demo_client_on_db(db, tenant_id, owner) < 0 ? -1 : 0;
     }
+    if (rc == 0) {
+        rc = st_instant_migrate_column(db, "connection_record", "id", "connected_at", NULL);
+    }
+    if (rc == 0) rc = st_instant_migrate_column(db, "specus_client_auth_nonce", "id", "expires_at", NULL);
+    if (rc == 0) rc = st_instant_migrate_column(db, "specus_management_registration_challenge", "registration_id", "expires_at", NULL);
+    if (rc == 0) rc = st_instant_migrate_column(db, "specus_websocket_ticket", "token_hash", "expires_at", NULL);
     if (fresh && rc == 0) {
         rc = exec_sql(db, "COMMIT");
     }
@@ -1659,6 +1705,147 @@ int st_storage_init(const char *path, int seed_demo_client)
 
     sqlite3_close(db);
     return rc == 0 ? 0 : -1;
+}
+
+static int websocket_ticket_identity_valid(const char *token_hash, const char *scope)
+{
+    return token_hash != NULL && *token_hash != '\0' && strlen(token_hash) <= 64U
+        && scope != NULL && (strcmp(scope, "connections") == 0
+            || strcmp(scope, "client-messages") == 0 || strcmp(scope, "public-transfer") == 0);
+}
+
+static int websocket_ticket_values(const char *token_hash, const char *scope, const char *attributes_json,
+    const char *remote_address_hash, const char *created_at, const char *expires_at,
+    char created[ST_INSTANT_CAPACITY], char expires[ST_INSTANT_CAPACITY])
+{
+    if (!websocket_ticket_identity_valid(token_hash, scope) || !st_json_object_keys_unique(attributes_json)
+        || (remote_address_hash != NULL && (strlen(remote_address_hash) == 0U || strlen(remote_address_hash) > 64U))
+        || st_instant_normalize(expires_at, expires) != 0 || st_instant_normalize(created_at, created) != 0
+        || st_instant_public(created, created, ST_INSTANT_CAPACITY) != 0) return -1;
+    return 0;
+}
+
+static int insert_websocket_ticket_on_db(sqlite3 *db, const char *token_hash, const char *scope,
+    const char *attributes_json, const char *remote_address_hash, const char *created, const char *expires)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "INSERT INTO specus_websocket_ticket"
+        "(token_hash,scope,attributes_json,remote_address_hash,created_at,expires_at) VALUES(?1,?2,?3,?4,?5,?6)", -1, &stmt, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 1, token_hash, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 2, scope, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 3, attributes_json, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = remote_address_hash == NULL ? sqlite3_bind_null(stmt, 4) : sqlite3_bind_text(stmt, 4, remote_address_hash, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 5, created, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 6, expires, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+int st_storage_issue_websocket_ticket(const char *path, const char *token_hash, const char *scope,
+    const char *attributes_json, const char *remote_address_hash, const char *created_at, const char *expires_at)
+{
+    char expires[ST_INSTANT_CAPACITY], created[ST_INSTANT_CAPACITY];
+    if (websocket_ticket_values(token_hash, scope, attributes_json, remote_address_hash, created_at, expires_at, created, expires) != 0) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int result = insert_websocket_ticket_on_db(db, token_hash, scope, attributes_json, remote_address_hash, created, expires);
+    sqlite3_close(db); return result;
+}
+
+int st_storage_issue_websocket_ticket_limited(const char *path, const char *token_hash, const char *scope,
+    const char *attributes_json, const char *remote_address_hash, const char *created_at,
+    const char *expires_at, unsigned int active_limit)
+{
+    char expires[ST_INSTANT_CAPACITY], created[ST_INSTANT_CAPACITY], cutoff[ST_INSTANT_CAPACITY];
+    if (active_limit == 0U || websocket_ticket_values(token_hash, scope, attributes_json, remote_address_hash, created_at, expires_at, created, expires) != 0
+        || st_instant_normalize(created_at, cutoff) != 0) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) { sqlite3_close(db); return -1; }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "DELETE FROM specus_websocket_ticket WHERE expires_at<?1", -1, &stmt, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 1, cutoff, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt); stmt = NULL;
+    int result = -1;
+    if (rc == SQLITE_DONE) {
+        rc = sqlite3_prepare_v2(db, "SELECT count(*) FROM specus_websocket_ticket WHERE "
+            "(?1='public-transfer' AND scope='public-transfer' COLLATE BINARY) OR "
+            "(?1<>'public-transfer' AND scope COLLATE BINARY IN('connections','client-messages'))", -1, &stmt, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 1, scope, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW) result = sqlite3_column_int64(stmt, 0) >= (long long)active_limit ? -2 : 0;
+        sqlite3_finalize(stmt);
+    }
+    if (result == 0) result = insert_websocket_ticket_on_db(db, token_hash, scope, attributes_json, remote_address_hash, created, expires);
+    if (result == 0 || result == -2) { if (exec_sql(db, "COMMIT") != 0) result = -1; }
+    if (result == -1) (void)exec_sql(db, "ROLLBACK");
+    sqlite3_close(db); return result;
+}
+
+int st_storage_consume_websocket_ticket(const char *path, const char *token_hash, const char *scope,
+    const char *remote_address_hash, const char *now, char **attributes_json)
+{
+    if (attributes_json == NULL) return -1;
+    *attributes_json = NULL;
+    char cutoff[ST_INSTANT_CAPACITY];
+    if (!websocket_ticket_identity_valid(token_hash, scope) || st_instant_normalize(now, cutoff) != 0) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    /* The write lock covers both read and deletion: a second process cannot read the same
+     * payload before this transaction consumes it. No newer SQLite RETURNING dependency. */
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) { sqlite3_close(db); return -1; }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT attributes_json FROM specus_websocket_ticket "
+        "WHERE token_hash=?1 COLLATE BINARY AND scope=?2 COLLATE BINARY AND expires_at>=?3 "
+        "AND (remote_address_hash IS NULL OR remote_address_hash=?4 COLLATE BINARY)", -1, &stmt, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 1, token_hash, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 2, scope, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 3, cutoff, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = remote_address_hash == NULL ? sqlite3_bind_null(stmt, 4) : sqlite3_bind_text(stmt, 4, remote_address_hash, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+    int result = rc == SQLITE_DONE ? 1 : -1;
+    char *payload = NULL;
+    if (rc == SQLITE_ROW && sqlite3_column_type(stmt, 0) == SQLITE_TEXT) {
+        const char *text = (const char *)sqlite3_column_text(stmt, 0);
+        int bytes = sqlite3_column_bytes(stmt, 0);
+        if (text != NULL && bytes >= 0 && strlen(text) == (size_t)bytes && st_json_object_keys_unique(text)) {
+            payload = malloc((size_t)bytes + 1U);
+            if (payload != NULL) { memcpy(payload, text, (size_t)bytes + 1U); result = 0; }
+        }
+    }
+    sqlite3_finalize(stmt); stmt = NULL;
+    if (result == 0) {
+        rc = sqlite3_prepare_v2(db, "DELETE FROM specus_websocket_ticket WHERE token_hash=?1 COLLATE BINARY AND scope=?2 COLLATE BINARY AND expires_at>=?3", -1, &stmt, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 1, token_hash, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 2, scope, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 3, cutoff, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+        if (rc != SQLITE_DONE || sqlite3_changes(db) != 1) result = -1;
+        sqlite3_finalize(stmt);
+    }
+    if (result >= 0 && exec_sql(db, "COMMIT") != 0) result = -1;
+    if (result < 0) (void)exec_sql(db, "ROLLBACK");
+    sqlite3_close(db);
+    if (result == 0) *attributes_json = payload; else free(payload);
+    return result;
+}
+
+int st_storage_delete_expired_websocket_tickets(const char *path, const char *before, int *deleted)
+{
+    if (deleted != NULL) *deleted = 0;
+    char cutoff[ST_INSTANT_CAPACITY];
+    if (st_instant_normalize(before, cutoff) != 0) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "DELETE FROM specus_websocket_ticket WHERE expires_at<?1", -1, &stmt, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 1, cutoff, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+    if (rc == SQLITE_DONE && deleted != NULL) *deleted = sqlite3_changes(db);
+    sqlite3_finalize(stmt); sqlite3_close(db);
+    return rc == SQLITE_DONE ? 0 : -1;
 }
 
 int st_storage_seed_demo_client(const char *path, const char *tenant_id, const char *owner_username)
@@ -2120,7 +2307,7 @@ static int scan_connection(sqlite3_stmt *stmt, st_storage_connection *connection
         || copy_text_column(stmt, 5, connection->remote_address, sizeof(connection->remote_address)) != 0
         || copy_text_column(stmt, 7, connection->failure_reason, sizeof(connection->failure_reason)) != 0
         || copy_text_column(stmt, 8, connection->disconnect_reason, sizeof(connection->disconnect_reason)) != 0
-        || copy_text_column(stmt, 9, connection->connected_at, sizeof(connection->connected_at)) != 0
+        || copy_instant_column(stmt, 9, connection->connected_at, sizeof(connection->connected_at)) != 0
         || copy_text_column(stmt, 10, connection->disconnected_at, sizeof(connection->disconnected_at)) != 0) {
         return -1;
     }
@@ -2814,6 +3001,68 @@ int st_storage_create_management_user(const char *path,
     return out_user == NULL ? 0 : st_storage_get_management_user_in_tenant(path, tenant_id, username, out_user);
 }
 
+/* Runs in the caller's account transaction. No SQLite JSON extension is required;
+ * cache exact key+JSON snapshots before deleting, so iteration cannot skip changed rows. */
+static int revoke_websocket_identity_on_db(sqlite3 *db, const char *tenant_id, const char *username)
+{
+    typedef struct { sqlite3_value *key, *json; } ticket_snapshot;
+    ticket_snapshot *snapshots = NULL;
+    size_t count = 0U;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT token_hash,attributes_json FROM specus_websocket_ticket "
+        "WHERE scope COLLATE BINARY IN('connections','client-messages')", -1, &stmt, NULL);
+    int result = rc == SQLITE_OK ? 0 : -1;
+    while (result == 0 && (rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (sqlite3_column_type(stmt, 1) != SQLITE_TEXT) continue;
+        const char *json = (const char *)sqlite3_column_text(stmt, 1);
+        int bytes = sqlite3_column_bytes(stmt, 1);
+        if (json == NULL || bytes < 0 || strlen(json) != (size_t)bytes || !st_websocket_ticket_identity_matches(json, tenant_id, username)) continue;
+        if (count >= SIZE_MAX / sizeof(*snapshots) - 1U) { result = -1; break; }
+        ticket_snapshot *grown = realloc(snapshots, (count + 1U) * sizeof(*snapshots));
+        if (grown == NULL) { result = -1; break; }
+        snapshots = grown;
+        snapshots[count].key = sqlite3_value_dup(sqlite3_column_value(stmt, 0));
+        snapshots[count].json = sqlite3_value_dup(sqlite3_column_value(stmt, 1));
+        ++count;
+        if (snapshots[count - 1U].key == NULL || snapshots[count - 1U].json == NULL) result = -1;
+    }
+    if (result == 0 && rc != SQLITE_DONE) result = -1;
+    sqlite3_finalize(stmt); stmt = NULL;
+    if (result == 0 && count > 0U) {
+        rc = sqlite3_prepare_v2(db, "DELETE FROM specus_websocket_ticket WHERE token_hash=?1 COLLATE BINARY "
+            "AND attributes_json=?2 COLLATE BINARY AND scope COLLATE BINARY IN('connections','client-messages')", -1, &stmt, NULL);
+        if (rc != SQLITE_OK) result = -1;
+        for (size_t i = 0U; result == 0 && i < count; ++i) {
+            rc = sqlite3_bind_value(stmt, 1, snapshots[i].key);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_value(stmt, 2, snapshots[i].json);
+            if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+            if (rc != SQLITE_DONE || sqlite3_changes(db) != 1 || sqlite3_reset(stmt) != SQLITE_OK || sqlite3_clear_bindings(stmt) != SQLITE_OK) result = -1;
+        }
+        sqlite3_finalize(stmt);
+    }
+    for (size_t i = 0U; i < count; ++i) { sqlite3_value_free(snapshots[i].key); sqlite3_value_free(snapshots[i].json); }
+    free(snapshots); return result;
+}
+
+static int management_identity_on_db(sqlite3 *db, const char *tenant_id, const char *normalized_login,
+    char username[81], char role[20])
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT COALESCE(NULLIF(login_name,''),username),role FROM specus_management_user "
+        "WHERE tenant_id=?1 AND login_name_normalized=?2", -1, &stmt, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 2, normalized_login, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+    int result = -1;
+    if (rc == SQLITE_ROW) {
+        const char *login = (const char *)sqlite3_column_text(stmt, 0), *value = (const char *)sqlite3_column_text(stmt, 1);
+        if (login != NULL && value != NULL && strlen(login) == (size_t)sqlite3_column_bytes(stmt, 0)
+            && strlen(value) == (size_t)sqlite3_column_bytes(stmt, 1) && copy_text_column(stmt, 0, username, 81U) == 0 && copy_text_column(stmt, 1, role, 20U) == 0) result = 0;
+    }
+    sqlite3_finalize(stmt); return result;
+}
+
+/* Both callers hold BEGIN IMMEDIATE, including the non-audited wrapper. */
 static int update_management_user_on_db(sqlite3 *db,
                                         const char *tenant_id,
                                         const char *username,
@@ -2825,6 +3074,8 @@ static int update_management_user_on_db(sqlite3 *db,
     if (username == NULL || management_login_name_key(username, key, sizeof(key)) != 0) {
         return -1;
     }
+    char canonical_user[81], previous_role[20];
+    if (management_identity_on_db(db, tenant_id, key, canonical_user, previous_role) != 0) return -1;
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "UPDATE specus_management_user SET "
@@ -2854,6 +3105,9 @@ static int update_management_user_on_db(sqlite3 *db,
         rc = -1;
     }
     sqlite3_finalize(stmt);
+    if (rc == 0 && (!enabled || (role != NULL && *role != '\0' && strcmp(role, previous_role) != 0))) {
+        rc = revoke_websocket_identity_on_db(db, normalize_tenant_id(tenant_id), canonical_user);
+    }
     return rc;
 }
 
@@ -2869,7 +3123,10 @@ int st_storage_update_management_user(const char *path,
     if (open_db(path, &db) != 0) {
         return -1;
     }
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) { sqlite3_close(db); return -1; }
     int rc = update_management_user_on_db(db, tenant_id, username, password_hash, role, enabled);
+    if (rc == 0 && exec_sql(db, "COMMIT") != 0) rc = -1;
+    if (rc != 0) (void)exec_sql(db, "ROLLBACK");
     sqlite3_close(db);
     if (rc != 0) {
         return -1;
@@ -3026,10 +3283,13 @@ static int delete_management_user_on_db(sqlite3 *db,
     if (username == NULL || management_login_name_key(username, key, sizeof(key)) != 0) {
         return -1;
     }
+    char canonical_user[81], previous_role[20];
+    if (management_identity_on_db(db, tenant_id, key, canonical_user, previous_role) != 0) return -1;
     int forgotten = forget_account_data_on_db(db, normalize_tenant_id(tenant_id), key, actor, owned);
     if (forgotten != 0) {
         return forgotten;
     }
+    if (revoke_websocket_identity_on_db(db, normalize_tenant_id(tenant_id), canonical_user) != 0) return -1;
     /*
      * The account's workbench rows go in the caller's transaction: favourites and recent opens are
      * personal history, and an account created later under the same name must start empty. Their
@@ -3388,7 +3648,7 @@ int st_storage_create_registration_challenge(const char *path,
         sqlite3_bind_text(stmt, 4, challenge->password_hash, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 5, challenge->code_hash, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(stmt, 6, challenge->attempts_remaining);
-        sqlite3_bind_text(stmt, 7, challenge->expires_at, -1, SQLITE_TRANSIENT);
+        bind_stored_instant(stmt, 7, challenge->expires_at);
         sqlite3_bind_text(stmt, 8, challenge->resend_available_at, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 9, challenge->created_at, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 10, challenge->updated_at, -1, SQLITE_TRANSIENT);
@@ -3447,12 +3707,34 @@ int st_storage_delete_expired_registration_challenges(const char *path, const ch
         "DELETE FROM specus_management_registration_challenge WHERE expires_at < ?",
         -1, &stmt, NULL);
     if (rc == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, expires_before, -1, SQLITE_TRANSIENT);
+        bind_stored_instant(stmt, 1, expires_before);
         rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
     } else rc = -1;
     sqlite3_finalize(stmt);
     sqlite3_close(db);
     return rc;
+}
+
+static int delete_expired_nonces_on_db(sqlite3 *db, const char *before, int *deleted)
+{
+    if (deleted != NULL) *deleted = 0;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "DELETE FROM specus_client_auth_nonce WHERE expires_at<?1", -1, &stmt, NULL);
+    if (rc == SQLITE_OK) rc = bind_stored_instant(stmt, 1, before);
+    if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+    if (rc == SQLITE_DONE && deleted != NULL) *deleted = sqlite3_changes(db);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+int st_storage_delete_expired_client_auth_nonces(const char *path, const char *before, int *deleted)
+{
+    if (deleted != NULL) *deleted = 0;
+    if (before == NULL) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int rc = delete_expired_nonces_on_db(db, before, deleted);
+    sqlite3_close(db); return rc;
 }
 
 int st_storage_consume_client_auth_nonce(const char *path,
@@ -3465,6 +3747,8 @@ int st_storage_consume_client_auth_nonce(const char *path,
         || now_ms > LLONG_MAX - ttl_ms) {
         return -1;
     }
+    char now[ST_INSTANT_CAPACITY], expires[ST_INSTANT_CAPACITY];
+    if (st_instant_format_millis(now_ms, now) != 0 || st_instant_format_millis(now_ms + ttl_ms, expires) != 0) return -1;
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) return -1;
     if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
@@ -3473,28 +3757,19 @@ int st_storage_consume_client_auth_nonce(const char *path,
     }
     /*
      * Java ClientAuthNonceService: drop what expired, then insert-if-absent decides. expires_at is
-     * Java's text form, "2026-10-07T01:02:03.004Z" here: fixed width, so text order is time order.
+     * the shared sortable seven-fraction form; exact expiry remains present until now passes it.
      */
     sqlite3_stmt *stmt = NULL;
     int result = -1;
-    int rc = sqlite3_prepare_v2(db,
-        "DELETE FROM specus_client_auth_nonce "
-        "WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%S', ?1 / 1000, 'unixepoch') || printf('.%03dZ', ?1 % 1000)",
-        -1, &stmt, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_int64(stmt, 1, now_ms);
-        rc = sqlite3_step(stmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
-    }
-    sqlite3_finalize(stmt);
-    stmt = NULL;
-    if (rc == SQLITE_OK
+    int rc = delete_expired_nonces_on_db(db, now, NULL);
+    if (rc == 0
         && sqlite3_prepare_v2(db,
                "INSERT OR IGNORE INTO specus_client_auth_nonce(id, api_key_hash, expires_at) "
-               "VALUES(?1, ?2, strftime('%Y-%m-%dT%H:%M:%S', ?3 / 1000, 'unixepoch') || printf('.%03dZ', ?3 % 1000))",
+               "VALUES(?1, ?2, ?3)",
                -1, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, nonce_id, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 2, api_key_hash, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt, 3, now_ms + ttl_ms);
+        sqlite3_bind_text(stmt, 3, expires, -1, SQLITE_TRANSIENT);
         if (sqlite3_step(stmt) == SQLITE_DONE) {
             result = sqlite3_changes(db) == 1 ? 0 : 1;
         }
@@ -5880,7 +6155,7 @@ int st_storage_record_connection_detail_with_tenant_and_id(const char *path,
         } else {
             sqlite3_bind_text(stmt, 8, disconnect_reason, -1, SQLITE_TRANSIENT);
         }
-        sqlite3_bind_text(stmt, 9, connected_at, -1, SQLITE_TRANSIENT);
+        bind_stored_instant(stmt, 9, connected_at);
         if (disconnected_at == NULL) {
             sqlite3_bind_null(stmt, 10);
         } else {
@@ -5977,6 +6252,29 @@ int st_storage_close_open_connections(const char *path,
     return rc == 0 ? 0 : -1;
 }
 
+int st_storage_close_open_connections_before(const char *path, const char *cutoff,
+                                               const char *disconnect_reason, const char *disconnected_at,
+                                               int *closed_count)
+{
+    if (closed_count != NULL) *closed_count = 0;
+    char stored[ST_INSTANT_CAPACITY];
+    if (st_instant_normalize(cutoff, stored) != 0) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "UPDATE connection_record SET disconnected_at=?1, "
+        "disconnect_reason=COALESCE(NULLIF(disconnect_reason,''),?2) "
+        "WHERE (disconnected_at IS NULL OR disconnected_at='') AND connected_at<?3", -1, &stmt, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 1, disconnected_at == NULL ? "" : disconnected_at, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 2, disconnect_reason == NULL ? "" : disconnect_reason, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 3, stored, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+    if (rc == SQLITE_DONE && closed_count != NULL) *closed_count = sqlite3_changes(db);
+    sqlite3_finalize(stmt); sqlite3_close(db);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
 static int append_connection_filters(sqlite3 *db,
                                      sqlite3_stmt *stmt,
                                      long long client_id,
@@ -5993,10 +6291,10 @@ static int append_connection_filters(sqlite3 *db,
         sqlite3_bind_int(stmt, (*index)++, success_filter);
     }
     if (from != NULL && *from != '\0') {
-        sqlite3_bind_text(stmt, (*index)++, from, -1, SQLITE_TRANSIENT);
+        bind_connection_bound(stmt, (*index)++, from);
     }
     if (to != NULL && *to != '\0') {
-        sqlite3_bind_text(stmt, (*index)++, to, -1, SQLITE_TRANSIENT);
+        bind_connection_bound(stmt, (*index)++, to);
     }
     return 0;
 }
@@ -6058,10 +6356,10 @@ static int append_visible_connection_filters(sqlite3_stmt *stmt,
         sqlite3_bind_int(stmt, (*index)++, success_filter);
     }
     if (from != NULL && *from != '\0') {
-        sqlite3_bind_text(stmt, (*index)++, from, -1, SQLITE_TRANSIENT);
+        bind_connection_bound(stmt, (*index)++, from);
     }
     if (to != NULL && *to != '\0') {
-        sqlite3_bind_text(stmt, (*index)++, to, -1, SQLITE_TRANSIENT);
+        bind_connection_bound(stmt, (*index)++, to);
     }
     return 0;
 }

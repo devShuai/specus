@@ -114,6 +114,9 @@ typedef struct st_connectivity_checker st_connectivity_checker;
 
 /* One checker serves the process: it owns the concurrency slots and the rate limiter. */
 st_connectivity_checker *st_connectivity_checker_new(const st_connectivity_device *device);
+/* Retain only while already owning a reference, or holding its publication lock.
+ * free releases one reference; the last reference destroys the checker. */
+void st_connectivity_checker_retain(st_connectivity_checker *checker);
 void st_connectivity_checker_free(st_connectivity_checker *checker);
 
 /*

@@ -21,6 +21,15 @@ CORE_OBJS := $(BUILD_DIR)/admin_http.o $(BUILD_DIR)/client_address.o $(BUILD_DIR
 SERVER := $(BUILD_DIR)/specus-server-c
 CORE_OBJS += $(BUILD_DIR)/url_decode.o
 URL_DECODE_TESTS := $(BUILD_DIR)/specus_c_url_decode_tests
+CONNECTIVITY_LIFETIME_TESTS := $(BUILD_DIR)/specus_c_connectivity_lifetime_tests
+CONNECTIVITY_SETTER_TESTS := $(BUILD_DIR)/specus_c_connectivity_setter_tests
+CORE_OBJS += $(BUILD_DIR)/instant.o $(BUILD_DIR)/instant_storage.o
+CORE_OBJS += $(BUILD_DIR)/websocket_ticket.o
+INSTANT_TESTS := $(BUILD_DIR)/specus_c_instant_tests
+INSTANT_MIGRATION_TESTS := $(BUILD_DIR)/specus_c_instant_migration_tests
+CONNECTION_TIME_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_connection_time_reference_tests
+AUTH_EXPIRY_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_auth_expiry_reference_tests
+WEBSOCKET_TICKET_STORAGE_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_websocket_ticket_storage_reference_tests
 ADMIN_TESTS := $(BUILD_DIR)/specus_c_admin_http_tests
 DIRECT_WEBSOCKET_TESTS := $(BUILD_DIR)/specus_c_direct_websocket_tests
 CLIENT_ADDRESS_TESTS := $(BUILD_DIR)/specus_c_client_address_tests
@@ -71,6 +80,8 @@ EMAIL_NUL_VECTOR_FILE := ../../../protocol/test-vectors/registration-email-nul-v
 PEER_MESH_API_TESTS := $(BUILD_DIR)/specus_c_peer_mesh_api_tests
 MANAGEMENT_OVERVIEW_TESTS := $(BUILD_DIR)/specus_c_management_overview_tests
 HTTP_WEBSOCKET_ROUTING_TESTS := $(BUILD_DIR)/specus_c_http_websocket_routing_tests
+SERVER_HARNESS_TESTS := $(BUILD_DIR)/specus_c_server_harness_tests
+WEBSOCKET_TICKET_API_TESTS := $(BUILD_DIR)/specus_c_websocket_ticket_request_tests $(BUILD_DIR)/specus_c_websocket_ticket_quota_tests $(BUILD_DIR)/specus_c_websocket_ticket_account_tests
 STORAGE_TESTS := $(BUILD_DIR)/specus_c_storage_tests
 SESSION_ORDER_TESTS := $(BUILD_DIR)/specus_c_session_order_tests
 SESSION_SCOPE_TESTS := $(BUILD_DIR)/specus_c_session_scope_tests
@@ -87,6 +98,11 @@ ALL_TESTS := $(TESTS) $(PUBLIC_COORDINATION_TESTS) $(ELASTICSEARCH_TRAFFIC_TESTS
 ALL_TESTS += $(PEER_MESH_E2E_TESTS) $(CLIENT_ROUTE_SCALE_TESTS)
 ALL_TESTS += $(NAT_SIZING_REFERENCE_TESTS)
 ALL_TESTS += $(SQLITE_REFERENCE_TESTS)
+ALL_TESTS += $(INSTANT_TESTS) $(INSTANT_MIGRATION_TESTS) $(CONNECTION_TIME_REFERENCE_TESTS)
+ALL_TESTS += $(AUTH_EXPIRY_REFERENCE_TESTS)
+ALL_TESTS += $(WEBSOCKET_TICKET_STORAGE_REFERENCE_TESTS)
+TESTS += $(CONNECTIVITY_LIFETIME_TESTS) $(CONNECTIVITY_SETTER_TESTS)
+ALL_TESTS += $(CONNECTIVITY_LIFETIME_TESTS) $(CONNECTIVITY_SETTER_TESTS)
 UNICODE_JAVA21_TESTS := $(BUILD_DIR)/specus_c_unicode_java21_tests
 UNICODE_JAVA21_VECTORS := ../../../protocol/test-vectors/java21-root-case-v1.json
 CORE_OBJS += $(BUILD_DIR)/unicode_java21.o
@@ -124,6 +140,11 @@ TESTS += $(URL_DECODE_TESTS)
 ALL_TESTS += $(URL_DECODE_TESTS)
 
 .PHONY: all test release clean
+ALL_TESTS += $(SERVER_HARNESS_TESTS) $(WEBSOCKET_TICKET_API_TESTS)
+TESTS += $(WEBSOCKET_TICKET_API_TESTS)
+REGISTRATION_EXPIRY_TESTS := $(BUILD_DIR)/specus_c_registration_expiry_tests
+ALL_TESTS += $(REGISTRATION_EXPIRY_TESTS)
+TESTS += $(REGISTRATION_EXPIRY_TESTS)
 
 all: $(SERVER) $(ALL_TESTS)
 
@@ -140,6 +161,8 @@ $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/unicode_java21.o: src/unicode_java21.h src/unicode_java21_data.h
+$(BUILD_DIR)/instant.o: src/instant.h
+$(BUILD_DIR)/instant_storage.o $(BUILD_DIR)/storage.o: src/instant.h src/instant_storage.h
 
 $(BUILD_DIR)/connectivity_check.o: src/connectivity_check.h
 
@@ -180,6 +203,11 @@ $(ADMIN_TESTS): $(CORE_OBJS) tests/admin_http_tests.c | $(BUILD_DIR)
 
 $(URL_DECODE_TESTS): $(CORE_OBJS) tests/url_decode_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/url_decode_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+$(CONNECTIVITY_LIFETIME_TESTS): $(CORE_OBJS) tests/connectivity_lifetime_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/connectivity_lifetime_tests.c $(CORE_OBJS) -Wl,--wrap=free -Wl,--wrap=st_connectivity_checker_new -Wl,--wrap=st_connectivity_handle $(LDFLAGS) -o $@
+
+$(CONNECTIVITY_SETTER_TESTS): $(CORE_OBJS) tests/connectivity_setter_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/connectivity_setter_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(DIRECT_WEBSOCKET_TESTS): $(CORE_OBJS) tests/direct_websocket_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/direct_websocket_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
@@ -313,6 +341,15 @@ $(PEER_MESH_API_TESTS): $(CORE_OBJS) tests/peer_mesh_api_tests.c tests/server_ha
 $(MANAGEMENT_OVERVIEW_TESTS): $(CORE_OBJS) tests/management_overview_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/management_overview_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
+$(REGISTRATION_EXPIRY_TESTS): $(CORE_OBJS) tests/registration_expiry_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/registration_expiry_tests.c $(CORE_OBJS) -Wl,--wrap=time -Wl,--wrap=clock_gettime $(LDFLAGS) -o $@
+
+$(SERVER_HARNESS_TESTS): $(CORE_OBJS) tests/server_harness_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/server_harness_tests.c tests/server_harness.c $(CORE_OBJS) -Wl,--wrap=bind $(LDFLAGS) -o $@
+
+$(WEBSOCKET_TICKET_API_TESTS): $(BUILD_DIR)/specus_c_%_tests: tests/%_tests.c tests/websocket_ticket_request_tests.c $(CORE_OBJS) | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(CORE_OBJS) -Wl,--wrap=clock_gettime $(LDFLAGS) -o $@
+
 $(HTTP_WEBSOCKET_ROUTING_TESTS): $(CORE_OBJS) tests/http_websocket_routing_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/http_websocket_routing_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
@@ -349,7 +386,23 @@ $(WORKBENCH_TESTS): $(CORE_OBJS) tests/workbench_tests.c | $(BUILD_DIR)
 $(MANAGEMENT_ACCOUNTS_TESTS): $(CORE_OBJS) tests/management_accounts_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/management_accounts_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
+$(INSTANT_TESTS): $(CORE_OBJS) tests/instant_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/instant_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(INSTANT_MIGRATION_TESTS): $(CORE_OBJS) tests/instant_migration_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/instant_migration_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(CONNECTION_TIME_REFERENCE_TESTS): $(CORE_OBJS) tests/connection_time_reference_tests.c tests/instant_reference_cases.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/connection_time_reference_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(AUTH_EXPIRY_REFERENCE_TESTS): $(CORE_OBJS) tests/auth_expiry_reference_tests.c tests/instant_reference_cases.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/auth_expiry_reference_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(WEBSOCKET_TICKET_STORAGE_REFERENCE_TESTS): $(CORE_OBJS) tests/websocket_ticket_storage_reference_tests.c tests/instant_reference_cases.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/websocket_ticket_storage_reference_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
 test: all
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/websocket_ticket_restart_tests.py $(abspath $(SERVER))
 	$(SQLITE_REFERENCE_TESTS)
 	$(NAT_SIZING_REFERENCE_TESTS) $(SERVER)
 	$(NAT_PUSH_REFERENCE_TEST_COMMAND)
@@ -381,7 +434,13 @@ test: all
 	$(PEER_MESH_API_TESTS)
 	$(MANAGEMENT_OVERVIEW_TESTS) $(SERVER)
 	$(HTTP_WEBSOCKET_ROUTING_TESTS) $(SERVER)
+	$(SERVER_HARNESS_TESTS) $(SERVER)
 	$(PEER_MESH_E2E_TESTS) $(SERVER)
+	$(INSTANT_TESTS)
+	$(INSTANT_MIGRATION_TESTS)
+	$(CONNECTION_TIME_REFERENCE_TESTS)
+	$(AUTH_EXPIRY_REFERENCE_TESTS)
+	$(WEBSOCKET_TICKET_STORAGE_REFERENCE_TESTS)
 
 release: CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O3 -DNDEBUG
 release: clean $(SERVER)
