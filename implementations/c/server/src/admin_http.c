@@ -30,6 +30,7 @@
 #include "traffic_capture.h"
 #include "turn_auth.h"
 #include "upstream_browser_headers.h"
+#include "url_decode.h"
 #include "workbench.h"
 
 #include <arpa/inet.h>
@@ -13657,25 +13658,7 @@ static int hex_nibble(char value)
 
 static char *admin_url_decode(const char *value, size_t len)
 {
-    char *out = (char *)malloc(len + 1U);
-    if (out == NULL) {
-        return NULL;
-    }
-    size_t w = 0;
-    for (size_t i = 0; i < len; ++i) {
-        if (value[i] == '%' && i + 2U < len) {
-            int high = hex_nibble(value[i + 1U]);
-            int low = hex_nibble(value[i + 2U]);
-            if (high >= 0 && low >= 0) {
-                out[w++] = (char)((high << 4) | low);
-                i += 2U;
-                continue;
-            }
-        }
-        out[w++] = value[i] == '+' ? ' ' : value[i];
-    }
-    out[w] = '\0';
-    return out;
+    return st_url_decode(value, len, NULL);
 }
 
 static int admin_snapshot_base64_value(unsigned char value)
@@ -17333,7 +17316,7 @@ static int handle_connection_websocket_request(int fd, const char *method, const
     int single_ticket_query = 0;
     if (query != NULL && strncmp(query + 1, "ticket=", 7U) == 0 && strchr(query + 1, '&') == NULL) {
         single_ticket_query = 1;
-        ticket = admin_query_string(path, "ticket");
+        ticket = st_url_decode_string(query + 8U, strlen(query + 8U));
     }
     char remote_address[ST_CLIENT_ADDRESS_MAX_LEN];
     admin_request_client_address(fd, request, remote_address);
@@ -17452,7 +17435,7 @@ static int handle_client_messages_websocket_request(int fd,
     int single_ticket_query = 0;
     if (query != NULL && strncmp(query + 1, "ticket=", 7U) == 0 && strchr(query + 1, '&') == NULL) {
         single_ticket_query = 1;
-        ticket = admin_query_string(path, "ticket");
+        ticket = st_url_decode_string(query + 8U, strlen(query + 8U));
     }
     char remote_address[ST_CLIENT_ADDRESS_MAX_LEN];
     admin_request_client_address(fd, request, remote_address);

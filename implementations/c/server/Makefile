@@ -19,6 +19,8 @@ endif
 BUILD_DIR := build
 CORE_OBJS := $(BUILD_DIR)/admin_http.o $(BUILD_DIR)/client_address.o $(BUILD_DIR)/client_auth_nonce.o $(BUILD_DIR)/client_package.o $(BUILD_DIR)/connectivity_check.o $(BUILD_DIR)/crypto.o $(BUILD_DIR)/decompression_limits.o $(BUILD_DIR)/elasticsearch_traffic.o $(BUILD_DIR)/github_release.o $(BUILD_DIR)/http_client.o $(BUILD_DIR)/json.o $(BUILD_DIR)/login_rate_limiter.o $(BUILD_DIR)/media_capture.o $(BUILD_DIR)/object_storage.o $(BUILD_DIR)/oidc.o $(BUILD_DIR)/password_hash.o $(BUILD_DIR)/peer_egress.o $(BUILD_DIR)/peer_mesh.o $(BUILD_DIR)/protocol.o $(BUILD_DIR)/public_coordination.o $(BUILD_DIR)/public_discovery.o $(BUILD_DIR)/public_room.o $(BUILD_DIR)/registration.o $(BUILD_DIR)/security.o $(BUILD_DIR)/security_baseline.o $(BUILD_DIR)/storage.o $(BUILD_DIR)/stun_turn.o $(BUILD_DIR)/tls_transport.o $(BUILD_DIR)/traffic_capture.o $(BUILD_DIR)/turn_auth.o $(BUILD_DIR)/stream_tombstones.o $(BUILD_DIR)/workbench.o $(BUILD_DIR)/http_share.o $(BUILD_DIR)/product_metrics.o $(BUILD_DIR)/upstream_browser_headers.o
 SERVER := $(BUILD_DIR)/specus-server-c
+CORE_OBJS += $(BUILD_DIR)/url_decode.o
+URL_DECODE_TESTS := $(BUILD_DIR)/specus_c_url_decode_tests
 ADMIN_TESTS := $(BUILD_DIR)/specus_c_admin_http_tests
 DIRECT_WEBSOCKET_TESTS := $(BUILD_DIR)/specus_c_direct_websocket_tests
 CLIENT_ADDRESS_TESTS := $(BUILD_DIR)/specus_c_client_address_tests
@@ -76,6 +78,8 @@ ALL_TESTS := $(TESTS) $(PUBLIC_COORDINATION_TESTS) $(ELASTICSEARCH_TRAFFIC_TESTS
 ALL_TESTS += $(PEER_MESH_E2E_TESTS) $(CLIENT_ROUTE_SCALE_TESTS)
 TESTS += $(SESSION_ORDER_TESTS) $(SESSION_SCOPE_TESTS)
 ALL_TESTS += $(SESSION_ORDER_TESTS) $(SESSION_SCOPE_TESTS)
+TESTS += $(URL_DECODE_TESTS)
+ALL_TESTS += $(URL_DECODE_TESTS)
 
 .PHONY: all test release clean
 
@@ -92,6 +96,9 @@ $(SERVER): $(CORE_OBJS) src/main.c | $(BUILD_DIR)
 
 $(ADMIN_TESTS): $(CORE_OBJS) tests/admin_http_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/admin_http_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(URL_DECODE_TESTS): $(CORE_OBJS) tests/url_decode_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/url_decode_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(DIRECT_WEBSOCKET_TESTS): $(CORE_OBJS) tests/direct_websocket_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/direct_websocket_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
