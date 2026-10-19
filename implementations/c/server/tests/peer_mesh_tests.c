@@ -314,6 +314,84 @@ static int test_egress_catalog_ipv6_targets(void)
     return failed;
 }
 
+/*
+ * ipv6PacketCapable follows the same current online session as ipv6TargetCapable, right after it in
+ * each entry, and the two declarations never stand in for each other.
+ */
+static int test_egress_catalog_ipv6_packets(void)
+{
+    char path[] = "/tmp/specus_c_peer_egress_ipv6_packets.XXXXXX";
+    int temp_fd = mkstemp(path);
+    if (temp_fd < 0) return 1;
+    close(temp_fd);
+    unlink(path);
+    if (st_storage_init(path, 0) != 0) return 1;
+    sqlite3 *db = NULL;
+    if (sqlite3_open(path, &db) != SQLITE_OK) { unlink(path); return 1; }
+
+    st_storage_client consumer, egress;
+    st_storage_peer_mesh_device device;
+    long long consumer_session = 0, egress_session = 0;
+    st_storage_peer_mesh_egress_switch egress_switch;
+    memset(&egress_switch, 0, sizeof(egress_switch));
+    snprintf(egress_switch.tenant_id, sizeof(egress_switch.tenant_id), "%s", "tenant-egress");
+    egress_switch.enabled = 1;
+    snprintf(egress_switch.updated_by, sizeof(egress_switch.updated_by), "%s", "admin");
+    if (st_storage_upsert_client(path, 0, "tenant-egress", "egress-consumer", "owner", 1, 60, &consumer) != 0
+        || st_storage_upsert_client(path, 0, "tenant-egress", "egress-dns", "owner", 1, 60, &egress) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &consumer, 1, &device) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &egress, 1, &device) != 0
+        || st_storage_upsert_peer_mesh_egress_switch(path, &egress_switch) != 0
+        || add_egress_policy(path, &egress, consumer.id) != 0
+        || open_egress_session(path, &consumer, 0, &consumer_session) != 0
+        || open_egress_session(path, &egress, 1, &egress_session) != 0) {
+        sqlite3_close(db); unlink(path); return 1;
+    }
+    egress_test_context context;
+    memset(&context, 0, sizeof(context));
+    context.dns_egress_online = 1;
+    st_peer_mesh_runtime runtime = {path, capture_egress_signal, egress_is_online, &context, 0, 2};
+    int failed = 0;
+    const int expected_packets[] = {1, 0, 0, 0};
+    const int expected_targets[] = {0, 1, 0, 0};
+    for (size_t i = 0; i < sizeof(expected_packets) / sizeof(expected_packets[0]); ++i) {
+        char sql[512];
+        if (i == 1 && open_egress_session(path, &egress, 0, &egress_session) != 0) { failed = 1; break; }
+        if (i == 0) snprintf(sql, sizeof(sql),
+            "UPDATE specus_client_session SET client_egress_ipv6_packets=1,client_egress_ipv6_targets=0 "
+            "WHERE id=%lld", egress_session);
+        else if (i == 1) snprintf(sql, sizeof(sql),
+            "UPDATE specus_client_session SET client_egress_ipv6_packets=0,client_egress_ipv6_targets=1 "
+            "WHERE id=%lld", egress_session);
+        else if (i == 2) snprintf(sql, sizeof(sql),
+            "UPDATE specus_client_session SET client_egress_version=0,client_egress_ipv6_packets=1,"
+            "client_egress_ipv6_targets=1 WHERE id=%lld", egress_session);
+        else {
+            snprintf(sql, sizeof(sql), "UPDATE specus_client_session SET status='DISCONNECTED' WHERE client_id=%lld", egress.id);
+            context.dns_egress_online = 0;
+        }
+        if (sqlite3_exec(db, sql, NULL, NULL, NULL) != SQLITE_OK) { failed = 1; break; }
+        context.capture.count = 0;
+        if (st_peer_mesh_refresh_tenant(&runtime, "tenant-egress") != 0) { failed = 1; break; }
+        const char *catalog = last_egress_catalog(&context.capture, "egress-consumer");
+        int packets = catalog_entry_flag(catalog, "egress-dns", "ipv6PacketCapable");
+        int targets = catalog_entry_flag(catalog, "egress-dns", "ipv6TargetCapable");
+        if (packets != expected_packets[i] || targets != expected_targets[i]) {
+            fprintf(stderr, "IPv6 packet catalog scenario %zu: got packets %d targets %d, expected %d %d\n",
+                    i, packets, targets, expected_packets[i], expected_targets[i]);
+            failed = 1;
+        }
+        if (i == 0 && (catalog == NULL || strstr(catalog,
+                "\"ipv6TargetCapable\":false,\"ipv6PacketCapable\":true,\"egressVersion\":1}") == NULL)) {
+            fprintf(stderr, "ipv6PacketCapable is not right after ipv6TargetCapable\n");
+            failed = 1;
+        }
+    }
+    sqlite3_close(db);
+    unlink(path);
+    return failed;
+}
+
 static int test_egress_catalog_domain_targets(void)
 {
     char path[] = "/tmp/specus_c_peer_egress_catalog_tests.XXXXXX";
@@ -1954,6 +2032,7 @@ int main(void)
     unlink(path);
     if (test_egress_catalog_domain_targets() != 0) return 1;
     if (test_egress_catalog_ipv6_targets() != 0) return 1;
+    if (test_egress_catalog_ipv6_packets() != 0) return 1;
     if (test_egress_catalog_egress_version() != 0) return 1;
     if (test_egress_config_domain_rules() != 0) return 1;
     if (test_egress_pushes_are_gated() != 0) return 1;

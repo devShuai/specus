@@ -2005,6 +2005,7 @@ static int pm_push_egress_catalog(const st_peer_mesh_runtime *runtime,
         int egress_version = announced ? egress->client_egress_version : 0;
         int domain_targets = announced && egress->client_egress_domain_targets;
         int ipv6_targets = announced && egress->client_egress_ipv6_targets;
+        int ipv6_packets = announced && egress->client_egress_ipv6_packets;
 
         st_egress_destination_rule rules[ST_EGRESS_MAX_DESTINATION_RULES];
         size_t rules_len = 0U;
@@ -2026,14 +2027,16 @@ static int pm_push_egress_catalog(const st_peer_mesh_runtime *runtime,
         }
         if (rc == 0) {
             /*
-             * IPv6 target sockets are independent of the consumer's packet family.
+             * IPv6 target sockets and IPv6 packets in SPEG1 are independent declarations.
              * All capability fields reflect the same current session. egressVersion is written
              * even when 0, because a consumer reads 0 as an egress that cannot take a flow but an
              * absent field as an old server it cannot judge.
              */
             rc = pm_appendf(&message,
-                            "],\"domainTargetCapable\":%s,\"ipv6TargetCapable\":%s,\"egressVersion\":%d}",
-                            domain_targets ? "true" : "false", ipv6_targets ? "true" : "false", egress_version);
+                            "],\"domainTargetCapable\":%s,\"ipv6TargetCapable\":%s,"
+                            "\"ipv6PacketCapable\":%s,\"egressVersion\":%d}",
+                            domain_targets ? "true" : "false", ipv6_targets ? "true" : "false",
+                            ipv6_packets ? "true" : "false", egress_version);
         }
         first = 0;
     }

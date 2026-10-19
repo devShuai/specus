@@ -957,7 +957,8 @@ int st_storage_init(const char *path, int seed_demo_client)
         "client_egress_version INTEGER NOT NULL DEFAULT 0,"
         "client_egress_domain_targets INTEGER NOT NULL DEFAULT 0,"
         "client_egress_ipv6_targets INTEGER NOT NULL DEFAULT 0,"
-        "client_http_route_version INTEGER NOT NULL DEFAULT 0"
+        "client_http_route_version INTEGER NOT NULL DEFAULT 0,"
+        "client_egress_ipv6_packets INTEGER NOT NULL DEFAULT 0"
         ");");
     }
     if (rc == 0) {
@@ -1452,6 +1453,11 @@ int st_storage_init(const char *path, int seed_demo_client)
     if (rc == 0) {
         /* Never infer an IPv6 declaration for an older session. */
         rc = add_column_if_missing(db, "specus_client_session", "client_egress_ipv6_targets",
+                                   "INTEGER NOT NULL DEFAULT 0");
+    }
+    if (rc == 0) {
+        /* Never infer an IPv6 packet declaration for an older session. */
+        rc = add_column_if_missing(db, "specus_client_session", "client_egress_ipv6_packets",
                                    "INTEGER NOT NULL DEFAULT 0");
     }
     if (rc == 0) {
@@ -2018,11 +2024,12 @@ static int load_current_egress_announcement(sqlite3 *db, st_storage_client *clie
     sqlite3_stmt *statement = NULL;
     if (sqlite3_prepare_v2(db,
         "SELECT id,client_egress_version,client_egress_domain_targets,client_egress_ipv6_targets,"
-        "netty_connected_at,http_login_at,tenant_id,client_id,status FROM specus_client_session "
+        "netty_connected_at,http_login_at,tenant_id,client_id,status,client_egress_ipv6_packets "
+        "FROM specus_client_session "
         "WHERE tenant_id=? AND client_id=? AND status='NETTY_ONLINE'", -1, &statement, NULL) != SQLITE_OK) return -1;
     sqlite3_bind_text(statement, 1, client->tenant_id, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(statement, 2, client->id);
-    int rc, found = 0, unknown = 0, version = 0, domain = 0, ipv6 = 0;
+    int rc, found = 0, unknown = 0, version = 0, domain = 0, ipv6 = 0, packets = 0;
     long long newest_id = 0;
     storage_session_instant newest = {0};
     while ((rc = sqlite3_step(statement)) == SQLITE_ROW) {
@@ -2054,14 +2061,16 @@ static int load_current_egress_announcement(sqlite3 *db, st_storage_client *clie
             version = sqlite3_column_int(statement, 1);
             domain = sqlite3_column_int(statement, 2) != 0;
             ipv6 = sqlite3_column_int(statement, 3) != 0;
+            packets = sqlite3_column_int(statement, 9) != 0;
         }
     }
     sqlite3_finalize(statement);
     if (!unknown && rc != SQLITE_DONE) return -1;
-    if (unknown || !found || version < 1) version = domain = ipv6 = 0;
+    if (unknown || !found || version < 1) version = domain = ipv6 = packets = 0;
     client->client_egress_version = version;
     client->client_egress_domain_targets = domain;
     client->client_egress_ipv6_targets = ipv6;
+    client->client_egress_ipv6_packets = packets;
     return 0;
 }
 
@@ -2216,6 +2225,7 @@ static int scan_client_session(sqlite3_stmt *stmt, st_storage_client_session *se
     session->client_egress_domain_targets = sqlite3_column_int(stmt, 31) != 0;
     session->client_http_route_version = sqlite3_column_int(stmt, 32);
     session->client_egress_ipv6_targets = sqlite3_column_int(stmt, 33) != 0;
+    session->client_egress_ipv6_packets = sqlite3_column_int(stmt, 34) != 0;
     return 0;
 }
 
@@ -4755,7 +4765,8 @@ static int load_client_session_by_id(const char *path, long long id, st_storage_
         "message_media_preview_capable, message_max_attachment_bytes, peer_service_discovery_version, "
         "peer_service_applications, http_login_at, netty_connected_at, "
         "disconnected_at, expires_at, channel_id, remote_address, client_egress_version, "
-        "client_egress_domain_targets, client_http_route_version, client_egress_ipv6_targets "
+        "client_egress_domain_targets, client_http_route_version, client_egress_ipv6_targets, "
+        "client_egress_ipv6_packets "
         "FROM specus_client_session WHERE id = ?",
         -1,
         &stmt,
@@ -4786,8 +4797,9 @@ int st_storage_create_client_session(const char *path,
         "machine_fingerprint, os_user, hostname, os_name, os_version, os_arch, client_version, java_version, local_addresses, "
         "message_send_capable, message_receive_capable, message_attachments_capable, message_media_preview_capable, "
         "message_max_attachment_bytes, peer_service_discovery_version, peer_service_applications, "
-        "http_login_at, expires_at, client_egress_version, client_egress_domain_targets, client_http_route_version, client_egress_ipv6_targets) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "http_login_at, expires_at, client_egress_version, client_egress_domain_targets, client_http_route_version, client_egress_ipv6_targets, "
+        "client_egress_ipv6_packets) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         -1,
         &stmt,
         NULL);
@@ -4821,6 +4833,7 @@ int st_storage_create_client_session(const char *path,
         sqlite3_bind_int(stmt, 27, session->client_egress_domain_targets ? 1 : 0);
         sqlite3_bind_int(stmt, 28, session->client_http_route_version < 0 ? 0 : session->client_http_route_version);
         sqlite3_bind_int(stmt, 29, session->client_egress_ipv6_targets ? 1 : 0);
+        sqlite3_bind_int(stmt, 30, session->client_egress_ipv6_packets ? 1 : 0);
         rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
     } else {
         rc = -1;
@@ -4851,7 +4864,8 @@ int st_storage_get_client_session_for_login(const char *path,
         "message_media_preview_capable, message_max_attachment_bytes, peer_service_discovery_version, "
         "peer_service_applications, http_login_at, netty_connected_at, "
         "disconnected_at, expires_at, channel_id, remote_address, client_egress_version, "
-        "client_egress_domain_targets, client_http_route_version, client_egress_ipv6_targets "
+        "client_egress_domain_targets, client_http_route_version, client_egress_ipv6_targets, "
+        "client_egress_ipv6_packets "
         "FROM specus_client_session WHERE id = ? AND token_hash = ?",
         -1,
         &stmt,

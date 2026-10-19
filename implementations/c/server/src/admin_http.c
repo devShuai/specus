@@ -3053,6 +3053,7 @@ static int build_database_client_auth_login_response(const char *database_path,
     int client_egress_domain_targets = st_egress_declares_domain_targets(egress_caps_raw,
                                                                          client_egress_version);
     int client_egress_ipv6_targets = st_egress_declares_ipv6_targets(egress_caps_raw, client_egress_version);
+    int client_egress_ipv6_packets = st_egress_declares_ipv6_packets(egress_caps_raw, client_egress_version);
     /*
      * From version 1 the client classifies an HTTP stream RST in metadata.failure; the
      * connectivity check trusts that only from such a session (service-connectivity-check.md 6).
@@ -3318,6 +3319,7 @@ static int build_database_client_auth_login_response(const char *database_path,
     session.client_egress_version = client_egress_version;
     session.client_egress_domain_targets = client_egress_domain_targets;
     session.client_egress_ipv6_targets = client_egress_ipv6_targets;
+    session.client_egress_ipv6_packets = client_egress_ipv6_packets;
     session.client_http_route_version = client_http_route_version;
     snprintf(session.peer_service_applications, sizeof(session.peer_service_applications),
              "%s", peer_service_applications);

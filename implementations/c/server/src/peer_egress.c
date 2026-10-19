@@ -517,6 +517,15 @@ int st_egress_declares_ipv6_targets(const char *capabilities_json, int version)
     return declared;
 }
 
+int st_egress_declares_ipv6_packets(const char *capabilities_json, int version)
+{
+    if (capabilities_json == NULL || st_egress_normalize_version(version) < 1) return 0;
+    char *raw = st_json_get_top_level_raw(capabilities_json, "ipv6PacketCapable");
+    int declared = raw != NULL && strcmp(raw, "true") == 0;
+    free(raw);
+    return declared;
+}
+
 static const char *validate_rule_target(const st_egress_rule *rule);
 
 /* Anything outside digits, dots and the prefix separator is treated as a name. */
