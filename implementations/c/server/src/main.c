@@ -139,6 +139,9 @@ typedef struct external_conn {
     int thread_started;
     pthread_t writer_thread;
     int writer_thread_started;
+    /* Reserved before publishing the stream; released after each worker's last socket use.
+     * Protected by session->map_lock, including failed thread creation. */
+    unsigned int io_workers;
     int done;
     int counted;
     pthread_mutex_t flow_lock;
@@ -1879,6 +1882,7 @@ static void release_session_listeners(specus_session *session)
         if (listener->fd >= 0) {
             shutdown(listener->fd, SHUT_RDWR);
         }
+        listener->done = 1;
     }
     pthread_mutex_unlock(&session->map_lock);
 }
@@ -4235,7 +4239,17 @@ static void release_external_count(external_conn *conn)
     pthread_mutex_unlock(&global_external_lock);
 }
 
-/* Closes a TCP stream and, the first time, tombstones it in the same map_lock section. */
+/* A stopped stream keeps its descriptor until neither worker can use it. Closing immediately
+ * after shutdown would race recv/send and allow a reused descriptor to name another socket. */
+static void close_conn_fd_locked(external_conn *conn)
+{
+    if (conn->done && conn->io_workers == 0U && conn->fd >= 0) {
+        close(conn->fd);
+        conn->fd = -1;
+    }
+}
+
+/* Stops a TCP stream and, the first time, tombstones it in the same map_lock section. */
 static void close_conn_locked(external_conn *conn)
 {
     if (!conn->done) {
@@ -4251,11 +4265,18 @@ static void close_conn_locked(external_conn *conn)
     pthread_mutex_unlock(&conn->write_lock);
     if (conn->fd >= 0) {
         shutdown(conn->fd, SHUT_RDWR);
-        close(conn->fd);
-        conn->fd = -1;
     }
     release_external_count(conn);
     conn->done = 1;
+    close_conn_fd_locked(conn);
+}
+
+static void external_worker_finished(external_conn *conn)
+{
+    pthread_mutex_lock(&conn->session->map_lock);
+    --conn->io_workers;
+    close_conn_fd_locked(conn);
+    pthread_mutex_unlock(&conn->session->map_lock);
 }
 
 static void free_external_write_queue(external_conn *conn)
@@ -4498,6 +4519,7 @@ static void *external_writer_thread(void *arg)
         pthread_mutex_unlock(&session->map_lock);
         break;
     }
+    external_worker_finished(conn);
     return NULL;
 }
 
@@ -4510,6 +4532,7 @@ static void *external_conn_thread(void *arg)
 
     if (send_open(session, conn->stream_id, conn->channel_id, conn->port) != 0) {
         mark_conn_done(conn);
+        external_worker_finished(conn);
         return NULL;
     }
 
@@ -4557,14 +4580,16 @@ static void *external_conn_thread(void *arg)
     pthread_mutex_unlock(&session->map_lock);
     printf("[nat] external read side closed channel=%s port=%d client=%s\n",
            conn->channel_id, conn->port, session->config.client_name);
+    external_worker_finished(conn);
     return NULL;
 }
 
-static int start_external_conn(specus_session *session,
+static int start_external_conn(specus_listener *listener,
                                int fd,
-                               int port,
                                const struct sockaddr_storage *remote)
 {
+    specus_session *session = listener->session;
+    int port = listener->port;
     external_conn *conn = (external_conn *)calloc(1, sizeof(*conn));
     if (conn == NULL) {
         close(fd);
@@ -4588,10 +4613,11 @@ static int start_external_conn(specus_session *session,
     }
 
     pthread_mutex_lock(&session->map_lock);
-    if (try_count_external_connection(conn) != 0) {
+    int stopped = !session->active || listener->done;
+    if (stopped || try_count_external_connection(conn) != 0) {
         pthread_mutex_unlock(&session->map_lock);
-        fprintf(stderr, "[nat] reject external connection on port=%d client=%s: limit reached\n",
-                port, session->config.client_name);
+        fprintf(stderr, "[nat] reject external connection on port=%d client=%s: %s\n",
+                port, session->config.client_name, stopped ? "listener stopped" : "limit reached");
         close(fd);
         pthread_cond_destroy(&conn->flow_cond);
         pthread_mutex_destroy(&conn->flow_lock);
@@ -4606,6 +4632,7 @@ static int start_external_conn(specus_session *session,
     }
     mark_stream_opened_locked(session, conn->stream_id);
     snprintf(conn->channel_id, sizeof(conn->channel_id), "c-%u", conn->stream_id);
+    conn->io_workers = 2U;
     conn->next = session->conns;
     session->conns = conn;
     pthread_mutex_unlock(&session->map_lock);
@@ -4613,6 +4640,7 @@ static int start_external_conn(specus_session *session,
     if (pthread_create(&conn->writer_thread, NULL, external_writer_thread, conn) != 0) {
         perror("pthread_create");
         pthread_mutex_lock(&session->map_lock);
+        conn->io_workers -= 2U;
         close_conn_locked(conn);
         pthread_mutex_unlock(&session->map_lock);
         return -1;
@@ -4621,6 +4649,7 @@ static int start_external_conn(specus_session *session,
     if (pthread_create(&conn->thread, NULL, external_conn_thread, conn) != 0) {
         perror("pthread_create");
         pthread_mutex_lock(&session->map_lock);
+        --conn->io_workers;
         close_conn_locked(conn);
         pthread_mutex_unlock(&session->map_lock);
         pthread_join(conn->writer_thread, NULL);
@@ -4650,7 +4679,7 @@ static void *listener_thread(void *arg)
         }
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        start_external_conn(session, fd, listener->port, &remote);
+        start_external_conn(listener, fd, &remote);
     }
 
     pthread_mutex_lock(&session->map_lock);
@@ -4726,8 +4755,6 @@ static void stop_specus_listener(specus_session *session, int port)
         if (!listener->done && listener->port == port) {
             if (listener->fd >= 0) {
                 shutdown(listener->fd, SHUT_RDWR);
-                close(listener->fd);
-                listener->fd = -1;
             }
             listener->done = 1;
         }
@@ -5008,9 +5035,8 @@ static void session_shutdown(specus_session *session)
     for (specus_listener *listener = session->listeners; listener != NULL; listener = listener->next) {
         if (listener->fd >= 0) {
             shutdown(listener->fd, SHUT_RDWR);
-            close(listener->fd);
-            listener->fd = -1;
         }
+        listener->done = 1;
     }
     for (external_conn *conn = session->conns; conn != NULL; conn = conn->next) {
         close_conn_locked(conn);

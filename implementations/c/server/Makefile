@@ -115,6 +115,9 @@ ALL_TESTS += $(CONNECTIVITY_RATE_HTTP_TESTS)
 TESTS += $(CLIENT_PACKAGE_CLOCK_TESTS)
 ALL_TESTS += $(CLIENT_PACKAGE_CLOCK_TESTS)
 CONTROL_WRITE_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_control_write_reference_tests
+SOCKET_LIFETIME_TESTS := $(BUILD_DIR)/specus_c_socket_lifetime_tests
+TESTS += $(SOCKET_LIFETIME_TESTS)
+ALL_TESTS += $(SOCKET_LIFETIME_TESTS)
 SESSION_REFERENCE_SERVER := $(BUILD_DIR)/specus_c_session_reference_server
 SESSION_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_session_reference_tests
 TESTS += $(CONTROL_WRITE_REFERENCE_TESTS)
@@ -187,6 +190,9 @@ $(SERVER): $(CORE_OBJS) src/main.c | $(BUILD_DIR)
 
 $(CONTROL_WRITE_REFERENCE_TESTS): $(CORE_OBJS) src/main.c tests/control_write_reference_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/control_write_reference_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(SOCKET_LIFETIME_TESTS): $(CORE_OBJS) src/main.c tests/socket_lifetime_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/socket_lifetime_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/session_reference_main.o: src/main.c tests/session_reference_recv.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -include tests/session_reference_recv.h -Dst_peer_mesh_push_on_logout=st_fixture_peer_logout -Dst_product_metrics_milestone=st_fixture_milestone -c $< -o $@
