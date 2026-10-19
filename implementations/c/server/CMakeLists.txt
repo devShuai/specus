@@ -663,3 +663,10 @@ target_compile_options(specus_c_pairing_expiry_tests PRIVATE -Wall -Wextra -Wped
 target_link_options(specus_c_pairing_expiry_tests PRIVATE -Wl,--wrap=time -Wl,--wrap=clock_gettime)
 add_test(NAME pairing_expiry_tests COMMAND specus_c_pairing_expiry_tests)
 set_tests_properties(pairing_expiry_tests PROPERTIES TIMEOUT 60)
+
+add_executable(specus_c_transfer_expiry_tests tests/transfer_expiry_tests.c)
+target_link_libraries(specus_c_transfer_expiry_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_transfer_expiry_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(specus_c_transfer_expiry_tests PRIVATE -Wl,--wrap=time -Wl,--wrap=clock_gettime)
+add_test(NAME transfer_expiry_tests COMMAND specus_c_transfer_expiry_tests)
+set_tests_properties(transfer_expiry_tests PROPERTIES TIMEOUT 90)

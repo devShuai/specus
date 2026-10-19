@@ -151,6 +151,9 @@ TESTS += $(PEER_SESSION_EXPIRY_TESTS)
 PAIRING_EXPIRY_TESTS := $(BUILD_DIR)/specus_c_pairing_expiry_tests
 ALL_TESTS += $(PAIRING_EXPIRY_TESTS)
 TESTS += $(PAIRING_EXPIRY_TESTS)
+TRANSFER_EXPIRY_TESTS := $(BUILD_DIR)/specus_c_transfer_expiry_tests
+ALL_TESTS += $(TRANSFER_EXPIRY_TESTS)
+TESTS += $(TRANSFER_EXPIRY_TESTS)
 
 all: $(SERVER) $(ALL_TESTS)
 
@@ -168,7 +171,7 @@ $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/unicode_java21.o: src/unicode_java21.h src/unicode_java21_data.h
 $(BUILD_DIR)/instant.o: src/instant.h
-$(BUILD_DIR)/instant_storage.o $(BUILD_DIR)/storage.o: src/instant.h src/instant_storage.h
+$(BUILD_DIR)/instant_storage.o $(BUILD_DIR)/storage.o $(BUILD_DIR)/object_storage.o $(BUILD_DIR)/public_room.o: src/instant.h src/instant_storage.h
 
 $(BUILD_DIR)/connectivity_check.o: src/connectivity_check.h
 
@@ -355,6 +358,9 @@ $(PEER_SESSION_EXPIRY_TESTS): $(CORE_OBJS) tests/peer_session_expiry_tests.c tes
 
 $(PAIRING_EXPIRY_TESTS): $(CORE_OBJS) tests/pairing_expiry_tests.c tests/instant_reference_cases.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/pairing_expiry_tests.c $(CORE_OBJS) -Wl,--wrap=time -Wl,--wrap=clock_gettime $(LDFLAGS) -o $@
+
+$(TRANSFER_EXPIRY_TESTS): $(CORE_OBJS) tests/transfer_expiry_tests.c tests/instant_reference_cases.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/transfer_expiry_tests.c $(CORE_OBJS) -Wl,--wrap=time -Wl,--wrap=clock_gettime $(LDFLAGS) -o $@
 
 $(SERVER_HARNESS_TESTS): $(CORE_OBJS) tests/server_harness_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/server_harness_tests.c tests/server_harness.c $(CORE_OBJS) -Wl,--wrap=bind $(LDFLAGS) -o $@

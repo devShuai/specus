@@ -3,6 +3,8 @@
 #include "object_storage.h"
 
 #include "crypto.h"
+#include "instant.h"
+#include "instant_storage.h"
 #include "json.h"
 #include "public_coordination.h"
 #include "public_discovery.h"
@@ -653,12 +655,6 @@ static long long object_new_id(void)
     return value == 0U ? 1LL : (long long)value;
 }
 
-static int object_iso_time(time_t value, char out[41])
-{
-    char date[9], timestamp[17];
-    return object_times(value, date, timestamp, out);
-}
-
 static int object_open(sqlite3 **db)
 {
     const char *path = getenv("SPECUS_DATABASE_PATH");
@@ -668,7 +664,7 @@ static int object_open(sqlite3 **db)
         *db = NULL;
         return -1;
     }
-    if (sqlite3_busy_timeout(*db, 5000) != SQLITE_OK) {
+    if (sqlite3_busy_timeout(*db, 5000) != SQLITE_OK || st_instant_register_sqlite(*db) != 0) {
         sqlite3_close(*db);
         *db = NULL;
         return -1;
@@ -725,10 +721,39 @@ static int object_bind_text(sqlite3_stmt *stmt, int index, const char *value)
     return sqlite3_bind_text(stmt, index, value, -1, SQLITE_TRANSIENT) == SQLITE_OK ? 0 : -1;
 }
 
+static int object_bind_instant(sqlite3_stmt *stmt, int index, const char *value)
+{
+    char stored[ST_INSTANT_CAPACITY];
+    return st_instant_normalize(value, stored) == 0 ? object_bind_text(stmt, index, stored) : -1;
+}
+
+static int object_live(const char *expiry, const char *cutoff, int allow_equal)
+{
+    char stored[ST_INSTANT_CAPACITY];
+    if (st_instant_normalize(expiry, stored) != 0) return 0;
+    int order = strcmp(stored, cutoff);
+    return order > 0 || (allow_equal && order == 0);
+}
+
+static char *object_escape_instant(const char *value)
+{
+    char public_value[41];
+    return st_instant_public(value, public_value, sizeof(public_value)) == 0 ? st_json_escape(public_value) : NULL;
+}
+
 static void object_column_text(sqlite3_stmt *stmt, int column, char *out, size_t out_len)
 {
     const char *value = (const char *)sqlite3_column_text(stmt, column);
     snprintf(out, out_len, "%s", value == NULL ? "" : value);
+}
+
+static void object_column_expiry(sqlite3_stmt *stmt, int column, char *out, size_t out_len)
+{
+    const char *value = (const char *)sqlite3_column_text(stmt, column);
+    int bytes = sqlite3_column_bytes(stmt, column);
+    /* Never turn an invalid stored value into a valid expiry by truncating at NUL or capacity. */
+    if (value == NULL || bytes < 0 || (size_t)bytes >= out_len || strlen(value) != (size_t)bytes) out[0] = '\0';
+    else memcpy(out, value, (size_t)bytes + 1U);
 }
 
 static void object_read_attachment(sqlite3_stmt *stmt, st_attachment *attachment)
@@ -750,8 +775,8 @@ static void object_read_attachment(sqlite3_stmt *stmt, st_attachment *attachment
     object_column_text(stmt, 13, attachment->status, sizeof(attachment->status));
     object_column_text(stmt, 14, attachment->created_at, sizeof(attachment->created_at));
     object_column_text(stmt, 15, attachment->updated_at, sizeof(attachment->updated_at));
-    object_column_text(stmt, 16, attachment->upload_expires_at, sizeof(attachment->upload_expires_at));
-    object_column_text(stmt, 17, attachment->expires_at, sizeof(attachment->expires_at));
+    object_column_expiry(stmt, 16, attachment->upload_expires_at, sizeof(attachment->upload_expires_at));
+    object_column_expiry(stmt, 17, attachment->expires_at, sizeof(attachment->expires_at));
     object_column_text(stmt, 18, attachment->uploaded_at, sizeof(attachment->uploaded_at));
 }
 
@@ -817,8 +842,8 @@ static int object_insert_attachment(sqlite3 *db, const st_attachment *value)
         && object_bind_text(stmt, 14, value->status) == 0
         && object_bind_text(stmt, 15, value->created_at) == 0
         && object_bind_text(stmt, 16, value->updated_at) == 0
-        && object_bind_text(stmt, 17, value->upload_expires_at) == 0
-        && object_bind_text(stmt, 18, value->expires_at) == 0
+        && object_bind_instant(stmt, 17, value->upload_expires_at) == 0
+        && object_bind_instant(stmt, 18, value->expires_at) == 0
         && sqlite3_step(stmt) == SQLITE_DONE;
     sqlite3_finalize(stmt);
     return rc ? 0 : -1;
@@ -832,15 +857,16 @@ static int object_active_storage_bytes(sqlite3 *db,
                                        const char *tenant,
                                        const char *username,
                                        long long excluded_id,
-                                       time_t at,
+                                       const char *at,
                                        long long *bytes)
 {
     static const char sql[] =
         "SELECT COALESCE(SUM(size_bytes),0) FROM transfer_attachment "
         "WHERE tenant_id=? AND owner_username=? AND id<>? AND "
-        "((status='PENDING' AND upload_expires_at>?) OR (status='UPLOADED' AND expires_at>?))";
-    char now[41];
-    if (object_iso_time(at, now) != 0) return -1;
+        "((status='PENDING' AND specus_instant(upload_expires_at)>?) OR (status='UPLOADED' AND specus_instant(expires_at)>?))";
+    char current[ST_INSTANT_CAPACITY];
+    if (at == NULL && st_instant_now(current) != 0) return -1;
+    const char *now = at == NULL ? current : at;
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK
         || object_bind_text(stmt, 1, tenant) != 0
@@ -1013,14 +1039,14 @@ int st_object_storage_cleanup_expired(void)
     sqlite3 *db = NULL;
     int open_rc = object_open(&db);
     if (open_rc != 0) return open_rc > 0 ? 0 : -1;
-    char now[41];
-    if (object_iso_time(time(NULL), now) != 0) {
+    char now[41], updated_at[41];
+    if (st_instant_now(now) != 0 || st_instant_public(now, updated_at, sizeof(updated_at)) != 0) {
         sqlite3_close(db);
         return -1;
     }
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db,
-            "DELETE FROM transfer_attachment_download_grant WHERE expires_at<?",
+            "DELETE FROM transfer_attachment_download_grant WHERE specus_instant(expires_at)<?",
             -1, &stmt, NULL) != SQLITE_OK) {
         sqlite3_close(db);
         return -1;
@@ -1034,7 +1060,7 @@ int st_object_storage_cleanup_expired(void)
         size_t count = 0U;
         if (sqlite3_prepare_v2(db,
                 "SELECT id,object_key FROM transfer_attachment "
-                "WHERE expires_at<? AND status<>'EXPIRED' ORDER BY expires_at ASC LIMIT 100",
+                "WHERE specus_instant(expires_at)<? AND status<>'EXPIRED' ORDER BY specus_instant(expires_at) ASC LIMIT 100",
                 -1, &stmt, NULL) != SQLITE_OK) {
             rc = -1;
             break;
@@ -1057,12 +1083,12 @@ int st_object_storage_cleanup_expired(void)
             }
             if (sqlite3_prepare_v2(db,
                     "UPDATE transfer_attachment SET status='EXPIRED',updated_at=? "
-                    "WHERE id=? AND expires_at<? AND status<>'EXPIRED'",
+                    "WHERE id=? AND specus_instant(expires_at)<? AND status<>'EXPIRED'",
                     -1, &stmt, NULL) != SQLITE_OK) {
                 rc = -1;
                 continue;
             }
-            sqlite3_bind_text(stmt, 1, now, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 1, updated_at, -1, SQLITE_TRANSIENT);
             sqlite3_bind_int64(stmt, 2, ids[i]);
             sqlite3_bind_text(stmt, 3, now, -1, SQLITE_TRANSIENT);
             int update_ok = sqlite3_step(stmt) == SQLITE_DONE;
@@ -1233,7 +1259,7 @@ static int object_attachment_view(st_object_buffer *json, const st_attachment *a
     char *file = st_json_escape(attachment->file_name);
     char *mime = st_json_escape(attachment->mime_type);
     char *status = st_json_escape(attachment->status);
-    char *expires = st_json_escape(attachment->expires_at);
+    char *expires = object_escape_instant(attachment->expires_at);
     char *sha = attachment->sha256[0] == '\0' ? NULL : st_json_escape(attachment->sha256);
     if (file == NULL || mime == NULL || status == NULL || expires == NULL
         || (attachment->sha256[0] != '\0' && sha == NULL)) {
@@ -1345,7 +1371,7 @@ static int object_upload_response(char *out,
     char *escaped_key = st_json_escape(attachment->object_key);
     char *escaped_url = st_json_escape(url);
     char *escaped_mime = st_json_escape(attachment->mime_type);
-    char *escaped_expiry = st_json_escape(attachment->upload_expires_at);
+    char *escaped_expiry = object_escape_instant(attachment->upload_expires_at);
     char *escaped_callback = callback != NULL && *callback != '\0' ? st_json_escape(callback) : NULL;
     if (escaped_key == NULL || escaped_url == NULL || escaped_mime == NULL || escaped_expiry == NULL
         || (callback != NULL && *callback != '\0' && escaped_callback == NULL)) {
@@ -1484,7 +1510,7 @@ static int object_create_upload(const st_object_config *config,
         }
     }
     long long used = 0;
-    if (object_active_storage_bytes(db, identity->tenant_id, identity->username, -1, time(NULL), &used) != 0
+    if (object_active_storage_bytes(db, identity->tenant_id, identity->username, -1, NULL, &used) != 0
         || !object_quota_allows(used, size_bytes, config->storage_quota_bytes)) {
         object_rollback(db);
         sqlite3_close(db);
@@ -1496,8 +1522,10 @@ static int object_create_upload(const st_object_config *config,
     strcpy(attachment.scope, public_scope ? "PUBLIC_TRANSFER" : "ADMIN_CLIENT_MESSAGE");
     strcpy(attachment.status, "PENDING");
     time_t now = time(NULL);
-    if (object_iso_time(now, attachment.created_at) != 0
-        || object_iso_time(now + (time_t)(config->retention_hours * 3600LL), attachment.expires_at) != 0) {
+    char instant[ST_INSTANT_CAPACITY];
+    if (st_instant_now(instant) != 0 || st_instant_public(instant, attachment.created_at, sizeof(attachment.created_at)) != 0
+        || config->retention_hours > LLONG_MAX / 3600LL
+        || st_instant_add_seconds(instant, config->retention_hours * 3600LL, attachment.expires_at) != 0) {
         object_rollback(db); sqlite3_close(db);
         return object_error(out, out_len, 500, "failed to allocate attachment time");
     }
@@ -1512,7 +1540,7 @@ static int object_create_upload(const st_object_config *config,
         free(upload_url); free(callback);
         upload_url = object_presign(config, "PUT", attachment.object_key, attachment.mime_type, NULL,
                                     config->upload_ttl, now, attachment.upload_expires_at, &callback);
-        if (upload_url == NULL) continue;
+        if (upload_url == NULL || st_instant_add_seconds(instant, config->upload_ttl, attachment.upload_expires_at) != 0) continue;
         inserted = object_insert_attachment(db, &attachment) == 0;
     }
     if (!inserted || object_commit(db) != 0) {
@@ -1558,9 +1586,9 @@ static int object_complete(const st_object_config *config,
         sqlite3_close(db);
         return object_write_view(out, out_len, &attachment);
     }
-    char now[41];
-    if (object_iso_time(time(NULL), now) != 0 || strcmp(attachment.status, "PENDING") != 0
-        || strcmp(attachment.upload_expires_at, now) < 0) {
+    char now[41], completed_at[41];
+    if (st_instant_now(now) != 0 || st_instant_public(now, completed_at, sizeof(completed_at)) != 0
+        || strcmp(attachment.status, "PENDING") != 0 || !object_live(attachment.upload_expires_at, now, 1)) {
         sqlite3_close(db);
         return object_error(out, out_len, 409, "attachment is not pending or upload URL is expired");
     }
@@ -1586,7 +1614,7 @@ static int object_complete(const st_object_config *config,
     }
     long long used = 0;
     if (object_active_storage_bytes(db, attachment.tenant_id, attachment.owner_username,
-                                    attachment.id, time(NULL), &used) != 0
+                                    attachment.id, NULL, &used) != 0
         || !object_quota_allows(used, attachment.size_bytes, config->storage_quota_bytes)) {
         object_rollback(db); sqlite3_close(db); (void)object_delete(config, attachment.object_key);
         return object_error(out, out_len, 429, "OSS storage quota is insufficient");
@@ -1596,7 +1624,7 @@ static int object_complete(const st_object_config *config,
         "UPDATE transfer_attachment SET status='UPLOADED',size_bytes=?,uploaded_at=?,updated_at=? "
         "WHERE id=? AND status='PENDING'", -1, &stmt, NULL) == SQLITE_OK
         && sqlite3_bind_int64(stmt, 1, attachment.size_bytes) == SQLITE_OK
-        && object_bind_text(stmt, 2, now) == 0 && object_bind_text(stmt, 3, now) == 0
+        && object_bind_text(stmt, 2, completed_at) == 0 && object_bind_text(stmt, 3, completed_at) == 0
         && sqlite3_bind_int64(stmt, 4, attachment.id) == SQLITE_OK
         && sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1;
     sqlite3_finalize(stmt);
@@ -1605,8 +1633,8 @@ static int object_complete(const st_object_config *config,
         return object_error(out, out_len, 409, "attachment completion raced with another request");
     }
     strcpy(attachment.status, "UPLOADED");
-    strcpy(attachment.uploaded_at, now);
-    strcpy(attachment.updated_at, now);
+    strcpy(attachment.uploaded_at, completed_at);
+    strcpy(attachment.updated_at, completed_at);
     sqlite3_close(db);
     return object_write_view(out, out_len, &attachment);
 }
@@ -1674,14 +1702,15 @@ static int object_create_download(const st_object_config *config,
     }
     int access = object_attachment_access(&attachment, identity, room_token, 0);
     free(room_token);
-    char now[41], month[8];
-    if (access != 0 || object_iso_time(time(NULL), now) != 0 || object_month(time(NULL), month) != 0) {
+    char now[41], created_at[41], month[8];
+    if (access != 0 || st_instant_now(now) != 0 || st_instant_public(now, created_at, sizeof(created_at)) != 0
+        || object_month(time(NULL), month) != 0) {
         sqlite3_close(db);
         return object_error(out, out_len,
                             access == 1 ? 401 : access == 2 ? 403 : access == 3 ? 400 : 500,
                             "attachment access is forbidden");
     }
-    if (strcmp(attachment.status, "UPLOADED") != 0 || strcmp(attachment.expires_at, now) <= 0) {
+    if (strcmp(attachment.status, "UPLOADED") != 0 || !object_live(attachment.expires_at, now, 0)) {
         sqlite3_close(db);
         return object_error(out, out_len, 409, "attachment is not uploaded or is expired");
     }
@@ -1694,7 +1723,7 @@ static int object_create_download(const st_object_config *config,
     char *token = NULL;
     long long grant_id = 0;
     char token_hash[65], grant_expiry[41];
-    if (object_iso_time(time(NULL) + (time_t)config->download_ttl, grant_expiry) != 0) {
+    if (st_instant_add_seconds(now, config->download_ttl, grant_expiry) != 0) {
         sqlite3_close(db); return object_error(out, out_len, 500, "failed to allocate download grant");
     }
     int inserted = 0;
@@ -1714,7 +1743,7 @@ static int object_create_download(const st_object_config *config,
             && object_bind_text(stmt, 3, identity->tenant_id) == 0
             && object_bind_text(stmt, 4, identity->username) == 0
             && sqlite3_bind_int64(stmt, 5, attachment.id) == SQLITE_OK
-            && object_bind_text(stmt, 6, now) == 0
+            && object_bind_text(stmt, 6, created_at) == 0
             && object_bind_text(stmt, 7, grant_expiry) == 0
             && sqlite3_step(stmt) == SQLITE_DONE;
         sqlite3_finalize(stmt);
@@ -1722,7 +1751,7 @@ static int object_create_download(const st_object_config *config,
     sqlite3_close(db);
     if (!inserted) { free(token); return object_error(out, out_len, 500, "failed to allocate download grant"); }
     char *escaped_token = st_json_escape(token);
-    char *escaped_expiry = st_json_escape(grant_expiry);
+    char *escaped_expiry = object_escape_instant(grant_expiry);
     free(token);
     if (escaped_token == NULL || escaped_expiry == NULL) { free(escaped_token); free(escaped_expiry); return -1; }
     st_object_buffer json = {0};
@@ -1791,16 +1820,16 @@ static int object_consume_download(const st_object_config *config,
         object_column_text(stmt, 1, tenant, sizeof(tenant));
         object_column_text(stmt, 2, username, sizeof(username));
         attachment_id = sqlite3_column_int64(stmt, 3);
-        object_column_text(stmt, 4, expires, sizeof(expires));
+        object_column_expiry(stmt, 4, expires, sizeof(expires));
         object_column_text(stmt, 5, consumed, sizeof(consumed));
     }
     sqlite3_finalize(stmt);
     char now[41], month[8];
     st_attachment attachment;
-    if (!selected || consumed[0] != '\0' || object_iso_time(time(NULL), now) != 0
-        || object_month(time(NULL), month) != 0 || strcmp(expires, now) <= 0
+    if (!selected || consumed[0] != '\0' || st_instant_now(now) != 0
+        || object_month(time(NULL), month) != 0 || !object_live(expires, now, 0)
         || object_find_attachment_any(db, attachment_id, &attachment) != 0
-        || strcmp(attachment.status, "UPLOADED") != 0 || strcmp(attachment.expires_at, now) <= 0) {
+        || strcmp(attachment.status, "UPLOADED") != 0 || !object_live(attachment.expires_at, now, 0)) {
         object_rollback(db); sqlite3_close(db);
         return object_error(out, out_len, 410, "download link is expired or already used");
     }
@@ -1819,10 +1848,12 @@ static int object_consume_download(const st_object_config *config,
         return object_error(out, out_len, 500, "failed to sign object download");
     }
     stmt = NULL;
-    int consumed_ok = sqlite3_prepare_v2(db,
+    char consumed_at[41];
+    int consumed_ok = st_instant_now(now) == 0 && st_instant_public(now, consumed_at, sizeof(consumed_at)) == 0
+        && object_live(attachment.expires_at, now, 0) && sqlite3_prepare_v2(db,
         "UPDATE transfer_attachment_download_grant SET consumed_at=?,updated_at=? "
-        "WHERE id=? AND token_hash=? AND consumed_at IS NULL AND expires_at>?", -1, &stmt, NULL) == SQLITE_OK
-        && object_bind_text(stmt, 1, now) == 0 && object_bind_text(stmt, 2, now) == 0
+        "WHERE id=? AND token_hash=? AND consumed_at IS NULL AND specus_instant(expires_at)>?", -1, &stmt, NULL) == SQLITE_OK
+        && object_bind_text(stmt, 1, consumed_at) == 0 && object_bind_text(stmt, 2, consumed_at) == 0
         && sqlite3_bind_int64(stmt, 3, grant_id) == SQLITE_OK
         && object_bind_text(stmt, 4, token_hash) == 0 && object_bind_text(stmt, 5, now) == 0
         && sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1;
@@ -1838,7 +1869,7 @@ static int object_consume_download(const st_object_config *config,
         && object_bind_text(stmt, 2, tenant) == 0 && object_bind_text(stmt, 3, username) == 0
         && sqlite3_bind_int64(stmt, 4, attachment.id) == SQLITE_OK
         && sqlite3_bind_int64(stmt, 5, attachment.size_bytes) == SQLITE_OK
-        && object_bind_text(stmt, 6, month) == 0 && object_bind_text(stmt, 7, now) == 0
+        && object_bind_text(stmt, 6, month) == 0 && object_bind_text(stmt, 7, consumed_at) == 0
         && sqlite3_step(stmt) == SQLITE_DONE;
     sqlite3_finalize(stmt);
     if (!usage_ok || object_commit(db) != 0) {
@@ -2136,14 +2167,14 @@ static int object_complete_callback(const st_object_config *config,
     if (object_begin(db) != 0) { sqlite3_close(db); free(key); return object_error(out, out_len, 503, "attachment persistence is busy"); }
     long long used = 0;
     if (object_active_storage_bytes(db, attachment.tenant_id, attachment.owner_username,
-                                    attachment.id, time(NULL), &used) != 0
+                                    attachment.id, NULL, &used) != 0
         || !object_quota_allows(used, size, config->storage_quota_bytes)) {
         object_rollback(db); sqlite3_close(db); (void)object_delete(config, key); free(key);
         return object_error(out, out_len, 429, "OSS storage quota is insufficient");
     }
     char now[41];
     sqlite3_stmt *stmt = NULL;
-    int updated = object_iso_time(time(NULL), now) == 0
+    int updated = st_instant_now(now) == 0 && st_instant_public(now, now, sizeof(now)) == 0
         && sqlite3_prepare_v2(db,
             "UPDATE transfer_attachment SET status='UPLOADED',size_bytes=?,uploaded_at=?,updated_at=? "
             "WHERE id=? AND status='PENDING'", -1, &stmt, NULL) == SQLITE_OK
@@ -2173,7 +2204,7 @@ static int object_open_read_only(sqlite3 **db)
     const char *path = getenv("SPECUS_DATABASE_PATH");
     if (path == NULL || *path == '\0') return 1;
     if (sqlite3_open_v2(path, db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK
-        || sqlite3_busy_timeout(*db, 5000) != SQLITE_OK) {
+        || sqlite3_busy_timeout(*db, 5000) != SQLITE_OK || st_instant_register_sqlite(*db) != 0) {
         if (*db != NULL) sqlite3_close(*db);
         *db = NULL;
         return -1;
@@ -2203,7 +2234,7 @@ static int object_table_exists(sqlite3 *db, const char *table, int *exists)
  * unavailable, or -1 when the read itself failed.
  */
 static int object_read_account_usage(const st_object_storage_identity *identity,
-                                     time_t now,
+                                     const char *now,
                                      const char *month,
                                      long long *storage_used,
                                      long long *download_used)
@@ -2228,12 +2259,14 @@ static int object_read_account_usage(const st_object_storage_identity *identity,
 }
 
 /* Download usage resets at midnight UTC on the first day of the month after the charged one. */
-static int object_usage_period(time_t now, char month[8], char resets_at[41])
+static int object_usage_period(const char *now, char month[8], char resets_at[41])
 {
-    struct tm value;
-    if (object_month(now, month) != 0 || gmtime_r(&now, &value) == NULL) return -1;
-    int year = value.tm_year + 1900 + (value.tm_mon == 11 ? 1 : 0);
-    int next_month = value.tm_mon == 11 ? 1 : value.tm_mon + 2;
+    char stored[ST_INSTANT_CAPACITY];
+    int year, current_month;
+    if (st_instant_normalize(now, stored) != 0 || sscanf(stored, "%4d-%2d", &year, &current_month) != 2) return -1;
+    memcpy(month, stored, 7U); month[7] = '\0';
+    year += current_month == 12 ? 1 : 0;
+    int next_month = current_month == 12 ? 1 : current_month + 1;
     int written = snprintf(resets_at, 41U, "%04d-%02d-01T00:00:00Z", year, next_month);
     return written == 20 ? 0 : -1;
 }
@@ -2245,7 +2278,7 @@ static int object_usage_period(time_t now, char month[8], char resets_at[41])
  * touches the presign rate limiter. Every field derives from the single instant `now`.
  */
 static int object_capabilities(const st_object_storage_identity *identity,
-                               time_t now,
+                               const char *now,
                                char *out,
                                size_t out_len)
 {
@@ -2256,7 +2289,7 @@ static int object_capabilities(const st_object_storage_identity *identity,
     /* Same rule as upload: a misconfigured provider is disabled there too. No network access. */
     int storage_enabled = object_load_config(&config) == 0 && config.enabled;
     char checked_at[41], month[8], resets_at[41];
-    if (object_iso_time(now, checked_at) != 0 || object_usage_period(now, month, resets_at) != 0)
+    if (st_instant_public(now, checked_at, sizeof(checked_at)) != 0 || object_usage_period(now, month, resets_at) != 0)
         return object_error(out, out_len, 500, "failed to resolve the usage period");
     long long storage_used = 0, download_used = 0;
     int read = object_read_account_usage(identity, now, month, &storage_used, &download_used);
@@ -2307,7 +2340,9 @@ int st_object_storage_build_response(const char *method,
     if (method == NULL || path == NULL) return 0;
     if (object_path_equals(path, "/api/public/transfer/attachments/capabilities")) {
         if (strcmp(method, "GET") != 0) return object_method_not_allowed(out, out_len);
-        return object_capabilities(identity, time(NULL), out, out_len);
+        char now[ST_INSTANT_CAPACITY];
+        if (st_instant_now(now) != 0) return object_error(out, out_len, 500, "failed to resolve the usage period");
+        return object_capabilities(identity, now, out, out_len);
     }
     static const char downloads[] = "/api/public/transfer/downloads/";
     int consume_download = strncmp(path, downloads, sizeof(downloads) - 1U) == 0;
@@ -2381,7 +2416,9 @@ int st_object_storage_capabilities_for_tests(const st_object_storage_identity *i
                                              char *out,
                                              size_t out_len)
 {
-    return object_capabilities(identity, (time_t)epoch_seconds, out, out_len);
+    char now[ST_INSTANT_CAPACITY];
+    if (st_instant_format(epoch_seconds, 0, now) != 0) return -1;
+    return object_capabilities(identity, now, out, out_len);
 }
 
 char *st_object_storage_presign_for_tests(const char *method,

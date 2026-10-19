@@ -179,7 +179,7 @@ static int open_db(const char *path, sqlite3 **db)
         *db = NULL;
         return -1;
     }
-    if (sqlite3_create_function_v2(*db, "specus_peer_session_expired", 1, SQLITE_UTF8,
+    if (st_instant_register_sqlite(*db) != 0 || sqlite3_create_function_v2(*db, "specus_peer_session_expired", 1, SQLITE_UTF8,
             NULL, peer_session_expired_sqlite, NULL, NULL, NULL) != SQLITE_OK) {
         sqlite3_close(*db);
         *db = NULL;
@@ -1725,6 +1725,9 @@ int st_storage_init(const char *path, int seed_demo_client)
     if (rc == 0) rc = st_instant_migrate_column(db, "specus_websocket_ticket", "token_hash", "expires_at", NULL);
     if (rc == 0) rc = st_instant_migrate_column(db, "peer_mesh_session", "id", "expires_at", NULL);
     if (rc == 0) rc = st_instant_migrate_column(db, "public_transfer_room_pairing_code", "id", "expires_at", NULL);
+    if (rc == 0) rc = st_instant_migrate_column(db, "transfer_attachment", "id", "upload_expires_at", NULL);
+    if (rc == 0) rc = st_instant_migrate_column(db, "transfer_attachment", "id", "expires_at", NULL);
+    if (rc == 0) rc = st_instant_migrate_column(db, "transfer_attachment_download_grant", "id", "expires_at", NULL);
     if (fresh && rc == 0) {
         rc = exec_sql(db, "COMMIT");
     }
@@ -3264,14 +3267,12 @@ static int forget_account_data_on_db(sqlite3 *db,
     rc = account_data_exec(db, "DELETE FROM user_diagram_document WHERE tenant_id = ? AND owner_username = ?",
                            tenant_id, login_name, NULL, NULL);
     if (rc == 0 && account_data_table_exists(db, "transfer_attachment")) {
-        /* Object storage writes these columns in this form, which compares as the time order. */
-        rc = account_data_exec(db,
-            "UPDATE transfer_attachment SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), "
-            "upload_expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), "
-            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') "
-            "WHERE tenant_id = ? AND owner_username = ? AND status <> 'EXPIRED' "
-            "AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
-            tenant_id, login_name, NULL, NULL);
+        char now[ST_INSTANT_CAPACITY], updated[ST_INSTANT_CAPACITY];
+        if (st_instant_now(now) != 0 || st_instant_public(now, updated, sizeof(updated)) != 0) rc = -1;
+        else rc = account_data_exec(db,
+            "UPDATE transfer_attachment SET expires_at=?3,upload_expires_at=?3,updated_at=?4 "
+            "WHERE tenant_id=?1 AND owner_username=?2 AND status<>'EXPIRED' AND specus_instant(expires_at)>?3",
+            tenant_id, login_name, now, updated);
     }
     if (rc == 0 && account_data_table_exists(db, "transfer_attachment_download_grant")) {
         rc = account_data_exec(db,

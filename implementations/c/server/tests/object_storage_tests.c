@@ -3,6 +3,7 @@
 #include "object_storage.h"
 
 #include "admin_http.h"
+#include "instant.h"
 #include "json.h"
 #include "public_room.h"
 #include "security.h"
@@ -504,15 +505,22 @@ static int cap_account_snapshots(const char *previous, const char *current, cons
 
     char response[4096];
     const cap_expected alice = {"true", 4096, 5, 1000, 330, 670, 50, 42, 8};
+    char before_check[ST_INSTANT_CAPACITY], after_check[ST_INSTANT_CAPACITY];
+    if (st_instant_now(before_check) != 0) { free(before); return -1; }
     int len = cap_get(CAP_ROUTE, "alice", "t1", "USER", response, sizeof(response));
+    if (st_instant_now(after_check) != 0) { free(before); return -1; }
     int failed = cap_expect_snapshot(len, response, &alice)
         | cap_expect_text(response, "downloadUsageMonth", current)
         | cap_expect_text(response, "downloadResetsAt", resets_at);
     const char *body = cap_body(response);
-    char *checked_at = body == NULL ? NULL : st_json_get_top_level_raw(body, "checkedAt");
-    if (checked_at == NULL || strlen(checked_at) != 22U || strncmp(checked_at + 1, current, 7U) != 0
-        || checked_at[20] != 'Z') {
-        fprintf(stderr, "capabilities checkedAt is not a UTC second in %s: %s\n", current,
+    char *checked_at = body == NULL ? NULL : st_json_get_top_level_string(body, "checkedAt");
+    char checked[ST_INSTANT_CAPACITY], public_checked[ST_INSTANT_CAPACITY];
+    if (checked_at == NULL || strncmp(checked_at, current, 7U) != 0
+        || st_instant_normalize(checked_at, checked) != 0
+        || st_instant_public(checked, public_checked, sizeof(public_checked)) != 0
+        || strcmp(public_checked, checked_at) != 0
+        || strcmp(checked, before_check) < 0 || strcmp(checked, after_check) > 0) {
+        fprintf(stderr, "capabilities checkedAt is not a public UTC Instant within the request in %s: %s\n", current,
                 checked_at == NULL ? "(missing)" : checked_at);
         failed = -1;
     }
