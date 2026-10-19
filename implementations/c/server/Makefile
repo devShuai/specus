@@ -56,6 +56,7 @@ SECURITY_RULES_TESTS := $(BUILD_DIR)/specus_c_security_rules_tests
 HTTP_ROUTE_LIFECYCLE_TESTS := $(BUILD_DIR)/specus_c_http_route_lifecycle_tests
 CLIENT_ROUTE_SCALE_TESTS := $(BUILD_DIR)/specus_c_client_route_scale_tests
 NAT_SIZING_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_nat_sizing_reference_tests
+SQLITE_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_sqlite_reference_tests
 NAT_STREAM_TESTS := $(BUILD_DIR)/specus_c_nat_stream_tests
 CONNECTION_ARCHIVE_TESTS := $(BUILD_DIR)/specus_c_connection_archive_tests
 TRAFFIC_DETAIL_API_TESTS := $(BUILD_DIR)/specus_c_traffic_detail_api_tests
@@ -81,6 +82,7 @@ TESTS := $(ADMIN_TESTS) $(DIRECT_WEBSOCKET_TESTS) $(CLIENT_ADDRESS_TESTS) $(CLIE
 ALL_TESTS := $(TESTS) $(PUBLIC_COORDINATION_TESTS) $(ELASTICSEARCH_TRAFFIC_TESTS) $(MEDIA_CAPTURE_TESTS) $(SESSION_LIFECYCLE_TESTS) $(SECURITY_RULES_TESTS) $(HTTP_ROUTE_LIFECYCLE_TESTS) $(NAT_STREAM_TESTS) $(PRODUCT_METRICS_TESTS) $(CONNECTION_ARCHIVE_TESTS) $(HTTP_WEBSOCKET_ROUTING_TESTS) $(TRAFFIC_DETAIL_API_TESTS) $(CLIENT_MESSAGES_TESTS) $(MANAGEMENT_LISTS_TESTS) $(MANAGEMENT_CRUD_TESTS) $(PEER_MESH_API_TESTS) $(MANAGEMENT_OVERVIEW_TESTS)
 ALL_TESTS += $(PEER_MESH_E2E_TESTS) $(CLIENT_ROUTE_SCALE_TESTS)
 ALL_TESTS += $(NAT_SIZING_REFERENCE_TESTS)
+ALL_TESTS += $(SQLITE_REFERENCE_TESTS)
 UNICODE_JAVA21_TESTS := $(BUILD_DIR)/specus_c_unicode_java21_tests
 UNICODE_JAVA21_VECTORS := ../../../protocol/test-vectors/java21-root-case-v1.json
 CORE_OBJS += $(BUILD_DIR)/unicode_java21.o
@@ -270,6 +272,9 @@ $(CLIENT_ROUTE_SCALE_TESTS): $(CORE_OBJS) tests/client_route_scale_tests.c tests
 $(NAT_SIZING_REFERENCE_TESTS): $(CORE_OBJS) tests/nat_sizing_reference_tests.c src/main.c tests/server_harness.c tests/server_harness.h ../../../protocol/test-vectors/nat-control-size-v1.json | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/nat_sizing_reference_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
+$(SQLITE_REFERENCE_TESTS): $(CORE_OBJS) tests/sqlite_reference_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/sqlite_reference_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
 $(NAT_STREAM_TESTS): $(CORE_OBJS) tests/nat_stream_tests.c tests/connectivity_nat_test_cases.h tests/connectivity_nat_complete_cases.h tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DST_CONNECTIVITY_VECTOR_DIR='"../../../protocol/test-vectors/"' tests/nat_stream_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
@@ -328,6 +333,7 @@ $(MANAGEMENT_ACCOUNTS_TESTS): $(CORE_OBJS) tests/management_accounts_tests.c | $
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/management_accounts_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 test: all
+	$(SQLITE_REFERENCE_TESTS)
 	$(NAT_SIZING_REFERENCE_TESTS) $(SERVER)
 	$(NAT_PUSH_REFERENCE_TEST_COMMAND)
 	$(SESSION_REFERENCE_TESTS) $(SESSION_REFERENCE_SERVER)

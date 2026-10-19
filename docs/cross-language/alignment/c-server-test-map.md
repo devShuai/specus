@@ -14,7 +14,7 @@
 
 以 JDK 21 的 `JavacTask.parse` 解析上述提交的全部 `src/test/java` 源文件（不解析依赖、不执行测试）：main 有 136 个 Java 源文件，其中 128 个类包含 591 个测试注解方法（565 个 `@Test`、14 个 `@ParameterizedTest`、12 个 `@TestFactory`）。另外 8 个源文件是无上述测试注解的辅助源码。注册分支同样为 128 类，仅 `RegistrationServiceTests` 由 2 个增加到 8 个，总注解方法为 597 个。这里是静态方法声明数，**不是运行次数、参数化/动态用例数、通过数或 C 覆盖数**。
 
-旧表的 79 类仍保留历史证据；本轮未重新核验它们当前增加或变更后的全部断言，因此不能把历史“覆盖73类”直接当作当前类的完整覆盖。当前main另有下列49类不在旧表中：前批完整阅读并说明了4类纯框架/平台差异；4个连通性检查类共20个注解方法，首批均为“部分”，之后依次补齐Vector类行为断言、Resource类7个、Rate类5个及NAT类7个参考方法的候选证据；随后补列控制写入、会话清理、离线通知与上线指标4类共8方法、HTTP流重置1类2方法、路由生命周期/失败关闭/NAT推送3类5方法，以及显式空快照/NAT精确大小与管理变更3类5方法的行为证据及限定差异，见对应新节。当前49=4类纯平台差异+15类候选覆盖（40个注解方法）+30类待核验；30也不包括旧79类的当前断言复核。表中增量是待合并C分支的候选对照状态，不是main完成率；最终提交CI须另行核验。待核验不等于C没有相应能力，同名功能也不等于覆盖已成立。
+旧表的79类仍保留历史证据；本轮未重新核验它们当前增加或变更后的全部断言，因此不能把历史“覆盖73类”直接当作当前类的完整覆盖。当前main另有下列49类不在旧表中：前批说明4类框架/平台差异；连通性4类20方法、控制写入/会话/离线通知/指标4类8方法、HTTP流重置1类2方法、路由生命周期/失败关闭/NAT推送3类5方法、显式空快照/NAT大小与管理变更3类5方法先后补证；本节新增SQLite二进制列/真实约束2类8方法的候选对照，并逐方法说明Spring/JDBC异常转换1类4方法的平台差异，见相应新节。当前49=5类限定平台差异+17类候选覆盖（48个注解方法）+27类待核验；27也不包括旧79类的当前断言复核。候选类内仍有明确列出的框架API差异，48不是48个独立C运行场景。表中增量是待合并C分支的候选对照状态，不是main完成率；最终提交CI须另行核验。待核验不等于C没有相应能力，同名功能也不等于覆盖已成立。
 
 新增“无（平台差异）”只限定到说明的框架断言。不得将其扩展为存储完整性、唯一约束、并发/回滚或 HTTP 契约的豁免；尤其不能把所有 SQLite/MySQL/MariaDB 测试一律排除。关闭 #35 前仍须为当前全部参考断言补齐 C 证据或逐项的书面差异说明，并完成该 issue 的其他运行时及真实环境验收。
 
@@ -30,15 +30,15 @@
 | `database/PostgresSchemaMigrationTests` | 10 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `database/SortableTimestampMigratorTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `database/SpecusSqliteDialectTests` | 9 | 无（平台差异） | 九项检查 Hibernate/JDBC 异常转换、约束类别/名称及回退；C 直接调用 sqlite3，无该转换层。不豁免 C 的唯一约束、回滚、busy 或 HTTP 错误语义。 |
-| `database/SqliteConstraintTranslationTests` | 3 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `database/SqliteConstraintTranslationTests` | 3 | 覆盖（行为及限定框架差异；候选） | `sqlite_reference_tests.c:media_unique/raw_constraints` 对生产媒体schema实际重复INSERT核验UNIQUE、table.column及原行保留，真实probe核验唯一约束。Dialect类身份与JPA/Spring异常包装仅作限定差异，不冒称C管理API状态、捕获竞争重试或业务事务回滚已测。 |
 | `database/SqliteDialectConfigurationTests` | 4 | 无（平台差异） | 四项检查 Spring/Hibernate dialect 替换和属性优先级；C 无此配置层。不代表 C 建表或迁移行为已覆盖。 |
 | `database/SqliteIdentityKeyMigratorTests` | 4 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `database/SqliteIdentityKeySchemaTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `database/SqliteIdentityKeyStartupRepairTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
-| `database/SqliteLobColumnTests` | 5 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `database/SqliteLobColumnTests` | 5 | 覆盖（参考5方法及限定DDL/夹具差异；候选） | 同一新程序核验实际4个BLOB列和TEXT预览、18字节NUL/非UTF-8 PNG的完整存储及管理列表/详情、旧NULL正文回退、TCP精确payload、两diagram版本的集合和快照；JDBC描述符、Java预览DDL及ticket CLOB差异逐项说明。不当作监听socket、全量采集门控、大容量或升级迁移验收。 |
 | `database/SqliteSchemaMetadataConfigurationTests` | 3 | 无（平台差异） | 三项仅检查 Hibernate 元数据提取策略与显式覆盖，不执行迁移；C 无此元数据层。SQLite 启动、升级、重启测试仍须另行对照。 |
 | `database/SqliteSchemaUpdateRestartTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
-| `database/SqliteSqlExceptionTranslatorTests` | 4 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `database/SqliteSqlExceptionTranslatorTests` | 4 | 无（平台差异） | 四方法的Spring/JDBC转换器、异常类和非SQLite SQLState回退在C无对应API；原生UNIQUE/PRIMARYKEY/NOTNULL与错误文本由 `raw_constraints` 真实核验，另验证C storage查询错误-1与成功无记录0/found=0及恢复。不豁免数据库完整性，也不证明MySQL/PostgreSQL支持。 |
 | `database/SqliteUniqueIndexMigratorTests` | 7 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `database/SqliteUniqueIndexStartupTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `handler/ManagedLoginLogoutPushTests` | 3 | 覆盖（行为及限定调用层差异；候选） | `session_reference_tests.c:pair_scenario` 的mode0/1/2，真实注册表在线状态、实际离线roster发送、数据关闭不下线及替换后最终关闭恰好一次；C的替换保护位于logout helper内部，不等同于Java handler从不调用mock，详见新节。 |
@@ -307,6 +307,41 @@ Rate批次结束时，四类连通性中Vector、Resource、Rate三类为候选�
 本批474个递归输入全部冻结并在完整回归后复核，涵盖C源码/脚本、全部嵌套协议固件、静态资源及4个Java参考源文件；其中221静态资源、34个二进制固件及Java/共享向量均与原归档不变。15个私有脚本仅规范化行尾，Git规范文本与前驱相同。首次测试编译的内部read_frame重名、缺sqlite3.h，以及核验器的连接表达式优先级与二进制固件路径计数错误均保留；修正的是夹具/核验器，不作为生产缺陷，最终实际固件数为34而非早期错误计数0。474冻结时映射仍是前驱原文；完整运行结束后才改本节及上方3行/汇总，并按阅读反馈澄清历史附件行和差异汇总中的presign-upload修复声称，其他473个输入不变，文档最终哈希另绑定阅读检查。该历史文字澄清不代表本批重做附件断言或改变旧79类历史计数。
 
 上一节33类是当时阶段记录；本节补证后剩30类待逐项对照，旧79类当前断言及#35其他运行时/真实环境验收仍未完成。本地67/67、Make、消毒器及负对照均不代替精确新提交的原始CI；后续须按PR #290绑定新提交、实际checkout/树和原始产物另行核验。不合并main、不关闭#35、不发版、不更新Homebrew，不清理未合并工作树/分支。
+
+## SQLite二进制列、空正文与约束错误（2026-10-19增量）
+
+本节以未合并C分支 `3ea89f3d9bebd6a88dadf9741a06931ba1baf1ff`（树 `0888d9a008e12711189f37cc4a6e978d09e672fd`）为基线，完整阅读3类12个Java注解方法、相关方言/转换器及夹具后补证。前驱原始Protocol12项与实验室9项已独立核验，全部21作业实际checkout为 `c3e5fcdc252c68addc380c5eb91c5cc87b8db6cf`，父提交为main `b8d6e72`和前驱，测试树与前驱相同；不以它接受本节新输入。新增 `sqlite_reference_tests.c`，仅修改测试、CMake/Make和映射，不改C生产源码、Java参考、共享向量或工作流。
+
+3类的处理口径不同：`SqliteLobColumnTests` 5方法和 `SqliteConstraintTranslationTests` 3方法列为行为及限定框架差异的候选对照；`SqliteSqlExceptionTranslatorTests` 4方法限定为Spring/JDBC转换API的平台差异，原生约束行为另有下述实测，不作数据库正确性的豁免。当前旧表外49=5类限定平台差异+17类未合并候选（48个注解方法）+27类待核验；不是main完成率，旧79类当前断言另待复核。7个C隔离场景不是12个Java方法，也不能与68个CTest套件相加。
+
+| Java方法 | C证据及精确断言 | 限定差异 |
+| --- | --- | --- |
+| `SqliteLobColumnTests.theLobColumnsKeepTheirSqliteTypes` | `schema_types` 经实际 `st_storage_init` 和room初始化后，用pragma读取HTTP请求/响应正文、TCP payload、diagram snapshot共4个BLOB列以及预览列的真实声明；另确认该C schema没有specus_websocket_ticket表。 | C预览列声明TEXT，Java为varchar(2147483647)，均为SQLite TEXT affinity；Java ticket attributes_json的CLOB列及getBlob/getBytes的JDBC描述符在C无对应，C票据不是该数据库实体。不因此豁免票据行为、完整字节读回或其他表迁移；本场景不验收跨重启票据持久化。 |
+| `httpExchangeDetailShowsTheCapturedBodies` | `http_binary` 以生产同步storage writer保存原参考JSON及18字节PNG（含NUL、非UTF-8的0xff），核验SQLite BLOB类型/长度/全部字节及生产storage getter完整读回；管理列表解析items恰1条、total=1、id=1后，详情解析requestPreviewText精确为原JSON、responsePreviewText精确为完整PNG的data:image/png;base64。 | Java经过TrafficInspectionService并flush，C同步写入没有flush队列；本夹具直接调用C生产存储writer，不冒称重新验证全局采集门控或设备转发。管理查看经过真实签名JWT、用户表及响应构造入口，不经过监听socket。 |
+| `httpExchangeDetailLoadsARowWithoutBodies` | `http_legacy_null` 保存正文列为SQL NULL的记录及原参考request/response preview，核验两正文确为NULL；实际管理列表单条且ID正确，storage getter成功且两正文指针/长度为NULL/0；详情逐值保留两个预览。 | 模拟旧行在当前schema中的NULL表示，不冒称从旧版本真实升级；不能用空串或查询失败替代SQL NULL加载成功。 |
+| `tcpFrameListAndDetailLoadThePayload` | `tcp_binary` 经生产writer保存同一18字节PNG，storage列表精确1行/ID/字节数，getter返回逐字节相同payload；管理列表解析items恰1条及其ID，再核验详情payloadBase64精确为原PNG。 | C列表为items信封；Java参考直接读服务的Page内容，不声称两种内部API或JSON信封逐字节相同。新断言不是只检查payloadBase64字段存在。 |
+| `diagramVersionsListAndDetailLoadTheSnapshot` | `diagram_binary` 用原roomId/token/peerId创建first=PNG与second=second两个版本，实际执行创建时的修剪路径，ID互异；SQLite中first快照为完整BLOB，列表解析后名称/ID集合恰好两条且无多余；两条详情update分别精确还原原base64。 | Java直接调service，C走生产公共响应构造及真实room凭证；无管理JWT授权推论，不是监听HTTP socket或大容量/50版本修剪边界验收。 |
+| `SqliteConstraintTranslationTests.theDefaultDialectTranslatesConstraintViolations` | 阅读实际C使用sqlite3接口和初始化schema；不构造不存在的Spring EntityManagerFactory或Hibernate Dialect。 | 本方法对SpecusSqliteDialect类身份的断言是框架差异，仅此一项不适用；同类真实唯一约束不能因此免测。 |
+| `aJpaSaveThatViolatesAUniqueIndexIsADataIntegrityViolation` | `media_unique` 对生产初始化的specus_http_media_capture表执行与参考相同关键字段的真实INSERT，再插重复deduplication_key；精确SQLITE_CONSTRAINT_UNIQUE及原生错误中table.column，原记录数量仍1且原state/object/status不变。 | Java通过JPA仓库并断言DataIntegrityViolationException、Hibernate UNIQUE与constraintName；C没有该异常转换层。C证据是实际schema的原生INSERT/约束，不冒称管理HTTP错误码、媒体捕获竞争重试或完整业务事务回滚。 |
+| `aJdbcTemplateInsertThatViolatesAUniqueIndexIsADuplicateKey` | `raw_constraints` 在真实SQLite连接建原参考形状的probe表/unique索引，首条成功后重复code精确UNIQUE，原行不丢；正常不同code仍可插入。 | C对照原生SQLite结果，不声称抛出Spring DuplicateKeyException。探针表由测试建立，不冒充生产媒体表；生产表唯一约束由上一行另测。 |
+| `SqliteSqlExceptionTranslatorTests.aUniqueViolationIsADuplicateKey` | `raw_constraints` 分别核验重复code的UNIQUE及重复id的PRIMARYKEY、前者原生错误包含probe.code，拒绝后原行保留。 | 平台差异仅限配置Spring translator并将两种SQLite结果包装为DuplicateKeyException；C无此对象/API。 |
+| `anyOtherViolationIsADataIntegrityViolation` | 同一真实probe中NULL code精确NOTNULL，原生消息含probe.code；失败不增加行，后续有效写入成功。 | DataIntegrityViolationException的Java类身份不适用于C；不豁免C自己的非空约束或错误返回。 |
+| `withoutTheTranslatorTheViolationIsUncategorized` | 同一原生唯一约束不因是否有Java包装器而消失；上述真实UNIQUE拒绝及原行保留仍须成立。 | “有/无JdbcTemplate translator时异常类型不同”完全是Java框架断言；C没有第二套默认JDBC异常分类，不制造测试专用转换器来假装对应。 |
+| `otherExceptionsGetTheDefaultTranslation` | `raw_constraints` 的missing表返回SQLITE_ERROR而非约束码；另对实际C storage getter确认有表但无记录是0/found=0，隔离改名真实表后查询失败是-1/found=0，恢复表后读取恢复。 | SQLState23505的DuplicateKey、MySQL1043握手异常的默认Spring回退，在仅用sqlite3的C中没有对应驱动/SQLState API；不借此豁免C读库失败语义，更不把该探针当真实MySQL/PostgreSQL支持。 |
+
+7场景各用独立临时SQLite文件和生产初始化；管理HTTP/TCP查看使用真实存储owner及签名JWT，公共diagram使用room凭证。PNG精确为18字节，正文/快照原始BLOB和解析后的视图分别比较；解析字符串使用解码后的显式长度，微型正负校准拒绝带NUL后缀、null与缺字段。没有进程外服务端、监听socket、跨NAT或真实外部数据库；C同步writer与Java service/flush的设置差异不等于重新验收所有采集路径。本节也不证明更大BLOB容量、C既有64KiB正文保留上限之外的完整保存、迁移/重启/并发/事务回滚或其他数据库类。
+
+三个隔离真实C存储源码变体分别少返回1字节HTTP正文、丢失NULL正文行的legacy preview、移除生产媒体表deduplication_key唯一约束；使用最终冻结驱动，均在对应完整字节/预览/原生唯一约束断言退出1，汇总脚本退出0。没有旧程序比较，不称为3个线上缺陷，也不声称变体经过消毒器。
+
+最终revision2冻结输入实际通过Linux CMake Release（O3/NDEBUG、Werror）68/68、零失败零跳过；原67个名称及序号保留，新增SQLite套件为68。独立O2/Werror完整Make在原600秒限制内通过，实际执行全部7场景；复用独立Make首轮已编译且源码未变的核心，最终SQLite程序重新编译，不把未变化的NAT程序没有重编译当成漏测。原HTTP38、Resource28、Rate17及实际10000键、路由12/scale3/大小5/名称6/管理14及6次拒绝不变、写入2/会话4/RST3/写失败4、正常NAT18及偏差重放3、两组真实10秒下界和TURN均保留。全新O2 ASan/UBSan构建的36个核心对象及最终驱动实际执行1个注册套件的7场景，通过且泄漏检查开启、无报告；不是36条路径都运行，也不外推全部服务端或3个变体的消毒器覆盖。
+
+归档基线477个文件，增加新测试后，478个源码/引用夹具/资源递归输入在完整运行后全部复核；包含未变的7个Java引用源文件（3测试类、1辅助类及3实现类）、221个静态资源和34个嵌套二进制协议固件。15个私有脚本只规范化行尾，Git规范文本与前驱相同。随后只修改映射的3行、汇总和本节，其他477个运行输入不变；这477并不是“基线477文件原封不动”的意思。最终文档哈希另绑定阅读检查，不声称文档最后字节也参加了此前运行。
+
+前一revision1的完整68/Make/SAN/负对照结果及输入保留为中间记录，它缺少本次最终HTTP列表与实际storage错误/不存在补强，不能代替最终输入。首轮把Java Page content当成C的items属于夹具错误；首次消毒器配置同时给全局O2和CMake Release，实际尾部O3导致既有connectivity代码的格式警告被Werror拒绝，原失败保留。正式消毒器沿用前批RelWithDebInfo/O2且仍Werror，不声称该O3插桩编译问题已修复。首次负对照手动链接不存在的可选Brotli库也保留，改为匹配实际核心的链接依赖，未修改解码器或放宽断言。
+
+最终核验器首次错误要求未变的NAT程序再次编译，随后又误把直接链接的main.c当作核心对象的-c命令；两次核验失败及脚本保留，按真实构建方式修正后复核通过，不算运行失败或生产修复。Make的Clock skew警告同样保留，未改宿主时间；以实际新程序编译命令以及CMake/Make/消毒器三个产物中新增HTTP列表、storage错误/恢复断言的存在排除误用旧驱动，不据警告猜测唯一成因。
+
+本节仍是未合并候选及限定平台说明，精确新提交原始CI须另按PR #290的实际checkout/树/日志/产物核验，不借用前驱绿灯；27类、旧79类当前断言及#35其他验收未完成。不合并main、不关闭#35、不发版、不更新Homebrew，不清理未合并工作树/分支。
 
 ## 历史表的读法与限制
 

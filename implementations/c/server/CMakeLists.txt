@@ -574,3 +574,9 @@ target_compile_definitions(specus_c_nat_sizing_reference_tests PRIVATE
 add_test(NAME nat_sizing_reference_tests
     COMMAND specus_c_nat_sizing_reference_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(nat_sizing_reference_tests PROPERTIES TIMEOUT 90)
+
+add_executable(specus_c_sqlite_reference_tests tests/sqlite_reference_tests.c)
+target_link_libraries(specus_c_sqlite_reference_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_sqlite_reference_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME sqlite_reference_tests COMMAND specus_c_sqlite_reference_tests)
+set_tests_properties(sqlite_reference_tests PROPERTIES TIMEOUT 60)
