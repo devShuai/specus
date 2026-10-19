@@ -563,3 +563,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         COMMAND specus_c_nat_push_reference_tests $<TARGET_FILE:specus_c_nat_push_reference_server>)
     set_tests_properties(nat_push_reference_tests PROPERTIES TIMEOUT 90)
 endif()
+
+# Exact shared sizing and management vectors use the real JSON builder and normal server.
+add_executable(specus_c_nat_sizing_reference_tests
+    tests/nat_sizing_reference_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_nat_sizing_reference_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_nat_sizing_reference_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_nat_sizing_reference_tests PRIVATE
+    ST_NAT_CONTROL_SIZE_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/nat-control-size-v1.json")
+add_test(NAME nat_sizing_reference_tests
+    COMMAND specus_c_nat_sizing_reference_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(nat_sizing_reference_tests PROPERTIES TIMEOUT 90)

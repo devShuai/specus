@@ -765,9 +765,9 @@ static int load_database_config(server_config *config, const char *database_path
     return 0;
 }
 
-static int build_nat_control_json(server_config *config)
+static int build_nat_control_json_named(server_config *config, const char *name)
 {
-    char *client_name = st_json_escape(config->client_name);
+    char *client_name = st_json_escape(name);
     char *public_address = st_json_escape(config->public_address);
     if (client_name == NULL || public_address == NULL) {
         free(client_name);
@@ -839,6 +839,11 @@ static int build_nat_control_json(server_config *config)
     }
     config->nat_control_json = sb_finish(&builder);
     return config->nat_control_json == NULL ? -1 : 0;
+}
+
+static int build_nat_control_json(server_config *config)
+{
+    return build_nat_control_json_named(config, config->client_name);
 }
 
 static int load_config(server_config *config)

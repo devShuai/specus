@@ -97,6 +97,37 @@ static int vec_array(const char *object, const char *key, char ***items, size_t 
     return rc;
 }
 
+/* These lifecycle fixtures create no TCP mappings. A missing/null list is not an empty snapshot. */
+static int explicit_empty_tcp_snapshot(const char *json)
+{
+    char **items = NULL;
+    size_t count = 0U;
+    int rc = vec_array(json, "specusConfigList", &items, &count);
+    int empty = rc == 0 && count == 0U;
+    st_json_free_string_array(items, count);
+    return empty;
+}
+
+static int check_empty_tcp_snapshot_parser(void)
+{
+    const char *const invalid[] = {
+        "{}", "{\"specusConfigList\":null}", "{\"specusConfigList\":{}}",
+        "{\"specusConfigList\":[{\"port\":42001}]}"
+    };
+    if (!explicit_empty_tcp_snapshot("{\"specusConfigList\":[]}")) {
+        fprintf(stderr, "empty TCP snapshot parser rejects an explicit empty array\n");
+        return 1;
+    }
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        if (explicit_empty_tcp_snapshot(invalid[i])) {
+            fprintf(stderr, "empty TCP snapshot parser accepts invalid case %zu\n", i);
+            return 1;
+        }
+    }
+    printf("NAT snapshot: explicit empty TCP array required; missing/null/object/nonempty controls rejected\n");
+    return 0;
+}
+
 /* A string array under key: 0 with the strings, 1 when it is null, -1 when absent or malformed. */
 static int vec_string_list(const char *object, const char *key, char ***items, size_t *count)
 {
@@ -388,10 +419,14 @@ static int check_push(replay *r, const char *step, const char *key)
     if (names_ok) {
         join_names(names, item_count, actual_text, sizeof(actual_text));
     }
-    int matches = names_ok && same_name_set(names, item_count, expected, expected_count);
+    int empty_tcp = explicit_empty_tcp_snapshot(json);
+    int matches = names_ok && empty_tcp && same_name_set(names, item_count, expected, expected_count);
     if (!matches) {
         step_fail(r, __LINE__, "%s: NAT_CONTROL routes [%s], expected [%s]; NAT_CONTROL was %s", key,
                   names_ok ? actual_text : "(no httpSpecusConfigList array of routes)", expected_text, json);
+        if (!empty_tcp) {
+            step_fail(r, __LINE__, "NAT_CONTROL must include the explicit empty specusConfigList of this fixture");
+        }
     }
     st_json_free_string_array(names, names == NULL ? 0U : item_count);
     st_json_free_string_array(items, item_count);
@@ -1275,6 +1310,9 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IOLBF, 0);
     signal(SIGPIPE, SIG_IGN);
     srand((unsigned int)wall_clock_ms());
+    if (check_empty_tcp_snapshot_parser() != 0) {
+        return 1;
+    }
 
     vector_json = read_file(ST_ROUTE_LIFECYCLE_VECTOR_FILE);
     if (vector_json == NULL || !st_json_is_valid_object(vector_json) || load_vector_constants() != 0) {

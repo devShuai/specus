@@ -8883,22 +8883,10 @@ static int handle_peer_mesh_acl_delete(const st_admin_context *context, long lon
  * this check, or straight to the database, is not sent: the login and the runtime push only log it,
  * and the manual push answers 409 with ST_ADMIN_NAT_CONTROL_NOT_SENT_BODY.
  */
-#define ST_ADMIN_NAT_CONTROL_NAME_BYTES (120U * 4U)
-#define ST_ADMIN_NAT_CONTROL_ESCAPED_NAME_BYTES (120U * 6U)
 #define ST_ADMIN_NAT_CONTROL_TOO_LARGE_BODY \
     "{\"error\":\"客户端的 TCP 映射和 HTTP route 将超过单条 NAT_CONTROL 消息 1 MiB 的上限，无法下发给客户端\"}"
 #define ST_ADMIN_NAT_CONTROL_NOT_SENT_BODY \
     "{\"error\":\"客户端的 TCP 映射和 HTTP route 超过单条 NAT_CONTROL 消息 1 MiB 的上限，未下发给客户端\"}"
-
-static size_t admin_varint_size(size_t value)
-{
-    size_t size = 1U;
-    while (value >= 0x80U) {
-        value >>= 7;
-        ++size;
-    }
-    return size;
-}
 
 /*
  * Whether client_name's NAT_CONTROL stays within the cap once added_entry, a list entry as
@@ -8935,18 +8923,16 @@ static int admin_nat_control_fits(const char *database_path,
     if (rc == 0) rc = append_http_route_config_list(&json, routes.items, routes.count);
     if (rc == 0) rc = admin_sb_append(&json, "]}");
     if (rc == 0) {
-        size_t json_len = json.len + ST_ADMIN_NAT_CONTROL_ESCAPED_NAME_BYTES;
+        size_t json_len = json.len;
         size_t removed_len = removed_entry == NULL ? 0U : strlen(removed_entry);
         if (removed_len <= json_len) {
             json_len -= removed_len;
         }
         /* An entry that joins the list brings the comma that separates it. */
         json_len += strlen(added_entry) + (removed_entry == NULL ? 1U : 0U);
-        /* As st_protocol_encode_nat_control writes it: clientName, a null toClientName, the type, the JSON. */
-        size_t body_len = admin_varint_size(ST_ADMIN_NAT_CONTROL_NAME_BYTES + 1U) + ST_ADMIN_NAT_CONTROL_NAME_BYTES
-            + 1U + admin_varint_size((size_t)ST_MESSAGE_TYPE_NAT_CONTROL)
-            + admin_varint_size(json_len + 1U) + json_len;
-        *fits = body_len <= ST_MAX_MESSAGE_BODY_SIZE;
+        size_t body_len = 0U;
+        rc = st_protocol_nat_control_reserved_body_size(json_len, &body_len);
+        *fits = rc == 0 && body_len <= ST_MAX_MESSAGE_BODY_SIZE;
     }
     free(public_address);
     free(mappings.items);
