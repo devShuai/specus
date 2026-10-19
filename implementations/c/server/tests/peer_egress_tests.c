@@ -49,6 +49,38 @@ static char *read_vector(const char *name)
     return text;
 }
 
+static int run_ipv6_target_announcement_vector(void)
+{
+    char *root = read_vector("peer-egress-ipv6-target-announcement-v1.json");
+    if (root == NULL) return 1;
+    char **cases = NULL;
+    size_t count = 0U;
+    int consumer_ipv6 = 1;
+    if (st_json_get_bool(root, "consumerIpv6DataPlaneEnabled", &consumer_ipv6) != 0
+        || consumer_ipv6 || st_json_get_raw_array(root, "login", &cases, &count) != 0 || count != 7U) {
+        free(root);
+        st_json_free_string_array(cases, count);
+        return 1;
+    }
+    int failures = 0;
+    for (size_t i = 0; i < count; ++i) {
+        char *caps = st_json_get_top_level_raw(cases[i], "capabilities");
+        int version = 0, normalized = -1, expected = -1;
+        if (caps != NULL) (void)st_json_get_int(caps, "version", &version);
+        if (st_json_get_int(cases[i], "normalizedVersion", &normalized) != 0
+            || st_json_get_bool(cases[i], "stored", &expected) != 0
+            || st_egress_normalize_version(version) != normalized
+            || st_egress_declares_ipv6_targets(caps, version) != expected) {
+            fprintf(stderr, "shared IPv6 target announcement case %zu failed\n", i);
+            failures++;
+        }
+        free(caps);
+    }
+    st_json_free_string_array(cases, count);
+    free(root);
+    return failures;
+}
+
 static int is_absent(const char *raw)
 {
     return raw == NULL || strcmp(raw, "null") == 0;
@@ -1259,6 +1291,7 @@ static int run_ipv6_forced_deny(const char *section)
 
 int main(void)
 {
+    if (run_ipv6_target_announcement_vector() != 0) return 1;
     char *authz = read_vector("peer-egress-authz-v1.json");
     char *rules = read_vector("peer-egress-rules-v1.json");
     char *management = read_vector("peer-egress-management-v1.json");

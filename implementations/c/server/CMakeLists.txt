@@ -419,6 +419,21 @@ target_link_libraries(specus_c_storage_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_storage_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME storage_tests COMMAND specus_c_storage_tests)
 
+add_executable(specus_c_session_order_tests tests/session_order_tests.c)
+target_link_libraries(specus_c_session_order_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_session_order_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_session_order_tests PRIVATE
+    ST_SESSION_ORDER_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/peer-egress-session-order-v1.json")
+add_test(NAME session_order_tests COMMAND specus_c_session_order_tests)
+
+add_executable(specus_c_session_scope_tests tests/session_order_tests.c)
+target_link_libraries(specus_c_session_scope_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_session_scope_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_session_scope_tests PRIVATE
+    ST_SESSION_ORDER_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/peer-egress-session-scope-v1.json"
+    ST_SESSION_ORDER_EXPECTED_CASES=8U ST_SESSION_SCOPE_NOCASE=1)
+add_test(NAME session_scope_tests COMMAND specus_c_session_scope_tests)
+
 add_executable(specus_c_stun_turn_tests tests/stun_turn_tests.c)
 target_link_libraries(specus_c_stun_turn_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_stun_turn_tests PRIVATE -Wall -Wextra -Wpedantic)

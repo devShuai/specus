@@ -16,9 +16,9 @@ func (db *DB) InsertClientSession(ctx context.Context, session ClientSession) er
 		 java_version, local_addresses, message_send_capable, message_receive_capable,
 		 message_attachments_capable, message_media_preview_capable, message_max_attachment_bytes,
 		 peer_service_discovery_version, peer_service_applications, client_egress_version,
-		 client_egress_domain_targets, http_login_at, netty_connected_at, disconnected_at,
+		 client_egress_domain_targets, client_egress_ipv6_targets, http_login_at, netty_connected_at, disconnected_at,
 		 expires_at, channel_id, remote_address)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	_, err := db.sql.ExecContext(ctx, query,
 		session.ID, defaultTenant(session.TenantID), session.CredentialID, session.IdentityID,
 		session.ClientID, session.ClientName, session.TokenHash, session.Status,
@@ -30,6 +30,7 @@ func (db *DB) InsertClientSession(ctx context.Context, session ClientSession) er
 		db.clientMessageCapabilityValue(session.MessageMediaPreviewCapable), session.MessageMaxAttachmentBytes,
 		session.PeerServiceDiscoveryVersion, nullableSessionText(session.PeerServiceApplications),
 		session.ClientEgressVersion, db.clientMessageCapabilityValue(session.ClientEgressDomainTargets),
+		db.clientMessageCapabilityValue(session.ClientEgressIPv6Targets),
 		formatTime(session.HTTPLoginAt), nullableTime(session.NettyConnectedAt),
 		nullableTime(session.DisconnectedAt), formatTime(session.ExpiresAt), session.ChannelID,
 		session.RemoteAddress)
@@ -43,7 +44,7 @@ func (db *DB) GetClientSession(ctx context.Context, id int64) (*ClientSession, e
 		client_version, java_version, local_addresses, message_send_capable, message_receive_capable,
 		message_attachments_capable, message_media_preview_capable, message_max_attachment_bytes,
 		peer_service_discovery_version, peer_service_applications, client_egress_version,
-		client_egress_domain_targets, http_login_at, netty_connected_at,
+		client_egress_domain_targets, client_egress_ipv6_targets, http_login_at, netty_connected_at,
 		disconnected_at, expires_at, channel_id, remote_address
 		FROM specus_client_session WHERE id = ?`)
 	session, err := scanClientSession(db.sql.QueryRowContext(ctx, query, id))
@@ -63,18 +64,38 @@ func (db *DB) GetOnlineClientSession(ctx context.Context, tenantID string, clien
 		client_version, java_version, local_addresses, message_send_capable, message_receive_capable,
 		message_attachments_capable, message_media_preview_capable, message_max_attachment_bytes,
 		peer_service_discovery_version, peer_service_applications, client_egress_version,
-		client_egress_domain_targets, http_login_at, netty_connected_at, disconnected_at, expires_at, channel_id, remote_address
+		client_egress_domain_targets, client_egress_ipv6_targets, http_login_at, netty_connected_at, disconnected_at, expires_at, channel_id, remote_address
 		FROM specus_client_session
-		WHERE tenant_id = ? AND client_id = ? AND status = ?
-		ORDER BY netty_connected_at DESC, id DESC LIMIT 1`)
-	session, err := scanClientSession(db.sql.QueryRowContext(ctx, query, defaultTenant(tenantID), clientID, status))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
+		WHERE tenant_id = ? AND client_id = ? AND status = ?`)
+	rows, err := db.sql.QueryContext(ctx, query, defaultTenant(tenantID), clientID, status)
 	if err != nil {
 		return nil, err
 	}
-	return &session, nil
+	defer rows.Close()
+	var newest *ClientSession
+	var newestAt time.Time
+	for rows.Next() {
+		session, at, known, err := scanClientSessionWithOrder(rows)
+		if err != nil {
+			return nil, err
+		}
+		// MySQL/MariaDB collations may ignore case or trailing spaces. Database
+		// candidate filtering must not broaden tenant or online-status identity.
+		if session.TenantID != defaultTenant(tenantID) || session.ClientID != clientID || session.Status != status {
+			continue
+		}
+		if !known {
+			// We cannot establish which online session is current. Do not borrow
+			// capabilities from a different row or hide an invalid connection time
+			// by falling back to HTTP login time.
+			return nil, nil
+		}
+		if newest == nil || at.After(newestAt) || (at.Equal(newestAt) && session.ID > newest.ID) {
+			current := session
+			newest, newestAt = &current, at
+		}
+	}
+	return newest, rows.Err()
 }
 
 // ClientHasOnlineMessageReceiveCapability matches Java's anyMatch across all online sessions.
@@ -87,7 +108,7 @@ func (db *DB) ListClientSessionsByClientIDsAndStatus(ctx context.Context, tenant
 		client_version, java_version, local_addresses, message_send_capable, message_receive_capable,
 		message_attachments_capable, message_media_preview_capable, message_max_attachment_bytes,
 		peer_service_discovery_version, peer_service_applications, client_egress_version,
-		client_egress_domain_targets, http_login_at, netty_connected_at, disconnected_at, expires_at, channel_id, remote_address
+		client_egress_domain_targets, client_egress_ipv6_targets, http_login_at, netty_connected_at, disconnected_at, expires_at, channel_id, remote_address
 		FROM specus_client_session
 		WHERE tenant_id = ? AND status = ? AND client_id IN (` + placeholders(len(clientIDs)) + `)`)
 	args := []any{defaultTenant(tenantID), status}
@@ -190,6 +211,11 @@ type clientSessionScanner interface {
 }
 
 func scanClientSession(scanner clientSessionScanner) (ClientSession, error) {
+	session, _, _, err := scanClientSessionWithOrder(scanner)
+	return session, err
+}
+
+func scanClientSessionWithOrder(scanner clientSessionScanner) (ClientSession, time.Time, bool, error) {
 	var (
 		session                             ClientSession
 		hostname, osName, osVersion, osArch sql.NullString
@@ -202,6 +228,7 @@ func scanClientSession(scanner clientSessionScanner) (ClientSession, error) {
 		messageAttachments, messagePreview  databaseBoolean
 		peerApplications                    sql.NullString
 		egressDomainTargets                 databaseBoolean
+		egressIPv6Targets                   databaseBoolean
 	)
 	err := scanner.Scan(&session.ID, &session.TenantID, &session.CredentialID, &session.IdentityID,
 		&session.ClientID, &session.ClientName, &session.TokenHash, &session.Status,
@@ -210,10 +237,10 @@ func scanClientSession(scanner clientSessionScanner) (ClientSession, error) {
 		&messageReceive, &messageAttachments,
 		&messagePreview, &session.MessageMaxAttachmentBytes,
 		&session.PeerServiceDiscoveryVersion, &peerApplications, &session.ClientEgressVersion,
-		&egressDomainTargets, &httpLoginAt, &nettyAt, &disconnectedAt,
+		&egressDomainTargets, &egressIPv6Targets, &httpLoginAt, &nettyAt, &disconnectedAt,
 		&expiresAt, &channelID, &remoteAddress)
 	if err != nil {
-		return ClientSession{}, err
+		return ClientSession{}, time.Time{}, false, err
 	}
 	session.Hostname = nullStringPtr(hostname)
 	session.OSName = nullStringPtr(osName)
@@ -224,6 +251,7 @@ func scanClientSession(scanner clientSessionScanner) (ClientSession, error) {
 	session.LocalAddresses = nullStringPtr(localAddresses)
 	session.MessageSendCapable = bool(messageSend)
 	session.ClientEgressDomainTargets = bool(egressDomainTargets)
+	session.ClientEgressIPv6Targets = bool(egressIPv6Targets)
 	session.MessageReceiveCapable = bool(messageReceive)
 	session.MessageAttachmentsCapable = bool(messageAttachments)
 	session.MessageMediaPreviewCapable = bool(messagePreview)
@@ -236,7 +264,12 @@ func scanClientSession(scanner clientSessionScanner) (ClientSession, error) {
 	session.ExpiresAt = parseTime(expiresAt)
 	session.ChannelID = nullStringPtr(channelID)
 	session.RemoteAddress = nullStringPtr(remoteAddress)
-	return session, nil
+	timestamp := httpLoginAt
+	if nettyAt.Valid && nettyAt.String != "" {
+		timestamp = nettyAt.String
+	}
+	at, known := parseClientSessionInstant(timestamp)
+	return session, at, known, nil
 }
 
 func nullableSessionText(value string) any {

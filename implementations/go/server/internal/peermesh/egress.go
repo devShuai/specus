@@ -130,17 +130,24 @@ func EgressDomainTargets(version int, declared bool) bool {
 	return NormalizeEgressVersion(version) >= 1 && declared
 }
 
+// EgressIPv6Targets normalizes the existing egress-side IPv6 socket declaration.
+// It does not imply that a consumer can carry an IPv6 packet through the mesh.
+func EgressIPv6Targets(version int, declared bool) bool {
+	return NormalizeEgressVersion(version) >= 1 && declared
+}
+
 // egressAnnouncementOf reads, from the egress's current online session, what it announced at login:
 // its clientEgressCapabilities.version (already normalised when the session was stored) and whether
 // it resolves domain targets. Offline, or no such announcement, is version 0 and no domain targets:
 // a consumer must neither count on an egress that cannot take a flow nor send a name to one that
-// cannot resolve it. Both come from the same session so the two catalogue fields never disagree.
-func (s *Service) egressAnnouncementOf(ctx context.Context, tenantID string, egressClientID int64) (version int, domainTargets bool) {
+// cannot resolve it. All capability fields come from the same newest online
+// session, including an explicit false after reconnecting with an older client.
+func (s *Service) egressAnnouncementOf(ctx context.Context, tenantID string, egressClientID int64) (version int, domainTargets, ipv6Targets bool) {
 	online, err := s.db.GetOnlineClientSession(ctx, tenantID, egressClientID, auth.StatusNettyOnline)
 	if err != nil || online == nil || online.ClientEgressVersion < 1 {
-		return 0, false
+		return 0, false, false
 	}
-	return online.ClientEgressVersion, online.ClientEgressDomainTargets
+	return online.ClientEgressVersion, online.ClientEgressDomainTargets, online.ClientEgressIPv6Targets
 }
 
 // egressCapabilitiesFor reads what the client announced at login. A client with no online session,
@@ -591,7 +598,7 @@ func (s *Service) BuildEgressCatalog(ctx context.Context, account store.ClientAc
 		}
 		device, err := s.db.FindPeerMeshDeviceByClientID(ctx, account.TenantID, policy.EgressClientID)
 		online := err == nil && device != nil && device.Enabled
-		egressVersion, domainTargets := s.egressAnnouncementOf(ctx, account.TenantID, policy.EgressClientID)
+		egressVersion, domainTargets, ipv6Targets := s.egressAnnouncementOf(ctx, account.TenantID, policy.EgressClientID)
 		message.Egresses = append(message.Egresses, EgressCatalogEntry{
 			ClientID:            policy.EgressClientID,
 			ClientName:          policy.EgressClientName,
@@ -599,10 +606,8 @@ func (s *Service) BuildEgressCatalog(ctx context.Context, account store.ClientAc
 			Scope:               policy.Scope,
 			Protocols:           egressProtocols(DecodeEgressDestinationRules(policy.DestinationRules, s.logger)),
 			DomainTargetCapable: domainTargets,
-			// Egresses declare IPv6 targets, but no consumer reads this yet: the consumer data plane
-			// carries IPv4 only. It is forwarded, as domainTargetCapable is, once that changes.
-			IPv6TargetCapable: false,
-			EgressVersion:     egressVersion,
+			IPv6TargetCapable:   ipv6Targets,
+			EgressVersion:       egressVersion,
 		})
 	}
 	return message, nil

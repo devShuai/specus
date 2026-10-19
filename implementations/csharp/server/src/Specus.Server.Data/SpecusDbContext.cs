@@ -1,6 +1,9 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Specus.Server.Data.Conversion;
 using Specus.Server.Data.Entities;
+using Specus.Server.Data.Migrations;
 
 namespace Specus.Server.Data;
 
@@ -102,6 +105,18 @@ public sealed class SpecusDbContext : DbContext
             {
                 user.LoginNameNormalized = normalized;
             }
+        }
+    }
+
+    protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
+    {
+        base.OnConfiguring(optionsBuilder);
+        // Use the public provider-builder assembly to identify SQLite, without
+        // replacing PostgreSQL/MySQL history services or changing the model.
+        if (optionsBuilder.Options.Extensions.Any(extension => extension.Info.IsDatabaseProvider
+            && extension.GetType().Assembly == typeof(SqliteDbContextOptionsBuilder).Assembly))
+        {
+            optionsBuilder.ReplaceService<IHistoryRepository, SpecusSqliteHistoryRepository>();
         }
     }
 
@@ -247,6 +262,7 @@ public sealed class SpecusDbContext : DbContext
             b.Property(x => x.PeerServiceApplications).HasColumnName("peer_service_applications").HasMaxLength(160);
             b.Property(x => x.ClientEgressVersion).HasColumnName("client_egress_version").IsRequired();
             b.Property(x => x.ClientEgressDomainTargets).HasColumnName("client_egress_domain_targets").IsRequired();
+            b.Property(x => x.ClientEgressIpv6Targets).HasColumnName("client_egress_ipv6_targets").HasDefaultValue(false).IsRequired();
             b.Property(x => x.HttpLoginAt).HasColumnName("http_login_at").HasMaxLength(40).IsRequired()
                 .HasConversion(iso);
             b.Property(x => x.NettyConnectedAt).HasColumnName("netty_connected_at").HasMaxLength(40)

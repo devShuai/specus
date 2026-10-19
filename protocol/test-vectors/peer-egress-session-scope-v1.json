@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "description": "Tenant and online-status identity are exact, independent of database collation. Foreign rows neither supply announcements nor poison timestamp ordering.",
+  "consumerIpv6DataPlaneEnabled": false,
+  "tenantId": "default",
+  "clientId": 2002,
+  "status": "NETTY_ONLINE",
+  "cases": [
+    {"name":"tenant-case-cannot-supply-announcement","sessions":[
+      {"id":1,"tenantId":"default","clientId":2002,"status":"NETTY_ONLINE","httpLoginAt":"2026-10-18T00:00:00Z","connectedAt":"2026-10-18T00:00:00Z","version":1,"domainTargetCapable":false,"ipv6TargetCapable":false},
+      {"id":2,"tenantId":"DEFAULT","clientId":2002,"status":"NETTY_ONLINE","httpLoginAt":"2026-10-18T00:01:00Z","connectedAt":"2026-10-18T00:01:00Z","version":9,"domainTargetCapable":true,"ipv6TargetCapable":true}],
+      "expected":{"sessionId":1,"version":1,"domainTargetCapable":false,"ipv6TargetCapable":false}},
+    {"name":"tenant-case-invalid-time-ignored","sessions":[
+      {"id":1,"tenantId":"default","clientId":2002,"status":"NETTY_ONLINE","httpLoginAt":"2026-10-18T00:00:00Z","connectedAt":"2026-10-18T00:00:00Z","version":1,"domainTargetCapable":true,"ipv6TargetCapable":true},
+      {"id":2,"tenantId":"DEFAULT","clientId":2002,"status":"NETTY_ONLINE","httpLoginAt":"2026-10-18T00:01:00Z","connectedAt":"invalid","version":9,"domainTargetCapable":false,"ipv6TargetCapable":false}],
+      "expected":{"sessionId":1,"version":1,"domainTargetCapable":true,"ipv6TargetCapable":true}},
+    {"name":"status-case-cannot-supply-announcement","sessions":[
+      {"id":1,"tenantId":"default","clientId":2002,"status":"NETTY_ONLINE","httpLoginAt":"2026-10-18T00:00:00Z","connectedAt":"2026-10-18T00:00:00Z","version":1,"domainTargetCapable":false,"ipv6TargetCapable":false},
+      {"id":2,"tenantId":"default","clientId":2002,"status":"netty_online","httpLoginAt":"2026-10-18T00:01:00Z","connectedAt":"2026-10-18T00:01:00Z","version":9,"domainTargetCapable":true,"ipv6TargetCapable":true}],
+      "expected":{"sessionId":1,"version":1,"domainTargetCapable":false,"ipv6TargetCapable":false}},
+    {"name":"status-case-invalid-time-ignored","sessions":[
+      {"id":1,"tenantId":"default","clientId":2002,"status":"NETTY_ONLINE","httpLoginAt":"2026-10-18T00:00:00Z","connectedAt":"2026-10-18T00:00:00Z","version":1,"domainTargetCapable":true,"ipv6TargetCapable":true},
+      {"id":2,"tenantId":"default","clientId":2002,"status":"netty_online","httpLoginAt":"2026-10-18T00:01:00Z","connectedAt":"invalid","version":9,"domainTargetCapable":false,"ipv6TargetCapable":false}],
+      "expected":{"sessionId":1,"version":1,"domainTargetCapable":true,"ipv6TargetCapable":true}},
+    {"name":"tenant-trailing-space-cannot-supply-announcement","sessions":[
+      {"id":1,"tenantId":"default","clientId":2002,"status":"NETTY_ONLINE","httpLoginAt":"2026-10-18T00:00:00Z","connectedAt":"2026-10-18T00:00:00Z","version":1,"domainTargetCapable":false,"ipv6TargetCapable":false},
+      {"id":2,"tenantId":"default ","clientId":2002,"status":"NETTY_ONLINE","httpLoginAt":"2026-10-18T00:01:00Z","connectedAt":"2026-10-18T00:01:00Z","version":9,"domainTargetCapable":true,"ipv6TargetCapable":true}],
+      "expected":{"sessionId":1,"version":1,"domainTargetCapable":false,"ipv6TargetCapable":false}},
+    {"name":"status-trailing-space-invalid-time-ignored","sessions":[
+      {"id":1,"tenantId":"default","clientId":2002,"status":"NETTY_ONLINE","httpLoginAt":"2026-10-18T00:00:00Z","connectedAt":"2026-10-18T00:00:00Z","version":1,"domainTargetCapable":true,"ipv6TargetCapable":true},
+      {"id":2,"tenantId":"default","clientId":2002,"status":"NETTY_ONLINE ","httpLoginAt":"2026-10-18T00:01:00Z","connectedAt":"invalid","version":9,"domainTargetCapable":false,"ipv6TargetCapable":false}],
+      "expected":{"sessionId":1,"version":1,"domainTargetCapable":true,"ipv6TargetCapable":true}},
+    {"name":"only-case-foreign-is-not-online","sessions":[
+      {"id":2,"tenantId":"DEFAULT","clientId":2002,"status":"NETTY_ONLINE","httpLoginAt":"2026-10-18T00:01:00Z","connectedAt":"2026-10-18T00:01:00Z","version":9,"domainTargetCapable":true,"ipv6TargetCapable":true}],
+      "expected":{"sessionId":null,"version":0,"domainTargetCapable":false,"ipv6TargetCapable":false}},
+    {"name":"matching-corrupt-time-remains-unknown","sessions":[
+      {"id":1,"tenantId":"default","clientId":2002,"status":"NETTY_ONLINE","httpLoginAt":"2026-10-18T00:00:00Z","connectedAt":"invalid","version":1,"domainTargetCapable":true,"ipv6TargetCapable":true},
+      {"id":2,"tenantId":"DEFAULT","clientId":2002,"status":"NETTY_ONLINE","httpLoginAt":"2026-10-18T00:01:00Z","connectedAt":"2026-10-18T00:01:00Z","version":9,"domainTargetCapable":true,"ipv6TargetCapable":true}],
+      "expected":{"sessionId":null,"version":0,"domainTargetCapable":false,"ipv6TargetCapable":false}}
+  ]
+}

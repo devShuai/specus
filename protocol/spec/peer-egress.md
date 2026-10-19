@@ -539,7 +539,18 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 
 `egressVersion` 取该出口**当前在线会话**登录时声明的 `clientEgressCapabilities.version`（服务端归一化、已存在会话上的那个值），出口不在线或没有声明时为 `0`。消费端据此判断「能力不支持」（上一节）；旧服务端不发这个字段，消费端读作未知，不据此阻断。
 
-`domainTargetCapable` 取该出口**当前在线会话**登录时在 `clientEgressCapabilities` 里声明的值：服务端把它与 `version` 一起保存在会话上（会话表列 `client_egress_domain_targets`，布尔，默认 `false`，已有数据库在启动时补上）。出口不在线、或登录时没有声明，为 `false`。出口重新登录、声明变化时，随出口上线这一变化照常重新下发目录。此前四个服务端都固定写 `false`，消费端无从得知哪台出口能解析域名，二期的域名规则因此无法判断 `EGRESS_RULE_EGRESS_NO_DOMAIN`。`ipv6TargetCapable` 在目录里仍固定为 `false`：客户端已经声明它，但消费端还没有读它的地方——名字解析在出口完成，消费端看到的始终是 IPv4 fake-IP；消费端 IPv6 数据面交付、IPv6 规则需要据此判断出口时，服务端再按 `domainTargetCapable` 的同一办法如实转发。
+`domainTargetCapable` 取该出口**当前在线会话**登录时在 `clientEgressCapabilities` 里声明的值：服务端把它与 `version` 一起保存在会话上（会话表列 `client_egress_domain_targets`，布尔，默认 `false`，已有数据库在启动时补上）。出口不在线、或登录时没有声明，为 `false`。出口重新登录、声明变化时，随出口上线这一变化照常重新下发目录。此前四个服务端都固定写 `false`，消费端无从得知哪台出口能解析域名，二期的域名规则因此无法判断 `EGRESS_RULE_EGRESS_NO_DOMAIN`。
+
+`ipv6TargetCapable` 同样如实转发当前在线会话的声明，存于会话列 `client_egress_ipv6_targets`（布尔，默认 `false`）。它指**出口侧能以 IPv6 socket 连接目标**，例如为 IPv4 fake-IP 流拨号到 AAAA-only 名字，不代表消费端能接管或传输 IPv6 包，也不授予出口访问权限。只在归一化后的 `version >= 1` 且显式声明 `true` 时保存为真；缺失、`false`、版本为零或负数均为假。版本、域名能力和 IPv6 目标能力必须来自同一最新在线会话，不能把多条会话的值分别取 MAX/OR；新会话声明假或使用旧客户端时，不能继承旧会话的真值。只有 HTTP 认证、已断开的会话以及其他租户的声明均不得冒充当前在线能力。
+
+“最新在线会话”按以下顺序确定，固定向量为 `peer-egress-session-order-v1.json`：
+
+1. 先按出口的租户、客户端 ID 和 `NETTY_ONLINE` 状态筛选。HTTP-only、已断开和其他租户／客户端的记录不参与比较，异常时间也不影响本出口。
+2. 用非 null 且非空串的控制连接时间；仅当它缺失时，才用 HTTP 登录时间。空白串不是缺失，格式错误的连接时间不能改用 HTTP 时间掩盖。
+3. 按 UTC 时间点比较，保留全部 9 位以内的小数精度；不得按字符串大小排序，也不得把纳秒舍入成 .NET tick、毫秒或浮点时间。允许 `YYYY-MM-DDTHH:mm:ss[.1–9 位数字](Z 或 ±HH:MM)`；偏移小时为 00–23、分钟为 00–59。历史 C 写入的 `YYYY-MM-DD HH:mm:ss[.1–9 位数字]` 无后缀形式视作 UTC。年份为 0001–9999，日期须为有效公历日期，秒为 00–59；闰秒、缺少时区的 T 形式、超过 9 位的小数及其他格式均不能用于比较。
+4. 时间点完全相同时，取较大的会话 ID。版本、域名能力和 IPv6 目标能力从这一行一起取；该行版本不支持出口时，整组为 `0/false/false`。若任何一条匹配的在线记录没有可比较的时间，就不能证明哪条最新，整组也报告 `0/false/false`，不借用另一行。这里的“未知”只影响能力声明，不改变设备归属、ACL 或控制连接本身。
+
+升级只新增默认假值的列，不从设备名、版本号或其他会话推测旧会话是否曾声明 IPv6；旧会话继续为假，重新 HTTP 登录后才能记录其实际声明。旧二进制忽略新增列即可回退，不需要删除新列或历史。声明值的固定向量为 `peer-egress-ipv6-target-announcement-v1.json`。这项声明链路的对齐不打开 `ConsumerCarriesIpv6`，不改变 `SPEG1` 的 IPv6 拒绝、AAAA NODATA 或现有路由行为；完整消费端 IPv6 数据面仍由 #245 交付。
 
 目录**不包含**出口的目标白名单细节：消费端不需要它，泄露出去等于把出口的内网拓扑告诉每个对端。消费端配了不被允许的目标时，由出口在建流阶段拒绝并通过 `flow-reject` 说明。
 
@@ -827,7 +838,7 @@ RST 被计为 `return-no-flow` 丢弃，应用对着同一拒绝重传 SYN 直�
 - 出口使用普通 socket 连接目标，因此不保留原始源地址；目标看到的是出口所在网络的出口地址。
 - 出口与消费端角色可以同时启用，但不构成出口链：hop 标记保证一跳即止。
 - 校验只拒绝 `/0`。运维手写 `0.0.0.0/1` 与 `128.0.0.0/1` 两条规则仍然可以覆盖全部地址，其中下半区目前只是因为覆盖 Peer Mesh 网段才被拒。堵住它需要定一个最小前缀长度，属于策略决定。IPv6 的 `::/1` 加 `8000::/1` 同理，且没有 mesh 网段挡住其中任何一半。
-- **IPv6 交付了规则的读法与匹配语义、出口侧的授权与按 AAAA 拨号，消费端数据面还没有。** 出口：IPv6 目的地址按自己的强制拒绝清单与 `LAN` 段判定，名字没有 A 记录时拨 AAAA 地址，`ipv6TargetCapable` 为 `true`；服务端接受并保存 IPv6 目的规则。所以「域名规则 → 只有 IPv6 的站点」今天就能经出口访问：消费端那一段仍是 IPv4 fake-IP。消费端：TUN 不读 IPv6 包、不装 IPv6 路由、SPEG1 不承载 IPv6（`EGRESS_IPV6_UNSUPPORTED`），所以合法的 IPv6 规则以 `EGRESS_RULE_IPV6_UNSUPPORTED` 不生效，应用直接访问 IPv6 地址的流量不受规则约束、照常走本机；fake-IP 的 DNS 应答对 AAAA 仍回 NODATA，名字规则命中的名字只给应用 IPv4 fake-IP。`egress test` 只接受 IPv4 地址与名字，输入 IPv6 地址报 `ADDRESS must be an IPv4 address.`。数据面交付时还需要定：消费端发出的 IPv6 包以什么源地址交给出口（mesh 只分配 IPv4 虚拟地址，出口按源地址核对会话）、三个平台的 IPv6 路由安装、冲突检查与旁路、出站 socket 的 IPv6 绑定（`IPV6_UNICAST_IF`、`IPV6_BOUND_IF`），以及目录如实转发 `ipv6TargetCapable`。
+- **IPv6 交付了规则的读法与匹配语义、出口侧的授权与按 AAAA 拨号，消费端数据面还没有。** 出口：IPv6 目的地址按自己的强制拒绝清单与 `LAN` 段判定，名字没有 A 记录时拨 AAAA 地址，`ipv6TargetCapable` 为 `true`；服务端接受并保存 IPv6 目的规则。所以「域名规则 → 只有 IPv6 的站点」今天就能经出口访问：消费端那一段仍是 IPv4 fake-IP。消费端：TUN 不读 IPv6 包、不装 IPv6 路由、SPEG1 不承载 IPv6（`EGRESS_IPV6_UNSUPPORTED`），所以合法的 IPv6 规则以 `EGRESS_RULE_IPV6_UNSUPPORTED` 不生效，应用直接访问 IPv6 地址的流量不受规则约束、照常走本机；fake-IP 的 DNS 应答对 AAAA 仍回 NODATA，名字规则命中的名字只给应用 IPv4 fake-IP。`egress test` 只接受 IPv4 地址与名字，输入 IPv6 地址报 `ADDRESS must be an IPv4 address.`。数据面交付时还需要定：消费端发出的 IPv6 包以什么源地址交给出口（mesh 只分配 IPv4 虚拟地址，出口按源地址核对会话）、三个平台的 IPv6 路由安装、冲突检查与旁路、出站 socket 的 IPv6 绑定（`IPV6_UNICAST_IF`、`IPV6_BOUND_IF`）。目录的 `ipv6TargetCapable` 已作为独立的出口声明保存并转发；这不代表消费端 IPv6 数据面已经交付。
 - **出口的 IPv6 拨号没有在真机上验收过。** 授权、候选地址的选择与 IPv6 socket 的建立由三端单元测试与共享向量覆盖；真实 AAAA 解析与经 IPv6 出网归 #50 的实机验收。
 - **macOS 的安装路径在 CI 的真机上跑，但指向的是 lo0 而不是 TUN。** GitHub 的 macos runner 给免密 sudo，所以 `peer-egress-macos.yml` 里有一条用例真的装一条文档保留前缀、在整表里查到它、再撤销并确认它不在了。指向的接口是 lo0：真正的 utun 必须先配上 IPv4 地址（见上），而在 CI 里造一个带地址的 utun 要另外一个进程把它持住。argv 形态、输出分类、读表与撤销都是真的，「装进 TUN」这一步与真机的差别只有接口名。
 - **macOS 的旁路下一跳同样是逐条解析的，没有批量。** 与 Windows 同一个原因：批量需要改三端共享的安装器接口。这边代价更小，一次 `route -n get` 是 26 ms。

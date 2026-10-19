@@ -19,4 +19,8 @@ public static class PeerEgressProtocol
     /// </summary>
     public static int NormalizeVersion(int version) =>
         version < 1 ? 0 : Math.Min(version, ProtocolVersion);
+
+    /// <summary>IPv6 target sockets on the egress, not consumer IPv6 packet support.</summary>
+    public static bool DeclaresIpv6Targets(int version, bool declared) =>
+        NormalizeVersion(version) >= 1 && declared;
 }

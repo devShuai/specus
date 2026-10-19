@@ -897,6 +897,7 @@ int st_storage_init(const char *path, int seed_demo_client)
         "remote_address TEXT,"
         "client_egress_version INTEGER NOT NULL DEFAULT 0,"
         "client_egress_domain_targets INTEGER NOT NULL DEFAULT 0,"
+        "client_egress_ipv6_targets INTEGER NOT NULL DEFAULT 0,"
         "client_http_route_version INTEGER NOT NULL DEFAULT 0"
         ");");
     }
@@ -1390,6 +1391,11 @@ int st_storage_init(const char *path, int seed_demo_client)
                                    "INTEGER NOT NULL DEFAULT 0");
     }
     if (rc == 0) {
+        /* Never infer an IPv6 declaration for an older session. */
+        rc = add_column_if_missing(db, "specus_client_session", "client_egress_ipv6_targets",
+                                   "INTEGER NOT NULL DEFAULT 0");
+    }
+    if (rc == 0) {
         /* Sessions stored before the connectivity check are older clients: their RSTs stay unclassified. */
         rc = add_column_if_missing(db, "specus_client_session", "client_http_route_version",
                                    "INTEGER NOT NULL DEFAULT 0");
@@ -1722,6 +1728,123 @@ int st_storage_count_clients_by_tenant(const char *path, const char *tenant_id, 
     return rc;
 }
 
+typedef struct {
+    int64_t seconds;
+    int nanoseconds;
+} storage_session_instant;
+
+static int session_time_digits(const char *text, size_t start, size_t count, int *number)
+{
+    *number = 0;
+    for (size_t i = start; i < start + count; ++i) {
+        if (text[i] < '0' || text[i] > '9') return 0;
+        *number = *number * 10 + text[i] - '0';
+    }
+    return 1;
+}
+
+/* Exact Gregorian seconds and nanoseconds; no floating point, local timezone or
+ * lexical comparison. Byte lengths ensure an embedded NUL cannot hide a suffix. */
+static int parse_session_instant(const char *text, size_t length, storage_session_instant *instant)
+{
+    int year, month, day, hour, minute, second;
+    if (text == NULL || length < 19U || text[4] != '-' || text[7] != '-'
+        || (text[10] != 'T' && text[10] != ' ') || text[13] != ':' || text[16] != ':'
+        || !session_time_digits(text, 0, 4, &year) || year < 1
+        || !session_time_digits(text, 5, 2, &month) || month < 1 || month > 12
+        || !session_time_digits(text, 8, 2, &day)
+        || !session_time_digits(text, 11, 2, &hour) || hour > 23
+        || !session_time_digits(text, 14, 2, &minute) || minute > 59
+        || !session_time_digits(text, 17, 2, &second) || second > 59) return 0;
+    static const int month_days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    int leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    if (day < 1 || day > month_days[month - 1] + (month == 2 && leap)) return 0;
+    size_t position = 19U;
+    int nanos = 0;
+    if (position < length && text[position] == '.') {
+        position++;
+        int digits = 0;
+        while (position < length && text[position] >= '0' && text[position] <= '9') {
+            if (digits == 9) return 0;
+            nanos = nanos * 10 + text[position++] - '0';
+            digits++;
+        }
+        if (digits == 0) return 0;
+        while (digits++ < 9) nanos *= 10;
+    }
+    int offset = 0;
+    if (text[10] == ' ') {
+        if (position != length) return 0;
+    } else if (position + 1U != length || text[position] != 'Z') {
+        int hours, minutes;
+        if (length - position != 6U || (text[position] != '+' && text[position] != '-')
+            || text[position + 3U] != ':'
+            || !session_time_digits(text, position + 1U, 2, &hours) || hours > 23
+            || !session_time_digits(text, position + 4U, 2, &minutes) || minutes > 59) return 0;
+        offset = (hours * 60 + minutes) * 60;
+        if (text[position] == '-') offset = -offset;
+    }
+    int64_t previous_year = year - 1;
+    int64_t days = previous_year * 365 + previous_year / 4 - previous_year / 100 + previous_year / 400 + day - 1;
+    for (int i = 0; i < month - 1; ++i) days += month_days[i] + (i == 1 && leap);
+    const int64_t epoch_days = 365 * INT64_C(1969) + 1969 / 4 - 1969 / 100 + 1969 / 400;
+    instant->seconds = (days - epoch_days) * 86400 + hour * 3600 + minute * 60 + second - offset;
+    instant->nanoseconds = nanos;
+    return 1;
+}
+
+static int load_current_egress_announcement(sqlite3 *db, st_storage_client *client)
+{
+    sqlite3_stmt *statement = NULL;
+    if (sqlite3_prepare_v2(db,
+        "SELECT id,client_egress_version,client_egress_domain_targets,client_egress_ipv6_targets,"
+        "netty_connected_at,http_login_at,tenant_id,client_id,status FROM specus_client_session "
+        "WHERE tenant_id=? AND client_id=? AND status='NETTY_ONLINE'", -1, &statement, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(statement, 1, client->tenant_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(statement, 2, client->id);
+    int rc, found = 0, unknown = 0, version = 0, domain = 0, ipv6 = 0;
+    long long newest_id = 0;
+    storage_session_instant newest = {0};
+    while ((rc = sqlite3_step(statement)) == SQLITE_ROW) {
+        const unsigned char *tenant = sqlite3_column_text(statement, 6);
+        const unsigned char *status = sqlite3_column_text(statement, 8);
+        static const char online[] = "NETTY_ONLINE";
+        size_t tenant_length = strlen(client->tenant_id);
+        /* A shared/custom SQLite collation can broaden SQL equality. Require
+         * exact identity before a row can supply or invalidate metadata. */
+        if (sqlite3_column_int64(statement, 7) != client->id || tenant == NULL || status == NULL
+            || sqlite3_column_bytes(statement, 6) != (int)tenant_length
+            || memcmp(tenant, client->tenant_id, tenant_length) != 0
+            || sqlite3_column_bytes(statement, 8) != (int)(sizeof(online) - 1U)
+            || memcmp(status, online, sizeof(online) - 1U) != 0) continue;
+        int column = sqlite3_column_type(statement, 4) != SQLITE_NULL && sqlite3_column_bytes(statement, 4) != 0 ? 4 : 5;
+        const char *timestamp = (const char *)sqlite3_column_text(statement, column);
+        storage_session_instant at;
+        if (!parse_session_instant(timestamp, (size_t)sqlite3_column_bytes(statement, column), &at)) {
+            unknown = 1;
+            break; /* Cannot order this matching online row; never borrow another one's capabilities. */
+        }
+        long long id = sqlite3_column_int64(statement, 0);
+        if (!found || at.seconds > newest.seconds
+            || (at.seconds == newest.seconds && (at.nanoseconds > newest.nanoseconds
+                || (at.nanoseconds == newest.nanoseconds && id > newest_id)))) {
+            found = 1;
+            newest = at;
+            newest_id = id;
+            version = sqlite3_column_int(statement, 1);
+            domain = sqlite3_column_int(statement, 2) != 0;
+            ipv6 = sqlite3_column_int(statement, 3) != 0;
+        }
+    }
+    sqlite3_finalize(statement);
+    if (!unknown && rc != SQLITE_DONE) return -1;
+    if (unknown || !found || version < 1) version = domain = ipv6 = 0;
+    client->client_egress_version = version;
+    client->client_egress_domain_targets = domain;
+    client->client_egress_ipv6_targets = ipv6;
+    return 0;
+}
+
 static int scan_client(sqlite3_stmt *stmt, st_storage_client *client)
 {
     client->id = sqlite3_column_int64(stmt, 0);
@@ -1748,7 +1871,8 @@ static int scan_client(sqlite3_stmt *stmt, st_storage_client *client)
     client->download_bytes = sqlite3_column_int64(stmt, 17);
     client->client_egress_version = sqlite3_column_int(stmt, 18);
     client->client_egress_domain_targets = sqlite3_column_int(stmt, 19) != 0;
-    return 0;
+    client->client_egress_ipv6_targets = sqlite3_column_int(stmt, 20) != 0;
+    return load_current_egress_announcement(sqlite3_db_handle(stmt), client);
 }
 
 /*
@@ -1871,6 +1995,7 @@ static int scan_client_session(sqlite3_stmt *stmt, st_storage_client_session *se
     session->client_egress_version = sqlite3_column_int(stmt, 30);
     session->client_egress_domain_targets = sqlite3_column_int(stmt, 31) != 0;
     session->client_http_route_version = sqlite3_column_int(stmt, 32);
+    session->client_egress_ipv6_targets = sqlite3_column_int(stmt, 33) != 0;
     return 0;
 }
 
@@ -2281,8 +2406,7 @@ static const char storage_client_list_sql[] =
         "COALESCE((SELECT client_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), ''), "
         "COALESCE((SELECT SUM(upload_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0), "
         "COALESCE((SELECT SUM(download_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0), "
-        "COALESCE((SELECT client_egress_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), 0), "
-        "COALESCE((SELECT client_egress_domain_targets FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), 0) "
+        "0, 0, 0 "
         "FROM client_account ORDER BY client_name";
 
 int st_storage_list_clients(const char *path,
@@ -2370,8 +2494,7 @@ int st_storage_get_client(const char *path, long long id, st_storage_client *cli
         "COALESCE((SELECT client_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), ''), "
         "COALESCE((SELECT SUM(upload_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0), "
         "COALESCE((SELECT SUM(download_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0), "
-        "COALESCE((SELECT client_egress_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), 0), "
-        "COALESCE((SELECT client_egress_domain_targets FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), 0) "
+        "0, 0, 0 "
         "FROM client_account WHERE rowid = ?",
         -1,
         &stmt,
@@ -2408,8 +2531,7 @@ int st_storage_get_client_by_name(const char *path, const char *client_name, st_
         "COALESCE((SELECT client_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), ''), "
         "COALESCE((SELECT SUM(upload_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0), "
         "COALESCE((SELECT SUM(download_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0), "
-        "COALESCE((SELECT client_egress_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), 0), "
-        "COALESCE((SELECT client_egress_domain_targets FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), 0) "
+        "0, 0, 0 "
         "FROM client_account WHERE client_name = ?",
         -1,
         &stmt,
@@ -4327,7 +4449,7 @@ static int load_client_session_by_id(const char *path, long long id, st_storage_
         "message_media_preview_capable, message_max_attachment_bytes, peer_service_discovery_version, "
         "peer_service_applications, http_login_at, netty_connected_at, "
         "disconnected_at, expires_at, channel_id, remote_address, client_egress_version, "
-        "client_egress_domain_targets, client_http_route_version "
+        "client_egress_domain_targets, client_http_route_version, client_egress_ipv6_targets "
         "FROM specus_client_session WHERE id = ?",
         -1,
         &stmt,
@@ -4358,8 +4480,8 @@ int st_storage_create_client_session(const char *path,
         "machine_fingerprint, os_user, hostname, os_name, os_version, os_arch, client_version, java_version, local_addresses, "
         "message_send_capable, message_receive_capable, message_attachments_capable, message_media_preview_capable, "
         "message_max_attachment_bytes, peer_service_discovery_version, peer_service_applications, "
-        "http_login_at, expires_at, client_egress_version, client_egress_domain_targets, client_http_route_version) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "http_login_at, expires_at, client_egress_version, client_egress_domain_targets, client_http_route_version, client_egress_ipv6_targets) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         -1,
         &stmt,
         NULL);
@@ -4392,6 +4514,7 @@ int st_storage_create_client_session(const char *path,
         sqlite3_bind_int(stmt, 26, session->client_egress_version);
         sqlite3_bind_int(stmt, 27, session->client_egress_domain_targets ? 1 : 0);
         sqlite3_bind_int(stmt, 28, session->client_http_route_version < 0 ? 0 : session->client_http_route_version);
+        sqlite3_bind_int(stmt, 29, session->client_egress_ipv6_targets ? 1 : 0);
         rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
     } else {
         rc = -1;
@@ -4422,7 +4545,7 @@ int st_storage_get_client_session_for_login(const char *path,
         "message_media_preview_capable, message_max_attachment_bytes, peer_service_discovery_version, "
         "peer_service_applications, http_login_at, netty_connected_at, "
         "disconnected_at, expires_at, channel_id, remote_address, client_egress_version, "
-        "client_egress_domain_targets, client_http_route_version "
+        "client_egress_domain_targets, client_http_route_version, client_egress_ipv6_targets "
         "FROM specus_client_session WHERE id = ? AND token_hash = ?",
         -1,
         &stmt,

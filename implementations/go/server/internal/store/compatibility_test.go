@@ -707,7 +707,8 @@ func TestStartupMigrationAddsTheClientEgressColumns(t *testing.T) {
 	if err := db.InsertClientSession(context.Background(), ClientSession{
 		ID: 7, TenantID: "tenant-a", ClientID: 11, ClientName: "legacy", TokenHash: "legacy-token",
 		Status: "HTTP_AUTHENTICATED", MachineFingerprint: "machine", OSUser: "user",
-		ClientEgressVersion: 1, ClientEgressDomainTargets: true, HTTPLoginAt: now, ExpiresAt: now.Add(time.Hour),
+		ClientEgressVersion: 1, ClientEgressDomainTargets: true, ClientEgressIPv6Targets: true,
+		HTTPLoginAt: now, ExpiresAt: now.Add(time.Hour),
 	}); err != nil {
 		t.Fatalf("a login on a migrated database failed: %v", err)
 	}
@@ -715,9 +716,15 @@ func TestStartupMigrationAddsTheClientEgressColumns(t *testing.T) {
 	if err != nil || session == nil || session.ClientEgressVersion != 1 || !session.ClientEgressDomainTargets {
 		t.Fatalf("read session: %+v err=%v", session, err)
 	}
+	if !session.ClientEgressIPv6Targets {
+		t.Fatal("migrated session lost the announced IPv6 target capability")
+	}
 	old, err := db.GetClientSession(context.Background(), 6)
 	if err != nil || old == nil || old.ClientEgressVersion != 0 || old.ClientEgressDomainTargets {
 		t.Fatalf("a session from before the upgrade must read as taking no part in egress: %+v err=%v", old, err)
+	}
+	if old.ClientEgressIPv6Targets {
+		t.Fatal("a legacy session must not acquire IPv6 target support during migration")
 	}
 }
 

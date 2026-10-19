@@ -45,4 +45,9 @@ public final class PeerEgressProtocol {
         }
         return Math.min(version, PROTOCOL_VERSION);
     }
+
+    /** Egress IPv6 sockets, independently of the consumer's packet family. */
+    public static boolean declaresIpv6Targets(int version, boolean declared) {
+        return normalizeVersion(version) >= 1 && declared;
+    }
 }
