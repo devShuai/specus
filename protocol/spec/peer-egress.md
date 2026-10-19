@@ -14,8 +14,8 @@
 | 不支持 | 行为 |
 | --- | --- |
 | 域名与域名后缀规则 | 配置校验阶段拒绝，返回 `EGRESS_RULE_DOMAIN_UNSUPPORTED`。不得忽略，更不得在启动时解析成静态 IP |
-| IPv6 单地址与 CIDR 规则 | 按下文「IPv6 写法」读取与校验，写错的报 `EGRESS_RULE_MALFORMED`；写法正确的，在消费端没有 IPv6 数据面时以 `EGRESS_RULE_IPV6_UNSUPPORTED` 不生效（三个客户端目前都没有）。匹配语义已定，见「规则语义」 |
-| IPv6 数据面 | `SPEG1` 收到 IPv6 packet 拒绝，返回 `EGRESS_IPV6_UNSUPPORTED` |
+| IPv6 单地址与 CIDR 规则 | 按下文「IPv6 写法」读取与校验，写错的报 `EGRESS_RULE_MALFORMED`；写法正确的，在消费端没有 IPv6 数据面时以 `EGRESS_RULE_IPV6_UNSUPPORTED` 不生效。匹配语义已定，见「规则语义」；数据面见「IPv6 数据面」（规范已定，三个客户端尚未实现） |
+| IPv6 数据面 | 见「IPv6 数据面」：`SPEG1` 原样承载 IPv6 packet，只发给声明了 `ipv6PacketCapable` 的出口；没有声明的出口收到 IPv6 packet 拒绝，返回 `EGRESS_IPV6_UNSUPPORTED` |
 | DNS 接管 | 不实现。一期不修改任何用户系统 DNS 配置 |
 | ICMP | 出口不代发。代 ping 需要 raw socket 权限，与「出口零特权」前提冲突。消费端对命中 `egress` 规则的 ICMP 包**丢弃**并计入 `unsupported-protocol`，不改走本机：规则说了这个目标不许从本地出去，ping 不通好过从本机地址 ping 通 |
 | 多跳出口链 | `SPEG1` 的 hop 标记已置位时拒绝，返回 `EGRESS_HOP_NOT_ALLOWED` |
@@ -25,7 +25,7 @@
 
 ## 数据面形态
 
-线上传输的是**原始 IPv4 packet**，出口侧用用户态连接栈终结后再用普通 socket 连接目标。消费端不解析 TCP。
+线上传输的是**原始 IP packet**（IPv4；IPv6 见「IPv6 数据面」），出口侧用用户态连接栈终结后再用普通 socket 连接目标。消费端不解析 TCP。
 
 由此得到两条贯穿全文的约束：
 
@@ -114,7 +114,7 @@
 
 消费端规则另有一条：落在 IPv4 映射段 `::ffff:0:0/96` 内的前缀以 `EGRESS_RULE_MALFORMED` 拒绝。这些地址是 IPv4 目标在 IPv6 套接字接口里的写法，线上的包从不以它为目的地址，这条规则永远不会命中，而写它的人以为覆盖了对应的 IPv4 地址——应写成 IPv4。出口策略的目的规则不做这项检查：映射段在出口的强制拒绝清单里，写进策略也不会放行任何东西，与在策略里写 `127.0.0.0/8` 一样。
 
-IPv6 规则不与 Peer Mesh 网段、fake-IP 池比较重叠（两者都是 IPv4）；`::/0` 与 `0.0.0.0/0` 同理拒绝。与 IPv4 一样，`::/1` 加 `8000::/1` 两条仍能覆盖全部 IPv6 地址，见「当前限制」。
+IPv6 规则不与 fake-IP 池比较重叠（池是 IPv4）。有 IPv6 数据面的消费端把设备 IPv6 地址的前缀 `fd53:7065:6375:7300::/96` 当作 Peer Mesh 网段，与它重叠的 IPv6 规则报 `EGRESS_RULE_MESH_OVERLAP`（见「IPv6 数据面」）；没有数据面时 IPv6 规则本来就不生效。`::/0` 与 `0.0.0.0/0` 同理拒绝。与 IPv4 一样，`::/1` 加 `8000::/1` 两条仍能覆盖全部 IPv6 地址，见「当前限制」。
 
 固定向量：`peer-egress-rules-v1.json` 的 `ipv6Prefixes`（写法：接受的给出规范地址与前缀长度，拒绝的逐条列出）与 `ipv6`（有 IPv6 数据面时的校验与匹配，以及同一份规则在没有数据面时的结果）；`configValidation` 里的 IPv6 用例是三个客户端今天的结果。
 
@@ -127,6 +127,92 @@ IPv6 规则不与 Peer Mesh 网段、fake-IP 池比较重叠（两者都是 IPv4
 离线校验按**默认 Peer Mesh 网段** `100.96.0.0/11` 判断重叠：真实网段在登录时由服务端下发，一条只与自定义网段重叠的规则要到应用规则时才被发现。
 
 固定向量：`protocol/test-vectors/peer-egress-rules-v1.json`。
+
+## IPv6 数据面
+
+> 规范已定、实现待交付（#245）。三个客户端交付之前，上文「一期边界」里 IPv6 规则不生效、`SPEG1` 拒绝 IPv6 的行为照旧；
+> 服务端转发 `ipv6PacketCapable` 之前，消费端读不到它，所有出口按未声明处理。
+
+消费端把命中规则的 IPv6 流量也引进 TUN，交给出口，与 IPv4 走同一套规则匹配、路由接管、出口授权与明确失败。三处选择：
+
+- **设备的 IPv6 地址由它的 mesh IPv4 推出**，不由服务端另行分配；
+- **`SPEG1` 原样承载 IPv6 packet**，IP 版本就是区分，不改帧格式，出口另声明 `ipv6PacketCapable`；
+- **DNS 对 AAAA 仍回 NODATA**（[peer-egress-dns.md](peer-egress-dns.md)）。域名规则继续经 IPv4 fake-IP，IPv6 规则只对应用直接使用的 IPv6 地址生效。
+
+固定向量：`protocol/test-vectors/peer-egress-ipv6-v1.json`。
+
+### 设备地址
+
+设备的 IPv6 地址是前缀 `fd53:7065:6375:7300::/96` 加上它的 mesh IPv4 作低 32 位，写成 RFC 5952 规范形式：`100.96.0.1` 是 `fd53:7065:6375:7300::6460:1`。前缀是 ULA，固定不变，不随 `peerMeshCidr` 走；地址的唯一范围与 IPv4 虚拟地址相同（租户内）。反推只认前缀内的地址。向量 `meshAddress`。
+
+这个前缀对 IPv6 来说就是 Peer Mesh 网段：
+
+- 与它重叠的 IPv6 规则报 `EGRESS_RULE_MESH_OVERLAP`（向量 `ruleValidation`）；
+- 设备之间的 mesh 流量仍只走 IPv4，消费端不为这个前缀装路由，发往其中的包丢弃并计 `ipv6-mesh-unsupported`；
+- 出口与回程按它判断「源在 mesh 网段内」，与 IPv4 的检查对应（见下）。
+
+### 消费端
+
+**TUN。** 网卡加上本机的推出地址，前缀长度 `/128`，不产生任何 on-link 路由；MTU 为 1280。`peerMeshMtu` 低于 1280 的设备没有 IPv6 数据面，IPv6 规则照旧报 `EGRESS_RULE_IPV6_UNSUPPORTED`。平台命令：
+
+| 平台 | 地址 | 规则路由 | 读表 |
+| --- | --- | --- | --- |
+| Linux | `ip -6 address add <地址>/128 dev <tun>` | `ip -6 route add <前缀> dev <tun>` | `ip -6 route show table main` |
+| Windows | `New-NetIPAddress -AddressFamily IPv6 -IPAddress <地址> -PrefixLength 128 -InterfaceIndex <n>` | `New-NetRoute -AddressFamily IPv6 -DestinationPrefix <前缀> -InterfaceIndex <n> -NextHop ::` | 原生 `GetIpForwardTable2(AF_INET6)` |
+| macOS | `ifconfig <utun> inet6 <地址> prefixlen 128` | `route -n add -inet6 -net <前缀> -interface <utun>` | `netstat -rn -f inet6` |
+
+与 IPv4 一样，macOS 的路由要在地址配好之后才能指向 utun。
+
+**路由接管**按「路由接管」一节，两族分开计划、分开冲突检查与漂移修复：精确前缀、不造 `::/0` 或两个 `/1`、`direct` 不装、`block` 装、旁路排最前。旁路为被 IPv6 规则覆盖的 IPv6 端点（控制、STUN/TURN、中继、对端）装 `/128`，下一跳按 IPv6 路由表与同样的回退规则选；安装记录照用，`cidr` 写 IPv6 规范形式。
+
+**从 TUN 读到的 IPv6 包**在规则匹配之前按序分流（向量 `consumerOutbound`）：
+
+1. 源是链路本地地址（`fe80::/10`）或目的是组播（`ff00::/8`）：系统自己的邻居发现、路由器请求与组播报告，**丢弃且不计数**；
+2. 源不是本机推出地址：丢弃，计 `ipv6-source-not-mesh`（应用绑定了别的地址，出口会拒绝它）；
+3. 目的在推出前缀内：丢弃，计 `ipv6-mesh-unsupported`；
+4. 对端会话的有效 MTU（[peer-mesh.md](peer-mesh.md) SPMTU2）低于 1280：丢弃，计 `ipv6-path-mtu`。IPv6 要求每条链路至少 1280，报告低于 1280 的 Packet Too Big 对 IPv6 协议栈没有意义；
+5. 其余按规则匹配，与 IPv4 相同。
+
+IPv6 包的协议按它的 next header 判断：TCP、UDP 之外（含任何扩展头、分片头、ICMPv6）命中 `egress` 规则时丢弃并计 `unsupported-protocol`，与 IPv4 的 ICMP 相同。
+
+**只发给声明了 `ipv6PacketCapable` 的出口。** 规则指向的出口在线、而目录里没有这项声明时，规则报 `EGRESS_RULE_EGRESS_NO_IPV6`，流量阻断并计 `egress-no-ipv6`；出口不在线时规则仍生效，流量计 `egress-unavailable`，与 `EGRESS_RULE_EGRESS_NO_DOMAIN` 同一套判法（[peer-egress-dns.md](peer-egress-dns.md#能力协商)）。向量 `ruleValidation`。
+
+**明确失败**沿用上文「明确失败」，只换地址族（向量 `failure`）：
+
+- 拒绝转发的 TCP 段按 RFC 793 回复位，规则与 IPv4 相同；IPv6 头 traffic class 0、flow label 0、hop limit 64，TCP 窗口 0、无选项；
+- 拒绝转发的 UDP 数据报回 ICMPv6 目的不可达、地址不可达（类型 1 代码 3，对应 IPv4 的主机不可达，协议栈报 `EHOSTUNREACH`），从原包的目的发回原包的源，引用原包直到整个错误报文不超过 1280 字节（RFC 4443 2.4）；
+- 消费端自己清掉的 TCP 流按 `resetOnPurge` 的规则造复位。
+
+**回程**（出口 → 消费端，向量 `returnPath`）：目的不是本机推出地址的包不归消费端（同时是出口的设备交给出口一侧）；源在推出前缀内的拒收，计 `return-mesh-source`；找不到本机发起、绑定该出口的存活流拒收，计 `return-no-flow`。
+
+### 出口
+
+声明了 `ipv6PacketCapable` 的出口按 IP 版本解析 `SPEG1` 的 `type=1` body（向量 `frames`）：
+
+- 版本 4：按「接收方校验」的 IPv4 规则；版本 6：按本节；其他版本沿用一期的 `EGRESS_IPV6_UNSUPPORTED`；
+- body 短于 40 字节，或 `40 + payloadLength` 大于 body：`EGRESS_FRAME_TRUNCATED`；小于 body：`EGRESS_FRAME_TRAILING_BYTES`（不承载 jumbogram，`payloadLength` 为 0 的包也按此判）；
+- 解析只取 next header 与（TCP、UDP 时）端口；按协议处理时 TCP、UDP 以外以 `EGRESS_PROTOCOL_DENIED` 拒绝，与 IPv4 的 ICMP 相同；
+- **源地址等于该已认证 session 对端的 mesh IPv4 推出的地址**；
+- 目的地址不在推出前缀内，并通过完整的出口授权判定：IPv6 目的地址的强制拒绝清单与 `LAN` 段见「强制拒绝清单」，与按 AAAA 拨号的目标同一份；
+- 用户态栈对 IPv6 的 TCP、UDP 与 IPv4 同一套状态机与上限，校验和按 RFC 8200 的伪首部；回程包源是目标地址、目的是消费端推出地址，hop limit 64。
+
+出口 → 消费端时，目的必须是该消费端的推出地址；源必须对应本机为它建的存活出口流，且不在推出前缀内。
+
+**出站 socket。** 声明 `ipv6PacketCapable` 的设备若同时是消费端，本机会往隧道装 IPv6 路由，出口的 IPv6 socket 因此与 IPv4 一样，connect 之前绑定到「没有隧道时系统会选的接口」，按 IPv6 路由表逐个目标选：
+
+| 平台 | 选项 |
+| --- | --- |
+| Windows | `IPV6_UNICAST_IF`（`IPPROTO_IPV6`，31），值为接口索引的**主机字节序**（与 IPv4 的 `IP_UNICAST_IF` 相反） |
+| macOS | `IPV6_BOUND_IF`（`IPPROTO_IPV6`，125），主机字节序 |
+| Linux | 与 IPv4 相同，打 `SO_MARK 0x5350`，不绑定接口 |
+
+候选与选择规则同「出站 socket」，读 IPv6 路由表（Windows `GetIpForwardTable2(AF_INET6)`，macOS `netstat -rn -f inet6`）。没有候选时拒绝建流，不退回不绑定。选择与选项编码的向量随实现补进 `peer-egress-socket-binding-v1.json`。
+
+### 能力
+
+登录 `environment.clientEgressCapabilities.ipv6PacketCapable`：出口能否接收 `SPEG1` 承载的 IPv6 packet，即实现了本节的出口部分。服务端与 `ipv6TargetCapable` 同样处理：存进会话列 `client_egress_ipv6_packets`（布尔，默认 `false`，已有数据库启动时补上），从同一条最新在线会话取值，转进 `egress-catalog` 的同名字段；只在归一化后的 `version >= 1` 且显式声明 `true` 时为真。
+
+`ipv6TargetCapable` 与它是两回事：前者说出口能以 IPv6 socket 连接目标（为 IPv4 fake-IP 流拨 AAAA 地址），后者说出口能接收消费端的 IPv6 包。消费端只看 `ipv6PacketCapable`。
 
 ## 路由接管
 
@@ -417,7 +503,7 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 
 没有 TUN 的节点（虚拟网卡为 `noop`）没有路由要去掉，按同样的规则选出来的就是系统自己的选择。TUN 名在系统里找不到对应接口时同样视为没有路由要去掉：不存在的接口上不会有路由。
 
-**IPv6 目标的 socket 不绑定接口**（Linux 照常打标记）。绑定防的是 socket 跟着本机隧道的路由走，而本功能不往隧道装任何 IPv6 路由：mesh 只有 IPv4，IPv6 规则在消费端不生效（`EGRESS_RULE_IPV6_UNSUPPORTED`）。`IP_UNICAST_IF` 与 `IP_BOUND_IF` 本来也只作用于 IPv4 socket。消费端 IPv6 数据面交付时会往隧道装 IPv6 路由，那时必须一并交付 `IPV6_UNICAST_IF`（Windows，`IPPROTO_IPV6` 31）与 `IPV6_BOUND_IF`（macOS，`IPPROTO_IPV6` 125）以及按 IPv6 路由表的选择。IPv4 映射地址不算 IPv6 目标，照旧走 IPv4 的选择（它本来就被强制拒绝清单挡住）。
+**IPv6 目标的 socket 目前不绑定接口**（Linux 照常打标记）。绑定防的是 socket 跟着本机隧道的路由走，而今天没有客户端往隧道装 IPv6 路由：IPv6 规则在消费端不生效（`EGRESS_RULE_IPV6_UNSUPPORTED`）。`IP_UNICAST_IF` 与 `IP_BOUND_IF` 本来也只作用于 IPv4 socket。消费端 IPv6 数据面会往隧道装 IPv6 路由，选项与选择规则见「IPv6 数据面」的出口部分，随数据面一起交付。IPv4 映射地址不算 IPv6 目标，照旧走 IPv4 的选择（它本来就被强制拒绝清单挡住）。
 
 **读表。** Windows 每次 connect 用 `GetIpForwardTable2` 与 `GetIpInterfaceTable` 原生读取，不经 PowerShell：一次 `Get-NetRoute` 要 419 ms，这两个调用是微秒级，不需要缓存，切网之后下一次 connect 就能看到。macOS 读 `netstat -rn -f inet`，与路由接管同一套读取与归一，25 ms 一次，结果保留 2 秒：隧道自己的路由本来就不参与选择，缓存能错过的只有物理网络的变化，而错过的后果是 connect 失败，不是泄漏。
 
@@ -434,7 +520,8 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 | `version` | 当前为 `1`。`0` 或缺省表示不支持出口 |
 | `consumerCapable` / `egressCapable` | 该客户端能否作为消费端 / 出口端 |
 | `domainTargetCapable` | 是否支持域名目标，即接受 `name-bind` 并在出口侧解析（[二期](peer-egress-dns.md)） |
-| `ipv6TargetCapable` | 出口是否连接 IPv6 目标：名字没有 A 记录时按 AAAA 记录拨号（[二期](peer-egress-dns.md)）。只说出口自己的 socket；SPEG1 仍只承载 IPv4，消费端 IPv6 数据面交付时另行协商 |
+| `ipv6TargetCapable` | 出口是否连接 IPv6 目标：名字没有 A 记录时按 AAAA 记录拨号（[二期](peer-egress-dns.md)）。只说出口自己的 socket |
+| `ipv6PacketCapable` | 出口是否接收 `SPEG1` 承载的 IPv6 packet（「IPv6 数据面」）。三个客户端实现之前不上报 |
 
 服务端**不得**向 `version` 为 `0` 或缺省的客户端下发 `egress-config` 或 `egress-catalog`。四个服务端都按这条门控。
 
@@ -531,6 +618,7 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
       "protocols": ["tcp", "udp"],
       "domainTargetCapable": false,
       "ipv6TargetCapable": false,
+      "ipv6PacketCapable": false,
       "egressVersion": 1
     }
   ]
@@ -550,7 +638,7 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 3. 按 UTC 时间点比较，保留全部 9 位以内的小数精度；不得按字符串大小排序，也不得把纳秒舍入成 .NET tick、毫秒或浮点时间。允许 `YYYY-MM-DDTHH:mm:ss[.1–9 位数字](Z 或 ±HH:MM)`；偏移小时为 00–23、分钟为 00–59。历史 C 写入的 `YYYY-MM-DD HH:mm:ss[.1–9 位数字]` 无后缀形式视作 UTC。年份为 0001–9999，日期须为有效公历日期，秒为 00–59；闰秒、缺少时区的 T 形式、超过 9 位的小数及其他格式均不能用于比较。
 4. 时间点完全相同时，取较大的会话 ID。版本、域名能力和 IPv6 目标能力从这一行一起取；该行版本不支持出口时，整组为 `0/false/false`。若任何一条匹配的在线记录没有可比较的时间，就不能证明哪条最新，整组也报告 `0/false/false`，不借用另一行。这里的“未知”只影响能力声明，不改变设备归属、ACL 或控制连接本身。
 
-升级只新增默认假值的列，不从设备名、版本号或其他会话推测旧会话是否曾声明 IPv6；旧会话继续为假，重新 HTTP 登录后才能记录其实际声明。旧二进制忽略新增列即可回退，不需要删除新列或历史。声明值的固定向量为 `peer-egress-ipv6-target-announcement-v1.json`。这项声明链路的对齐不打开 `ConsumerCarriesIpv6`，不改变 `SPEG1` 的 IPv6 拒绝、AAAA NODATA 或现有路由行为；完整消费端 IPv6 数据面仍由 #245 交付。
+升级只新增默认假值的列，不从设备名、版本号或其他会话推测旧会话是否曾声明 IPv6；旧会话继续为假，重新 HTTP 登录后才能记录其实际声明。旧二进制忽略新增列即可回退，不需要删除新列或历史。声明值的固定向量为 `peer-egress-ipv6-target-announcement-v1.json`。`ipv6PacketCapable` 按同样规则保存与转发（会话列 `client_egress_ipv6_packets`），见「IPv6 数据面」的「能力」。这项声明链路的对齐不打开 `ConsumerCarriesIpv6`，不改变 `SPEG1` 的 IPv6 拒绝、AAAA NODATA 或现有路由行为；完整消费端 IPv6 数据面仍由 #245 交付。
 
 目录**不包含**出口的目标白名单细节：消费端不需要它，泄露出去等于把出口的内网拓扑告诉每个对端。消费端配了不被允许的目标时，由出口在建流阶段拒绝并通过 `flow-reject` 说明。
 
@@ -608,7 +696,7 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 | `flags` | 1 | bit0 = hop；其余位保留，必须为 `0` |
 | `reserved` | 1 | 必须为 `0` |
 
-`type=1` 的 body 是完整 IPv4 packet。`type=2` 的 body 是 UTF-8 JSON object，无空白，键序按本文给出的顺序。
+`type=1` 的 body 是完整 IPv4 packet，或（发给声明了 `ipv6PacketCapable` 的出口时）完整 IPv6 packet。`type=2` 的 body 是 UTF-8 JSON object，无空白，键序按本文给出的顺序。
 
 hop 标记由出口设备在**自己作为消费端**转发流量时置位。出口收到已置位的帧一律拒绝——不支持多跳出口链。
 
@@ -616,7 +704,7 @@ hop 标记由出口设备在**自己作为消费端**转发流量时置位。出
 
 消费端 → 出口（`type=1`）：
 
-- IP 版本必须为 4；IPv6 返回 `EGRESS_IPV6_UNSUPPORTED`
+- IP 版本必须为 4；IPv6 返回 `EGRESS_IPV6_UNSUPPORTED`。声明了 `ipv6PacketCapable` 的出口对版本 6 按「IPv6 数据面」校验，以下各条是版本 4 的
 - IPv4 `totalLength` 精确等于 body 长度，尾随字节拒绝
 - **源地址等于该已认证 session 对端获分配的虚拟 IP**。不得仅信任包内源地址，否则对端可伪造其他获授权虚拟 IP
 - 目标地址**不在** Peer Mesh 虚拟网段内
@@ -680,7 +768,8 @@ RST 被计为 `return-no-flow` 丢弃，应用对着同一拒绝重传 SYN 直�
 | `EGRESS_PORT_DENIED` | 地址与协议命中但端口未授权 |
 | `EGRESS_LIMIT_EXCEEDED` | 并发、新建流速率或配额上限 |
 | `EGRESS_RULE_DOMAIN_UNSUPPORTED` | 配置校验：一期不支持域名规则 |
-| `EGRESS_RULE_IPV6_UNSUPPORTED` | 配置校验：写法正确的 IPv6 规则，而本消费端没有 IPv6 数据面（三个客户端目前都没有） |
+| `EGRESS_RULE_IPV6_UNSUPPORTED` | 配置校验：写法正确的 IPv6 规则，而本消费端没有 IPv6 数据面（三个客户端目前都没有；`peerMeshMtu` 低于 1280 的设备也没有） |
+| `EGRESS_RULE_EGRESS_NO_IPV6` | 配置校验：IPv6 规则指向的出口在线，却没有声明 `ipv6PacketCapable` |
 | `EGRESS_RULE_MALFORMED` | 配置校验：前缀非法、主机位非零，或 IPv6 规则落在 IPv4 映射段内 |
 | `EGRESS_RULE_MISSING_TARGET` | 配置校验：`action=egress` 缺少 `egressClientId` |
 | `EGRESS_RULE_MESH_OVERLAP` | 配置校验：规则覆盖 Peer Mesh 虚拟网段 |
@@ -693,7 +782,7 @@ RST 被计为 `return-no-flow` 丢弃，应用对着同一拒绝重传 SYN 直�
 | `EGRESS_FRAME_RESERVED_SET` | `reserved` 字节或保留 flag 位非零 |
 | `EGRESS_FRAME_TRUNCATED` | 帧短于固定头，或 body 不足以构成 IPv4 packet |
 | `EGRESS_FRAME_TRAILING_BYTES` | IPv4 `totalLength` 与 body 长度不符 |
-| `EGRESS_IPV6_UNSUPPORTED` | 数据面收到 IPv6 packet |
+| `EGRESS_IPV6_UNSUPPORTED` | 没有声明 `ipv6PacketCapable` 的出口收到 IPv6 packet；或 IP 版本既不是 4 也不是 6 |
 | `EGRESS_FRAME_MALFORMED_CONTROL` | `type=2` 的 body 不是 UTF-8 JSON object |
 | `EGRESS_CONTROL_UNSUPPORTED` | 控制消息类型未在本版本实现 |
 | `EGRESS_NAME_UNRESOLVED` | 二期：出口解析名字失败或没有可用地址 |
@@ -776,6 +865,10 @@ RST 被计为 `return-no-flow` 丢弃，应用对着同一拒绝重传 SYN 直�
 | `fake-ip-stale` | 二期：fake-IP 映射的名字已没有规则认领，或改由 `direct` 认领 |
 | `egress-no-domain` | 二期：域名规则指向的出口在线，却没有声明 `domainTargetCapable` |
 | `dns-not-local` | 二期：发往 DNS 应答者的查询不是本机发出的 |
+| `egress-no-ipv6` | IPv6 规则指向的出口在线，却没有声明 `ipv6PacketCapable` |
+| `ipv6-source-not-mesh` | 从 TUN 读到的 IPv6 包，源不是本机推出地址 |
+| `ipv6-mesh-unsupported` | 发往推出前缀内的 IPv6 包：设备之间的 mesh 流量只走 IPv4 |
+| `ipv6-path-mtu` | 对端会话的有效 MTU 低于 IPv6 最小值 1280 |
 
 **`blocked` 与 `refused` 按原因/错误码分别计数，不汇总。** 「没有出口在线」与「被出口拒绝」数字一样大，却是完全不同的两个问题。计数为零的不输出：一排零会把真正发生过的那一条埋掉。
 
@@ -838,7 +931,7 @@ RST 被计为 `return-no-flow` 丢弃，应用对着同一拒绝重传 SYN 直�
 - 出口使用普通 socket 连接目标，因此不保留原始源地址；目标看到的是出口所在网络的出口地址。
 - 出口与消费端角色可以同时启用，但不构成出口链：hop 标记保证一跳即止。
 - 校验只拒绝 `/0`。运维手写 `0.0.0.0/1` 与 `128.0.0.0/1` 两条规则仍然可以覆盖全部地址，其中下半区目前只是因为覆盖 Peer Mesh 网段才被拒。堵住它需要定一个最小前缀长度，属于策略决定。IPv6 的 `::/1` 加 `8000::/1` 同理，且没有 mesh 网段挡住其中任何一半。
-- **IPv6 交付了规则的读法与匹配语义、出口侧的授权与按 AAAA 拨号，消费端数据面还没有。** 出口：IPv6 目的地址按自己的强制拒绝清单与 `LAN` 段判定，名字没有 A 记录时拨 AAAA 地址，`ipv6TargetCapable` 为 `true`；服务端接受并保存 IPv6 目的规则。所以「域名规则 → 只有 IPv6 的站点」今天就能经出口访问：消费端那一段仍是 IPv4 fake-IP。消费端：TUN 不读 IPv6 包、不装 IPv6 路由、SPEG1 不承载 IPv6（`EGRESS_IPV6_UNSUPPORTED`），所以合法的 IPv6 规则以 `EGRESS_RULE_IPV6_UNSUPPORTED` 不生效，应用直接访问 IPv6 地址的流量不受规则约束、照常走本机；fake-IP 的 DNS 应答对 AAAA 仍回 NODATA，名字规则命中的名字只给应用 IPv4 fake-IP。`egress test` 只接受 IPv4 地址与名字，输入 IPv6 地址报 `ADDRESS must be an IPv4 address.`。数据面交付时还需要定：消费端发出的 IPv6 包以什么源地址交给出口（mesh 只分配 IPv4 虚拟地址，出口按源地址核对会话）、三个平台的 IPv6 路由安装、冲突检查与旁路、出站 socket 的 IPv6 绑定（`IPV6_UNICAST_IF`、`IPV6_BOUND_IF`）。目录的 `ipv6TargetCapable` 已作为独立的出口声明保存并转发；这不代表消费端 IPv6 数据面已经交付。
+- **IPv6 交付了规则的读法与匹配语义、出口侧的授权与按 AAAA 拨号；消费端数据面的规范已定（「IPv6 数据面」，向量 `peer-egress-ipv6-v1.json`），实现还没有。** 出口：IPv6 目的地址按自己的强制拒绝清单与 `LAN` 段判定，名字没有 A 记录时拨 AAAA 地址，`ipv6TargetCapable` 为 `true`；服务端接受并保存 IPv6 目的规则。所以「域名规则 → 只有 IPv6 的站点」今天就能经出口访问：消费端那一段仍是 IPv4 fake-IP。消费端：TUN 不读 IPv6 包、不装 IPv6 路由、SPEG1 不承载 IPv6（`EGRESS_IPV6_UNSUPPORTED`），所以合法的 IPv6 规则以 `EGRESS_RULE_IPV6_UNSUPPORTED` 不生效，应用直接访问 IPv6 地址的流量不受规则约束、照常走本机；fake-IP 的 DNS 应答对 AAAA 仍回 NODATA，名字规则命中的名字只给应用 IPv4 fake-IP。`egress test` 只接受 IPv4 地址与名字，输入 IPv6 地址报 `ADDRESS must be an IPv4 address.`。源地址、帧、平台命令与出站 socket 的 IPv6 绑定已在「IPv6 数据面」定下；平台路由与 socket 选择的向量随实现补齐。目录的 `ipv6TargetCapable` 已作为独立的出口声明保存并转发；这不代表消费端 IPv6 数据面已经交付。
 - **出口的 IPv6 拨号没有在真机上验收过。** 授权、候选地址的选择与 IPv6 socket 的建立由三端单元测试与共享向量覆盖；真实 AAAA 解析与经 IPv6 出网归 #50 的实机验收。
 - **macOS 的安装路径在 CI 的真机上跑，但指向的是 lo0 而不是 TUN。** GitHub 的 macos runner 给免密 sudo，所以 `peer-egress-macos.yml` 里有一条用例真的装一条文档保留前缀、在整表里查到它、再撤销并确认它不在了。指向的接口是 lo0：真正的 utun 必须先配上 IPv4 地址（见上），而在 CI 里造一个带地址的 utun 要另外一个进程把它持住。argv 形态、输出分类、读表与撤销都是真的，「装进 TUN」这一步与真机的差别只有接口名。
 - **macOS 的旁路下一跳同样是逐条解析的，没有批量。** 与 Windows 同一个原因：批量需要改三端共享的安装器接口。这边代价更小，一次 `route -n get` 是 26 ms。
