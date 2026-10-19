@@ -13573,6 +13573,20 @@ int st_admin_build_response(const char *method, const char *path, char *out, siz
     return st_admin_build_response_with_body(method, path, NULL, out, out_len);
 }
 
+static int admin_is_public_page_entry(const char *request_path)
+{
+    const char *entries[] = {"/nat-detect", "/transfer", "/diagram", "/diagram-embed", "/download"};
+    size_t path_len = strcspn(request_path, "?");
+    for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); ++i) {
+        size_t entry_len = strlen(entries[i]);
+        if ((path_len == entry_len || (path_len == entry_len + 1 && request_path[entry_len] == '/'))
+            && strncmp(request_path, entries[i], entry_len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int st_admin_resolve_static_path(const char *static_root,
                                  const char *request_path,
                                  char *file_path,
@@ -13584,7 +13598,8 @@ int st_admin_resolve_static_path(const char *static_root,
         || strstr(request_path, "..") != NULL) {
         return -1;
     }
-    const char *relative = request_path[1] == '\0' ? "index.html" : request_path + 1;
+    const char *relative = request_path[1] == '\0' || admin_is_public_page_entry(request_path)
+        ? "index.html" : request_path + 1;
     const char *query = strchr(relative, '?');
     size_t relative_len = query == NULL ? strlen(relative) : (size_t)(query - relative);
     if (relative_len == 0) {
