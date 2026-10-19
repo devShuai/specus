@@ -385,6 +385,13 @@ set_tests_properties(security_rules_tests PROPERTIES TIMEOUT 120)
 
 # Java HttpWebSocketRoutingTests on a real server process: how /http/** splits WebSocket upgrades
 # from plain requests, raw query characters, and the public route runtime asset.
+add_executable(specus_c_server_harness_tests tests/server_harness_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_server_harness_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_server_harness_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(specus_c_server_harness_tests PRIVATE -Wl,--wrap=bind)
+add_test(NAME server_harness_tests COMMAND specus_c_server_harness_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(server_harness_tests PROPERTIES TIMEOUT 60)
+
 add_executable(specus_c_http_websocket_routing_tests tests/http_websocket_routing_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_http_websocket_routing_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_http_websocket_routing_tests PRIVATE -Wall -Wextra -Wpedantic)

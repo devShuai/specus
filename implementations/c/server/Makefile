@@ -64,6 +64,7 @@ MANAGEMENT_CRUD_TESTS := $(BUILD_DIR)/specus_c_management_crud_tests
 PEER_MESH_API_TESTS := $(BUILD_DIR)/specus_c_peer_mesh_api_tests
 MANAGEMENT_OVERVIEW_TESTS := $(BUILD_DIR)/specus_c_management_overview_tests
 HTTP_WEBSOCKET_ROUTING_TESTS := $(BUILD_DIR)/specus_c_http_websocket_routing_tests
+SERVER_HARNESS_TESTS := $(BUILD_DIR)/specus_c_server_harness_tests
 STORAGE_TESTS := $(BUILD_DIR)/specus_c_storage_tests
 SESSION_ORDER_TESTS := $(BUILD_DIR)/specus_c_session_order_tests
 SESSION_SCOPE_TESTS := $(BUILD_DIR)/specus_c_session_scope_tests
@@ -84,6 +85,7 @@ TESTS += $(URL_DECODE_TESTS)
 ALL_TESTS += $(URL_DECODE_TESTS)
 TESTS += $(CONNECTIVITY_LIFETIME_TESTS) $(CONNECTIVITY_SETTER_TESTS)
 ALL_TESTS += $(CONNECTIVITY_LIFETIME_TESTS) $(CONNECTIVITY_SETTER_TESTS)
+ALL_TESTS += $(SERVER_HARNESS_TESTS)
 
 .PHONY: all test release clean
 
@@ -227,6 +229,9 @@ $(PEER_MESH_API_TESTS): $(CORE_OBJS) tests/peer_mesh_api_tests.c tests/server_ha
 $(MANAGEMENT_OVERVIEW_TESTS): $(CORE_OBJS) tests/management_overview_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/management_overview_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
+$(SERVER_HARNESS_TESTS): $(CORE_OBJS) tests/server_harness_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/server_harness_tests.c tests/server_harness.c $(CORE_OBJS) -Wl,--wrap=bind $(LDFLAGS) -o $@
+
 $(HTTP_WEBSOCKET_ROUTING_TESTS): $(CORE_OBJS) tests/http_websocket_routing_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/http_websocket_routing_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
@@ -286,6 +291,7 @@ test: all
 	$(PEER_MESH_API_TESTS)
 	$(MANAGEMENT_OVERVIEW_TESTS) $(SERVER)
 	$(HTTP_WEBSOCKET_ROUTING_TESTS) $(SERVER)
+	$(SERVER_HARNESS_TESTS) $(SERVER)
 	$(PEER_MESH_E2E_TESTS) $(SERVER)
 
 release: CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O3 -DNDEBUG
