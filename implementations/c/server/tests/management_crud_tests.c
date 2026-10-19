@@ -610,6 +610,173 @@ static int test_mappings(void)
     return failed;
 }
 
+/* ---- path variables ----------------------------------------------------------------------- */
+
+/*
+ * The @PathVariable long of every management endpoint outside Peer Mesh (which peer_mesh_api_tests
+ * covers): a segment Spring cannot convert is its 400, any long it can (0, negative, hex, padded,
+ * percent-encoded, with ";" parameters) reaches the service, which answers as for an id it does not
+ * have. The C server used to take only positive decimals and answer 404 for the rest.
+ */
+static int test_path_variables(void)
+{
+    static const struct {
+        const char *method;
+        const char *prefix;
+        const char *suffix;
+        const char *body;
+    } endpoints[] = {
+        {"PUT", "/api/admin/client-downloads/", "", "{\"platform\":\"linux\",\"name\":\"n\",\"url\":\"https://x\"}"},
+        {"POST", "/api/admin/client-downloads/", "/latest", NULL},
+        {"DELETE", "/api/admin/client-downloads/", "", NULL},
+        {"PUT", "/api/admin/client-credentials/", "", "{\"enabled\":true}"},
+        {"DELETE", "/api/admin/client-credentials/", "", NULL},
+        {"GET", "/api/admin/clients/", "", NULL},
+        {"PUT", "/api/admin/clients/", "", "{\"clientName\":\"path-var\"}"},
+        {"DELETE", "/api/admin/clients/", "", NULL},
+        {"POST", "/api/admin/clients/", "/force-refresh-port-mapping", NULL},
+        {"POST", "/api/admin/clients/", "/nat-control", NULL},
+        {"POST", "/api/admin/clients/", "/specus-mappings",
+         "{\"listenPort\":21901,\"targetPort\":80,\"targetAddress\":\"127.0.0.1\"}"},
+        {"POST", "/api/admin/clients/", "/http-routes", "{\"routeKey\":\"pv\",\"targetBaseUrl\":\"http://127.0.0.1:1\"}"},
+        {"PUT", "/api/admin/specus-mappings/", "", "{\"listenPort\":21901,\"targetPort\":80,\"targetAddress\":\"h\"}"},
+        {"DELETE", "/api/admin/specus-mappings/", "", NULL},
+        {"PUT", "/api/admin/http-routes/", "", "{\"routeKey\":\"pv\",\"targetBaseUrl\":\"http://127.0.0.1:1\"}"},
+        {"DELETE", "/api/admin/http-routes/", "", NULL},
+        {"GET", "/api/admin/traffic/http-exchanges/", "", NULL},
+        {"GET", "/api/admin/traffic/tcp-frames/", "", NULL},
+        {"GET", "/api/admin/diagrams/", "", NULL},
+        {"PUT", "/api/admin/diagrams/", "", "{\"title\":\"t\",\"content\":\"{}\"}"},
+        {"DELETE", "/api/admin/diagrams/", "", NULL},
+    };
+    /* Segments Spring's NumberUtils.parseNumber refuses for a long. */
+    static const char *const refused[] = {
+        "abc", "1.5", "1a", "%zz", "1%00", "9223372036854775808", "-9223372036854775809", "0x", "+0x1", "--1",
+    };
+    /* Segments that bind to a long no row has, and that long. */
+    static const struct {
+        const char *segment;
+        const char *value;
+    } unknown[] = {
+        {"0", "0"}, {"-1", "-1"}, {"-0x5", "-5"}, {"%2D7", "-7"}, {"0;v=1", "0"}, {"%200%20", "0"}, {"%230", "0"},
+        {"9223372036854775807", "9223372036854775807"}, {"-9223372036854775808", "-9223372036854775808"},
+    };
+    int failed = 0;
+    char path[256];
+    char reference[512];
+    for (size_t e = 0; e < sizeof(endpoints) / sizeof(endpoints[0]) && !failed; ++e) {
+        for (size_t r = 0; r < sizeof(refused) / sizeof(refused[0]) && !failed; ++r) {
+            snprintf(path, sizeof(path), "%s%s%s", endpoints[e].prefix, refused[r], endpoints[e].suffix);
+            failed = expect(endpoints[e].method, path, endpoints[e].body, admin_token, 400,
+                            "{\"error\":\"Bad Request\"}") != 0;
+        }
+        snprintf(path, sizeof(path), "%s987654321%s", endpoints[e].prefix, endpoints[e].suffix);
+        int reference_status = call(endpoints[e].method, path, endpoints[e].body, admin_token);
+        snprintf(reference, sizeof(reference), "%s", last_body == NULL ? "" : last_body);
+        if (!failed && reference_status <= 0) {
+            fprintf(stderr, "FAIL %s %s: the unknown id answered %d %s\n", endpoints[e].method, path,
+                    reference_status, reference);
+            failed = 1;
+        }
+        for (size_t u = 0; u < sizeof(unknown) / sizeof(unknown[0]) && !failed; ++u) {
+            /* The answer for 987654321 with the id it names, if any, being this one. */
+            char expected[600];
+            const char *named = strstr(reference, "987654321");
+            if (named == NULL) {
+                snprintf(expected, sizeof(expected), "%s", reference);
+            } else {
+                snprintf(expected, sizeof(expected), "%.*s%s%s", (int)(named - reference), reference,
+                         unknown[u].value, named + strlen("987654321"));
+            }
+            snprintf(path, sizeof(path), "%s%s%s", endpoints[e].prefix, unknown[u].segment, endpoints[e].suffix);
+            int status = call(endpoints[e].method, path, endpoints[e].body, admin_token);
+            if (status != reference_status || last_body == NULL || strcmp(last_body, expected) != 0) {
+                fprintf(stderr, "FAIL %s %s: expected %d %s as for 987654321, got %d %s\n", endpoints[e].method,
+                        path, reference_status, expected, status, last_body == NULL ? "" : last_body);
+                failed = 1;
+            }
+        }
+    }
+    /* A known id written the ways Spring also binds it reaches the same row. */
+    char plain[256];
+    snprintf(plain, sizeof(plain), "/api/admin/clients/%lld", client_a);
+    failed = failed || expect("GET", plain, NULL, admin_token, 200, NULL) != 0;
+    char *known = failed ? NULL : strdup(last_body);
+    failed = failed || known == NULL;
+    const char *const forms[] = {"/api/admin/clients/%%20%lld%%20", "/api/admin/clients/0x%llx",
+                                 "/api/admin/clients/%lld;jsessionid=abc", "/api/admin/clients/+%lld"};
+    for (size_t f = 0; f < sizeof(forms) / sizeof(forms[0]) && !failed; ++f) {
+        snprintf(path, sizeof(path), forms[f], client_a);
+        failed = expect("GET", path, NULL, admin_token, 200, NULL) != 0 || strcmp(last_body, known) != 0;
+        if (failed) fprintf(stderr, "FAIL GET %s: expected the body of %s\n", path, plain);
+    }
+    free(known);
+    /* No segment, or a path Java does not map past it, is no match: 404 as in Spring. */
+    failed = failed || expect("GET", "/api/admin/clients/", NULL, admin_token, 404, NULL) != 0
+        || expect("GET", "/api/admin/clients/1/unknown", NULL, admin_token, 404, NULL) != 0;
+    printf("%s path variables bind as Spring's long\n", failed ? "FAIL" : "ok  ");
+    return failed;
+}
+
+/* ---- management user request body --------------------------------------------------------- */
+
+/*
+ * POST /api/admin/users and PUT /api/admin/users/{username} bind UserMutation(String username,
+ * String password, ManagementRole role, Boolean enabled) with Jackson before the service checks the
+ * caller: an "enabled" that is no Boolean, a String member given an object or array, and a missing
+ * or non-object body are Spring's 400, even for a caller who is not an administrator. The C server
+ * used to read "enabled" leniently and ignore a value of another type.
+ */
+static int test_user_mutation_binding(void)
+{
+    static const char *const refused[] = {
+        "{\"username\":\"bind-u\",\"password\":\"bind-secret\",\"enabled\":\"yes\"}",
+        "{\"username\":\"bind-u\",\"password\":\"bind-secret\",\"enabled\":\"1\"}",
+        "{\"username\":\"bind-u\",\"password\":\"bind-secret\",\"enabled\":{}}",
+        "{\"username\":\"bind-u\",\"password\":\"bind-secret\",\"enabled\":[true]}",
+        "{\"username\":{\"name\":\"bind-u\"},\"password\":\"bind-secret\"}",
+        "{\"username\":\"bind-u\",\"password\":[\"bind-secret\"]}",
+        "{\"username\":\"bind-u\",\"password\":\"bind-secret\",\"role\":{}}",
+        "[]",
+        "\"bind-u\"",
+    };
+    int failed = 0;
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]) && !failed; ++i) {
+        failed = expect("POST", "/api/admin/users", refused[i], admin_token, 400, "{\"error\":\"Bad Request\"}") != 0
+            || expect("POST", "/api/admin/users", refused[i], user_token, 400, "{\"error\":\"Bad Request\"}") != 0;
+    }
+    failed = failed || expect("POST", "/api/admin/users", NULL, admin_token, 400, "{\"error\":\"Bad Request\"}") != 0
+        || expect("GET", "/api/admin/users", NULL, admin_token, 200, NULL) != 0
+        || strstr(last_body, "bind-u") != NULL
+        /* What binds still meets the service's administrator check. */
+        || expect("POST", "/api/admin/users", "{\"username\":\"bind-u\",\"password\":\"bind-secret\"}", user_token,
+                  403, NULL) != 0
+        /* The Boolean coercions Jackson allows: case variants of true/false and integers. */
+        || expect("POST", "/api/admin/users",
+                  "{\"username\":\"bind-u\",\"password\":\"bind-secret\",\"enabled\":\"FALSE\"}", admin_token, 201,
+                  "\"enabled\":false") != 0
+        || expect("POST", "/api/admin/users", "{\"username\":\"bind-v\",\"password\":\"bind-secret\",\"enabled\":0}",
+                  admin_token, 201, "\"enabled\":false") != 0
+        || expect("POST", "/api/admin/users", "{\"username\":\"bind-w\",\"password\":\"bind-secret\",\"enabled\":null}",
+                  admin_token, 201, "\"enabled\":true") != 0
+        /* A number given for a String member is its text. */
+        || expect("POST", "/api/admin/users", "{\"username\":20261019,\"password\":\"bind-secret\"}", admin_token,
+                  201, "\"username\":\"20261019\"") != 0;
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]) && !failed; ++i) {
+        failed = expect("PUT", "/api/admin/users/bind-u", refused[i], admin_token, 400, "{\"error\":\"Bad Request\"}")
+            != 0;
+    }
+    failed = failed || expect("PUT", "/api/admin/users/bind-u", NULL, admin_token, 400, "{\"error\":\"Bad Request\"}") != 0
+        || expect("PUT", "/api/admin/users/bind-u", "{\"enabled\":\"no\"}", user_token, 400,
+                  "{\"error\":\"Bad Request\"}") != 0
+        /* The refused updates changed nothing: bind-u is still disabled. */
+        || expect("PUT", "/api/admin/users/bind-u", "{}", admin_token, 200, "\"enabled\":false") != 0
+        || expect("PUT", "/api/admin/users/bind-u", "{\"enabled\":\"True\"}", admin_token, 200, "\"enabled\":true") != 0
+        || expect("PUT", "/api/admin/users/bind-u", "{\"enabled\":7}", admin_token, 200, "\"enabled\":true") != 0;
+    printf("%s management user body binds as Jackson's UserMutation\n", failed ? "FAIL" : "ok  ");
+    return failed;
+}
+
 /* ---- client name availability ------------------------------------------------------------- */
 
 static int test_name_availability(void)
@@ -856,6 +1023,8 @@ int main(void)
         failed = test_name_availability() != 0 || failed;
         failed = test_traffic_usage() != 0 || failed;
         failed = test_peer_import_targets() != 0 || failed;
+        failed = test_path_variables() != 0 || failed;
+        failed = test_user_mutation_binding() != 0 || failed;
         failed = test_database_initialize() != 0 || failed;
     }
     free(last_body);
