@@ -159,8 +159,9 @@ int st_client_package_rate_limit(const char *remote_address,
             if (reusable == SIZE_MAX) reusable = index;
             break;
         }
-        int expired = now < candidate->started_at
-            || now - candidate->started_at >= window_seconds;
+        /* Match Java: a backward wall-clock adjustment must not issue fresh quota. */
+        int expired = now >= candidate->started_at
+            && now - candidate->started_at >= window_seconds;
         if (strcmp(candidate->source, source) == 0) {
             matched = candidate;
             if (expired) {

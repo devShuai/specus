@@ -4,6 +4,7 @@
 
 #include "crypto.h"
 #include "http_client.h"
+#include "instant.h"
 #include "json.h"
 #include "password_hash.h"
 #include "security.h"
@@ -19,6 +20,7 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <utf8proc.h>
 
 typedef struct {
     st_registration_turnstile_handler turnstile;
@@ -464,12 +466,31 @@ static const char *registration_text_error(char *value, size_t max_length, size_
 
 /*
  * The local part or the domain of an address as jakarta.mail InternetAddress.checkAddress (strict)
- * takes it: not empty, no leading, trailing or doubled dot, no control character, space or special;
- * the domain is ASCII. Quoted local parts and domain literals, which Java also takes, are refused.
+ * takes it. Quoted local parts preserve escapes and may contain dots/specials;
+ * bracketed domain literals are not subjected to DNS-label grammar. The caller
+ * still applies Java's whole-address regex (including ASCII whitespace and @).
+ * Unicode domain normalization/storage remains a separate alignment requirement.
  */
 static int registration_address_part(const char *start, const char *end, int domain)
 {
-    if (start == end || *start == '.' || end[-1] == '.') return 0;
+    if (start == end) return 0;
+    if (!domain && *start == '"') {
+        if (end - start < 2 || end[-1] != '"') return 0;
+        for (const char *p = start + 1; p < end - 1; ++p) {
+            if (*p == '"') return 0;
+            if (*p == '\\' && ++p >= end - 1) return 0;
+        }
+        return 1;
+    }
+    if (domain && *start == '[') {
+        if (end - start < 2 || end[-1] != ']') return 0;
+        for (const char *p = start + 1; p < end - 1; ++p) {
+            unsigned char c = (unsigned char)*p;
+            if (c <= 0x20U || c >= 0x7fU || c == '[' || c == ']') return 0;
+        }
+        return 1;
+    }
+    if (*start == '.' || end[-1] == '.') return 0;
     for (const char *p = start; p < end; ++p) {
         unsigned char c = (unsigned char)*p;
         if (c <= 0x20U || c == 0x7fU || (domain && c > 0x7fU) || strchr("()<>,;:\\\"[]@", c) != NULL
@@ -491,6 +512,9 @@ static const char *registration_normalize_email(char *email)
     if (!registration_has_text(email)) return "邮箱不能为空";
     registration_java_trim(email);
     for (char *p = email; *p != '\0'; ++p) *p = (char)tolower((unsigned char)*p);
+    for (const unsigned char *p = (const unsigned char *)email; *p != '\0'; ++p) {
+        if (strchr(" \t\r\n\f\v", *p) != NULL) return "邮箱格式无效";
+    }
     const char *at = strchr(email, '@');
     const char *domain = at == NULL ? NULL : at + 1;
     const char *last_dot = domain == NULL ? NULL : strrchr(domain, '.');
@@ -525,7 +549,8 @@ int st_registration_request(const char *database_path,
         return -1;
     }
     char *username = st_json_get_string(json_body, "username");
-    char *email = st_json_get_string(json_body, "email");
+    size_t email_len = 0U;
+    char *email = st_json_get_string_len(json_body, "email", &email_len);
     char *password = st_json_get_string(json_body, "password");
     char *turnstile = st_json_get_string(json_body, "turnstileToken");
     /* Java AuthController.register: the challenge first, then requestRegistration's checks in order. */
@@ -546,7 +571,10 @@ int st_registration_request(const char *database_path,
                                           "password is too long");
     }
     if (refusal == NULL) {
-        refusal = registration_normalize_email(email);
+        /* The raw address must not contain NUL, including characters trim would remove.
+         * Validate the decoder's complete byte sequence, not a silently truncated prefix. */
+        refusal = email != NULL && memchr(email, '\0', email_len) != NULL
+            ? "邮箱格式无效" : registration_normalize_email(email);
     }
     if (refusal != NULL) {
         registration_error(error, error_len, refusal);
@@ -634,7 +662,19 @@ int st_registration_request(const char *database_path,
     memset(response, 0, sizeof(*response));
     snprintf(response->registration_id, sizeof(response->registration_id), "%s", challenge.registration_id);
     const char *at = strchr(email, '@');
-    size_t visible = (size_t)(at - email) <= 2U ? 1U : 2U;
+    /* Raw local-part code points, including quotes/escapes, not UTF-8 bytes or graphemes.
+     * Three decoded points suffice to choose the one- or two-point prefix. */
+    size_t offset = 0U, ends[3] = {0U, 0U, 0U}, count = 0U;
+    size_t local_bytes = (size_t)(at - email);
+    while (offset < local_bytes && count < 3U) {
+        utf8proc_int32_t point;
+        utf8proc_ssize_t width = utf8proc_iterate((const utf8proc_uint8_t *)email + offset,
+                                                (utf8proc_ssize_t)(local_bytes - offset), &point);
+        if (width <= 0) { count = 0U; break; } /* Never emit a partial/invalid UTF-8 prefix. */
+        offset += (size_t)width;
+        ends[count++] = offset;
+    }
+    size_t visible = count == 0U ? 0U : count <= 2U ? ends[0] : ends[1];
     snprintf(response->email_masked, sizeof(response->email_masked), "%.*s***%s",
              (int)visible, email, at);
     snprintf(response->expires_at, sizeof(response->expires_at), "%s", challenge.expires_at);
@@ -684,11 +724,12 @@ int st_registration_verify(const char *database_path,
         free(registration_id); free(code);
         return -1;
     }
-    time_t now = time(NULL);
-    time_t expires = registration_parse_time(challenge.expires_at);
+    char expires[ST_INSTANT_CAPACITY], cutoff[ST_INSTANT_CAPACITY];
     char now_text[64];
-    if (now == (time_t)-1 || registration_format_time(now, now_text) != 0
-        || expires == (time_t)-1 || expires <= now || challenge.attempts_remaining <= 0) {
+    if (st_instant_now(cutoff) != 0 || st_instant_public(cutoff, now_text, sizeof(now_text)) != 0
+        || st_instant_normalize(challenge.expires_at, expires) != 0
+        || strcmp(expires, cutoff) <= 0
+        || challenge.attempts_remaining <= 0) {
         (void)st_storage_delete_registration_challenge(database_path, challenge.registration_id);
         registration_error(error, error_len, "验证码无效或已过期");
         free(registration_id); free(code);

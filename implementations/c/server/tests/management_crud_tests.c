@@ -29,6 +29,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <utf8proc.h>
 
 #define JWT_SECRET "management-crud-jwt-secret-long-enough-2026"
 #define BUILT_IN "crud-root"
@@ -116,6 +117,7 @@ static int repeat_into(char *out, size_t out_len, const char *unit, size_t times
 typedef struct {
     char code[7];
     char username[400];
+    char email[1024];
 } mailbox;
 
 static int fake_turnstile(void *ctx, const char *token, const char *action)
@@ -128,11 +130,11 @@ static int fake_turnstile(void *ctx, const char *token, const char *action)
 
 static int fake_email(void *ctx, const char *email, const char *username, const char *code, long long ttl)
 {
-    (void)email;
     (void)ttl;
     mailbox *box = ctx;
     snprintf(box->code, sizeof(box->code), "%s", code);
     snprintf(box->username, sizeof(box->username), "%s", username);
+    snprintf(box->email, sizeof(box->email), "%s", email);
     return 0;
 }
 
@@ -140,10 +142,162 @@ static int register_with(const char *username, const char *email, const char *pa
                          int status, const char *needle)
 {
     char body[2048];
+    char *escaped_email = st_json_escape(email);
+    if (escaped_email == NULL) return -1;
     snprintf(body, sizeof(body),
              "{\"username\":\"%s\",\"email\":\"%s\",\"password\":\"%s\",\"turnstileToken\":\"%s\"}",
-             username, email, password, token);
+             username, escaped_email, password, token);
+    free(escaped_email);
     return expect("POST", "/auth/register", body, NULL, status, needle);
+}
+
+static int valid_utf8(const char *text)
+{
+    if (text == NULL) return 0;
+    size_t length = strlen(text), offset = 0U;
+    while (offset < length) {
+        utf8proc_int32_t point;
+        utf8proc_ssize_t width = utf8proc_iterate((const utf8proc_uint8_t *)text + offset,
+                                                (utf8proc_ssize_t)(length - offset), &point);
+        if (width <= 0) return 0;
+        offset += (size_t)width;
+    }
+    return 1;
+}
+
+static int test_registration_mailbox_vectors(const char *path, int mask_only)
+{
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) return 1;
+    char json[32768];
+    size_t bytes = fread(json, 1U, sizeof(json) - 1U, file);
+    int failed = ferror(file) || bytes == sizeof(json) - 1U;
+    fclose(file);
+    json[bytes] = '\0';
+    char **cases = NULL;
+    size_t count = 0U;
+    int version = 0;
+    if (failed || !st_json_is_valid_object(json) || st_json_get_int(json, "version", &version) != 0
+        || version != 1 || st_json_get_raw_array(json, "cases", &cases, &count) != 0
+        || count != (mask_only == 2 ? 14U : mask_only ? 24U : 36U)) return 1;
+    mailbox box = {{0}, {0}, {0}};
+    st_registration_set_handlers(fake_turnstile, fake_email, &box);
+    for (size_t i = 0U; i < count; ++i) {
+        char *name = st_json_get_string(cases[i], "name");
+        char *email = st_json_get_string(cases[i], "email");
+        char *normalized = mask_only == 1 && email != NULL ? strdup(email) : st_json_get_string(cases[i], "normalized");
+        char *masked = st_json_get_string(cases[i], "masked");
+        int accepted = mask_only == 1;
+        int valid = name != NULL && email != NULL
+            && (mask_only == 1 || st_json_get_bool(cases[i], "accepted", &accepted) == 0);
+        char username[80];
+        snprintf(username, sizeof(username), "mailbox-%s-%zu", mask_only == 2 ? "nul" : mask_only ? "mask" : "form", i);
+        int result = !valid || (accepted && (normalized == NULL || masked == NULL));
+        if (!result && mask_only == 2) {
+            /* Keep escaped NUL and its suffix in the HTTP request, not in a C string
+             * which would lose bytes when st_json_escape reads it. */
+            char *raw_email = st_json_get_top_level_raw(cases[i], "email");
+            char body[4096];
+            memset(&box, 0, sizeof(box));
+            if (raw_email == NULL) result = 1;
+            else {
+                snprintf(body, sizeof(body), "{\"username\":\"%s\",\"email\":%s,\"password\":\"pw\",\"turnstileToken\":\"ok\"}", username, raw_email);
+                result = expect("POST", "/auth/register", body, NULL, accepted ? 202 : 400,
+                                accepted ? "\"registrationId\"" : "\"error\":\"邮箱格式无效\"") != 0;
+            }
+            free(raw_email);
+            if (!accepted) {
+                st_storage_registration_challenge pending;
+                result = box.email[0] != '\0' || st_storage_find_registration_challenge(db_path, username, "", &pending) == 0 || result;
+            }
+        } else if (!result) result = register_with(username, email, "pw", "ok", accepted ? 202 : 400,
+                                                   accepted ? "\"registrationId\"" : "\"error\":\"邮箱格式无效\"") != 0;
+        if (!result && accepted) {
+            char actual_masked[1024];
+            last_member("emailMasked", actual_masked, sizeof(actual_masked));
+            st_storage_registration_challenge stored;
+            result = !valid_utf8(last_body) || !st_json_is_valid_object(last_body)
+                || !valid_utf8(actual_masked) || strcmp(box.email, normalized) != 0 || strcmp(actual_masked, masked) != 0
+                || st_storage_find_registration_challenge(db_path, username, normalized, &stored) != 0
+                || strcmp(stored.email, normalized) != 0;
+        }
+        /* Each corpus owns its challenge; repeated addresses in another corpus must not
+         * turn mask assertions into a pending-registration conflict. Clean up even if the
+         * expected mask fails, so the negative control tests each address independently. */
+        if (accepted && last_status == 202) {
+            char registration_id[128];
+            last_member("registrationId", registration_id, sizeof(registration_id));
+            result = st_storage_delete_registration_challenge(db_path, registration_id) != 0 || result;
+        }
+        printf("%s shared registration %s %s\n", result ? "FAIL" : "ok  ",
+               mask_only == 2 ? "NUL raw HTTP/no-mail/no-challenge" : mask_only ? "Unicode mask HTTP/UTF8" : "mailbox form", name == NULL ? "missing-name" : name);
+        failed = result || failed;
+        free(name); free(email); free(normalized); free(masked);
+    }
+    st_registration_set_handlers(NULL, NULL, NULL);
+    st_json_free_string_array(cases, count);
+    return failed;
+}
+
+/* Java limits the normalized address to 254 UTF-16 units, not 254 UTF-8 bytes.
+ * Keep an ASCII mask prefix here: Unicode masking has its own contract/tests. */
+static int test_registration_email_storage(void)
+{
+    mailbox box = {{0}, {0}, {0}};
+    st_registration_set_handlers(fake_turnstile, fake_email, &box);
+    static const char *const units[] = {"a", "\xe7\x94\xa8", "\xf0\x9f\x98\x80", "\xe7\x94\xa8"};
+    static const size_t repeats[] = {245U, 245U, 122U, 243U};
+    static const size_t byte_lengths[] = {254U, 744U, 500U, 740U};
+    int failed = 0;
+    for (size_t i = 0; i < sizeof(repeats) / sizeof(repeats[0]); ++i) {
+        char repeated[1024];
+        char email[1100];
+        char username[80];
+        int result = repeat_into(repeated, sizeof(repeated), units[i], repeats[i]) != 0;
+        if (result) { failed = 1; continue; }
+        snprintf(email, sizeof(email), "%sab%s%s@e.test", i == 3U ? "\"" : "", repeated,
+                 i == 2U ? "\xe7\x94\xa8" : i == 3U ? "\"" : "");
+        snprintf(username, sizeof(username), "mailbox-storage-%zu", i);
+        result = strlen(email) != byte_lengths[i]
+            || register_with(username, email, "pw", "ok", 202, "\"registrationId\"") != 0;
+        char registration_id[128];
+        last_member("registrationId", registration_id, sizeof(registration_id));
+        st_storage_registration_challenge stored;
+        int loaded = st_storage_get_registration_challenge(db_path, registration_id, &stored);
+        int complete_email = loaded == 0 && strcmp(stored.email, email) == 0;
+        result = result || strcmp(box.email, email) != 0 || !complete_email;
+        printf("%s registration email storage case=%zu bytes=%zu stored=%zu exact=%d\n",
+               result ? "FAIL" : "ok  ", i, strlen(email), loaded == 0 ? strlen(stored.email) : 0U,
+               complete_email);
+
+        /* A new SQLite connection reads the challenge; then verify the real code over HTTP.
+         * The verified full address must survive and prevent another account claiming it. */
+        char body[256];
+        snprintf(body, sizeof(body), "{\"registrationId\":\"%s\",\"code\":\"%s\"}", registration_id, box.code);
+        int verified = expect("POST", "/auth/register/verify", body, NULL, 200, NULL) == 0;
+        st_storage_management_user user;
+        int registered = verified && st_storage_get_management_user_in_tenant(db_path, "default", username, &user) == 0
+            && st_storage_management_email_exists(db_path, email) == 1
+            && st_storage_get_registration_challenge(db_path, registration_id, &stored) != 0;
+        snprintf(username, sizeof(username), "mailbox-storage-duplicate-%zu", i);
+        int duplicate_refused = register_with(username, email, "pw", "ok", 400, "该邮箱已注册") == 0;
+        printf("%s registration email verification case=%zu registered=%d duplicateRefused=%d\n",
+               registered && duplicate_refused ? "ok  " : "FAIL", i, registered, duplicate_refused);
+        result = result || !registered || !duplicate_refused;
+
+        /* One extra BMP unit crosses the same reference limit, without sending email. */
+        char too_long[1104];
+        if (i == 3U) snprintf(too_long, sizeof(too_long), "\"x%s", email + 1);
+        else snprintf(too_long, sizeof(too_long), "x%s", email);
+        box.email[0] = '\0';
+        int refused = register_with("mailbox-storage-over-limit", too_long, "pw", "ok", 400,
+                                    "邮箱格式无效") == 0 && box.email[0] == '\0';
+        printf("%s registration email UTF16 limit case=%zu refusedWithoutMail=%d\n",
+               refused ? "ok  " : "FAIL", i, refused);
+        failed = result || !refused || failed;
+    }
+    st_registration_set_handlers(NULL, NULL, NULL);
+    return failed;
 }
 
 /*
@@ -692,6 +846,10 @@ int main(void)
     if (!failed) {
         port = ntohs(address.sin_port);
         failed = test_registration() != 0;
+        failed = test_registration_mailbox_vectors(ST_MAILBOX_VECTOR_FILE, 0) != 0 || failed;
+        failed = test_registration_mailbox_vectors(ST_EMAIL_MASK_VECTOR_FILE, 1) != 0 || failed;
+        failed = test_registration_mailbox_vectors(ST_EMAIL_NUL_VECTOR_FILE, 2) != 0 || failed;
+        failed = test_registration_email_storage() != 0 || failed;
         failed = test_me() != 0 || failed;
         failed = test_credentials() != 0 || failed;
         failed = test_mappings() != 0 || failed;

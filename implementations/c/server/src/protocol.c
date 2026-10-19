@@ -469,6 +469,33 @@ st_buffer st_protocol_encode_message_response(const char *client_name,
     return buffer;
 }
 
+int st_protocol_nat_control_reserved_body_size(size_t empty_name_json_bytes, size_t *body_bytes)
+{
+    const size_t field_bytes = ST_NAT_CONTROL_CLIENT_NAME_RESERVE_CHARACTERS * 4U;
+    const size_t escaped_bytes = ST_NAT_CONTROL_CLIENT_NAME_RESERVE_CHARACTERS * 6U;
+    if (body_bytes == NULL) {
+        return -1;
+    }
+    *body_bytes = 0U;
+    if (empty_name_json_bytes > UINT32_MAX - escaped_bytes - 1U) {
+        return -1;
+    }
+    size_t json_bytes = empty_name_json_bytes + escaped_bytes;
+    compact_writer prefixes = {0};
+    /* Use the encoder's actual compact-string/enum prefixes, not a second varint codec. */
+    int rc = writer_varint(&prefixes, (uint32_t)field_bytes + 1U)
+        || writer_varint(&prefixes, 0U)
+        || writer_varint(&prefixes, ST_MESSAGE_TYPE_NAT_CONTROL)
+        || writer_varint(&prefixes, (uint32_t)json_bytes + 1U);
+    if (rc != 0 || json_bytes > SIZE_MAX - field_bytes - prefixes.len) {
+        free(prefixes.data);
+        return -1;
+    }
+    *body_bytes = prefixes.len + field_bytes + json_bytes;
+    free(prefixes.data);
+    return 0;
+}
+
 st_buffer st_protocol_encode_nat_control(const char *client_name, const char *nat_control_json)
 {
     compact_writer payload = {0};

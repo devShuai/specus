@@ -12,6 +12,7 @@
 #define ST_MAX_BODY_SIZE (ST_MAX_FRAME_SIZE - ST_HEADER_SIZE)
 #define ST_PRE_AUTH_MAX_FRAME_SIZE (16U * 1024U)
 #define ST_MAX_MESSAGE_BODY_SIZE (1024U * 1024U)
+#define ST_NAT_CONTROL_CLIENT_NAME_RESERVE_CHARACTERS 120U
 #define ST_MAX_NAT_METADATA_SIZE 65535U
 #define ST_CONNECTION_ROLE_CONTROL "control"
 #define ST_CONNECTION_ROLE_DATA "data"
@@ -90,6 +91,10 @@ st_buffer st_protocol_encode_message_response(const char *client_name,
                                                int message_type,
                                                const char *message);
 st_buffer st_protocol_encode_nat_control(const char *client_name, const char *nat_control_json);
+/* MESSAGE body bytes for an implementation's empty-clientName JSON, reserving the longest
+ * allowed rename independently in its UTF8 field and JSON representation. No frame header.
+ * Returns -1 for an unencodable length/overflow or NULL output, otherwise 0. */
+int st_protocol_nat_control_reserved_body_size(size_t empty_name_json_bytes, size_t *body_bytes);
 st_buffer st_protocol_encode_nat_message(int type, uint8_t flags, uint32_t stream_id, uint32_t value,
                                          const char *meta_json, const uint8_t *data, size_t data_len);
 st_buffer st_protocol_encode_empty_packet(int8_t command);

@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "scope": "Masking of valid normalized email addresses only; not address acceptance, normalization, deliverability or grapheme segmentation. Split at the first @, count raw local-part Unicode code points (including quotes and escapes); show one for <=2 points, otherwise two, then *** and the unchanged @domain.",
+  "cases": [
+    {"name":"ascii-one", "email":"a@example.test", "masked":"a***@example.test"},
+    {"name":"ascii-two", "email":"ab@example.test", "masked":"a***@example.test"},
+    {"name":"ascii-three", "email":"abc@example.test", "masked":"ab***@example.test"},
+    {"name":"accent-one", "email":"é@example.test", "masked":"é***@example.test"},
+    {"name":"accent-two", "email":"éà@example.test", "masked":"é***@example.test"},
+    {"name":"accent-three", "email":"éàü@example.test", "masked":"éà***@example.test"},
+    {"name":"chinese-one", "email":"用@example.test", "masked":"用***@example.test"},
+    {"name":"chinese-two", "email":"用户@example.test", "masked":"用***@example.test"},
+    {"name":"chinese-three", "email":"用户名@example.test", "masked":"用户***@example.test"},
+    {"name":"emoji-one", "email":"😀@example.test", "masked":"😀***@example.test"},
+    {"name":"emoji-two", "email":"😀😃@example.test", "masked":"😀***@example.test"},
+    {"name":"emoji-three", "email":"😀😃😄@example.test", "masked":"😀😃***@example.test"},
+    {"name":"ascii-emoji-two", "email":"a😀@example.test", "masked":"a***@example.test"},
+    {"name":"emoji-ascii-two", "email":"😀a@example.test", "masked":"😀***@example.test"},
+    {"name":"ascii-emoji-three", "email":"a😀b@example.test", "masked":"a😀***@example.test"},
+    {"name":"emoji-ascii-three", "email":"😀ab@example.test", "masked":"😀a***@example.test"},
+    {"name":"combining-two-points", "email":"e\u0301@example.test", "masked":"e***@example.test"},
+    {"name":"combining-three-points", "email":"e\u0301x@example.test", "masked":"e\u0301***@example.test"},
+    {"name":"emoji-joiner-three-points", "email":"👩\u200d💻@example.test", "masked":"👩\u200d***@example.test"},
+    {"name":"quoted-empty", "email":"\"\"@example.test", "masked":"\"***@example.test"},
+    {"name":"quoted-chinese", "email":"\"用\"@example.test", "masked":"\"用***@example.test"},
+    {"name":"quoted-emoji", "email":"\"😀\"@example.test", "masked":"\"😀***@example.test"},
+    {"name":"quoted-escape", "email":"\"\\\"x\"@example.test", "masked":"\"\\***@example.test"},
+    {"name":"literal-domain", "email":"ab@[127.0.0.1]", "masked":"a***@[127.0.0.1]"}
+  ]
+}

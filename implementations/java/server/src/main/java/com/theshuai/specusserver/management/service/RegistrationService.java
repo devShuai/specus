@@ -206,6 +206,9 @@ public class RegistrationService {
     }
 
     private String normalizeEmail(String rawEmail) {
+        if (rawEmail != null && rawEmail.indexOf('\0') >= 0) {
+            throw new IllegalArgumentException("邮箱格式无效");
+        }
         if (!StringUtils.hasText(rawEmail)) {
             throw new IllegalArgumentException("邮箱不能为空");
         }
@@ -245,7 +248,8 @@ public class RegistrationService {
     private static String maskEmail(String email) {
         int at = email.indexOf('@');
         String local = email.substring(0, at);
-        String visible = local.length() <= 2 ? local.substring(0, 1) : local.substring(0, 2);
+        int visiblePoints = local.codePointCount(0, local.length()) <= 2 ? 1 : 2;
+        String visible = local.substring(0, local.offsetByCodePoints(0, visiblePoints));
         return visible + "***" + email.substring(at);
     }
 

@@ -734,8 +734,33 @@ static int control_round(int fd, int *nat_controls, int *peer_config, char **fir
  * is back within the limit. Before, the login closed the connection without the Peer Mesh push, and
  * the client logged in again into the same failure.
  */
+/* Match the Java assertion on actual route entries, not merely absence of a substring
+ * in an arbitrary (or incomplete) NAT_CONTROL JSON document. An empty list is valid. */
+static int first_nat_has_no_fill_routes(const char *json)
+{
+    char **routes = NULL;
+    size_t count = 0U;
+    if (json == NULL || !st_json_is_valid_object(json)
+        || st_json_get_raw_array(json, "httpSpecusConfigList", &routes, &count) != 0) return 0;
+    int valid = 1;
+    for (size_t i = 0; i < count; ++i) {
+        char *route = st_json_get_top_level_string(routes[i], "route");
+        if (route == NULL || strncmp(route, "fill-", 5U) == 0) valid = 0;
+        free(route);
+    }
+    st_json_free_string_array(routes, count);
+    return valid;
+}
+
 static int scenario_existing_oversize_nat_control(test_server *server)
 {
+    CHECK(first_nat_has_no_fill_routes("{\"httpSpecusConfigList\":[]}")
+              && first_nat_has_no_fill_routes("{\"httpSpecusConfigList\":[{\"route\":\"web\"}]}")
+              && !first_nat_has_no_fill_routes("{}")
+              && !first_nat_has_no_fill_routes("{\"httpSpecusConfigList\":null}")
+              && !first_nat_has_no_fill_routes("{\"httpSpecusConfigList\":[{}]}")
+              && !first_nat_has_no_fill_routes("{\"httpSpecusConfigList\":[{\"route\":\"fill-0001\"}]}"),
+          "first NAT_CONTROL route-list assertion calibration");
     char *vector = read_file(ST_NAT_CONTROL_SIZE_VECTOR_FILE);
     char *scenario = vector == NULL ? NULL : st_json_get_top_level_raw(vector, "existingOversize");
     char *error_contains = vector == NULL ? NULL : st_json_get_top_level_string(vector, "errorContains");
@@ -749,7 +774,7 @@ static int scenario_existing_oversize_nat_control(test_server *server)
         && st_json_get_int(scenario, "fillTargetBaseUrlMaxBytes", &target_bytes) == 0
         && st_json_get_raw_array(scenario, "steps", &steps, &step_count) == 0;
     free(scenario);
-    CHECK(loaded && json_bytes > 0 && target_bytes > 32 && target_bytes < 512,
+    CHECK(loaded && step_count == 7U && json_bytes > 0 && target_bytes > 32 && target_bytes < 512,
           "cannot read existingOversize of %s", ST_NAT_CONTROL_SIZE_VECTOR_FILE);
 
     scale_client c;
@@ -851,10 +876,15 @@ static int scenario_existing_oversize_nat_control(test_server *server)
                 fprintf(stderr, "FAIL step %zu %s: answered %d, expected %d: %.300s\n", i, op, status, expect,
                         answer == NULL ? "(no response)" : answer);
                 failed = 1;
-            } else if (status == 409 && (answer == NULL || strstr(answer, error_contains) == NULL)) {
-                fprintf(stderr, "FAIL step %zu %s: the 409 does not name %s: %.300s\n", i, op, error_contains,
-                        answer == NULL ? "" : answer);
-                failed = 1;
+            } else if (status == 409) {
+                char *reason = answer != NULL && st_json_is_valid_object(answer)
+                    ? st_json_get_top_level_string(answer, "error") : NULL;
+                if (reason == NULL || strstr(reason, error_contains) == NULL) {
+                    fprintf(stderr, "FAIL step %zu %s: the 409 JSON error field does not name %s: %.300s\n",
+                            i, op, error_contains, answer == NULL ? "" : answer);
+                    failed = 1;
+                }
+                free(reason);
             }
         }
         free(answer);
@@ -867,9 +897,9 @@ static int scenario_existing_oversize_nat_control(test_server *server)
             failed = 1;
         }
         if (!failed && nat_control_expected
-            && (nat_controls == 0 || first_nat == NULL || strstr(first_nat, "\"fill-") != NULL)) {
+            && (nat_controls == 0 || !first_nat_has_no_fill_routes(first_nat))) {
             fprintf(stderr, "FAIL step %zu %s: %d NAT_CONTROL(s), the first %s\n", i, op, nat_controls,
-                    first_nat == NULL ? "missing" : "still listing the database routes");
+                    first_nat == NULL ? "missing" : "has an invalid route list or still lists fill routes");
             failed = 1;
         } else if (!failed && !nat_control_expected && nat_controls != 0) {
             fprintf(stderr, "FAIL step %zu %s: %d NAT_CONTROL(s) reached the client\n", i, op, nat_controls);

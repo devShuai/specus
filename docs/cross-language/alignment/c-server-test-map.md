@@ -2,29 +2,377 @@
 
 > 本文属于 [跨语言对齐](../cross-language-java-alignment-plan.md) 系列，为 Issue #35 验收项“Java 参考测试均有对应 C 单测/集成测试或书面平台差异说明”而写。
 
-本文逐个列出 `implementations/java/server/src/test` 下的 Java server 测试类，说明 C server（`implementations/c/server`）里哪一项测试验证了同样的行为。没有对应测试时，写明原因：C 没有这项能力（平台或范围差异），或者能力在 C 源码里但没有测试。
+本文保留历史 Java server 测试类与 C server（`implementations/c/server`）行为证据的逐行对照，并补列当前源码中尚未完成对照的类。历史表、当前源码清单和本轮核验状态分别标注；本文不代表 #35 已全量完成。
 
-清单按 2026-10-06 `docs/c-server-claims` 分支（已合入 `main` `5394a3b`）的源码树逐项核对，不是从既有文档转抄。2026-10-07 `fix/c-server-test-gaps` 补齐了 TURN 对端策略、浏览器头改写、Turnstile、SemVer、流量明细采集与摘要查询几行，并按当时的源码重新核对了这几行和平台差异行。同日 `fix/c-server-parity-packages` 补齐了客户端发布与下载（`ClientDownloadLink*`、`ClientPackage*`、`GitHubReleaseCatalogTests`）、连接归档、云端流程图与 Peer 服务迁移共 9 行，并按当时的源码重新核对了这几行。同日 `fix/c-server-parity-http` 也 按当时的源码重新核对了 `SecurityRulesTests`、`ConnectionRoleHandlerTests`、`HttpQueryStringCodecTests`、`HttpSpecusBodyLimitFilterTests`、`HttpSpecusControllerAuthenticationTests`、`HttpStreamExchangeTests`、`ResponseRewriterTests`、`HttpRouteServiceTests`、`ClientAccountServiceTests` 九行，补测试时发现的偏差在各行说明里列出。同日 `fix/c-server-parity-transfer` 按当时的源码重新核对了公共互传与 WebSocket 的 10 行（`PublicTransfer*`、`WebSocketTicketServiceTests`、`TransferAttachmentServiceTests`、`AliyunOssObjectStorageServiceTests`），其中 8 行改为覆盖，两行因管理事件扇出这一平台差异仍记为部分。同日 `fix/c-server-parity-rest` 按当时的源码重新核对了 `HttpWebSocketRoutingTests`、`HttpStreamExchangeTests`、`ClientAuthNonceServiceIntegrationTests`、`ClientAuthNonceRepositoryCustomImplTests`、`ManagementUserServiceTests`、`ManagementUserServiceIntegrationTests`、`TrafficInspectionServiceTests`、`HttpTrafficExchangeStoreTests`、`ConnectionEventsWebSocketHandlerTests`、`PeerMeshServiceTests`（路径统计）与 `StunTurnServerMetricsTests` 十一行。同日 `feat/tenant-scoped-login-names`（#183）按当时的源码重新核对了 `ManagementUserServiceTests`、`ManagementUserServiceIntegrationTests`、`ManagementUserSchemaMigratorTests`、`AuthControllerRefreshTests` 与 `ManagementContextResolverTests` 五行。同日 `fix/c-server-parity-crud`（API 盘点第 9 节第 5、7 项）按当时的源码重新核对了 `ClientAccountServiceTests`、`PeerServiceDiscoveryServiceTests`、`TrafficInspectionServiceTests`、`HttpTrafficExchangeStoreTests` 与 `LegacyDemoCredentialSanitizerIntegrationTests` 五行，涉及名称可用性、Peer 服务导入的去重范围、`br` 的书面差异与演示客户端所在的租户；状态都不变。同日 `fix/c-server-parity-peer-api`（API 盘点第 9 节第 8 项）按当时的源码重新核对了 `PeerEgressResourceTests`、`PeerMeshServiceTests`、`PeerServiceDiscoveryServiceTests`、`PublicPeerMeshResourceTests`、`TrafficInspectionServiceTests`、`HttpTrafficExchangeStoreTests` 与 `HttpMediaManifestSupportTests` 七行，涉及 Peer Mesh / Egress 管理端点的文案与状态码、会话关闭的通知与 `br` 解码；状态都不变。
+清单按 2026-10-06 `docs/c-server-claims` 分支（已合入 `main` `5394a3b`）的源码树逐项核对，不是从既有文档转抄。2026-10-07 `fix/c-server-test-gaps` 补齐了 TURN 对端策略、浏览器头改写、Turnstile、SemVer、流量明细采集与摘要查询几行，并按当时的源码重新核对了这几行和平台差异行。同日 `fix/c-server-parity-packages` 补齐了客户端发布与下载（`ClientDownloadLink*`、`ClientPackage*`、`GitHubReleaseCatalogTests`）、连接归档、云端流程图与 Peer 服务迁移共 9 行，并按当时的源码重新核对了这几行。同日 `fix/c-server-parity-http` 也 按当时的源码重新核对了 `SecurityRulesTests`、`ConnectionRoleHandlerTests`、`HttpQueryStringCodecTests`、`HttpSpecusBodyLimitFilterTests`、`HttpSpecusControllerAuthenticationTests`、`HttpStreamExchangeTests`、`ResponseRewriterTests`、`HttpRouteServiceTests`、`ClientAccountServiceTests` 九行，补测试时发现的偏差在各行说明里列出。同日 `fix/c-server-parity-transfer` 按当时的源码重新核对了公共互传与 WebSocket 的 10 行（`PublicTransfer*`、`WebSocketTicketServiceTests`、`TransferAttachmentServiceTests`、`AliyunOssObjectStorageServiceTests`），其中当时 8 行改为覆盖，两行因管理事件扇出差异记为部分；该扇出缺口后来由 #261 补齐，见第 6、9 节。同日 `fix/c-server-parity-rest` 按当时的源码重新核对了 `HttpWebSocketRoutingTests`、`HttpStreamExchangeTests`、`ClientAuthNonceServiceIntegrationTests`、`ClientAuthNonceRepositoryCustomImplTests`、`ManagementUserServiceTests`、`ManagementUserServiceIntegrationTests`、`TrafficInspectionServiceTests`、`HttpTrafficExchangeStoreTests`、`ConnectionEventsWebSocketHandlerTests`、`PeerMeshServiceTests`（路径统计）与 `StunTurnServerMetricsTests` 十一行。同日 `feat/tenant-scoped-login-names`（#183）按当时的源码重新核对了 `ManagementUserServiceTests`、`ManagementUserServiceIntegrationTests`、`ManagementUserSchemaMigratorTests`、`AuthControllerRefreshTests` 与 `ManagementContextResolverTests` 五行。同日 `fix/c-server-parity-crud`（API 盘点第 9 节第 5、7 项）按当时的源码重新核对了 `ClientAccountServiceTests`、`PeerServiceDiscoveryServiceTests`、`TrafficInspectionServiceTests`、`HttpTrafficExchangeStoreTests` 与 `LegacyDemoCredentialSanitizerIntegrationTests` 五行，涉及名称可用性、Peer 服务导入的去重范围、`br` 的书面差异与演示客户端所在的租户；状态都不变。同日 `fix/c-server-parity-peer-api`（API 盘点第 9 节第 8 项）按当时的源码重新核对了 `PeerEgressResourceTests`、`PeerMeshServiceTests`、`PeerServiceDiscoveryServiceTests`、`PublicPeerMeshResourceTests`、`TrafficInspectionServiceTests`、`HttpTrafficExchangeStoreTests` 与 `HttpMediaManifestSupportTests` 七行，涉及 Peer Mesh / Egress 管理端点的文案与状态码、会话关闭的通知与 `br` 解码；状态都不变。
 
-基线之后 Java 又新增了 22 个测试类，本表尚未逐行对照：`TransferExpiryOrderingTests`（附件过期排序，#147）、`HttpRouteConnectivityCheckRateTests`、`HttpRouteConnectivityCheckVectorTests`、`NatConnectivityProbeTests`、`HttpRouteConnectivityCheckResourceTests`（连通性检查）、`HttpShareHttpTests`、`HttpShareVectorTests`（临时 HTTP 分享）、`HttpSpecusControllerFailClosedTests`、`HttpSpecusControllerStreamResetTests`、`NatControlServiceHttpRoutesTests`、`WorkbenchCascadeTests`、`WorkbenchResourceTests`、`WorkbenchVectorTests`（服务工作台）、`ManagedLoginProductMetricsTests`、`ProductMetricsModelTests`、`ProductMetricsVectorTests`、`ProductMetricsWritePathTests`、`ProductMetricsSweepTests`（产品指标）、`MariaDbSchemaTests`、`MySqlColumnTypeTests`（MySQL 方言建表与列类型；C 只用 SQLite）、`SqliteLobColumnTests`（Hibernate SQLite 方言读回 BLOB 列；C 直接用 sqlite3 API，不经 JDBC）、`ManagementAccountsHttpTests`（账号生命周期，#199；C 由 ctest `management_accounts_tests` 重放同一份向量 `management-accounts-v1.json` 并走删除后重建与邮箱释放）。下文的计数只含基线的 79 个类。
+旧记录曾列出基线后新增的 22 类；该清单已不完整。当前提交的完整范围盘点与未完成项见下一节，下文历史表的计数仍只含原基线 79 类。
 
-## 读法
+## 2026-10-19 时间与 WebSocket 票据增量
 
-- **覆盖**：C 测试验证了该 Java 测试类断言的行为。
-- **部分**：只有一部分行为有 C 测试，“说明”列写出缺的部分。
-- **无**：没有 C 测试，“说明”列写原因。
+本增量整合 main `7401639e053c0db85f9e53b7ec1311bb354af5ae`，保留已合并的 URL 解码完整性、会话排序、IPv6 能力通告及 connectivity 生命周期修复。下方 128 类/49 类盘点仍锚定其写明的历史提交，不代表这个新 main 的完整测试清单。
+
+- `instant.c` 提供七位小数的 UTC 存储格式、100ns 截断、偏移解析及公开响应格式。`instant_storage.c` 用每批 500 行的主键分页迁移，并条件更新旧值；无效文本保留。输入范围为 C 已有的四位年份，额外接受 SQLite 历史空格时间格式，不声称接受 Java 的所有扩展年份输入。
+- 目前接入真实初始化和写入/查询的是连接记录 `connected_at`、登录 nonce、注册 challenge 及 WebSocket ticket 的 `expires_at`。`connection_time_reference_tests` 覆盖四种整秒/小数、历史/新写入组合的上下界、可见范围、公开视图、启动严格截止和关停收尾；`auth_expiry_reference_tests` 覆盖 nonce/challenge 的八种组合。它们不代表全部到期字段已对齐。
+- `registration_expiry_tests` 经过实际验证码验证和 SQLite 账号写入，固定当前时刻为半秒，分别检查到期前 100ns、恰好到期、到期后 100ns。旧实现用整秒 `time(NULL)` 比较，会接受同一秒内已过期的验证码；新实现使用高精度时钟，只有尚未到期的验证码能创建账号。
+- `websocket_ticket_storage_reference_tests` 验证三种 scope、来源绑定、严格过期清理、到期瞬间仍可消费、单次消费、跨进程争抢和失败回滚。配置 SQLite 后三个入口共用持久票据服务；未配置时保留有界内存实现。管理两种 scope 共用 1024 配额，公开互传单独 1024。
+- `websocket_ticket_request_tests` 经过真实 HTTP/WebSocket，覆盖 84 个到期边界及错误 scope/地址/含 NUL 或重复查询不消耗票据。`websocket_ticket_quota_tests` 在内存和数据库两种实现中让八个真实 HTTP 签发请求争用最后一个配额，验证恰好一次成功、消费恢复配额和过期清理。
+- `websocket_ticket_account_tests` 验证禁用/删除的事务回滚、恢复/同名重建不复活旧票据、旧账号凭据失效，以及其他身份和公开互传隔离。`websocket_ticket_restart_tests.py` 让实际 main 程序初始化新库、退出并由另一个进程重启，再核验六个存储字段、三种 scope 和重放拒绝。`createdAt` 按 Java `Instant.toString()` 的可变宽格式检查，只有 `expiresAt` 要求七位小数；API 监听器进程重启与 main 启动分别验收。
+
+这些测试已注册到 CMake 和完整 Make；精确提交的结果以 PR #290 的验证记录为准。票据账号写入失败仍遵循 C 既有 409 映射，该探针不证明 Java/Spring 存储异常分类已对齐。`SortableTimestampMigratorTests` 和 `SortableTimestampOrderingTests` 仍有附件、下载授权、Peer 会话、配对码、媒体等字段待接入和逐方法验证；`TransferExpiryOrderingTests` 仍待完整对照。旧 79 类当前断言、其余新增类及 #35 的 HA、背压和跨 NAT 要求继续保留，不能据本增量关闭 #35。
+
+## 2026-10-18 范围盘点与后续核验清单（状态更新至2026-10-19）
+
+本次范围锚定已合并的 main `b8d6e725686b7353db98082b6082a94f5b7c8afa`；注册修复分支另锚定 `37851ae8c020fdd5a52bd0232a4ef00861f01891`。下文“当前main”均指这个锚定快照，不实时追踪分支变化。不将尚未合并的归属转移分支新增测试混入 main 的完成率。
+
+以 JDK 21 的 `JavacTask.parse` 解析上述提交的全部 `src/test/java` 源文件（不解析依赖、不执行测试）：main 有 136 个 Java 源文件，其中 128 个类包含 591 个测试注解方法（565 个 `@Test`、14 个 `@ParameterizedTest`、12 个 `@TestFactory`）。另外 8 个源文件是无上述测试注解的辅助源码。注册分支同样为 128 类，仅 `RegistrationServiceTests` 由 2 个增加到 8 个，总注解方法为 597 个。这里是静态方法声明数，**不是运行次数、参数化/动态用例数、通过数或 C 覆盖数**。
+
+旧表的79类仍保留历史证据；本轮未重新核验它们当前增加或变更后的全部断言，因此不能把历史“覆盖73类”直接当作当前类的完整覆盖。当前main另有下列49类不在旧表中：前批说明4类框架/平台差异；连通性4类20方法、控制写入/会话/离线通知/指标4类8方法、HTTP流重置1类2方法、路由生命周期/失败关闭/NAT推送3类5方法、显式空快照/NAT大小与管理变更3类5方法先后补证；本节新增SQLite二进制列/真实约束2类8方法的候选对照，并逐方法说明Spring/JDBC异常转换1类4方法的平台差异，见相应新节。当前49=5类限定平台差异+17类候选覆盖（48个注解方法）+27类待核验；27也不包括旧79类的当前断言复核。候选类内仍有明确列出的框架API差异，48不是48个独立C运行场景。表中增量是待合并C分支的候选对照状态，不是main完成率；最终提交CI须另行核验。待核验不等于C没有相应能力，同名功能也不等于覆盖已成立。
+
+新增“无（平台差异）”只限定到说明的框架断言。不得将其扩展为存储完整性、唯一约束、并发/回滚或 HTTP 契约的豁免；尤其不能把所有 SQLite/MySQL/MariaDB 测试一律排除。关闭 #35 前仍须为当前全部参考断言补齐 C 证据或逐项的书面差异说明，并完成该 issue 的其他运行时及真实环境验收。
+
+下表方法数写单值时表示两个锚定提交相同；只有 `RegistrationServiceTests` 用“main／注册分支”分列。
+
+| 旧表外的 Java 测试类 | 注解方法（main／注册分支） | 当前对照状态 | 依据或剩余工作 |
+| --- | ---: | --- | --- |
+| `connectivity/HttpRouteConnectivityCheckRateTests` | 5 | 覆盖（参考5方法；候选） | 核心 `run_rate_events` 及三个边界函数保留；新增 `connectivity_rate_http_tests.c:parameters/events/capacity` 逐字段比较共享声明、回放全部17事件并核验完整HTTP响应及两条节流日志，再以实际10000键验证满表503/no-run、有效键不驱逐及到期恢复。不缩小容量、不增加运行时测试开关；新提交CI另验。 |
+| `connectivity/HttpRouteConnectivityCheckVectorTests` | 1 | 覆盖（行为；候选；日志框架差异见下） | `connectivity_http_vector_tests.c:replay/assert_http` 将38个向量逐一送入生产HTTP响应构造入口、真实JWT/SQLite与并发占位；共享 `assert_vector_response` 复用完整结果、探测/脚本、预算、元数据与日志断言。仅本类范围，非实网/跨NAT验收；本批CI须另验。`@TestFactory` 的一个声明不等于一个运行用例。 |
+| `connectivity/NatConnectivityProbeTests` | 7 | 覆盖（参考7方法；候选） | `connectivity_nat_test_cases.h` 的15个真实进程/socket场景及 `connectivity_nat_complete_cases.h` 的3个场景，对应分类全集、能力组合、103/600、断链、完整元数据/帧序列、真实10秒静默及同设备会话变化。另在进程内时钟偏差下重复3个完整场景；本地Linux CMake61/61、完整Make及正常18场景消毒器通过。包含本地600分类与单调超时修复，不外推跨NAT；精确新提交CI另验。 |
+| `database/MariaDbSchemaTests` | 4 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `database/MySqlColumnTypeTests` | 2 | 无（平台差异） | 两项均是 Hibernate `MySQLDialect` 的静态 DDL 类型/utf8mb4 行大小检查；C 只用 SQLite。C 自身的大对象保存与完整读回仍须由相应行为测试核验。 |
+| `database/PostgresSchemaMigrationTests` | 10 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `database/SortableTimestampMigratorTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `database/SpecusSqliteDialectTests` | 9 | 无（平台差异） | 九项检查 Hibernate/JDBC 异常转换、约束类别/名称及回退；C 直接调用 sqlite3，无该转换层。不豁免 C 的唯一约束、回滚、busy 或 HTTP 错误语义。 |
+| `database/SqliteConstraintTranslationTests` | 3 | 覆盖（行为及限定框架差异；候选） | `sqlite_reference_tests.c:media_unique/raw_constraints` 对生产媒体schema实际重复INSERT核验UNIQUE、table.column及原行保留，真实probe核验唯一约束。Dialect类身份与JPA/Spring异常包装仅作限定差异，不冒称C管理API状态、捕获竞争重试或业务事务回滚已测。 |
+| `database/SqliteDialectConfigurationTests` | 4 | 无（平台差异） | 四项检查 Spring/Hibernate dialect 替换和属性优先级；C 无此配置层。不代表 C 建表或迁移行为已覆盖。 |
+| `database/SqliteIdentityKeyMigratorTests` | 4 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `database/SqliteIdentityKeySchemaTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `database/SqliteIdentityKeyStartupRepairTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `database/SqliteLobColumnTests` | 5 | 覆盖（参考5方法及限定DDL/夹具差异；候选） | 同一新程序核验实际4个BLOB列和TEXT预览、18字节NUL/非UTF-8 PNG的完整存储及管理列表/详情、旧NULL正文回退、TCP精确payload、两diagram版本的集合和快照；JDBC描述符、Java预览DDL及ticket CLOB差异逐项说明。不当作监听socket、全量采集门控、大容量或升级迁移验收。 |
+| `database/SqliteSchemaMetadataConfigurationTests` | 3 | 无（平台差异） | 三项仅检查 Hibernate 元数据提取策略与显式覆盖，不执行迁移；C 无此元数据层。SQLite 启动、升级、重启测试仍须另行对照。 |
+| `database/SqliteSchemaUpdateRestartTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `database/SqliteSqlExceptionTranslatorTests` | 4 | 无（平台差异） | 四方法的Spring/JDBC转换器、异常类和非SQLite SQLState回退在C无对应API；原生UNIQUE/PRIMARYKEY/NOTNULL与错误文本由 `raw_constraints` 真实核验，另验证C storage查询错误-1与成功无记录0/found=0及恢复。不豁免数据库完整性，也不证明MySQL/PostgreSQL支持。 |
+| `database/SqliteUniqueIndexMigratorTests` | 7 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `database/SqliteUniqueIndexStartupTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `handler/ManagedLoginLogoutPushTests` | 3 | 覆盖（行为及限定调用层差异；候选） | `session_reference_tests.c:pair_scenario` 的mode0/1/2，真实注册表在线状态、实际离线roster发送、数据关闭不下线及替换后最终关闭恰好一次；C的替换保护位于logout helper内部，不等同于Java handler从不调用mock，详见新节。 |
+| `handler/ManagedLoginProductMetricsTests` | 1 | 覆盖（行为及限定API差异；候选） | `session_reference_tests.c:metrics_scenario` 经真实用户/凭证/连接验证非默认tenant及owner、固定client_online、一次control回调、data无新增与真实落库；C直接调用通用原语而非Java clientOnline包装方法，详见新节。 |
+| `http/HttpRouteLifecycleVectorTests` | 1 | 覆盖（共享9场景；候选） | `http_route_lifecycle_tests.c` 以真实REST凭证/HTTP认证重放全部9个共享server场景，核验完整推送路由集、HTTP/WS拒绝、重连/改名/旧token及实际双EOF；原C-only场景保留。工厂声明不是场景执行数，本批精确提交CI另验。 |
+| `http/HttpShareHttpTests` | 8 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `http/HttpShareVectorTests` | 11 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `http/HttpSpecusControllerFailClosedTests` | 2 | 覆盖（参考2方法；候选） | 路由套件新增直接删库中保护路由及直接禁用客户端的2个真实场景，旧control/data始终可心跳；有效转发正控后验证404/no-store、拒绝请求在有序心跳屏障内零NAT帧，不把管理踢线当失败关闭前提。 |
+| `http/HttpSpecusControllerStreamResetTests` | 2 | 覆盖（行为及既定错误信封差异；候选） | `http_log_reason_reference_tests.c` 逐字比较Java的控制字符/NUL、null及256码点截断预期；`http_reset_reason_reference_tests.c:reset_reason_case` 的3个真实进程/socket场景验证固定公网502、完整安全诊断落库、请求字段及零上游响应字节，并在原连接继续HTTP/TCP。不是另外三个HTTP类的完整对照，精确新提交CI另验。 |
+| `http/NatControlPushFailureVectorTests` | 2 | 覆盖（行为及限定夹具差异；候选） | 保留容量套件全部7步超限配置回放，补JSON error及首条路由列表断言；新增Linux `nat_push_reference_tests.c` 实际4步写失败，核验真实发送锁入口、内核RST、失败回调、201/409/409/204及同一route持久化。C逐步重绑同一HTTP token的control，不冒称Java同一失败通道或每步NAT字节写入内核，详见新节。 |
+| `management/controller/HttpRouteConnectivityCheckResourceTests` | 7 | 覆盖（参考7方法；候选） | `connectivity_http_resource_tests.c` 补齐34种无效body、12种有效请求、完整离线/404/401/503/429响应及SQLite路由访问顺序观察；`connectivity_resource_wire_tests.c` 用真实进程/socket及生产会话表验证owner/admin离线完整结果。另修复并验证9个ASCII Long-ID边界；不扩张为全部数字字符、URL解码或跨NAT验收。 |
+| `management/controller/ManagementAccountsHttpTests` | 8 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `management/controller/WorkbenchCascadeTests` | 6 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `management/controller/WorkbenchConcurrentWriteTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `management/controller/WorkbenchResourceTests` | 7 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `management/controller/WorkbenchVectorTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `management/service/HttpMediaCaptureSqliteRaceTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `management/service/HttpMediaCaptureSqliteTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `management/service/HttpShareServiceRouteLockTests` | 6 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `management/service/NatControlServiceHttpRoutesTests` | 2 | 覆盖（参考2方法；候选） | 原路由套件在线删除/离线删除后复用token重连场景明确验证HTTP数组；新增 `explicit_empty_tcp_snapshot` 同时要求TCP数组存在且为空，缺失/null/对象/非空均拒绝。不是仅凭空route数量推断登录快照。 |
+| `management/service/NatControlSizeLimitHttpTests` | 1 | 覆盖（共享14步；候选） | `nat_sizing_reference_tests.c:sizing_management_steps` 在真实服务端逐步回放原14个HTTP操作，命中精确1MiB边界，6次400解析error并比较两配置表全部行/类型/字段/时间戳；接受的ID与字段另读回，每步实际生成的启用配置均符合预留上限。设置及填充差异见下。 |
+| `management/service/NatControlSizingVectorTests` | 2 | 覆盖（参考2方法；候选；名称仅限编码层） | 同一新程序以生产JSON构造和管理入口共用计算核验5个精确J/body/fits值及varint边界；6类参考名称经真实JSON/compact编码并解码回原值、实际body不超过预留。未据此验收C公共改名、存储或登录对长名称的接受范围。 |
+| `management/service/RegistrationServiceTests` | 2／8 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `management/service/SortableTimestampOrderingTests` | 7 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `management/service/TransferExpiryOrderingTests` | 3 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `management/service/WorkbenchItemWriterTests` | 3 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `productmetrics/ProductMetricsModelTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `productmetrics/ProductMetricsSweepTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `productmetrics/ProductMetricsVectorTests` | 3 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `productmetrics/ProductMetricsWritePathTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `server/ControlWriteFailureTests` | 2 | 覆盖（行为及限定Future API差异；候选） | `control_write_reference_tests.c` 将真实半帧写入socketpair后注入失败，验证关断及后续零字节；另以实际send锁竞争及字节比对验证半帧期间不插队、释放后两整帧。C无调用者可取消的Future；不声称覆盖pthread_cancel。 |
+| `session/SessionUtilTests` | 2 | 覆盖（参考2方法；候选） | `session_reference_tests.c:pair_scenario` 的mode0/1：当前control关闭带走data；按旧客户端端口识别并暂停真实旧EOF，绑定并验证新control/data后释放旧清理，新连接保持存活与在线。 |
+
+## 连通性检查的逐方法对照（本轮增量）
+
+本节初次逐方法核对基于注册分支 `dbccd2fdfed6e46791594c0182b1e52fecad708f` 的 Java/C 源码；它是上方 `37851ae8c020fdd5a52bd0232a4ef00861f01891` 的直接后继，只修改本清单，两者的相关 Java/C 源码相同。首批提交 `fee457f` 只给 `tests/connectivity_check_tests.c` 增加断言，Java方法和C生产实现未改；后续生产修复、核心向量及HTTP补证分别单列。下列未标为增量的HTTP响应构造入口和NAT证据来自原基线，不冒充新增用例。四个类共20个注解方法，属于上面49类中的4类；Vector、Resource、Rate、NAT依次补证后均列为参考行为的候选覆盖，不另计为20个测试类，也不等于#35全部验收。
+
+C的 `test_connectivity_check_endpoint` 调用 `st_admin_build_response_with_auth`，经过生产响应构造、JWT与SQLite，但不经过监听socket；Java的对应资源测试使用MockMvc，也不是实网HTTP。`connectivity_check_tests.c` 的假设备通过注入presence、probe、单调时钟和日志回调驱动核心检查器，不是真实设备。下列 `nat_stream_tests` 场景使用真实进程/socket；相关的 `session_lifecycle_tests` 也有真实进程/socket场景，但不能由此推定已覆盖全部探测链路状态。
+
+首批限流补证的本地 WSL Ubuntu 24.04 焦点可执行程序以 `-O2 -Wall -Wextra -Wpedantic -Werror` 构建并运行通过；ASan/UBSan版本也已实际执行同一组焦点用例，退出码0、无消毒器报告。两版均执行原38个状态向量、原 `rate.events` 与请求规则，加上三个边界回归。受测输入是 `fee457f` 的 `tests/connectivity_check_tests.c` 与未变的 `src/connectivity_check.c`、`src/json.c`，使用仓库共享向量、OpenSSL和pthread；消毒器版本改用 `-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer`。本段限流焦点结果不替代后续生产修复的新提交CI，也不表示整个服务端经过消毒器验证。
+
+键表用实际10000键容量，未缩小上限。两个隔离负对照分别注入“拒绝消耗用户额度”和“满表驱逐尚有效键”，注入缺陷后的测试均按预期失败。旧测试在满表驱逐缺陷下仍退出0，而新增容量断言能令其失败；扣额缺陷也触发原事件断言，因此不把两个负对照都称为只有新增断言才能发现。这不表示正常实现测试失败，也不证明其他回归均已排除。此处不声称已重跑本轮全部CMake测试、完整HTTP/NAT矩阵或跨NAT真机验收。关闭#35的完整范围应同时核对该issue及[跨语言对齐计划](../cross-language-java-alignment-plan.md)，不能只检查本节。
+
+| Java 方法 | C证据 | 已核验范围 | 剩余缺口或差异 |
+| --- | --- | --- | --- |
+| `HttpRouteConnectivityCheckRateTests.rateEventsReplayThroughTheLimiter` | 核心 `run_rate_events`；新增 `parameters` | 共享事件的接纳、拒绝状态、code、limitedBy、Retry-After保留；向量algorithm必须为gcra，perRoute/perUser的intervalMs/burst逐字段与生产共用编译常量比较 | 对应参考声明与事件断言，不是GCRA算法的形式证明；常量仅搬到头文件、数值未改 |
+| `rateEventsReplayThroughTheEndpoint` | 新增 `connectivity_rate_http_tests.c:events`；原核心回放保留 | 全部17事件按原顺序，经真实JWT/SQLite及生产HTTP响应构造入口；逐项完整body、状态、精确Cache-Control: private, no-store、Retry-After、Content-Type/Length，非零时钟起点123456789ms，精确两条t1/alice及admin拒绝日志、后续拒绝不重复记录；拒绝不执行连通性检查的presence/probe | 与Java MockMvc一样不经过监听socket；离线假设备、固定墙钟不是实网NAT。日志框架差异见Vector行及HTTP向量段，仅限级别注册 |
+| `aRefusalConsumesNeitherKey` | 核心 `run_refusal_consumes_neither_key` | 路由拒绝20次不消耗另一用户的10次预算；因用户额度耗尽而拒绝的请求也不消耗其所请求路由的额度 | 本方法核心限额断言对应；不冒称这组核心调用也经过HTTP |
+| `aFullKeyTableRefusesNewKeysWithoutEvictingLiveOnes` | 核心 `run_full_key_table_boundaries`；新增HTTP `capacity` | 实际10000键满表拒新键、不驱逐有效键；10秒路由键过期但用户键表仍满，30秒后可接纳；HTTP层另验证完整响应及无运行 | 沿用实际生产容量，未使用缩小键表或私有检查器访问 |
+| `aFullKeyTableIsCheckBusy` | 核心 `run_full_key_table_is_busy`；新增HTTP `capacity` | 以10000次进程内生产HTTP响应构造调用实际准入、填满路由/用户键表后，新键得到完整503 CHECK_BUSY、Retry-After1及private no-store，presence/完成日志不增加、零探测 | Java该HTTP方法构造容量2的测试限流器；C不用对应测试构造器，而在生产10000容量下核验同一语义，不经过监听socket |
+| `HttpRouteConnectivityCheckVectorTests.everyCaseOfTheSharedVector` | `connectivity_http_vector_tests.c:replay/assert_http`；共享 `assert_vector_response`；核心 `run_case/run_vector_admission_constants` | 全部38个向量经生产HTTP响应构造入口、真实JWT/SQLite，逐一核验状态、完整有序body、Cache-Control、Content-Type、Retry-After及401无code；32个200结果的固定checkedAt、元数据/探测/脚本/预算/完整日志断言同核心版本；6个拒绝零探测/零完成日志；真实线程占住1个同路由或全部32个进程槽位，释放后所有占位请求200 | Java的Logback INFO级别在C字符串日志回调中没有同一框架概念，书面差异仅限级别注册；完整字段与一次完成日志未豁免。与Java MockMvc一样不经过监听socket，假设备不等于真实NAT；工厂声明、行为及框架差异已逐项对应，不据此证明另外3类；Resource后续补证见下 |
+| `NatConnectivityProbeTests.everyClassifiedResetOfACapableSessionReachesTheCheck` | 新增 `run_nat_parity_cases/parity_reset/parity_result/parity_member_count`；原向量/单分类场景保留 | 共享rstFailures的键全集/条数与8个已知分类名字对应，逐个通过真实进程/socket，精确outcome/stoppedAt/code/HEAD与DEVICE_ONLINE断言、reason不泄露；实际OPEN后空FIN，客户端RST后不再收到该流RST/WINDOW_UPDATE，以同连接心跳作屏障 | 额外添加第9个声明键时原15场景程序仍退出0，新全集断言退出1；这是输入完整性对照，不是新增生产缺陷。本地最终整批回归见下，精确新提交CI另验 |
+| `aResetIsUnverifiedWithoutTheCapabilityOrWithAnUnknownFailure` | 新增 `parity_reset` 的legacy/unknown/absent三个真实场景；原核心向量保留 | 未声明能力的connect-refused、已声明能力的未知failure及缺省failure均精确TARGET_UNVERIFIED/unverified/target-reachable、HEAD、无statusClass；客户端RST后无多余回包，数据通道还能服务HTTP/TCP | 行为候选补证；最终本地结果见下，精确新提交CI另验，不外推跨NAT |
+| `theProbeOpensAFixedRequestAndTheHeadEndsIt` | 新增 `complete_fallback/complete_open/complete_reset`；原迟到帧及FIN结束测试保留 | HEAD OPEN/空FIN/RST、不同流ID的GET OPEN/空FIN严格顺序；完整有序metadata、32位小写hex requestId、固定头与空query；GET204+FIN后无RST；已结束HEAD/GET迟到帧逐帧无回复且同连接可继续服务 | FIN已读的确定性通过既有测试等待机制新增get模式，仅等待GET、同一预算；生产默认关闭，Java用EmbeddedChannel同步脚本，两者的调度方式不同，见下 |
+| `aSilentDeviceIsResetWhenTheTimeIsUp` | 新增 `complete_silence/complete_long_http`；原预算向量保留 | 真实静默设备收到OPEN/空FIN，实际等待约10秒收到对应RST；完整TARGET_TIMEOUT结果、totalMs10000；之后迟到响应头静默、连接可继续HTTP/TCP | Java直接exchange用30ms，C经真实API保留10000ms预算；新测试用12秒HTTP观察窗及9900ms最小等待检查，原5秒辅助入口和420秒NAT门禁不改，不是缩短协议超时 |
+| `aDataConnectionThatClosesIsALostLink` | 新增 `parity_closed_link`；原link-lost向量保留 | 实际读到OPEN/空FIN后关闭data，精确DEVICE_LINK_LOST/device-online/failed、HEAD、无statusClass且不泄露reason；control保持，重新绑定data后仍能服务 | 真实进程/socket候选，不是仅由假probe返回LINK_LOST |
+| `aHeadOutsideTheStatusRangeIsAProtocolError` | 新增 `parity_bad_status` 的103、600及额外legacy600场景 | 实际响应OPEN分别携带103/600，精确TARGET_PROTOCOL_ERROR、DEVICE_ONLINE及无statusClass；同通道仍能服务；复现并修正600被误报为DEVICE_LINK_LOST，未提高对旧客户端RST分类的信任 | 一处真实生产偏差，两个600回归场景不是两个缺陷；最终新提交CI另验 |
+| `theLinkFollowsTheSessionTable` | 新增 `complete_sessions/complete_session_exchange/complete_offline` | 同一client依次无连接→control-only→data v0→未绑定新HTTP会话v1但旧data仍v0→绑定新data v1→data关闭→control关闭；结果逐阶段对应，关闭后以实际EOF而非固定sleep为屏障 | Java直接更新测试capability缓存；C通过真实HTTP认证/重绑定驱动。用7个路由避开同一路由限流，仍是同一client，不重置生产限流器；不豁免会话所属能力语义 |
+| `HttpRouteConnectivityCheckResourceTests.aVisibleRouteOfAnOfflineClientIsCheckedAndStopsAtTheDevice` | `resource_scenario` 0/1及 `connectivity_resource_wire_tests` | owner/admin各自完整有序body、checkedAt、无Retry-After及私有缓存；构造入口用固定时钟与离线回调，另由两个真实进程/socket场景验证生产会话表的离线结果和真实UTC时间格式；目标/path不泄露 | 对应本参考方法；在线探测和会话变化由NAT类另行补证，本行不代替跨NAT真实环境验收 |
+| `anUnknownRouteAndARouteTheCallerCannotSeeAnswerTheSame404` | `resource_scenario` 2 | 未知、他人、他租户，以及abc/0/-7/溢出ID共7种响应，精确同一404 body、private no-store、无Retry-After | 本方法对应；另有9个ASCII Long-ID边界，不据此声称所有Unicode数字或URL解码规则已对齐 |
+| `withoutAManagementSessionTheAnswerIs401` | `resource_scenario` 3、`positive_observer_control` | 无token严格生产响应入口401、框架JSON无code、private no-store、零探测/完成日志；SQLite观察器验证零路由表访问，随后有效请求作为观察器正控 | 对应不访问路由记录的行为；观察的是C真实SQL访问，不是虚构Java仓库方法调用 |
+| `invalidBodiesAndPathsAre400BeforeTheRouteIsLookedUp` | `invalid_corpus/invalid_body` | 全部34种Java无效body/path经未知route999回放，逐个400精确body与响应头、零路由表访问/探测/完成日志；正常请求正控验证观察器确实看得到路由访问 | 本方法对应；不只用未知route的400代替顺序观察 |
+| `validBodiesAndPathsAreChecked` | `resource_scenario` 5–16 | 12种Java有效请求各用新进程/检查器，包括无body、空白、空对象、转义/保留字符、256字节路径边界、text/plain及省略Content-Type；逐一完整DEVICE_OFFLINE结果 | 有效请求用真实JWT和生产响应构造；假离线回调的边界由前述真实进程/socket离线补证限定 |
+| `unreadableRecordsAre503NotNotConfigured` | `resource_scenario` 17；先前HTTP向量configReadable=false | 破坏路由表结构但保留用户表可读，真实JWT正常认证；完整503 CHECK_UNAVAILABLE、Retry-After1、private no-store、零探测/完成日志 | 本参考方法对应；不是把认证库不可读当作路由库错误 |
+| `theSameRouteIsRateLimitedForEveryCaller` | `resource_scenario` 18 | owner完整离线200后，同租户admin得到完整429 CHECK_RATE_LIMITED、Retry-After10及private no-store；两者共享同一检查器和路由 | 本方法对应；Rate类逐事件HTTP及实际满键表503另由后续增量补证，不混算本场景 |
+
+### 生产修复 `3d9af54`：已结束探测的迟到帧
+
+`fee457f` 基线确有行为差异：Java丢弃已结束探测的迟到响应，C的原测试却要求迟到DATA得到RST7。该差异不是平台豁免。[连通性检查契约](../../../protocol/spec/service-connectivity-check.md)第5节要求丢弃在途响应DATA、不回WINDOW_UPDATE；Java `abandonHttpStream` 及本类测试另明确丢弃迟到OPEN/DATA/FIN/RST，不回任何帧。
+
+本增量修改C `main.c`：结束决定在发送RST之前生效，pending尚未移除时也不再接收探测响应；移除后在每条数据连接中用独立的1024条有界历史记录已结束探测，不与该连接普通流的1024条历史争用。探测自己的历史满后按原有有界结构淘汰最旧项；被淘汰的极迟到帧回到现有未知/最近关闭流规则，不保证无限期静默，这与Java的有界历史一致。四个流ID分配路径都先清除两类历史，避免复用ID仍被当成旧探测。普通未知流DATA/FIN的RST7、未知OPEN的RST8、从未打开流的RST断开连接及窗口溢出检查没有被全局静默化。
+
+新增socket回归对迟到DATA、DATA|END_STREAM、FIN、RST和响应OPEN逐帧检查：每发一个迟到帧，再在同一有序数据连接发送心跳；收到该次心跳响应前，不得收到该流的任何NAT帧（不只是没有RST，也包括没有WINDOW_UPDATE）。该连接的读循环先同步分派前面的NAT帧再处理心跳，测试没有并发发送其他心跳；这是处理屏障，不是等待任意固定延时后推断静默。随后在原数据连接完成新的HTTP请求（状态200且body为`served`），以及TCP DATA转送与RST关闭，证明仍可服务，不只是socket未关闭。覆盖被RST结束的HEAD/GET及已由FIN结束的探测；另对1025条普通未知流逐条断言RST7，再确认原探测仍静默。独立的私有状态检查验证1024条自身上限、复用清理和pending到历史的交接；它不是实网强制复用32位ID的验收。
+
+同一新增socket测试对未修复基线在首个迟到DATA处失败；仅把探测查询错误改为共用普通流历史的负对照，在1025条普通流更替之后失败。私有状态检查也能检出故意不清除复用ID的缺陷。这些证据只接受本增量的已结束探测行为，不补足本表其他分类、预算、元数据、断链、HTTP入口或跨NAT真机缺口。首次完整本地CMake因导出准备问题为48/56（7项脚本CRLF、1项缺静态资源），原日志保留；重新按Linux行尾导出并补齐静态资源后，同一生产候选完整CMake为56/56、零跳过，完整Make也通过且保留600秒限制。两次导出的C生产和测试源码规范化行尾后相同，不把测试准备差异说成源码修复。该本地结果不是新提交CI；最终提交、测试树及原始CI产物由[PR #290进度记录](https://github.com/devShuai/specus/pull/290)逐批绑定核验，不借用旧提交绿灯。
+
+### 后续增量：核心向量的请求参数与时钟断言
+
+本批以 `3d9af54b580ba3201770ea0e9a4c554a4b7334ab`（树 `6e2fd97958c0b96fa5aa92c856f8661003348dc2`）为源码基线，只补 `connectivity_check_tests.c` 与本清单，不修改C生产实现、Java参考、共享向量或工作流。本批受测测试文件Git blob为 `d1d4b79529ea95226095b35438ebd1c73ff1f200`；最终提交会绑定该文件，而不在本文写入自引用的文档提交SHA。38个向量中32个为200结果、6个为拒绝；不是新增38个类或Java方法，也不是新增实网请求数。200表示检查结果成功返回，可能在设备离线等阶段零探测；每条向量的具体探测次数由requests决定。
+
+核心回放采用与Java参考相同的单调时钟起点7000000ms、`t1`租户、`api`路由和`/healthz`路径。每个探测记录实际timeout参数，逐项比较HEAD为10000ms、GET为10000减HEAD的atMs（脚本相对本次检查开始的毫秒数），并要求实际探测数、脚本答案数、已消耗答案数与向量requests数全部相等。元数据固定键顺序为 `source, phase, requestId, method, route, relativePath, rawQuery, headers`，值分别为http/request、生成的ID、对应HEAD或GET、api、/healthz、空query及精确有序的两个Accept/User-Agent头；requestId另验证32位小写十六进制。沿用生产的RAND_bytes及原回退，不替换随机字节来源，本批只验证ID格式，不证明随机性或唯一性。额外字段、头或请求不会被只查子串的旧断言放过。这里核验的是核心传给设备回调的预算参数与状态决策，不是实际NAT设备耗时或超时回收验收。
+
+在本批WSL Ubuntu24.04构建中，只有connectivity测试可执行程序自行定义libc `time` 符号，固定为 `2026-10-06T08:00:00Z`，验证完整checkedAt；该进程内解析time符号的调用会使用此固定值，没有为生产增加墙钟注入接口，其他测试可执行程序与服务端均未链接该定义。每个200要求恰好一条完整日志，逐字段比较outcome/stage/code/totalMs并禁止路径/目标泄露；拒绝要求无完成日志和零探测。工厂的预算声明与C公开常量比较，并顺序占用名额验证每路由1个、每进程32个的实际准入边界；这不是多线程/多实例并发证明。
+
+正常焦点版本与ASan/UBSan版本均实际执行38个向量、原限流/请求规则及新增工厂边界并通过，消毒器无报告；本批还完整运行CMake56/56、零跳过和Make（保留600秒限制）。CMake与Make产物的符号检查均确认：仅connectivity测试程序定义time，服务端仍从libc导入time。七个隔离生产缺陷变体分别为GET仍给10000ms而非剩余预算、额外空trailerNames、requestId首字符改为G、日志totalMs加1、结果算完后额外发GET、耗时错误使用绝对单调时间、墙钟偏移1秒；同一变体在旧测试全部退出0，在增强测试全部退出1，对应原始失败断言及输入对照由PR进度记录保留。它们只证明对应断言的检错能力，不代表所有错误已排除；变体不进入提交，七个变体未宣称都经过消毒器，焦点消毒器结果不冒充整个服务端消毒器验收。在该核心断言批次结束时，逐向量HTTP入口和响应头仍有缺口，所以当时四类仍为“部分”；后续HTTP补证见下一节，#35仍继续开放。本节记录本批已核验的本地结果；最终提交CI是否收齐并通过，须按PR #290所列该精确提交/测试树/运行产物另行核验，不借用 `3d9af54` 的CI结果接受本批。
+
+### 后续增量：共享向量经过生产HTTP入口
+
+本批源码基线为 `75f09b059294cca4f1efe163f406297babd5dd59`（树 `1e46ab2180c7b3bea6584514dd7a718c0a02c40d`）。新增 `connectivity_http_vector_tests.c`，把核心回放的设备脚本和结果断言抽到测试专用 `connectivity_check_test_support.h`，两层复用同一套完整比较；原限流事件、三个边界、请求规则和工厂断言保留。测试专用固定time移到 `connectivity_test_clock.c`，只链接核心及HTTP向量两个可执行程序；不修改生产实现、Java参考、共享向量、工作流或运行门禁。共享JSON压紧辅助函数同时加容量/转义边界拒绝与微型回归，不以截断结果作通过依据。
+
+每个向量使用独立子进程、SQLite文件和一次设置的生产检查器，避免跨用例状态泄漏或增加生产重置接口。调用 `st_admin_build_response_with_auth`，正常请求使用真实签发的Bearer JWT并由用户表重新解析账号；routeId42、t1/alice、api及健康路径与Java相同。不可见路由实际归其他用户；读库失败只破坏路由表结构，保留用户表，因此503不是认证失败冒充的结果。逐响应检查唯一且精确的Cache-Control、Retry-After、Content-Type及Content-Length；401读取真实框架JSON，明确验证无顶层code后才归一为核心401表示，不丢弃未经验证的响应体。200的完整字段顺序、阶段顺序、状态、固定checkedAt、元数据、预算、脚本耗尽及日志字符串/条数仍由共享断言逐一比较；32个200结果不等于32个探测或实网请求。
+
+route-in-progress由真实线程在生产HTTP入口占住42号路由；server-busy用32个不同真实用户/路由同时占住全部进程槽位。测试等待实际probe回调全部阻塞后才发送目标请求，不直接调用admit伪造占位；等待及释放完成仍各受原10秒界限约束，释放并join后逐个验证占位请求200。目标请求结束后停止捕获日志，再释放占位请求，避免把它们的完成日志算作目标日志。子进程正常exit，使ASan/UBSan及退出时泄漏检查有机会执行；没有关闭泄漏检查。C的日志回调不携带Java Logback的INFO注册级别；仅此框架概念书面记差异，不豁免日志字段、次数或脱敏。该证据对应Vector类的行为断言，不代表监听socket、真实设备时钟/网络、跨NAT或另外三个连通性类已覆盖；这是该HTTP向量批次的范围，Resource后续补证另列如下。
+
+本批本地验证和负对照的最终结果由PR #290按精确输入另行列明；不使用75f或3d9的CI作为新批次CI。隔离负对照分别修改HTTP缓存头、重试秒数、路由可见性及实际前置401响应；核心回放均仍退出0，新HTTP回放均退出1并保留对应失败断言。最初修改内部401分支的变体没有命中前置鉴权路径，核心/HTTP均退出0；这个未命中结果也保留，不计入上述四个成功负对照。负对照源码不进入提交，也不声称全部变体经过消毒器。本批不合并main、不关闭#35、不发版或更新Homebrew；41类待对照及旧79类当前断言复核仍未完成。
+
+### 后续增量：资源类请求语料、SQL访问顺序与真实离线接入
+
+本批基于 `6b4a140f081f37736c6ce292ec02bb81204c6de5`（树 `63b1556e9e1eb03f837f622eebf9bc3de0c9845f`），完整阅读同一Java资源类的7个测试方法后补证。新增 `connectivity_http_resource_tests.c` 与 `connectivity_resource_wire_tests.c`，将HTTP夹具/响应头辅助函数抽到测试专用 `connectivity_http_test_support.h`。前者接入原HTTP向量可执行程序，原38向量和核心限流/请求规则仍执行；不是新增Java类或方法。28个独立子进程场景包括参考7方法对应的19个场景和额外9个ASCII ID边界；一个场景可能回放多个请求，不能把28当请求总数。34种无效body及12种有效请求完整沿用Java语料，不另造更容易通过的子集。
+
+
+为防止复制转义后得到“另一种同样无效的输入”，另由JDK21求值参考类中的原始语料表达式，并在测试链接时包装C生产响应构造函数、记录实际收到的UTF-8 body及Content-Type后原样转调。34种无效body按多重集逐字节相等（不声称回放顺序相同），12种有效请求按顺序逐字节比较body与内容类型；无body的NULL与空串仅归一为零字节。此私有核对不修改候选源码、不捕获Bearer，也不是重跑Spring/Java资源测试。候选最终完整CMake58/58、零跳过，完整Make保留600秒限制通过；焦点消毒器结果和新提交CI仍须按精确输入另验，不把该本地结果当新CI。
+
+每个场景使用真实SQLite与生产响应构造入口；有认证场景使用签发JWT并重新解析真实用户角色/租户，未登录场景不发送token。未登录场景使用无默认管理员的严格 `with_auth` 入口；带真实Bearer的内容类型场景使用 `with_content`。首轮曾误用 `with_content(NULL认证)` 的旧辅助入口，得到默认管理员的404，失败记录保留；源码核对表明实际socket入口始终关闭该回退，因此未把夹具错误宣称为线上鉴权绕过，也未改生产鉴权政策。
+
+SQL访问顺序由测试进程通过SQLite的auto-extension给每个新连接安装authorizer观察，在夹具建立完成后注册；authorizer不按动作编号过滤，只要参数1或2精确等于http_route_mapping就计数，观察全部命名路由表的动作；不改变其允许/拒绝结果，不增加生产注入接口。无认证场景在调用前为0，34种无效请求分别在调用前清零、返回后逐个要求路由动作计数为0，并要求无探测/完成日志；随后同一观察器下发有效请求，必须看到连接和路由访问，防止把失效观察器的零值当成功。另将观察器故意断开的私有测试变体确实失败。这个零访问结论仅限所测入口、语料和调用观察窗口。仅返回400不足以证明顺序：另一个隔离生产变体在请求解析前偷偷查路由再丢弃结果，原38个HTTP向量仍退出0，新增资源回放因观察到访问而退出1。另一个隔离生产变体在未认证请求返回401前偷偷查路由，原38向量仍退出0，新增资源回放在无认证场景退出1。两个提前读取变体的响应码仍可正确，失败来自新增SQL观察断言，不把它们与失效观察器这个测试夹具变体混为一类。观察证据是C数据库交互，不冒称Java mock仓库调用；它不证明无认证请求完全不读任何表，正常Bearer解析本就需要读用户表。
+
+构造入口为确定性结果注入离线presence与时钟；为覆盖Java资源参考使用真实NAT探测器时的离线接入，另启动两个真实服务端进程，分别以owner及同租户admin经loopback HTTP请求。没有设备连接，不替换生产会话表/presence或生产时钟；逐个核验完整离线body、真实UTC checkedAt格式、private no-store、无Retry-After及目标/path脱敏。这只补真实离线接入，不代表在线设备、数据通道变化、NAT帧分类或跨NAT验收。
+
+扩展检查还复现生产差异：旧C解析器把路由ID限制在18位，会把SQLite中实际存在的 `9223372036854775807` 误报404；Java参考使用 `Long.parseLong`。本批只修改 `src/connectivity_check.c` 的ID解析，按LLONG_MAX逐位检查溢出，允许正号和前导零，仍拒绝溢出、空正号、空白、重复正号和非正ID。9个ASCII输入在JDK21解析探针与C HTTP场景逐项对应；旧生产输入在合法最大ID处失败、修复后通过的原日志保留。该证据不声称覆盖Long.parseLong所有Unicode数字字符或URL解码差异。Java参考、共享向量、工作流和既有运行门禁未修改；最终完整本地验证与新提交CI须由PR #290按本批精确输入列明，不借用6b4或75f的结果。
+
+Resource批次结束时只完成该类参考7方法的候选对照，并修复上述ASCII ID边界；当时Rate与NAT两类仍部分。后续Rate补证如下；41类待对照及旧79类当前断言复核仍未完成，不合并main、不关闭#35、不发版或更新Homebrew。
+
+### 后续增量：Rate参数声明、逐事件HTTP与实际满键表
+
+本批基于 `bf51ca333b08d9de70708a6c3ef9e2c096ee9e57`（树 `91cbfa907e89dfdcd3a9bf5e662b946940595d52`），补齐Rate类5个参考方法的上述缺口。生产改动只把原有五个固定限流宏从 `connectivity_check.c` 搬到头文件供实现与测试共用，数值仍为路由10000ms/1、用户30000ms/10、每表10000键；没有运行时调参、重置接口、较小容量或检查器内部访问。相同编译环境下，搬移前后整个检查器 `-E -P` 预处理输出逐字节相等（SHA256 `6cb38ece84285f891bd77ecdfdc7c6f7f4035069352011393a6f25f80c822723`），不宣称本批修复限流算法。Java参考、共享向量、工作流及原门禁均未修改；Make补头文件依赖，避免已有对象漏编译。
+
+新增独立 `connectivity_rate_http_tests.c` 可执行程序，保留原核心/HTTP38/Resource/真实socket测试。`parameters` 比较共享算法字面量及四个字段与生产常量；`events` 在一个检查器内按原顺序回放全部17事件，使用Java相同的非零单调起点123456789ms及t1租户。每次通过真实签名JWT、用户表重新解析和生产HTTP响应构造入口，核验完整响应body与私有缓存/重试等头；接纳离线请求的presence与完成日志必须增加，拒绝则不增加、始终零探测。最终精确比较两条拒绝日志及其顺序，检查同一分钟后续拒绝保持安静。本批只为新增Rate程序添加固定time链接；构建中合计核心、HTTP向量、Rate三个程序定义time，服务端与真实socket测试仍导入libc time。它们都不是实际设备/网络时钟测试。
+
+`capacity` 仅把SQLite夹具写入批成一个事务以控制准备成本，不改变生产初始化、认证或路由读取。随后在进程内生产HTTP响应构造入口真正准入10000个不同路由/用户请求，逐个验证完整离线响应，而不是直接填限流器。新键在+1ms得到503 CHECK_BUSY/Retry-After1且不执行连通性检查；旧有效键仍429/Retry-After10；+10000ms路由键到期但用户表仍满，仍503且不执行连通性检查；+30000ms成功恢复。所有边界同时核验完整body、精确Cache-Control: private, no-store与presence/完成日志计数。“不执行检查”不表示免除JWT认证或用户/路由读取。这比Java该HTTP方法的容量2测试构造器使用更大真实容量，但只对应相同满表语义，不声称负载性能或实网验收。
+
+五个隔离输入变体分别把向量algorithm从gcra改为fixed-window、路由interval从10000改为10001、路由burst从1改为2、用户interval从30000改为30001、用户burst从10改为11，每次只改一字段；原核心回放均退出0，新增参数断言均退出1。这些是声明一致性负对照，不叫生产缺陷。另两个隔离生产变体分别只把Retry-After20写成19、把日志节流错误改为与绝对时钟比较；同一变体下原bf51 HTTP38+Resource回放均退出0，新增Rate事件回放均退出1。两类对照的旧测试比较口径不同，不能混称七个生产缺陷或所有旧测试都检不出。变体不进入候选，也不声称都经过消毒器；它们只证明对应断言能发现相应错误。最终提交的PR进度记录绑定该批冻结文件及这些原始通过/失败日志，本文不嵌入本机临时路径或自引用提交SHA。
+
+本批完整本地CMake59/59、零跳过及Make（原600秒限制）通过；焦点ASan/UBSan实际运行核心、HTTP向量/Resource和新增Rate三个程序，含实际10000键，3/3通过、无报告，退出时泄漏检查未关闭。消毒器范围不含真实socket程序或全服务端。新增Rate的CTest上限120秒、子进程110秒；不放宽任何既有门禁。本地结果不等于新提交CI，最终精确提交/测试树/原始运行仍须由PR #290独立核验，不借用bf51绿灯。
+
+Rate批次结束时，四类连通性中Vector、Resource、Rate三类为候选覆盖，NAT仍部分；后续NAT增量见下。这不是对下方旧79类历史标签的重新评估。41类待对照、旧79类当前断言复核及#35其他运行时/真实环境验收仍未完成。本批不合并main、不关闭#35、不发版、不更新Homebrew。
+
+### 后续增量：NAT七方法的真实帧接入与时钟回归
+
+本批以 `d3bed42ac13350e1a0637d4adcf13f73bd6d78bc` 为源码基线，完整阅读NAT参考类7方法并保留原NAT、HTTP、限流、资源与普通流保护。15个分类/能力/非法状态/断链场景及首个18场景输入都曾完成本地CMake59/59和Make原600秒限制验证；这些是分阶段输入的历史结果，不作为后续修改的最终验收。分类全集断言和后述两项时钟修复接入后，最终冻结输入在2026-10-19完成Linux CMake61/61、零跳过及完整Make（原600秒限制）。正常18个真实进程/socket场景的服务端与测试程序均插桩，ASan/UBSan实际执行通过、无报告，退出泄漏检查未关闭且每个子服务必须干净退出；另外还执行包限流时钟与原包下载两个消毒器程序。这不是所有服务端路径或跨语言实网环境验收，也不借用d3b的CI。
+
+15场景=8个分类+3个能力/未知或缺省failure组合+3个103/600组合+1个断链；再加回退、静默、会话变化3个主场景成为18个。分类全集来自[共享向量的rstFailures对象](../../../protocol/test-vectors/service-connectivity-check-v1.json)：route-not-loaded、target-invalid、connect-refused、connect-timeout、dns-failed、tls-failed、unreachable、protocol-error；逐键预期stage/code以该对象为准，不由测试名字猜测。
+
+实际发现一处生产差异：C对600响应头按HTTP流规则本地拒绝并发RST8后，却把本地拒绝错误当连接中断，结果为DEVICE_LINK_LOST；Java按LOCAL origin返回InvalidHead，由检查器报告TARGET_PROTOCOL_ERROR。候选在原probe枚举末尾增加INVALID_HEAD（保留原值），区分本地reset、对端reset和真实连接关闭；本地非法HEAD不依赖客户端分类能力，旧客户端自报failure仍不可信。未修复实现用同一15场景仅两种600（capable/legacy）失败、其余13项通过；修复后15项均通过。首轮夹具错误把解码器的空metadata表示`{}`当作NULL、一次私有宏不可见导致的编译失败，以及成功结果stoppedAt应为null而非阶段名的后续夹具失败均保留，不把这些测试错误宣称为额外线上缺陷。
+
+完整回退场景使用既有 `SPECUS_CONNECTIVITY_PROBE_TEST_AWAIT_END` 的新增get测试模式：只在GET响应头后、同一原有截止时间内等FIN；HEAD405仍立即RST，再产生GET。默认不启用；既有true模式仍等所有响应。它只让“FIN已经被读到”的条件确定，不增加生产预算、重置状态或伪造线上帧。测试逐帧核验元数据及请求FIN的原始metadata长度为零（解码器会把缺省值表示成`{}`），GET的FIN结束后无RST；每个迟到帧后都用同一有序连接的心跳屏障验证没有该流任何回复。fixture的配置路由名是app（Java为api），实际OPEN必须精确携带各自配置值；不将额外字段或只查子串当成完整对应。
+
+静默场景没有缩短生产10000ms预算，也没有放宽原辅助函数的5秒I/O门禁。只有这个新增实际10秒场景自行使用12秒HTTP观察窗，要求实际等待不少于9900ms、结果totalMs恰为10000及正确RST流号，随后迟到响应头无回复，连接继续提供HTTP/TCP服务。原NAT测试目标仍限420秒。会话场景同一client使用7个不同路由以免重复触发每路由10秒限流（不重置限流器），用真实认证及control/data重绑定驱动能力0→1；新HTTP会话尚未绑定时旧data仍按能力0，验证能力属于实际绑定的数据会话，而不是“数据库里最新声明”。data/control关闭等待实际EOF后才检查下一状态，不用任意sleep推定会话已移除。
+
+三个隔离生产负对照分别在主进程发帧前把relativePath从/改为x、跳过静默超时的RST、错误使用最新HTTP会话而非绑定data会话的能力。每个变体下，执行先前15场景的程序均退出0，执行新增3场景的程序均退出1，分别命中完整metadata、缺少RST及错误分类断言；不表示新增程序的三个子场景在每个变体下都失败。这是特定旧15/新3口径，不声称整个旧测试套件都无法发现，也不把三个变体放进候选。与真实600基线复现不同，它们是主动注入的检错实验，未宣称所有变体也经过消毒器。
+
+分类声明完整性另有独立输入对照：只在共享rstFailures增加第9个测试键，旧15场景程序仍退出0，最终测试在启动服务前因全集/条数不符退出1；不是把多余声明变成生产故障。计数辅助函数先验证JSON对象及键唯一，只数对象自身成员，不把嵌套对象、数组或字符串里的冒号算进来；空对象、嵌套/带冒号字符串、重复键、数组及截断输入均有微型回归。结合逐个读取并实际回放8个已知名字，防止共享表增加条目时测试仍静默只跑旧子集。
+
+前一含全集断言的输入实际CMake为58/59、零跳过：包括NAT在内的58项通过，仅client_package_tests在“unknown来源第三次请求应被限流”断言失败；完整Make因此未执行。该原始失败及完整日志保留，不用先前59/59或18场景消毒器替代。未改动的包下载测试随后连续50次未复现；另一个只在测试进程内回拨时间的受控限流器探针证明，C在墙钟回退时会重置额度，而Java参考不重置。这是独立可重现的语义偏差，不能认定为历史失败的唯一原因。后续冻结输入已包括最小过期判断修复：仅在当前时间不早于窗口起点，且已过完整窗口时才重新发额度；独立的 `client_package_clock_tests.c` 对unknown别名共用预算、不同来源独立、回退不补额、Retry-After、精确到期及前跳均有回归。相同O3/DNDEBUG下，原核心退出1、修复核心退出0；没有调整宿主机时钟或添加生产调时接口。只给新增包限流测试定义time；先前核心/HTTP向量/Rate三个固定time程序保持不变，正常服务端与原包下载测试仍导入libc time。
+
+加上包限流回归的下一输入CMake60/60通过，但完整Make在真实静默场景测得7068ms就收到RST，低于原9900ms下界，结果仍声称totalMs10000；失败同样保留。检查器使用MONOTONIC预算，底层却用默认REALTIME条件变量及截止时间。当前候选仅把探测等待的条件变量与截止时间统一为MONOTONIC，并明确处理初始化失败，不改变普通HTTP等待、原预算或时间下界。新增偏差库使进程的REALTIME读数比内核真实墙钟慢3秒；在相同O3/DNDEBUG下，旧实现实际7000ms失败，修复后约10000ms通过。这证明混用时钟能触发错误，不声称已捕获历史现场的系统调时；原7068ms失败的确切或唯一触发原因仍未证明。一次筛选条件过窄、没有执行目标场景的早期探针也保留，未计入成功对照。
+
+新增Linux测试库 `connectivity_clock_offset.c` 只在独立CMake/Make回归中加载，使测试进程及子服务端的REALTIME读数偏移，MONOTONIC不变，不改变宿主机时间。该回归重复运行原3个完整场景；正常18场景加3次偏差重放是21次执行，不是21个不同场景。三个元数据/超时RST/绑定会话能力的生产负对照已基于最终单调时钟源码重新执行，仍均为旧15场景程序退出0、新3场景程序退出1。最终输入的正常18场景、包限流时钟回归及原包下载程序也通过ASan/UBSan、无报告；此消毒器范围不包括偏差库重放或服务端全部路径。
+
+本批把NAT类7个参考方法列为候选覆盖，与Vector/Resource/Rate三类合计4类；尚未合并的候选不计入main完成率。精确新提交CI仍须按PR #290的提交、实际测试树及原始产物另行核验，本文的本地通过不替代它。41类待对照、旧79类当前断言复核及#35其他运行时/真实环境验收仍未完成；不合并main、不关闭#35、不发版或更新Homebrew。
+
+## 控制写入、会话清理、离线通知与上线指标（2026-10-19增量）
+
+参考源码锚定未合并C分支前驱 `b1d1590fac4ede8823e264d68dcb729d642e5ea1`，相关Java类与上方main盘点一致。本节完整阅读4类8个注解方法后，给出逐方法候选对照；没有改Java参考方法或C生产源码。本节新增2个写入单元场景及4个真实进程场景，部分场景同时对应两个Java类，不能计为8个独立新增C场景，更不能加入main完成率。下表另外引用的旧会话生命周期场景不计为本批新增。前面各阶段保留的“41类待核验”是当时记录；本节之后当前剩余为37类，旧79类当前断言仍未全部复核。
+
+`control_write_reference_tests.c` 将真实 `src/main.c` 包含进专用测试可执行程序，仅在该可执行程序替换 `send` 与锁入口。实际字节使用AF_UNIX/SOCK_STREAM socketpair，注入点不替代生产编码、`session_send_packet`、锁或关断逻辑。`session_reference_tests.c` 则启动独立的专用测试server，使用真实HTTP/JWT/SQLite、控制/data TCP连接、会话注册表、替换及清理线程；只有该server的main对象别名化recv、logout helper、指标原语，由 `session_reference_observer.c` 转发真实调用并记录有界事件。`session_reference_recv.h` 先声明libc再替换调用，避免强化内联绕开观察器；构建核验对象确实引用观察器符号。正常 `specus-server-c` 不包含观察器或新运行时开关。本节不是TLS、跨NAT或全部服务端路径的验收。
+
+本节roster计数精确指真实logout helper进入生产send回调的发送尝试次数；观察器继续调用真实回调，并非只记mock。它没有逐条单独断言send返回值，也未比对旁观端收到的roster正文，不代表客户端已经确认通知。参考Java方法检查的是logout调用及当时在线状态，本节相应核验这层行为和发送保护，不能扩张为可靠通知投递验收；旁观连接的heartbeat用于证明它仍实际存活。
+
+| Java 方法 | C证据及精确断言 | 限定差异 |
+| --- | --- | --- |
+| `ControlWriteFailureTests.aWriteCutShortClosesTheChannelAndNothingFollowsIt` | 写入测试先以真实sendto送出正长度半帧，再注入ECONNRESET；第一次调用失败且write_failed置位，对端收到逐字节相同前缀与EOF，随后第二消息和heartbeat均失败，实际send调用数不增长、线上无后续字节。 | Java的IOException/ChannelFuture由C返回值、write_failed和socket关断对应；不将合成errno称为实际网络故障复现。 |
+| `ControlWriteFailureTests.aFrameBeingWrittenCannotBeCutShortByItsCaller` | 第一线程真实写出半帧后由条件变量持有；记录第二线程确已进入相同send锁的竞争入口，trylock=EBUSY且两次调用均未返回；释放第一线程后join，线上严格为两个完整编码帧，之后heartbeat仍成功。 | Java额外断言flushed Future的cancel(true)=false；C同步私有API只返回int，没有调用者可取消的Future，此API断言不适用。不声称执行了pthread_cancel、异步线程取消或所有线程终止情形。 |
+| `SessionUtilTests.closingTheCurrentControlConnectionClosesItsDataConnection` | 进程mode0真实关闭当前control发送方向，等待control和data实际EOF；logout观察时真实在线查询已为false，持久会话为DISCONNECTED，真实旁观设备仍可heartbeat。 | C以生产注册表查询与真实连接对应Java的两个getChannel结果，不伪造会话或在线回调。 |
+| `SessionUtilTests.closingAReplacedControlConnectionLeavesTheNewDataConnection` | mode1按旧客户端socket本地端口核验真实旧EOF进入屏障；旧关闭记录尚未完成时重新绑定同一HTTP会话的新control/data并heartbeat，再释放旧EOF；等待旧控制记录写入REPLACED_BY_NEW_LOGIN，之后新两通道仍可heartbeat且会话NETTY_ONLINE。原有 `session_lifecycle_tests.c:test_same_session_relogin_replaces_old_pair` 另在正常server二进制上明确等待旧control、旧data和旧NAT流实际EOF，再验证新连接存活。 | 新屏障补足原场景“先等旧EOF、后绑新data”未强制的迟到清理时序；原有旧通道关闭证据不冒充新增。屏障只延迟真实recv结果返回，不伪造EOF或生产注册表内容；5秒单调期限为测试失效上限，不按固定睡眠推断清理完成。 |
+| `ManagedLoginLogoutPushTests.closingTheControlConnectionTellsThePeersOnceTheClientIsUnbound` | mode0真实logout helper恰好一次，调用时生产online=false；实际转发的roster恰好一次到真实在线旁观设备，校准“零发送”检查不是因为没有接收方。 | 观察器转发真正helper和send，未把mock发送计数冒充真实发送。 |
+| `ManagedLoginLogoutPushTests.closingAControlConnectionReplacedByANewerLoginLeavesTheClientOnline` | mode1释放旧清理后online=true、实际departure roster=0且新两连接仍可用；再真实关闭当前control，等待当前control/data EOF、DISCONNECTED及实际departure roster恰好一次。 | Java handler不调用pushOnLogout mock；C teardown会调用helper一次，由helper内部的真实online保护返回零发送。调用层粒度不同，本文只把“客户端不被误宣告离线及最终一次离线通知”记为对应行为，不谎称C替换清理零helper调用。 |
+| `ManagedLoginLogoutPushTests.closingTheDataConnectionLeavesTheClientOnline` | mode2等待data真实EOF；control和旁观设备仍可heartbeat、会话NETTY_ONLINE，目标logout helper和departure roster均为0。 | 不以持久状态单独替代控制连接实际存活检查。 |
+| `ManagedLoginProductMetricsTests.controlLoginReportsClientOnlineForTheOwner` | mode3启用统计后经管理HTTP真实创建普通owner、登录及创建凭证；先证实非默认tenant已有一条client_online_at为空的进度，control登录及heartbeat后恰好一次固定client_online、tenant与owner全匹配，data登录及双heartbeat后没有新增；实际owner字段落库，OS用户和默认tenant无进度。 | Java调用clientOnline(account)且handler从不直接调用通用milestone；C直接以已认证client记录的tenant/owner和固定CLIENT_ONLINE调用通用原语。仅此包装API不同，不豁免归属、步骤、次数及data零新增；本节没有核验整个ProductMetricsService。 |
+
+本节保留首轮失败：最初编译参数直接重命名recv，glibc强化内联仍调用原recv，旧EOF没有进入屏障；强制前缀头及对象符号检查修正的是夹具，不是生产缺陷。最初指标夹具用初始化管理员直接断言进度落库，前提不成立：共享规范及Java/C实现都只由account_created创建进度，client_online不会补建。现在在启用统计后走真实建号路径，并显式检查初始进度，不把它解释为“管理员一概不统计”。
+
+事件读取有明确截止屏障，不靠睡眠推断零事件：当前control的最终shutdown位于logout helper转发、观察事件追加及连接关闭记录之后，所以mode0/1在该control实际EOF后比较通知次数；mode2在data实际EOF后，以control/旁观连接heartbeat确认存活并要求全体logout回调为0。mode1的旧连接关闭记录同样位于旧helper和本连接的配对清理之后：记录出现时这些可能影响新连接的步骤已完成，剩余步骤只shutdown旧fd、注销该连接对象并释放内存，不等同于断言整个旧线程已退出。指标回调及落库在control线程进入后续heartbeat循环前完成，data线程也需独立heartbeat屏障。计数窗口截止于上述明确事件，之后夹具清理旁观连接的通知不计入，不声称无限期没有其他业务事件。
+
+隔离的生产源码故障注入分别移除写失败关断、移除写锁、取消旧连接displaced保护、漏调logout、记错owner、data也记上线、硬编码默认tenant，以及仅保留旧替换清理的helper调用、漏掉最终当前连接的离线发送。每个变体均须由对应新增断言检出；它们不进入提交，不证明正常实现存在这些缺陷，也没有声称所有变体的旧全量测试都通过。写锁变体由未观察到第二锁竞争入口而超时失败，不能说它已测得线上帧交错。补强后的首次负对照脚本曾过度要求“完全漏调logout”走到最终关闭断言，但它先在旧helper次数处失败，脚本自身退出1；该次记录保留，随后增加仅漏最终通知的独立变体，区分两种失败阶段。
+
+最终负对照结果已核验：写入2个隔离变体各退出1，由各自写失败关断/锁竞争断言检出，汇总脚本退出0；调整脚本并以最终加强的进程夹具重跑上述6个会话/指标变体，也全部在各自预期阶段退出1，汇总脚本退出0。正常实现的焦点与消毒器测试通过。这里的8是缺陷注入变体数，不是新增Java方法数、C正常场景数或生产缺陷数。
+
+最终本地输入核验通过：CMake Release（O3/NDEBUG、Werror）63/63、零失败零跳过；原61个测试序号保留，新增写入与会话测试为62/63。独立O2/Werror Make构建及完整 `make test` 通过，原10000键容量、正常及进程时钟偏差下的真实10秒探测门禁均保留。严格O3焦点的写入2场景与专用测试server进程4场景通过；O2 ASan/UBSan、开启泄漏检查的写入2场景及带观察器server/驱动进程4场景通过，无消毒器报告，不外推普通server所有路径。构建后核验CMake/Make专用main对象确实引用recv观察器，普通server均不含fixture符号；全部生产src经Git文本规范化比较与前驱一致。先前未含最终通知/非默认tenant补强的完整通过记录另行保留，不冒充最终输入结果。
+
+本批精确新提交CI仍待核验，不能沿用前驱 `b1d1590` 的21项CI作为本批结果。失败日志、负对照源码及二进制留在本地证据，不进入发布产物。本节仍是未合并候选；37类待逐项对照、旧79类当前断言复核以及#35其他运行时/真实环境验收尚未完成。不合并main、不关闭#35、不发版、不更新Homebrew。
+
+## HTTP流重置：公网错误、诊断与流量字节（2026-10-19增量）
+
+本节源码基线为未合并C分支 `1f59784a065aa58b7f77f157f0ab9b6ccd4d98db`（树 `038b1dbf20398d522b8518e721be85e3b76453d8`），本节新增1类2个Java注解方法的候选对照，该批结束时累计为9类30方法。前驱原始Protocol 12项与实验室9项CI已独立核验通过，其实际测试合成提交为 `250387984ddc143e4d784af689861dc93f2c0e10`、测试树与前驱相同；这些绿灯不能作为本批新增修复的验收证据。Java参考类与上方main盘点一致，Java源码、共享规范/向量和工作流不变。同期完整阅读的 `HttpSpecusControllerFailClosedTests`、`NatControlPushFailureVectorTests`、`HttpRouteLifecycleVectorTests` 在该批结束时仍待逐项核验，不因读过源码或相关功能已存在而改为覆盖；后续补证单列于下一节。
+
+| Java方法 | C证据及精确断言 | 限定差异 |
+| --- | --- | --- |
+| `clientResetBeforeResponseHeadersReturnsGenericBadGatewayAndLogsEscapedReason` | `http_reset_reason_reference_tests.c:reset_reason_case` mode0：真实HTTP/JWT/SQLite、control/data连接，收到实际请求FIN后发送带Java相同URL/query/CRLF伪造头reason及connect-refused分类的RST；公网严格502及固定通用正文，不泄露IP、URL、secret、分类或伪造头。真实失败明细逐项核验client、GET、相对路径、原始query、success=false、完整转义原因、request_bytes=0及response_bytes=0；日志保留完整转义原因而无原始CR。原数据连接随后继续提供HTTP与TCP服务。 | Java使用EmbeddedChannel、MockServletResponse和mock记录器；C经真实进程/线上帧并检查实际SQLite记录。按既定 `http-route.md` 第1节，C继续用JSON错误信封承载同一固定通用文本，Java正文是纯文本；不为追求字节相同而更改已规定的C信封。 |
+| `logSafeReasonEscapesControlCharactersAndTruncates` | `http_log_reason_reference_tests.c` 逐字比较原Java字符串的CR/LF/TAB/NUL/U+2028/反斜线、NULL为空及300个x保留前256个再加截断标记；额外检查257个emoji按完整码点截断、非NUL结尾的不完整UTF-8有界处理、旧C字符串入口和小输出缓冲。mode1在真实FIN后、mode2在实际发送满1MiB信用且未补窗口/尚不能发FIN的上传中发送含NUL的RST，两条生产错误分支都验证NUL后的完整诊断、零上游响应字节及原连接可继续服务。 | Java String与C字节串/缓冲API不同；新增带长度的可选sink回调优先，旧on_reset和C字符串格式入口仍保留。256按Unicode码点而非UTF-8字节计数；这些额外边界不是新增Java注解方法。 |
+
+具体长度入口为 `on_reset_bytes(ctx, code, reason, reason_len)` 与 `st_admin_log_safe_reason_n(reason, reason_len, out, out_len)`；未设置新回调时回退到旧 `on_reset`，旧 `st_admin_log_safe_reason` 继续接收C字符串。mode2的请求体为1MiB+1字节，驱动实际读到该stream累计恰好1MiB的DATA，期间若读到FIN或超额DATA就失败，不发送WINDOW_UPDATE；剩余1字节没有信用可发，随后RST触发上传等待的失败路径。这里是loopback真实进程/帧验证，不是跨NAT或TLS验收。
+
+公网固定文本仍为 `HTTP 转发请求失败`，C正文精确为 `{"error":"HTTP 转发请求失败"}`；诊断截断标记为 `...(truncated)`。实际复现两处生产偏差。第一，旧C把JSON中的 `\u0000` 解码后当C字符串结尾，日志及管理失败原因丢失后缀；候选沿解析、pending保存/拷贝、正常等待及上传失败两条报告路径传递字节长度，并在诊断中把NUL转义为可见的 `\u0000`。这不是邮箱输入的NUL拒绝规则，也不改变RST自由诊断文本的输入政策或metadata.failure分类解析。第二，在尚未收到任何上游响应时，旧C把本地生成的35字节JSON错误正文记入response_bytes；候选只将这种本地失败记录的响应流量计为0，仍保留本地错误正文用于明细采集，不改变公网正文或已转发响应分支的实际字节统计。本批实测零字节场景不证明所有部分响应、改写缓冲或采集路径的计数均已对齐。
+
+基线实际复现和中间输入分别保留：最初探针漏给共享向量编译宏只造成编译失败，不算生产证据；修正后同一真实RST场景在完整安全原因断言失败，原日志明确止于NUL。补充明细夹具时曾误用不存在的client_id列，SQL设置失败也不算统计偏差；改为实际client_name键后，原实现与仅修NUL的中间实现都实测response_bytes=35而非0。没有删除这些准备失败，也不把脚本退出0误读成其内期望失败的可执行程序退出0。
+
+两个独立故障负对照已执行：仅把收到的reason长度改回strlen时，普通泄露reason场景通过、两个NUL场景均在完整落库原因断言失败；仅把本地失败response_bytes从0改回body_len时，三个真实场景都实测35而非0并失败。两个变体的可执行程序各退出1，核验这些预期失败的脚本退出0；它们不进入提交，不声称整个旧测试套件在这些变体下都通过。正常焦点的格式程序、三场景、原admin HTTP程序及上一批写入2/会话4场景通过；O2/NDEBUG ASan/UBSan的格式程序、三场景驱动与普通服务端也实际通过、退出泄漏检查开启且无报告。消毒器证据不外推TLS、负对照或服务端全部路径。
+
+新增两个测试接入CMake/Make，原63个Linux CTest序号与全部旧测试入口保留；新格式与真实RST套件的序号为64/65。真实RST套件复用原nat_stream真实连接夹具但不执行其原main，原nat_stream的独立完整入口未删减。首轮完整CMake为58/65、零跳过：7个脚本入口因私有Linux导出的CRLF行尾在执行测试逻辑前失败，其余58项通过；原始完整输入及失败日志保留。仅规范化副本脚本行尾后，15个脚本的Git规范文本均与前驱相同，不把准备修正说成生产修复。
+
+修正副本导出后的完整Linux CMake Release（O3/NDEBUG、Werror）65/65、零失败零跳过。O2/Werror完整Make首次在原TURN断言“stale nonce刷新应得438”处未取得有效响应而失败，记录保留；前驱O2、本批O2及O3的完整TURN程序独立重放均通过，原失败的确切或唯一原因仍未证明。没有改TURN生产代码、原2秒UDP接收超时或断言，也不声称重放通过就修复了该历史失败。随后相同149个冻结执行源码输入、相同O2二进制，在原600秒上限下完整Make通过，保留实际10000键、原正常NAT及进程时钟偏差下的真实10秒门禁。最终CMake注册的两个新增套件（格式程序及三场景）另独立通过ASan/UBSan，两个故障变体也用最终真实RST程序重跑，均命中原定失败阶段。
+
+上述是本批本地证据；精确新提交CI仍须按PR #290的实际提交/测试树及原始产物另验，不能借前驱21项绿灯。上节37类是该阶段记录；该批结束时36类待对照，旧79类当前断言复核及#35其他运行时/真实环境验收仍未完成。不合并main、不关闭#35、不发版、不更新Homebrew。
+
+## HTTP路由生命周期、失败关闭与NAT推送（2026-10-19增量）
+
+本节基于未合并C分支 `acf0d43484af106c4807d8eb8efa401d455dd6a7`（树 `8153c74b9373c3c83915c2834931a21c9e5b35ed`），完整阅读3类5个Java注解方法后补证。前驱原始Protocol12项和实验室9项CI已独立核验，实际合成提交 `c7841c6259841bc8476f366a0dfedac888443e6a` 的树与前驱相同；不能拿前驱21项绿灯接受本节。本节最终输入已通过下述本地完整核验，这3类列为未合并的候选覆盖，累计12类35方法；不是main覆盖率，也不是本节新提交CI已通过。Java参考和C生产源码不变；共享 `nat-control-size-v1.json` 只更新C夹具的说明，去掉notes后与前驱逐字段一致，步骤、状态和常量未变。
+
+| Java方法 | C证据及精确断言 | 限定差异 |
+| --- | --- | --- |
+| `HttpRouteLifecycleVectorTests.serverScenarios` | `http_route_lifecycle_tests.c:replay_current_scenario/run_step/check_request` 实际重放共享向量全部9个server场景：登录及变更后的完整路由集合（含空集合）、路由启停/删除、客户端启停/改名/删除及重建、旧token拒绝或跟随原账号、HTTP状态或允许状态集合、no-store、Basic挑战、正文、是否转发及WebSocket拒绝不得101。通过管理REST创建凭证并实际HTTP认证，后续重连复用原token；断开等待两条真实连接EOF后再确认持久会话DISCONNECTED。 | Java使用真实Spring/Netty监听器和脚本客户端，C使用真实进程、HTTP/JWT/SQLite及TCP控制/data连接。一个工厂方法对应9个共享场景，不是9个Java注解方法。原有C-only账号换名后同名账号替换场景仍保留，不计为本批新增。 |
+| `HttpSpecusControllerFailClosedTests.deletedProtectedRouteReturnsNotFoundAndOpensNoStream` | 新增 `deleted_protected_route_scenario`：先以有效凭据成功转发作观察器正控；旧保护路由无凭据401且零NAT帧，随后只直接删除SQLite路由记录，不触发管理推送或踢线；同一仍存活的控制/data连接下，无凭据得到404/no-store且零NAT帧，之后两连接仍可心跳。 | Java使用真实认证服务、mock仓库与绑定的EmbeddedChannel，C用直接改库保留旧连接的相同前提。零帧结论截止于下述有序心跳屏障，不声称无限期静默；主动发出的心跳及其响应不算业务出站帧。 |
+| `HttpSpecusControllerFailClosedTests.routeOfDisabledClientReturnsNotFoundAndOpensNoStream` | 新增 `disabled_client_scenario`：先成功转发校准，随后只将当前客户端记录enabled置0，不调用管理接口清理连接；确认两旧连接仍活着，再用无凭据及有效凭据分别取得404/no-store、零NAT帧，最后两连接仍能心跳。 | C额外核验有效Basic也不能绕过当前禁用状态；不把“账号已禁用所以连接原本就不在线”当作本参考方法的证据。 |
+| `NatControlPushFailureVectorTests.existingOversizeConfigurationIsNeitherSentNorDisconnecting` | 保留 `client_route_scale_tests.c:scenario_existing_oversize_nat_control/control_round` 的全部7个共享步骤：真实Peer Mesh登录推送、超限期间零NAT_CONTROL及控制连接持续可心跳、手动409的JSON error字段、新建201/删除204、直接缩小配置后首条NAT_CONTROL。新增 `first_nat_has_no_fill_routes` 要求真实JSON路由数组存在、逐个route不以fill-开头；空列表可接受，缺列表/null/缺route及fill路由均有断言校准。 | 原有容量套件另两场景继续运行，不冒充本批新场景。该旧夹具直接存储接入凭证后走真实HTTP登录，不声称它也覆盖了REST创建凭证；本批另两类的真实REST凭证设置不挪作它的设置证据。Java在静默窗口等待，C在同一控制通道以有序心跳收集管理操作已发送的推送。 |
+| `NatControlPushFailureVectorTests.writeFailureAnswersAsAnOfflineClient` | 新增 `nat_push_reference_tests.c:replay_all_write_failures`，同一次真实REST凭证创建及HTTP认证、同一client/session/token，按共享4步执行createRoute201、push409、refresh409、delete204。每步真实NAT回调都到达目标控制连接send锁竞争入口，内核确认RST后放行登录，实际回调结果为-1；409解析JSON error字段，不能只在整段响应找文本。前三步核验同一实际route ID、client_name、route、target及enabled仍在库，最后删除该ID并确认不存在，查询错误不当作不存在。 | Java四步始终绑定同一写入失败的EmbeddedChannel；C按既有写失败关闭语义清理失败连接，每步仅重绑同一HTTP token的真实control，不重新HTTP认证或换客户端。每步证明至少一次真实NAT发送入口/失败回调，不要求恰好一次回调，也不声称每步另有NAT字节或部分帧进入内核；失败的登录写可能已使该连接不可写。 |
+
+`existingOversize` 的7步严格按共享顺序为：connect（成功登录、收到Peer Mesh推送）→pushNatControl（409）→forceRefreshPortMapping（409）→createRoute（停用的idle路由，201）→deleteFillRoute（204）→shrinkInStore（只在库中停用填充路由，不触发管理推送）→pushNatControl（200，收到首条且不含fill路由的NAT_CONTROL）。每步之后仍要求control可用，最后一步之前不能有NAT_CONTROL。Java该方法经管理REST创建凭证并实际HTTP认证；C这个旧超限夹具直接存储凭证再HTTP认证，只是设置路径不同，不把REST创建凭证本身算作已测。
+
+路由套件总计12个真实进程场景=9个共享场景+1个保留C-only场景+2个新增失败关闭场景。拒绝请求既数OPEN，也数所有NAT帧，并拒绝意外的数据通道包。HTTP响应结束不能证明另一条TCP连接已排空；驱动在该响应之后向仍存活的data发送心跳，读取到对应心跳响应前继续计数。该屏障仅截止本次读取窗口，不等待或排除未来的异步任务，也不把单条TCP连接的有序性解释为跨线程业务全部完成。此处没有并发发送其他心跳；队列中的OPEN也会被计入，正常转发正控会实际收到OPEN并回答。成功请求的FIN/窗口帧可正常存在，只有期望不转发的请求要求零NAT帧。失去连接的生命周期场景另以实际EOF为截止，不把关闭的socket解释为仍在线失败关闭场景。
+
+`nat_push_reference_server.c` 只编译到Linux专用测试server：包含真实main代码，仅别名化管理NAT回调注册及锁调用，在生产注册表查找并持有目标真实control引用，原样调用注册的生产回调。在真实发送锁入口发布事件后，等实际socket的TCP_INFO变为TCP_CLOSE，再允许持有该锁的登录继续；内核状态等待有5秒单调上限及1ms轮询间隔，不以任意100ms睡眠推断RST已发生。普通 `specus-server-c` 不链接这些观察器，也没有新增生产开关。Linux限定的是TCP_INFO夹具，不是对其他平台行为的豁免；本节未证明TLS、跨NAT或所有平台实网行为。
+
+9个独立故障变体分别漏掉新建自动推送、漏掉删除自动推送、写失败谎报200、新建目标错误落库、忽略客户端禁用、删除路由仍发401挑战、插入非OPEN的NAT FIN、409把error改成detail、首条NAT_CONTROL缺正确路由列表。最后三项有明确的前版对照：本批早期只数OPEN的12场景程序、整段文本查错误的4步程序、只查fill子串的7步超限程序分别仍退出0，对应补强程序退出1；不声称这些变体能躲过全部旧测试。各变体不进入候选，不算9个线上缺陷，也不声称所有变体都经过消毒器。最终冻结程序对9个变体重新执行，均在对应预期断言处退出1，核验这些失败的汇总脚本退出0。
+
+准备失败保留：观察器最初误用会话fd字段及main参数、驱动误用不存在的存储getter，均是夹具编译错误，不是生产缺陷。首次完整CMake59/66，7项shell测试因导出副本CRLF在逻辑执行前失败，Make未执行；原输入/日志保留。专用脚本仅规范化15个私有脚本的行尾，规范文本与前驱一致；初次内联规范化命令的引号错误也保留。随后含零NAT帧断言、尚未加最终JSON结构断言的中间输入完整CMake66/66、零跳过及独立O2完整Make（原600秒上限）通过，但不能冒充最终输入。初轮负对照核验脚本误把FAIL的词序写反而退出1，实际变体测试结果已失败；保留原记录后按真实日志词序核验，并另外运行未执行的变体。
+
+最终冻结输入已实际通过Linux CMake Release（O3/NDEBUG、Werror）66/66、零失败零跳过；原65个CTest名称与序号完整保留，新增NAT写失败套件为66。独立O2/Werror完整Make在原600秒上限下通过；实际10000键及正常/进程时钟偏差下两组真实10秒门禁保留。3个注册套件（12场景路由、原3场景容量、4步NAT写失败）的驱动及所用普通/专用服务端实际通过O2 ASan/UBSan，退出泄漏检查开启且无报告；不外推全部服务端路径或9个负对照的消毒器覆盖。
+
+213个执行源码/脚本/顶层向量输入的冻结哈希在验证后未变；另核验34个二进制协议fixture与最初冻结归档及前驱逐字节一致，并重新执行CMake/Make的协议fixture程序通过，不把213写成全部递归输入数。221个静态资源另核验与前驱一致并保留实际字节哈希。74个C生产文件和3个Java参考类与前驱规范文本一致，CMake/Make普通服务端均无新增NAT观察器符号。本批不声称修复新的线上生产缺陷；改进的是参考测试证据与检错能力。
+
+上方阶段记录的36类在本节补证后剩33类待逐项对照，旧79类当前断言复核及#35其他运行时/真实环境验收仍未完成。本节精确新提交CI仍须按PR #290的提交、实际测试树及原始产物另验，不借前驱绿灯。不合并main、不关闭#35、不发版或更新Homebrew。
+
+## 显式空快照、NAT精确大小与管理变更（2026-10-19增量）
+
+本节基于未合并C分支 `06e7261baac787479d1bed2e8d14311773687ad8`（树 `7df04e67ecde0dd327703577c2250f645fd04ed5`），完整阅读3类5个Java注解方法后补证。前驱原始Protocol12项及实验室9项已独立核验，21个作业实际checkout为 `1206d53481ec326846226f03d7a92c9ecf70d1b3`，父提交为main `b8d6e72`及前驱，测试树与前驱相同；这些绿灯不作为本节新输入的CI。本节3类仍是未合并候选，累计15类40方法；5个大小case、6类名称和14个管理步骤不是新增25个Java方法。Java参考、共享规范/向量、工作流及既有门禁不变。
+
+| Java方法 | C证据及精确断言 | 限定差异 |
+| --- | --- | --- |
+| `NatControlServiceHttpRoutesTests.deletingTheLastRoutePushesAnExplicitEmptyList` | 原共享 `delete-last-protected-route-while-online` 实际先收到含web的NAT_CONTROL，删除最后一条route后，`check_push` 要求下一条消息有数组类型的httpSpecusConfigList且为空；缺字段/null不作空列表。 | Java用mock仓库及EmbeddedChannel，C用真实管理HTTP、SQLite及control/data连接；本批保留原共享9场景，不把原有HTTP数组断言说成新增。 |
+| `loginPushCarriesTheEmptySnapshotOfAClientWithNothingLeft` | 原共享 `delete-last-route-while-offline` 等旧两连接实际EOF及离线后删除route，再不做新HTTP认证、复用旧token重连；登录推送的HTTP数组明确为空，新增 `explicit_empty_tcp_snapshot` 还要求specusConfigList存在、为数组且为空。所有期待推送的生命周期步骤都核验该无TCP映射夹具的空TCP列表。 | 对应真实登录NAT_CONTROL，而非把HTTP登录响应当控制推送。微型回归将缺字段/null/对象/非空列表与显式[]区分；本节不证明有TCP映射时的完整列表，那由原scale场景另测。 |
+| `NatControlSizeLimitHttpTests.managementStepsMatchTheVector` | `sizing_management_steps` 在全新实际服务端按原顺序执行共享management全部14步。第0步得到201、实际空名字J=1047369及预留MESSAGE body=1048576；多1字节更新400。所有6次400都解析顶层JSON error并含NAT_CONTROL，前后读取两张配置表中该客户端全部行、全部列名/类型/值（含disabled行及时间戳）并作SHA256比较，数据库错误不作相等；每步还读回接受条目的ID/名称/目标/开关等字段，每个实际启用快照的预留body不超过上限。 | Java直接保存client，C经管理API创建client；两者都直接填充数据库后才重放规定操作。C用多条目标不超过511字节的route，Java可用32KiB目标；仅填充手段不同，不豁免精确J、任一步、错误字段或持久化。此管理场景客户端未连control/data，不冒充在线推送或跨NAT验收。 |
+| `NatControlSizingVectorTests.sizingMatchesTheVector` | `sizing_vector_cases/sizing_exact_config` 用真实生产JSON构造生成下表5个规定长度的空名字配置，逐项比较管理入口共用的 `st_protocol_nat_control_reserved_body_size` 与共享bodyBytes/fits；包括JSON长度前缀的varint宽度变化、恰好1MiB及多1字节。上限和120单位/480字段字节/720 JSON字节预留声明逐项比较；额外检查不可编码长度、溢出及NULL输出拒绝。 | J是各实现自己生成的空名字JSON字节数，不要求Java与C整份JSON逐字节相同。计算使用compact编码器自身的前缀写法，不以测试里复制的另一套公式作证。120单位指Java参考名称样本的UTF-16码元数，不是C公共接口接受120个任意Unicode码点的承诺。 |
+| `theReserveCoversEveryNameARenameAllows` | `sizing_name_families` 给真实JSON构造和compact编码器输入参考6组名称：120个控制字符、引号、中文、U+2028、ASCII，以及60个emoji（120 UTF-16单位）；配置含1个TCP mapping及带转义相关字符的HTTP目标。实际MESSAGE body均不大于空名字配置的预留值，并解码核验类型、无toClientName、字段名及JSON内名字逐字相同。 | 这是给定名称的JSON/协议编码层证据；通过内部按给定名字构造的函数避免运行时配置缓冲提前截断样本，不经公共创建/改名/存储/TCP登录路径。不能据此宣称120个中文名称均能在C完整流程中使用，也不代表所有Unicode输入已验收；那些路径及长度边界仍需各自核验。 |
+
+五组精确值如下；J不含名字预留，body包含预留。按共享向量的说明，body字节数为 `482 + 1 + 1 + varintBytes(J + 721) + J + 720`；其中482是名字字段的480字节及2字节长度前缀，两个1分别为空toClientName及NAT_CONTROL类型前缀。J=15662/15663时，预留JSON的长度标记J+721从16383变成16384，前缀由2字节变成3字节。
+
+| 空名字JSON字节数J | 预留MESSAGE body字节数 | fits（≤1048576） |
+| ---: | ---: | --- |
+| 1000 | 2206 | true |
+| 15662 | 16868 | true |
+| 15663 | 16870 | true |
+| 1047369 | 1048576 | true |
+| 1047370 | 1048577 | false |
+
+本批生产改动为提取已有预留大小计算到protocol.c/h，管理准入实际调用该函数；它复用compact字符串/枚举的前缀编码，并显式拒绝不可编码长度、溢出或无输出位置。main.c将现有JSON构造分为按给定名字构造的内部函数和沿用配置名字的原包装入口；正常服务端仍调用原入口。1MiB、120单位名称预留及共享步骤/状态均未放宽，不宣称本批修复线上大小计算缺陷。CMake和Make的实际admin对象均引用共用计算，普通server不链接新的NAT观察器。
+
+共享14步严格保留：创建恰满的edge201→再建启用route400→再建启用mapping400→建停用idle201→建停用tcp-idle201→启用idle400→启用tcp-idle400→只改edge明细开关200→edge目标加1字节400→停用edge200→启用idle200→启用tcp-idle200→再启用edge400→删除edge204。拒绝不改任何现有条目，接受仍读回精确字段；停用条目不计入启用快照但仍纳入拒绝前后存储比较。该14步与上一节existingOversize的7步、写失败的4步是不同场景，不能相互替代。
+
+本文是源码/测试证据索引，不是独立的逐字节HTTP回放手册。完整输入以 `protocol/test-vectors/nat-control-size-v1.json` 的management及notes、`nat_sizing_reference_tests.c:sizing_management_steps/sizing_fill_store` 为准：初始填到J=1046969（距最大J余400），edge按实际构造补到精确边界，第7步将detailCaptureEnabled设为true；完整HTTP方法/端点、请求字段与各步实际J/body由该驱动及日志记录。不同实现的填充行数和JSON可不同，不另要求各步body逐字节相同；不因此放宽原步骤、拒绝不变或接受字段断言。
+
+5个隔离实际服务端变体分别缺失TCP数组、预留少算1字节、400把error改成detail、拒绝时改写updated_at、接受时丢失detailCaptureEnabled。当前冻结驱动均在各自预期断言退出1，核验脚本退出0。旧12场景路由程序在缺TCP数组变体下仍退出0；旧3场景scale程序在少算1字节及错误400字段两个变体下仍退出0；只做了这3个旧程序比较，不声称全部旧测试都检不出5个变体。变体不进入提交，不算5个线上缺陷，也未声称它们都经过消毒器。
+
+本批最终本地输入通过Linux CMake Release（O3/NDEBUG、Werror）67/67、零失败零跳过，原66个名称与序号保留，新增大小/管理套件为67；独立O2/Werror完整Make在原600秒限制内通过。完整日志核验原HTTP38、Resource28、Rate17及实际10000键、写入2/会话4/RST3/写失败4、正常NAT18及进程时钟偏差重放3，正常与偏差下的真实10秒下界保留。全新ASan/UBSan构建的普通/观察器server及4个注册套件（路由12、原scale3、写失败4步、新大小/管理）通过，泄漏检查开启、无报告，不外推全部服务端路径或5个变体的消毒器覆盖。
+
+本批474个递归输入全部冻结并在完整回归后复核，涵盖C源码/脚本、全部嵌套协议固件、静态资源及4个Java参考源文件；其中221静态资源、34个二进制固件及Java/共享向量均与原归档不变。15个私有脚本仅规范化行尾，Git规范文本与前驱相同。首次测试编译的内部read_frame重名、缺sqlite3.h，以及核验器的连接表达式优先级与二进制固件路径计数错误均保留；修正的是夹具/核验器，不作为生产缺陷，最终实际固件数为34而非早期错误计数0。474冻结时映射仍是前驱原文；完整运行结束后才改本节及上方3行/汇总，并按阅读反馈澄清历史附件行和差异汇总中的presign-upload修复声称，其他473个输入不变，文档最终哈希另绑定阅读检查。该历史文字澄清不代表本批重做附件断言或改变旧79类历史计数。
+
+上一节33类是当时阶段记录；本节补证后剩30类待逐项对照，旧79类当前断言及#35其他运行时/真实环境验收仍未完成。本地67/67、Make、消毒器及负对照均不代替精确新提交的原始CI；后续须按PR #290绑定新提交、实际checkout/树和原始产物另行核验。不合并main、不关闭#35、不发版、不更新Homebrew，不清理未合并工作树/分支。
+
+## SQLite二进制列、空正文与约束错误（2026-10-19增量）
+
+本节以未合并C分支 `3ea89f3d9bebd6a88dadf9741a06931ba1baf1ff`（树 `0888d9a008e12711189f37cc4a6e978d09e672fd`）为基线，完整阅读3类12个Java注解方法、相关方言/转换器及夹具后补证。前驱原始Protocol12项与实验室9项已独立核验，全部21作业实际checkout为 `c3e5fcdc252c68addc380c5eb91c5cc87b8db6cf`，父提交为main `b8d6e72`和前驱，测试树与前驱相同；不以它接受本节新输入。新增 `sqlite_reference_tests.c`，仅修改测试、CMake/Make和映射，不改C生产源码、Java参考、共享向量或工作流。
+
+3类的处理口径不同：`SqliteLobColumnTests` 5方法和 `SqliteConstraintTranslationTests` 3方法列为行为及限定框架差异的候选对照；`SqliteSqlExceptionTranslatorTests` 4方法限定为Spring/JDBC转换API的平台差异，原生约束行为另有下述实测，不作数据库正确性的豁免。当前旧表外49=5类限定平台差异+17类未合并候选（48个注解方法）+27类待核验；不是main完成率，旧79类当前断言另待复核。7个C隔离场景不是12个Java方法，也不能与68个CTest套件相加。
+
+| Java方法 | C证据及精确断言 | 限定差异 |
+| --- | --- | --- |
+| `SqliteLobColumnTests.theLobColumnsKeepTheirSqliteTypes` | `schema_types` 经实际 `st_storage_init` 和room初始化后，用pragma读取HTTP请求/响应正文、TCP payload、diagram snapshot共4个BLOB列以及预览列的真实声明；另确认该C schema没有specus_websocket_ticket表。 | C预览列声明TEXT，Java为varchar(2147483647)，均为SQLite TEXT affinity；Java ticket attributes_json的CLOB列及getBlob/getBytes的JDBC描述符在C无对应，C票据不是该数据库实体。不因此豁免票据行为、完整字节读回或其他表迁移；本场景不验收跨重启票据持久化。 |
+| `httpExchangeDetailShowsTheCapturedBodies` | `http_binary` 以生产同步storage writer保存原参考JSON及18字节PNG（含NUL、非UTF-8的0xff），核验SQLite BLOB类型/长度/全部字节及生产storage getter完整读回；管理列表解析items恰1条、total=1、id=1后，详情解析requestPreviewText精确为原JSON、responsePreviewText精确为完整PNG的data:image/png;base64。 | Java经过TrafficInspectionService并flush，C同步写入没有flush队列；本夹具直接调用C生产存储writer，不冒称重新验证全局采集门控或设备转发。管理查看经过真实签名JWT、用户表及响应构造入口，不经过监听socket。 |
+| `httpExchangeDetailLoadsARowWithoutBodies` | `http_legacy_null` 保存正文列为SQL NULL的记录及原参考request/response preview，核验两正文确为NULL；实际管理列表单条且ID正确，storage getter成功且两正文指针/长度为NULL/0；详情逐值保留两个预览。 | 模拟旧行在当前schema中的NULL表示，不冒称从旧版本真实升级；不能用空串或查询失败替代SQL NULL加载成功。 |
+| `tcpFrameListAndDetailLoadThePayload` | `tcp_binary` 经生产writer保存同一18字节PNG，storage列表精确1行/ID/字节数，getter返回逐字节相同payload；管理列表解析items恰1条及其ID，再核验详情payloadBase64精确为原PNG。 | C列表为items信封；Java参考直接读服务的Page内容，不声称两种内部API或JSON信封逐字节相同。新断言不是只检查payloadBase64字段存在。 |
+| `diagramVersionsListAndDetailLoadTheSnapshot` | `diagram_binary` 用原roomId/token/peerId创建first=PNG与second=second两个版本，实际执行创建时的修剪路径，ID互异；SQLite中first快照为完整BLOB，列表解析后名称/ID集合恰好两条且无多余；两条详情update分别精确还原原base64。 | Java直接调service，C走生产公共响应构造及真实room凭证；无管理JWT授权推论，不是监听HTTP socket或大容量/50版本修剪边界验收。 |
+| `SqliteConstraintTranslationTests.theDefaultDialectTranslatesConstraintViolations` | 阅读实际C使用sqlite3接口和初始化schema；不构造不存在的Spring EntityManagerFactory或Hibernate Dialect。 | 本方法对SpecusSqliteDialect类身份的断言是框架差异，仅此一项不适用；同类真实唯一约束不能因此免测。 |
+| `aJpaSaveThatViolatesAUniqueIndexIsADataIntegrityViolation` | `media_unique` 对生产初始化的specus_http_media_capture表执行与参考相同关键字段的真实INSERT，再插重复deduplication_key；精确SQLITE_CONSTRAINT_UNIQUE及原生错误中table.column，原记录数量仍1且原state/object/status不变。 | Java通过JPA仓库并断言DataIntegrityViolationException、Hibernate UNIQUE与constraintName；C没有该异常转换层。C证据是实际schema的原生INSERT/约束，不冒称管理HTTP错误码、媒体捕获竞争重试或完整业务事务回滚。 |
+| `aJdbcTemplateInsertThatViolatesAUniqueIndexIsADuplicateKey` | `raw_constraints` 在真实SQLite连接建原参考形状的probe表/unique索引，首条成功后重复code精确UNIQUE，原行不丢；正常不同code仍可插入。 | C对照原生SQLite结果，不声称抛出Spring DuplicateKeyException。探针表由测试建立，不冒充生产媒体表；生产表唯一约束由上一行另测。 |
+| `SqliteSqlExceptionTranslatorTests.aUniqueViolationIsADuplicateKey` | `raw_constraints` 分别核验重复code的UNIQUE及重复id的PRIMARYKEY、前者原生错误包含probe.code，拒绝后原行保留。 | 平台差异仅限配置Spring translator并将两种SQLite结果包装为DuplicateKeyException；C无此对象/API。 |
+| `anyOtherViolationIsADataIntegrityViolation` | 同一真实probe中NULL code精确NOTNULL，原生消息含probe.code；失败不增加行，后续有效写入成功。 | DataIntegrityViolationException的Java类身份不适用于C；不豁免C自己的非空约束或错误返回。 |
+| `withoutTheTranslatorTheViolationIsUncategorized` | 同一原生唯一约束不因是否有Java包装器而消失；上述真实UNIQUE拒绝及原行保留仍须成立。 | “有/无JdbcTemplate translator时异常类型不同”完全是Java框架断言；C没有第二套默认JDBC异常分类，不制造测试专用转换器来假装对应。 |
+| `otherExceptionsGetTheDefaultTranslation` | `raw_constraints` 的missing表返回SQLITE_ERROR而非约束码；另对实际C storage getter确认有表但无记录是0/found=0，隔离改名真实表后查询失败是-1/found=0，恢复表后读取恢复。 | SQLState23505的DuplicateKey、MySQL1043握手异常的默认Spring回退，在仅用sqlite3的C中没有对应驱动/SQLState API；不借此豁免C读库失败语义，更不把该探针当真实MySQL/PostgreSQL支持。 |
+
+7场景各用独立临时SQLite文件和生产初始化；管理HTTP/TCP查看使用真实存储owner及签名JWT，公共diagram使用room凭证。PNG精确为18字节，正文/快照原始BLOB和解析后的视图分别比较；解析字符串使用解码后的显式长度，微型正负校准拒绝带NUL后缀、null与缺字段。没有进程外服务端、监听socket、跨NAT或真实外部数据库；C同步writer与Java service/flush的设置差异不等于重新验收所有采集路径。本节也不证明更大BLOB容量、C既有64KiB正文保留上限之外的完整保存、迁移/重启/并发/事务回滚或其他数据库类。
+
+三个隔离真实C存储源码变体分别少返回1字节HTTP正文、丢失NULL正文行的legacy preview、移除生产媒体表deduplication_key唯一约束；使用最终冻结驱动，均在对应完整字节/预览/原生唯一约束断言退出1，汇总脚本退出0。没有旧程序比较，不称为3个线上缺陷，也不声称变体经过消毒器。
+
+最终revision2冻结输入实际通过Linux CMake Release（O3/NDEBUG、Werror）68/68、零失败零跳过；原67个名称及序号保留，新增SQLite套件为68。独立O2/Werror完整Make在原600秒限制内通过，实际执行全部7场景；复用独立Make首轮已编译且源码未变的核心，最终SQLite程序重新编译，不把未变化的NAT程序没有重编译当成漏测。原HTTP38、Resource28、Rate17及实际10000键、路由12/scale3/大小5/名称6/管理14及6次拒绝不变、写入2/会话4/RST3/写失败4、正常NAT18及偏差重放3、两组真实10秒下界和TURN均保留。全新O2 ASan/UBSan构建的36个核心对象及最终驱动实际执行1个注册套件的7场景，通过且泄漏检查开启、无报告；不是36条路径都运行，也不外推全部服务端或3个变体的消毒器覆盖。
+
+归档基线477个文件，增加新测试后，478个源码/引用夹具/资源递归输入在完整运行后全部复核；包含未变的7个Java引用源文件（3测试类、1辅助类及3实现类）、221个静态资源和34个嵌套二进制协议固件。15个私有脚本只规范化行尾，Git规范文本与前驱相同。随后只修改映射的3行、汇总和本节，其他477个运行输入不变；这477并不是“基线477文件原封不动”的意思。最终文档哈希另绑定阅读检查，不声称文档最后字节也参加了此前运行。
+
+前一revision1的完整68/Make/SAN/负对照结果及输入保留为中间记录，它缺少本次最终HTTP列表与实际storage错误/不存在补强，不能代替最终输入。首轮把Java Page content当成C的items属于夹具错误；首次消毒器配置同时给全局O2和CMake Release，实际尾部O3导致既有connectivity代码的格式警告被Werror拒绝，原失败保留。正式消毒器沿用前批RelWithDebInfo/O2且仍Werror，不声称该O3插桩编译问题已修复。首次负对照手动链接不存在的可选Brotli库也保留，改为匹配实际核心的链接依赖，未修改解码器或放宽断言。
+
+最终核验器首次错误要求未变的NAT程序再次编译，随后又误把直接链接的main.c当作核心对象的-c命令；两次核验失败及脚本保留，按真实构建方式修正后复核通过，不算运行失败或生产修复。Make的Clock skew警告同样保留，未改宿主时间；以实际新程序编译命令以及CMake/Make/消毒器三个产物中新增HTTP列表、storage错误/恢复断言的存在排除误用旧驱动，不据警告猜测唯一成因。
+
+本节仍是未合并候选及限定平台说明，精确新提交原始CI须另按PR #290的实际checkout/树/日志/产物核验，不借用前驱绿灯；27类、旧79类当前断言及#35其他验收未完成。不合并main、不关闭#35、不发版、不更新Homebrew，不清理未合并工作树/分支。
+
+## 历史表的读法与限制
+
+- **覆盖**：保留历史记录的类级评估标签，不是本轮逐断言完整覆盖的结论。部分历史“覆盖”行仍列有“未断言／未测”项；以说明中的缺口为准，这些断言仍需补证，不能据标签勾选当前验收项。
+- **部分**：历史记录中只有部分行为有 C 测试，“说明”列写出缺的部分。
+- **无**：历史记录中没有对应 C 测试，“说明”列写原因；若同时列出行为差异或无测试路径，这些缺口不会因“平台差异”标签自动消失。
 - **C 证据**的写法：
   - `文件:函数`：`tests/` 下的 C 测试函数。
   - 带引号的字符串：`tests/admin_http_tests.c` 的检查大多直接写在 `main()` 里，引号内是该检查失败时打印的 `fprintf` 文本，可以直接 grep 定位。写在其它文件里的会注明文件名。
   - ctest 名：`CMakeLists.txt` 注册的测试。
   - `scripts/*.sh`：端到端脚本。其中 `nat_e2e_smoke.sh`、`runtime_config_e2e.sh`、`direct_route_e2e.sh` 和 `java_c_discovery_interop.sh` 只由 CI 的「C server (Linux)」任务运行，不在 ctest 里。
-- 单个 Java 测试类的 `@Test` 数含 `@ParameterizedTest`。
+- 历史表单个类的 `@Test` 数含 `@ParameterizedTest`，是当时记录，不保证等于当前注解数，也不与新增盘点中包含 `@TestFactory` 的静态方法数相加。
 
-## 汇总
+## 历史基线汇总（非当前全部测试覆盖）
 
 79 个 Java 测试类中，**覆盖 73 个，部分 0 个，无 6 个**（2026-10-08 按逐行状态重算：`fix/c-server-parity-peer` 与 `fix/c-server-parity-transfer` 之后，`fix/c-server-parity-rest` 把 WebSocket 路由、登录 nonce、流量明细两类、连接事件、STUN/TURN 指标与 HTTP 流共 7 个类改为覆盖，`PeerMeshServiceTests` 由两个分支合起来补齐；`feat/tenant-scoped-login-names`（#183）实现了按租户唯一的登录名，把 `ManagementUserServiceTests`、`ManagementUserServiceIntegrationTests`（原为部分）与 `ManagementUserSchemaMigratorTests`（原为无）改为覆盖）。 2026-10-13 #261 补齐两个 Redis 相关类的管理事件缺口；计数仍只含这 79 个基线类，不代表后续全部新增类或 #35 完成。
 
-审计点名的类目前的状态如下：
+原审计点名的类在历史记录中的状态如下（不是本轮对当前全部断言的复核结论）：
 
 | Java 测试类 | 状态 | 一句话 |
 | --- | --- | --- |
@@ -37,9 +385,9 @@
 | `ClientAuthNonceServiceTests`、`ClientAuthNonceServiceIntegrationTests`、`ClientAuthNonceRepositoryCustomImplTests` | 覆盖 / 覆盖 / 无 | C 原子消费 nonce（`client_auth_nonce_tests`）；配置数据库时存进与 Java 同名同列的 `specus_client_auth_nonce` 表，真实进程重启后仍拒绝重放（原先在进程内存，重启即清空，已修正）；仓库方言测试不适用（C 只用 SQLite） |
 | `TrafficInspectionServiceTests` | 覆盖 | 默认关闭、HTTP body 以二进制保存、gzip 原样保存只解码预览、二进制无文本预览、按预览长度截断、媒体采集接管的响应不存 body、TCP 全量保存均有测试（`traffic_capture_tests`、`media_capture_tests`、`nat_stream_tests`）；C 原先只存预览不存 HTTP body，已修正；每个 body 只存前 64 KiB 是书面差异 |
 | `StunTurnServerMetricsTests` | 覆盖 | 目的地址策略的全部用例（含 IPv6、IPv4-mapped 与 CGNAT 的两半）由 `stun_turn_tests` 对 CreatePermission 与 ChannelBind 验证；relay 工作队列的丢弃数与高水位是平台差异：C 在一个 select 线程里同步转发，没有可丢弃的工作队列，也没有指标注册表 |
-| `ConnectionEventsWebSocketHandlerTests` | 覆盖 | #132 补了真实 socket 的 created/updated 事件、租户与归属过滤、ticket 规则，即 Java 集群发布失败时退回的本地投递；Redis 集群扇出是书面范围差异，影响是多实例部署时管理页只看到本实例的事件 |
+| `ConnectionEventsWebSocketHandlerTests` | 覆盖 | #132 的本地 socket 证据加 #261 的真实 Redis 双 C、C↔Java 原生事件扇出、过滤与故障本地回退，详见第 6 节；“多实例只看本机事件”已不是现状，但这不构成数据库 HA 或 Pub/Sub 漏收保证 |
 
-全部 6 个“无”：`SpecusServerApplicationTests`、`GlobalExceptionHandlerTests`、`ClientDownloadSchemaMigratorTests`、`LegacyDemoCredentialSanitizerIntegrationTests`、`ClientAuthNonceRepositoryCustomImplTests`、`JpaHttpTrafficExchangeStoreIntegrationTests`。都是书面平台差异，见各行说明。
+历史标为“无”的6类：`SpecusServerApplicationTests`、`GlobalExceptionHandlerTests`、`ClientDownloadSchemaMigratorTests`、`LegacyDemoCredentialSanitizerIntegrationTests`、`ClientAuthNonceRepositoryCustomImplTests`、`JpaHttpTrafficExchangeStoreIntegrationTests`。各行分别限定框架差异及仍欠缺的行为证据，不是六类全部断言的平台豁免；例如ClientDownloadSchemaMigratorTests的唯一约束、去重迁移与补列路径仍须补证。
 
 ## 1. 启动、认证与安全规则
 
@@ -62,7 +410,7 @@
 
 | Java 测试类 | @Test | 状态 | C 证据 | 说明 |
 | --- | ---: | --- | --- | --- |
-| `database/ClientDownloadSchemaMigratorTests` | 1 | 无 | — | 平台差异，经核对不影响 C 的行为正确性。Java 的迁移器为旧 Java 库补 `catalog_key`/`latest_slot` 唯一槽、把重复的版本与 latest 去重、把 `v1.2.3` 归一为 `1.2.3`；C 只给 `client_download_link` 补列（`src/storage.c`），但 C 自己的写路径维持同样的不变式：写入前去掉一个 `v`（`admin_http.c` 读取客户端包请求处），latest 只允许已启用且有版本的行，设为 latest 时在同一事务里清掉同一 implementation/platform/arch 槽的其他 latest（`st_storage_upsert_client_download_link_extended`）。读路径也容忍遗留数据：`parse_admin_semver` 接受一个 `v` 前缀，版本检查在同槽多个 latest 中按 SemVer 取最高。C 写出的数据因此不需要这次迁移。剩下的差异：没有数据库级唯一约束，库外写入或并发创建仍可能产生重复目录项；把 Java 未迁移的旧库交给 C 时，重复行不会被清理（公开目录里同一目标可能出现多个 latest）。补列路径本身没有测试。 |
+| `database/ClientDownloadSchemaMigratorTests` | 1 | 无 | — | 这里既有实现方式差异，也有尚未对齐的行为缺口，不能据此认定 C 已完整对齐。Java 的迁移器为旧 Java 库补 `catalog_key`/`latest_slot` 唯一槽、把重复的版本与 latest 去重、把 `v1.2.3` 归一为 `1.2.3`；C 只给 `client_download_link` 补列（`src/storage.c`），历史核对记载了 C 写路径的以下处理，但不足以证明同样的数据库不变式：写入前去掉一个 `v`（`admin_http.c` 读取客户端包请求处），latest 只允许已启用且有版本的行，设为 latest 时在同一事务里清掉同一 implementation/platform/arch 槽的其他 latest（`st_storage_upsert_client_download_link_extended`）。读路径也容忍遗留数据：`parse_admin_semver` 接受一个 `v` 前缀，版本检查在同槽多个 latest 中按 SemVer 取最高。这些应用层处理不能替代数据库约束或证明无需迁移。剩下的差异：没有数据库级唯一约束，库外写入或并发创建仍可能产生重复目录项；把 Java 未迁移的旧库交给 C 时，重复行不会被清理（公开目录里同一目标可能出现多个 latest）。补列路径本身没有测试。 |
 | `database/LegacyDemoCredentialSanitizerIntegrationTests` | 4 | 无 | 相关但不等价：`security_baseline_tests` 断言未设置环境时禁止演示数据 | C 不存在这项能力，也不需要：C 从不写入公开的演示凭据，只在 dev/test 下创建一个没有 api key 的 `Demo client`，与 Java `DatabaseInitializer` 一样启动时建在 `SPECUS_AUTH_TENANT_ID` 租户、`database/initialize` 时建在调用者的租户，属内置管理员（`fix/c-server-parity-crud` 起；原先固定为 `default` 租户的 `admin`，`management_crud_tests`）。 |
 | `database/ManagementUserSchemaMigratorTests` | 5 | 覆盖 | `management_accounts_tests.c:test_init_removes_email_records_of_deleted_accounts`；`tests/storage_tests.c`：`test_login_name_migration_backfills_legacy_rows`、`test_login_name_migration_refuses_duplicates_inside_a_tenant`、`test_login_name_migration_rejects_a_wrong_index`；`admin_http_tests.c:test_legacy_accounts_sign_in_after_migration` | #183 的三项一一对应（[management-accounts.md](../../../protocol/spec/management-accounts.md) 第 3 节）；#199 的两项（第 3 节第 6 步）：`st_storage_init` 删掉指向不存在账号的邮箱记录、其他记录不动，再运行一次结果不变；C 的邮箱表由 `st_storage_init` 建好，“没有邮箱表时照常运行”无需单测。前三项：`st_storage_init` 给旧库补 `login_name` 与 `login_name_normalized`，回填后建唯一索引 `uq_management_user_tenant_login_name (tenant_id, login_name_normalized)`，再运行一次结果不变，另一租户的同名账号照常存在而同租户的第二种拼写被索引拒绝；同一租户内大小写不同的两个旧账号在写入任何行之前拒绝启动，原因（含 `duplicate management login name` 与租户名）由 `st_storage_migrate_management_login_names` 返回；名字对、定义不对的索引同样拒绝（`must be unique on (tenant_id, login_name_normalized)`）。另测了旧库升级后原账号照常登录（默认租户的账号不带租户、其他租户的账号不带租户经旧账号键或带上租户）且原有客户端归属不变。差异：C 只用 SQLite；规范登录名只折叠 ASCII 字母（与 SQLite 的 `lower()` 一致，契约第 11 节）；`st_storage_init` 在每个请求都可能运行，索引已就位且没有未回填的行时只做一次计数。 |
 | `database/PeerServiceDiscoverySchemaMigratorTests` | 2 | 覆盖 | `storage_tests.c:test_peer_service_discovery_migration`、`storage_tests.c:test_peer_mesh_egress_domain_rules_migration`、`storage_tests.c:test_client_session_domain_targets_migration` | 旧 session 表补齐 `peer_service_discovery_version`、`peer_service_applications`、`client_egress_version`、`client_egress_domain_targets`，已有行与不写这些列的新行都是 0（applications 为 NULL）；旧共享表补 `mdns_import_enabled` 与 `allowed_client_ids`（关闭），`enabled` 为 NULL 的行置为关闭；新库两张表默认关闭；启动两次幂等。补测时修正：C 原先不给旧共享表补这两列，也不处理 NULL 的 `enabled`。MySQL/PostgreSQL 方言不适用。 |
@@ -116,12 +464,14 @@
 
 ## 6. 流量观测与管理事件
 
+管理事件集群测试的执行入口为 CMake 注册的 ctest `management_cluster_e2e`（真实 Redis、双 C，90 秒原门禁）。C↔Java 使用 CI `C and Java Redis management interoperability E2E` 步骤：构建相应提交后运行 `timeout --preserve-status 120s python3 implementations/c/server/scripts/management_cluster_e2e.py build/c-server/specus-server-c --java-jar implementations/java/server/target/specus-server.jar`。入口见 `implementations/c/server/CMakeLists.txt` 与 `.github/workflows/protocol-v2.yml`；它们说明如何重放，不等于本次已重新执行，也不替代具体运行的提交和日志。
+
 | Java 测试类 | @Test | 状态 | C 证据 | 说明 |
 | --- | ---: | --- | --- | --- |
 | `management/service/TrafficInspectionServiceTests` | 6 | 覆盖 | ctest `traffic_capture_tests`（`test_capture_switch_and_preview_size`、`test_java_preview_cases`、`test_text_sanitizing`、`test_body_types`、`test_store`、`test_stored_bodies`）；`media_capture_tests.c:test_captured_media_detail_keeps_no_body`；`admin_http_tests.c` "HTTP detail captured with SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED unset"；`nat_stream_tests.c`：`check_tcp_capture_off_by_default`、`check_tcp_capture_enabled`、`check_http_detail_bodies`（真实进程） | 6 个用例逐一对应：通道开关与全局开关缺一不采（HTTP 与 TCP）；HTTP body 以二进制保存、文本预览按预览长度截断（`01234567`）；gzip 响应原样保存、只为预览解码，类型 `json`、表头保留 `Content-Encoding`；PNG body 不生成文本预览、类型 `image`；媒体采集接管的响应保留实际大小与类型，不存 body 也没有预览；TCP 帧全量保存、预览截为 4 字节、偏移与帧序号。补测时修正四处：全局开关 `SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED` 原先只影响状态接口；预览原先是前 1024 字节的小写十六进制和只保留 ASCII 的文本，现按 Java 的预览长度（默认 256）、大写空格分隔十六进制、UTF-8 文本；SQLite 侧 body 类型原先自成一套，现与 `HttpBodyTypeClassifier` 一致；C 原先只存预览、不存 HTTP body（本分支补上，媒体采集接管的响应原先也会存下前 64 KiB）。差异：C 每个 body 只存前 64 KiB（转发路径只为响应留这么多），更长时 `requestTruncated`/`responseTruncated` 为 true，Java 存整个 body；`br` 只在构建找到 libbrotlidec 时解码（`fix/c-server-parity-peer-api`，CI 与发布构建已装 `libbrotli-dev`；没装的构建不解码，见 [API 盘点](c-server-api-inventory.md) 第 8 节，`traffic_capture_tests` 按构建分别断言）；C 同步写库，没有待写队列与批量 flush。 |
 | `management/storage/HttpTrafficExchangeStoreTests` | 3 | 覆盖 | `traffic_capture_tests.c`：`test_store`、`test_stored_bodies`、`test_body_display`；`elasticsearch_traffic_tests` 的 "Elasticsearch HTTP summary carried headers or previews"、"Elasticsearch HTTP summary carried the binary body"、"Elasticsearch HTTP binary body detail mismatch"；`admin_http_tests.c`：`test_http_exchange_body_detail`、"http exchange page response mismatch"（摘要 JSON 六个字段为 `null`）；`nat_stream_tests.c:check_http_detail_bodies` | 三项都有对应：ES 摘要排除表头、预览与 `requestBodyData`/`responseBodyData`；ES 与 SQLite 的摘要都不读 body，详情才读，二进制 body 在详情里显示为 `data:<type>;base64,…`（PNG 得 `data:image/png;base64,iVBORw0KGgo=`），id 是 JSON 字符串。详情按 Java `HttpBodyDataCodec` 显示：文本整段显示并清理控制字符，有 `Content-Encoding` 先解码（解不开时显示原字节的 `data:application/octet-stream;base64,…`），没存 body 时回到预览。补测时修正：SQLite 列表原先读出并返回每行的表头与预览；详情接口原先翻列表找行，ES 模式下没有表头与预览；C 原先不存 body，二进制 body 的详情只有空的文本预览。`br`：`fix/c-server-parity-peer-api` 起构建找到 libbrotlidec 时与 Java 一样解码（`decompression_limits_tests`、`traffic_capture_tests`），没装 `libbrotli-dev` 的构建仍按解不开处理（[API 盘点](c-server-api-inventory.md) 第 8 节）。 |
 | `management/storage/JpaHttpTrafficExchangeStoreIntegrationTests` | 1 | 无 | 相关：上行的 SQLite 摘要断言；`traffic_detail_api_tests` 的 "sqlite search as Java's JPA store" | 平台差异：这是 JPA 仓库对真实数据库的集成测试，C 没有 JPA。它要求的“摘要不读大字段”在 C 由上行 `test_store` 对 SQLite 断言。`fix/c-server-parity-edges` 起，C 的 SQLite 搜索按 `JpaHttpTrafficExchangeStore` 的谓词生成（字段表、`lower(col) LIKE` 与转义、数字字段、按记录租户的管理员视图），由 `traffic_detail_api_tests` 经管理 API 逐个查询验证。 |
-| `websocket/ConnectionEventsWebSocketHandlerTests` | 2 | 覆盖 | `admin_http_tests.c`（#132）：管理员收到本租户全部事件、普通用户只收到自己客户端的、其他租户收不到，普通 HTTP 426，缺/重用/错用 ticket 403；#261 `management_cluster_e2e.py` | `managementEventPublishesThroughClusterAndDeliversOnlyAfterRedisFanout` 对应真实 Redis、双 C 的原生连接事件：两端各收到一次，接收时核验 tenant/group 并按当前客户端 owner 过滤；C↔Java 原生事件双向投递由同一脚本的 `--java-jar` 验证。`managementEventFallsBackToLocalDeliveryWhenClusterPublishFails` 对应停止私有 Redis 后真实客户端断开产生的 updated 事件仍在本地投递，远端不冒充已送达。未修复 main 二进制运行同一 E2E 在等待远端 created 事件时失败。原先 C 仅本实例投递的差异已由 #261 消除；这不提供数据库 HA，Pub/Sub 漏收边界仍与 Java 相同。 |
+| `websocket/ConnectionEventsWebSocketHandlerTests` | 2 | 覆盖 | `admin_http_tests.c`（#132）：管理员收到本租户全部事件、普通用户只收到自己客户端的、其他租户收不到，普通 HTTP 426，缺/重用/错用 ticket 403；#261 `management_cluster_e2e.py` | `managementEventPublishesThroughClusterAndDeliversOnlyAfterRedisFanout` 对应真实 Redis、双 C 的原生连接事件：两端各收到一次，接收时核验 tenant/group 并按当前客户端 owner 过滤；C↔Java 原生事件双向投递由同一脚本的 `--java-jar` 验证。`managementEventFallsBackToLocalDeliveryWhenClusterPublishFails` 对应停止私有 Redis 后真实客户端断开产生的 updated 事件仍在本地投递，远端不冒充已送达。修复时的旧版本负对照在等待远端 created 事件时失败；这里未列其提交，不能将该历史负对照误认成本次锚定 main 的运行结果。原先 C 仅本实例投递的差异已由 #261 消除；这不提供数据库 HA，Pub/Sub 漏收边界仍与 Java 相同。 |
 
 ## 7. HTTP 媒体采集
 
@@ -158,14 +508,14 @@
 | `websocket/PublicTransferDiscoveryWebSocketHandlerTests` | 14 | 覆盖 | ctest `public_transfer_tests`（进程内 admin server，loopback 上的真实 HTTP 与 WebSocket）：`test_duplicate_peer_ids`、`test_client_name_uniqueness`、`test_merged_rosters`、`test_signal_to_invisible_peer`、`test_unidentifiable_addresses`、`test_broadcast_stays_in_group`、`test_hidden_peer`、`test_room_capacity_per_group`、`test_viewer_text_messages`；`public_discovery_cluster_e2e`（隐身端跨多个 presence 续期周期保持连接、不进入共享名称索引，可见端保持租约）；`admin_http_tests.c:test_public_discovery_websocket`："public discovery viewer write was not rejected"、"public discovery merged-net targeted route mismatch" 等 | 14 项逐一对应：同组、同网跨房间、同组跨网三种重复 peerId 都先发 error 再以 1008 关闭，已在线的连接收不到任何消息；名称全局唯一且忽略大小写（含非 ASCII）；合并 roster 的成员集合与逐接收者的 `sameRoom`；同网不同 roomId 互见；定向信令跨房间到达同网目标、发给不可见目标时静默丢弃；`unknown` 与纯空白地址不构成同网而同组仍可见（loopback 请求解析不出这两种地址，测试经 socketpair 以该地址驱动同一个 handler）；无目标广播只到同组；隐身端不在 roster 中但收得到 roster、能发信令；房间上限按组计算；VIEWER 的 whiteboard/clipboard/attachment 文本被拒、signal 放行。presence 刷新跳过隐身端由集群 E2E 对两个真实进程验证（Java 以 mock 断言 refresh 只调一次）。补测时修正四处：名称冲突的错误文本是 "display name is already connected"（Java/Go/.NET 为 "client name is already in use"）；进程内名称比较只对 ASCII 忽略大小写（Java `equalsIgnoreCase`）；纯空白地址被当作同网；显示名含 ISO 控制字符时照常加入（Java 以 "client name contains invalid characters" 拒绝）。差异：C 对 `unknown` 不区分大小写，Java 只认字面量（真实地址不会是这种写法）。 |
 | `websocket/PublicTransferCoordinationRedisIT` | 2 | 覆盖 | ctest `public_coordination_tests`（连真实 Redis，并重新执行自身作为第二个实例）："second instance mismatch"、"merged same-net/same-group roster mismatch"、"a peer ID taken on the net was registered in another group"、"directed lookup across groups and nets mismatch"、"revision after unregister was not strictly larger"、"registration policy mismatch"、"global name availability mismatch"、"distributed rate limit mismatch"；ctest `public_discovery_cluster_e2e`（两个 C 进程，含跨实例共享的配对码兑换窗口）；`java_c_discovery_interop.sh` | 第二个进程与第一个共享房间容量、全局名称和限流窗口，并收到对方发布的事件；合并 roster 的成员与顺序、网内 peerId 唯一、定向查找可达其他组的同网目标而查不到异网目标、注销后 roster revision 严格增大都有断言。#261 的 `management_cluster_e2e.py` 用真实 Redis、双 C 加第三租户进程，以及 C↔Java 验证 kind 4/5 双向事件、无重复投递、owner/tenant 过滤、回滚不发布、未知 reason、远端 ticket 清除、两类 WebSocket 撤销及 Redis 故障本地回退。补测时修正：集群模式下配对码兑换与公开 presign 的来源 IP 窗口仍在进程内计数，N 个实例放行 N 倍次数，Redis 故障时也不失败关闭（Java `PublicTransferRateLimiter` 与 public-transfer-cluster.md 第 6 节要求共享 Redis 窗口）；现改用共享窗口，E2E 验证两个实例合计计数、Redis 停止后返回 `429`。 |
 | `websocket/PublicTransferCoordinationServiceTests` | 4 | 覆盖 | ctest `public_cluster_codec_tests`：`test_identifiers`（"groupId/netId vectors"、"netId does not vary by public address only"、"netId of an empty address"）；`public_coordination_tests`："address '%s' made a net"；`public_transfer_tests`：`test_unidentifiable_addresses` | netId 与 groupId 的 sha256 向量、netId 只随地址变化、空地址的 netId 与 Java `netId(null)` 相同；`unknown`、纯空白与空串地址在 Redis roster 和进程内 discovery 中都不构成同网。补测时修正：纯空白地址原先被视为同网（`public_same_net`、`cluster_visible` 只拒绝 `""` 和 `"unknown"`）。 |
-| `websocket/PublicTransferClusterFrameTests` | 4 | 覆盖 | ctest `public_cluster_codec_tests`（读取 `protocol/test-vectors/public-transfer-cluster-v2.json`）：`test_canonical_frames`、`test_malformed_frames`、`test_identifiers`；`public_coordination_tests` "STCE Pub/Sub event mismatch"；`public_discovery_cluster_e2e` | 文本与管理事件的规范帧逐字节一致并解码回原字段；管理事件形状（无目标、无来源租约、revision 0、无 excludeSource、payload 非空）在编码和解码两侧都拒绝；尾随字节、截断、版本、保留字节、未知 flag 或 kind、无目标或空白目标的二进制帧、空白 group、非法 UTF-8 身份都被拒；groupId 推导向量与房间分量分隔。#261 增加 `canonicalManagementRevocation` 的逐字节回放、kind 5 编解码形状拒绝与 `managementGroupId` 的共享 tenant 向量、Java trim 和 null/empty 摘要；真实跨实例测试拒绝错绑租户、重复 JSON 字段、escaped NUL 和非法 UTF-8。补测时修正两处：解码器把最长 128 字节的 group 复制进 65 字节的字段（订阅线程栈溢出），目标与来源身份上限是 480/64 字节而非 STCE 的 512；解码只校验长度，不校验 UTF-8、空白与管理事件形状。 |
+| `websocket/PublicTransferClusterFrameTests` | 4 | 覆盖 | ctest `public_cluster_codec_tests`（读取 `protocol/test-vectors/public-transfer-cluster-v2.json`）：`test_canonical_frames`、`test_malformed_frames`、`test_identifiers`；`public_coordination_tests` "STCE Pub/Sub event mismatch"；`public_discovery_cluster_e2e` | 文本与管理事件的规范帧逐字节一致并解码回原字段；违反管理事件形状要求（无目标、无来源租约、revision 0、无 excludeSource、payload 非空）的帧在编码和解码两侧都拒绝；尾随字节、截断、版本、保留字节、未知 flag 或 kind、无目标或空白目标的二进制帧、空白 group、非法 UTF-8 身份都被拒；groupId 推导向量与房间分量分隔。#261 增加 `canonicalManagementRevocation` 的逐字节回放、kind 5 编解码形状拒绝与 `managementGroupId` 的共享 tenant 向量、Java trim 和 null/empty 摘要；真实跨实例测试拒绝错绑租户、重复 JSON 字段、escaped NUL 和非法 UTF-8。补测时修正两处：解码器把最长 128 字节的 group 复制进 65 字节的字段（订阅线程栈溢出），目标与来源身份上限是 480/64 字节而非 STCE 的 512；解码只校验长度，不校验 UTF-8、空白与管理事件形状。 |
 | `websocket/PublicTransferRelayFrameTests` | 2 | 覆盖 | ctest `public_transfer_tests`：`test_relay_frames`（"the relayed STWR2 frame is not the client frame with the authenticated source"、"a relay frame with %s was not refused"）；"public discovery STWR2 relay mismatch"；`public_discovery_cluster_e2e` "cross-instance binary envelope mismatch" | 转发帧与客户端帧逐字节相同，只多出服务端填入的已认证来源；伪造来源、STAP2 尾随字节、目标含换行或 NUL、目标为空白或全角空格时都回 "invalid binary relay frame" 并以 1008 关闭。补测时修正：目标原先只拒绝 NUL，空白目标和含其他控制字符的目标会被转发（Java 拒绝 blank 与 ISO control）。 |
 | `websocket/WebSocketTicketServiceTests` | 1 | 覆盖 | ctest `public_transfer_tests`：`test_ticket_scope_and_address`；"public discovery ticket reuse was not rejected"、"websocket ticket response mismatch" | 公共互传 ticket 用于 `/ws/connections`、`/ws/client-messages` 得 `403`，`connections` 与 `client-messages` 两种管理 ticket 用于 discovery 或对方端点也得 `403`，来源地址不符得 `403`；这些被拒的尝试都不消费 ticket，随后以正确端点和地址升级得 `101`，再用一次得 `403`。C 的公共互传 ticket 与管理 ticket 分存两处，scope 不符即查不到；管理 ticket 在同一存储内按 endpoint 区分。 |
 | `management/controller/PublicTransferRoomResourceTests` | 2 | 覆盖 | ctest `public_transfer_tests`：`test_redeem_client_address`（"the redemption was not keyed by the last untrusted X-Forwarded-For hop"、"X-Real-IP was used although X-Forwarded-For named the client"、"forwarded headers from an untrusted peer changed the redemption source"） | 以每个来源一次的兑换限流观察服务端按哪个地址计数：可信代理之后取 `X-Forwarded-For` 最后一个不可信跳而不是 `X-Real-IP`；未配置可信代理时，直连客户端改写 `X-Forwarded-For`/`X-Real-IP` 不改变计数来源。配对码创建与兑换响应都带 `Cache-Control: no-store`。 |
 | `management/service/PublicTransferRoomServiceTests` | 12 | 覆盖 | ctest `public_transfer_tests`：`test_room_credentials`（"the owner token was not stored as a SHA-256 hash"、"an unknown invitation-shaped token created a shadow OWNER room"、"an expired invitation was accepted"、"a revoked invitation was accepted"、"expiresInSeconds %lld answered %d"、"pairing code shape or persisted digest mismatch"、"the redeemed token is not a 24-hour EDITOR token"、"the snapshot was not stored decoded"）；`admin_http_tests.c:test_public_room_access_contract`："public room exhausted pairing code was accepted"、"public room viewer diagram write was not rejected" 等；`security_tests.c` "pairing-code HMAC vector mismatch" | 12 项逐一对应，经 HTTP 与 ws-ticket 入口验证：首次使用的 Token 成为房主且只存 SHA-256；未知的 `st-editor-`/`st-viewer-` Token、已过期与已撤销的邀请都得 `403` 且不创建影子房主房间；不带有效期的邀请 `expiresAt` 为 null；有效期 299 与 604801 秒得 `400`，300 与 604800 秒得 `200` 且到期时间正好晚这么多秒；配对码 8 位、默认一次、只存 64 位摘要；兑换得到 24 小时 EDITOR Token，库中到期时间与响应一致；耗尽的配对码 `400`；VIEWER 不能建版本；快照 base64 解码后入库。 |
 | `management/repository/PublicTransferRoomPairingCodeRepositoryTests` | 1 | 覆盖 | "public room exhausted pairing code was accepted"；"public room atomic pairing code create mismatch" 及其后的双线程并发兑换（恰好一个成功） | — |
 | `management/service/PublicTransferRateLimiterTests` | 1 | 覆盖 | "public room pairing redemption rate limit mismatch" | — |
-| `management/service/TransferAttachmentServiceTests` | 19 | 覆盖 | `object_storage_tests.c`：`test_capabilities_*`、`att_public_paths`、`att_callback_paths`、`att_upload_normalization`、`att_filename_normalization`、`att_id_collision`、`att_pending_download`、`att_expiration_batches`；`object_storage_e2e`（真实进程：直传、grant 一次性、下载计费、限流） | 19 项逐一对应（模块入口 + loopback 假 OSS）：capabilities 三项；房间 PENDING 上限、VIEWER 不能上传、账号存储额度；元数据归一（去路径、SHA-256 存小写、roomId 去空白、关联持久房间与账号）；文件名表（Unicode 码点、点号折叠、长度边界）；ID 冲突时换新 ID 与新 key 重试（为此新增 `st_object_storage_set_ids_for_tests` 接缝）；PENDING 附件下载被拒且不建 grant、不访问 OSS；受邀 VIEWER 下载；月下载额度；grant 只能消费一次；callback 完成后 client complete 幂等且不再 HEAD；complete 时对象缺失被拒，超大或超存储额度先删对象再拒；205 条过期记录分三批先删对象再标 EXPIRED。补测时修正两处：超过 180 字符且以点结尾的文件名保留了末尾的点（3.2.1 规定末尾的点不构成扩展名）；presign-upload 的检查顺序与 Java 不同（Java 先查来源 IP 窗口再解析房间，先查房间 PENDING 再查存储额度），C 先拒 VIEWER 和无效字段而不计入窗口，`object_storage_e2e` 相应把窗口放宽为 2 次。不适用：Java 以定宽 `SortableInstant` 存时间的断言，C 在自己的 SQLite 表中存整秒 ISO-8601，响应中的时间字段一致。差异：C 的错误文本为英文（第 5 节规定客户端只按状态码处理）。 |
+| `management/service/TransferAttachmentServiceTests` | 19 | 覆盖 | `object_storage_tests.c`：`test_capabilities_*`、`att_public_paths`、`att_callback_paths`、`att_upload_normalization`、`att_filename_normalization`、`att_id_collision`、`att_pending_download`、`att_expiration_batches`；`object_storage_e2e`（真实进程：直传、grant 一次性、下载计费、限流） | 19 项逐一对应（模块入口 + loopback 假 OSS）：capabilities 三项；房间 PENDING 上限、VIEWER 不能上传、账号存储额度；元数据归一（去路径、SHA-256 存小写、roomId 去空白、关联持久房间与账号）；文件名表（Unicode 码点、点号折叠、长度边界）；ID 冲突时换新 ID 与新 key 重试（为此新增 `st_object_storage_set_ids_for_tests` 接缝）；PENDING 附件下载被拒且不建 grant、不访问 OSS；受邀 VIEWER 下载；月下载额度；grant 只能消费一次；callback 完成后 client complete 幂等且不再 HEAD；complete 时对象缺失被拒，超大或超存储额度先删对象再拒；205 条过期记录分三批先删对象再标 EXPIRED。历史补测记录的文件名修正：超过 180 字符且以点结尾的文件名原先保留了末尾的点（3.2.1 规定末尾的点不构成扩展名）。另有presign-upload检查顺序差异记录：Java先查来源IP窗口再解析房间，先查房间PENDING再查存储额度；当时C先拒VIEWER和无效字段而不计入窗口，`object_storage_e2e` 相应把窗口放宽为2次。这是夹具适配，不是生产检查顺序已修复的证据；该断言的当前状态仍须随旧79类复核，不能由本行历史“覆盖”标签认定对齐。不适用：Java 以定宽 `SortableInstant` 存时间的断言，C 在自己的 SQLite 表中存整秒 ISO-8601，响应中的时间字段一致。差异：C 的错误文本为英文（第 5 节规定客户端只按状态码处理）。 |
 | `management/service/TransferCapabilitiesVectorTests` | 1 | 覆盖 | `object_storage_tests.c:test_capabilities_shared_vector`（`protocol/test-vectors/transfer-capabilities-v1.json`） | — |
 | `management/storage/object/AliyunOssObjectStorageServiceTests` | 3 | 覆盖 | `object_storage_tests.c:test_download_vector`、`test_upload_callback_header`、`att_callback_paths`（"callback key fetched %d times, last from %s"、"second callback key fetched %d times in all"、"a failed callback key fetch was cached"）；`object_storage_e2e` 的 `x-st-grant` | 三项都有对应：下载 V4 向量与 grant 标记、上传 callback header；callback 验签经 `/api/public/transfer/oss-callback` 入口：头里给的是 `http://` 的 gosspublic 地址，公钥只以 `https://gosspublic.alicdn.com/callback_pub_key_v1.pem` 取一次，之后的 callback 复用缓存，另一个 key 路径再取一次，取失败不缓存；首尾带空白的头裁剪后命中同一缓存。补测时修正：C 每次 callback 都重新下载公钥（Java 按固定后的 URL 缓存），也不裁剪 `x-oss-pub-key-url`；测试接缝由“直接给 PEM”改为“替换取公钥的 HTTPS 请求、可见被请求的 URL”。 |
 
@@ -173,7 +523,7 @@
 
 此前列出的编号项都已修正：原第 3 项（OIDC 只代理 code 交换）由 `fix/c-server-oidc` 修正，并由 `oidc_tests` 覆盖；原第 4–6 项（HTTP 流忽略 `DATA|END_STREAM`、未知流上的 DATA/FIN/RST 被静默丢弃、入站 `HEARTBEAT_RESPONSE` 被当作协议违规）由 `fix/c-server-stream-semantics` 修正，并由 `nat_stream_tests` 覆盖；原第 7 项（TURN 私网 peer 策略放行全部 IPv6，且测试从未在策略开启时运行）由 #132 修正，`fix/c-server-test-gaps` 又修正了同一策略只查第一个对端地址、以及不核对 allocation 身份两处，见第 8 节。仍然存在的差异写在上表各行的“说明”列。
 
-`fix/c-server-parity-transfer` 补测时发现并修正的差异（详见第 9 节各行）：STCE 解码器把 65 至 128 字节的 group 复制进 65 字节的字段，且不校验 UTF-8、空白与管理事件形状；名称冲突的错误文本与 Java 不同、进程内名称比较只对 ASCII 忽略大小写、显示名含控制字符照常加入；纯空白地址被当作同网；STWR2 目标可为空白或含控制字符；集群模式下配对码兑换与 presign 的来源 IP 窗口不共享；presign-upload 的检查顺序与 Java 不同；以点结尾的超长文件名保留了末尾的点；OSS callback 每次都重新下载公钥。
+`fix/c-server-parity-transfer` 历史补测记为已修正的差异（详见第 9 节各行，本轮未重新核验其当前全部断言）：STCE 解码器把 65 至 128 字节的 group 复制进 65 字节的字段，且不校验 UTF-8、空白与管理事件形状；名称冲突的错误文本与 Java 不同、进程内名称比较只对 ASCII 忽略大小写、显示名含控制字符照常加入；纯空白地址被当作同网；STWR2 目标可为空白或含控制字符；集群模式下配对码兑换与 presign 的来源 IP 窗口不共享；以点结尾的超长文件名保留了末尾的点；OSS callback 每次都重新下载公钥。presign-upload检查顺序另有差异记录，但放宽测试窗口不构成生产修复证据，不能归入本汇总的已修正项；其当前对齐状态待旧79类逐断言复核。
 
 `fix/c-server-test-gaps` 补测时发现并修正的其他差异（详见各行）：转发给设备前不改写 `Origin`/`Referer`/`Sec-Fetch-Site`（第 4 节）；Turnstile siteverify 返回非 JSON 时回 `400`、token 被原地改写（第 1 节）；SemVer 解析接受空标识符（第 5 节）；全局采集开关不起作用、预览格式与 body 类型和 Java 不同、摘要列表返回表头与预览（第 6 节）。
 

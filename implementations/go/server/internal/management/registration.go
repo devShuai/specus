@@ -237,6 +237,9 @@ func (s *registrationService) adminUsername() string {
 }
 
 func normalizeRegistrationEmail(value string) (string, error) {
+	if strings.ContainsRune(value, '\x00') {
+		return "", validation("邮箱格式无效")
+	}
 	normalized := strings.ToLower(strings.TrimSpace(value))
 	if normalized == "" {
 		return "", validation("邮箱不能为空")
@@ -286,11 +289,12 @@ func maskRegistrationEmail(email string) string {
 	if at <= 0 {
 		return "***"
 	}
-	visible := 2
-	if at < visible {
-		visible = at
+	local := []rune(email[:at])
+	visible := 1
+	if len(local) > 2 {
+		visible = 2
 	}
-	return email[:visible] + "***" + email[at:]
+	return string(local[:visible]) + "***" + email[at:]
 }
 
 func maxInt(left, right int) int {

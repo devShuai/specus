@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "connectivity_check.h"
 #include "json.h"
@@ -14,94 +15,7 @@
  * byte once the runtime routeId and checkedAt are taken out.
  */
 
-#ifndef ST_CONNECTIVITY_VECTOR_DIR
-#define ST_CONNECTIVITY_VECTOR_DIR "../../../protocol/test-vectors/"
-#endif
-
-typedef struct {
-    char kind[16];
-    int status;
-    char failure[32];
-    char cause[16];
-    long long at_ms;
-} scripted_answer;
-
-typedef struct {
-    long long now;
-    int control_online;
-    int data_online;
-    int capability;
-    scripted_answer answers[4];
-    size_t answers_len;
-    size_t next_answer;
-    char metadata[4][1024];
-    size_t probes;
-    char last_log[512];
-    size_t logs;
-    size_t refusal_logs;
-} fake_device;
-
-static void fake_presence(void *ctx, const char *client_name, int *control_online, int *data_online)
-{
-    (void)client_name;
-    fake_device *device = (fake_device *)ctx;
-    *control_online = device->control_online;
-    *data_online = device->data_online;
-}
-
-static void fake_probe(void *ctx,
-                       const char *client_name,
-                       const char *metadata_json,
-                       long long timeout_ms,
-                       st_connectivity_probe_answer *answer)
-{
-    (void)client_name;
-    (void)timeout_ms;
-    fake_device *device = (fake_device *)ctx;
-    if (device->probes < 4U) {
-        snprintf(device->metadata[device->probes], sizeof(device->metadata[0]), "%s", metadata_json);
-    }
-    ++device->probes;
-    memset(answer, 0, sizeof(*answer));
-    answer->capability = device->capability;
-    if (device->next_answer >= device->answers_len) {
-        answer->kind = ST_CONNECTIVITY_PROBE_TIMEOUT;
-        device->now = ST_CONNECTIVITY_BUDGET_MS;
-        return;
-    }
-    const scripted_answer *scripted = &device->answers[device->next_answer++];
-    device->now = scripted->at_ms;
-    if (strcmp(scripted->kind, "response") == 0) {
-        answer->kind = ST_CONNECTIVITY_PROBE_RESPONSE;
-        answer->status_code = scripted->status;
-    } else if (strcmp(scripted->kind, "rst") == 0) {
-        answer->kind = ST_CONNECTIVITY_PROBE_RESET;
-        snprintf(answer->failure, sizeof(answer->failure), "%s", scripted->failure);
-    } else if (strcmp(scripted->kind, "link-lost") == 0) {
-        answer->kind = ST_CONNECTIVITY_PROBE_LINK_LOST;
-    } else if (strcmp(scripted->kind, "open-failed") == 0) {
-        answer->kind = strcmp(scripted->cause, "stream-limit") == 0
-            ? ST_CONNECTIVITY_PROBE_STREAM_LIMIT : ST_CONNECTIVITY_PROBE_WRITE_FAILED;
-    } else {
-        answer->kind = ST_CONNECTIVITY_PROBE_TIMEOUT;
-        device->now = ST_CONNECTIVITY_BUDGET_MS;
-    }
-}
-
-static long long fake_now(void *ctx)
-{
-    return ((fake_device *)ctx)->now;
-}
-
-static void fake_log(void *ctx, const char *line)
-{
-    fake_device *device = (fake_device *)ctx;
-    snprintf(device->last_log, sizeof(device->last_log), "%s", line);
-    ++device->logs;
-    if (strstr(line, " refused code=CHECK_RATE_LIMITED") != NULL) {
-        ++device->refusal_logs;
-    }
-}
+#include "connectivity_check_test_support.h"
 
 typedef struct {
     int readable;
@@ -123,68 +37,6 @@ static int fake_load(void *ctx, long long route_id, st_connectivity_route *route
     return ST_CONNECTIVITY_ROUTE_FOUND;
 }
 
-static char *read_vector(void)
-{
-    char path[1024];
-    snprintf(path, sizeof(path), "%s%s", ST_CONNECTIVITY_VECTOR_DIR, "service-connectivity-check-v1.json");
-    FILE *file = fopen(path, "rb");
-    if (file == NULL) {
-        fprintf(stderr, "cannot open %s\n", path);
-        return NULL;
-    }
-    fseek(file, 0, SEEK_END);
-    long size = ftell(file);
-    fseek(file, 0, SEEK_SET);
-    char *data = size > 0 ? (char *)malloc((size_t)size + 1U) : NULL;
-    if (data != NULL && fread(data, 1, (size_t)size, file) == (size_t)size) {
-        data[size] = '\0';
-    } else {
-        free(data);
-        data = NULL;
-    }
-    fclose(file);
-    return data;
-}
-
-/* Drops whitespace outside strings, so the pretty-printed expectation compares byte for byte. */
-static void minify(const char *in, char *out, size_t out_len)
-{
-    size_t written = 0;
-    int in_string = 0;
-    for (const char *p = in; *p != '\0' && written + 1U < out_len; ++p) {
-        if (in_string) {
-            out[written++] = *p;
-            if (*p == '\\' && p[1] != '\0') {
-                out[written++] = *++p;
-            } else if (*p == '"') {
-                in_string = 0;
-            }
-        } else if (*p == '"') {
-            in_string = 1;
-            out[written++] = *p;
-        } else if (*p != ' ' && *p != '\n' && *p != '\r' && *p != '\t') {
-            out[written++] = *p;
-        }
-    }
-    out[written] = '\0';
-}
-
-static int bool_or(const char *json, const char *key, int fallback)
-{
-    int value = fallback;
-    if (json != NULL && st_json_get_bool(json, key, &value) != 0) {
-        value = fallback;
-    }
-    return value;
-}
-
-static void copy_string(const char *json, const char *key, char *out, size_t out_len)
-{
-    char *value = st_json_get_top_level_string(json, key);
-    snprintf(out, out_len, "%s", value == NULL ? "" : value);
-    free(value);
-}
-
 static int run_case(const char *raw_case)
 {
     char name[96];
@@ -197,15 +49,17 @@ static int run_case(const char *raw_case)
 
     fake_device device;
     memset(&device, 0, sizeof(device));
+    device.now = CHECK_START_MS;
+    device.check_start = CHECK_START_MS;
     device.control_online = 1;
     device.data_online = 1;
     fake_routes routes = {
         .readable = bool_or(input, "configReadable", 1),
         .visible = bool_or(input, "routeVisible", 1),
     };
-    snprintf(routes.route.tenant_id, sizeof(routes.route.tenant_id), "default");
-    snprintf(routes.route.client_name, sizeof(routes.route.client_name), "device-a");
-    snprintf(routes.route.route, sizeof(routes.route.route), "app");
+    snprintf(routes.route.tenant_id, sizeof(routes.route.tenant_id), "t1");
+    snprintf(routes.route.client_name, sizeof(routes.route.client_name), "device-42");
+    snprintf(routes.route.route, sizeof(routes.route.route), "api");
     snprintf(routes.route.target_base_url, sizeof(routes.route.target_base_url), "http://127.0.0.1:8080/base");
     routes.route.route_enabled = 1;
     routes.route.client_enabled = 1;
@@ -226,6 +80,7 @@ static int run_case(const char *raw_case)
     char **answers = NULL;
     size_t answers_len = 0;
     if (input != NULL && st_json_get_raw_array(input, "answers", &answers, &answers_len) == 0) {
+        if (answers_len > 4U) failed = 1;
         for (size_t i = 0; i < answers_len && i < 4U; ++i) {
             scripted_answer *answer = &device.answers[device.answers_len++];
             copy_string(answers[i], "kind", answer->kind, sizeof(answer->kind));
@@ -243,7 +98,7 @@ static int run_case(const char *raw_case)
     char admission[32];
     copy_string(input == NULL ? "{}" : input, "admission", admission, sizeof(admission));
     if (strcmp(admission, "route-in-progress") == 0) {
-        failed |= st_connectivity_admit(checker, "default", "admin", 42, 0, &occupied) != 0;
+        failed |= st_connectivity_admit(checker, "t1", "admin", 42, CHECK_START_MS, &occupied) != 0;
     } else if (strcmp(admission, "server-busy") == 0) {
         for (long long id = 1; id <= 32; ++id) {
             char user[32];
@@ -252,10 +107,10 @@ static int run_case(const char *raw_case)
         }
     }
 
-    const char *body = bool_or(input, "requestValid", 1) ? "" : "{\"path\":\"/../admin\"}";
+    const char *body = bool_or(input, "requestValid", 1) ? "{\"path\":\"/healthz\"}" : "{\"path\":\"/status/../admin\"}";
     st_connectivity_request request = {
         .authenticated = bool_or(input, "authenticated", 1),
-        .tenant_id = "default",
+        .tenant_id = "t1",
         .username = "alice",
         .route_id = "42",
         .body = body,
@@ -264,86 +119,46 @@ static int run_case(const char *raw_case)
     st_connectivity_response response;
     failed |= st_connectivity_handle(checker, &request, fake_load, &routes, &response) != 0;
 
-    int want_status = 0;
-    int want_retry = 0;
-    (void)st_json_get_int(expect == NULL ? "{}" : expect, "httpStatus", &want_status);
-    if (!failed && response.status != want_status) {
-        fprintf(stderr, "%s: status %d, want %d\n", name, response.status, want_status);
-        failed = 1;
-    }
-    if (!failed && want_status != 200) {
-        char want_code[48];
-        copy_string(expect, "code", want_code, sizeof(want_code));
-        if (st_json_get_int(expect, "retryAfterSeconds", &want_retry) != 0) {
-            want_retry = want_status == 429 || want_status == 503 ? 1 : 0;
-        }
-        char want_body[96];
-        snprintf(want_body, sizeof(want_body), "{\"code\":\"%s\"}", want_code);
-        if (want_status == 401 ? response.body != NULL
-                               : response.body == NULL || strcmp(response.body, want_body) != 0) {
-            fprintf(stderr, "%s: body %s, want %s\n", name, response.body == NULL ? "(none)" : response.body,
-                    want_status == 401 ? "(none)" : want_body);
-            failed = 1;
-        }
-        if (response.retry_after_seconds != want_retry) {
-            fprintf(stderr, "%s: Retry-After %d, want %d\n", name, response.retry_after_seconds, want_retry);
-            failed = 1;
-        }
-        if (device.probes != 0U) {
-            fprintf(stderr, "%s: a refused check reached the device\n", name);
-            failed = 1;
-        }
-    } else if (!failed) {
-        char *body_raw = st_json_get_top_level_raw(expect, "body");
-        static char want[8192];
-        static char got[8192];
-        minify(body_raw == NULL ? "" : body_raw, want, sizeof(want));
-        free(body_raw);
-        /* Take the runtime fields out; they must be present and well-formed. */
-        const char *prefix = "{\"schemaVersion\":1,\"kind\":\"http-route\",\"routeId\":42,\"checkedAt\":\"";
-        const char *checked_at = strncmp(response.body, prefix, strlen(prefix)) == 0
-            ? response.body + strlen(prefix) : NULL;
-        if (checked_at == NULL || strlen(checked_at) < 22U || checked_at[4] != '-' || checked_at[10] != 'T'
-            || checked_at[19] != 'Z' || checked_at[20] != '"' || checked_at[21] != ',') {
-            fprintf(stderr, "%s: runtime fields malformed in %s\n", name, response.body);
-            failed = 1;
-        } else {
-            snprintf(got, sizeof(got), "{\"schemaVersion\":1,\"kind\":\"http-route\",%s", checked_at + 22);
-            if (strcmp(got, want) != 0) {
-                fprintf(stderr, "%s: body mismatch\n got: %s\nwant: %s\n", name, got, want);
-                failed = 1;
-            }
-        }
-        /* Each request is one probe with the fixed metadata; the log line names no target. */
-        for (size_t i = 0; i < device.probes && i < 4U; ++i) {
-            const char *metadata = device.metadata[i];
-            char *method = st_json_get_top_level_string(metadata, "method");
-            char *relative = st_json_get_top_level_string(metadata, "relativePath");
-            char *query = st_json_get_top_level_string(metadata, "rawQuery");
-            int ok = method != NULL && strcmp(method, i == 0U ? "HEAD" : "GET") == 0
-                && relative != NULL && strcmp(relative, "/") == 0 && query != NULL && *query == '\0'
-                && strstr(metadata, "\"headers\":[\"Accept:*/*\",\"User-Agent:specus-connectivity-check/1\"]") != NULL
-                && strstr(metadata, "contentLength") == NULL && strstr(metadata, "\"requestId\":\"") != NULL;
-            free(method);
-            free(relative);
-            free(query);
-            if (!ok) {
-                fprintf(stderr, "%s: probe metadata %s\n", name, metadata);
-                failed = 1;
-            }
-        }
-        if (strncmp(device.last_log, "[connectivity-check] tenant=default user=alice route=42 outcome=", 64U) != 0
-            || strstr(device.last_log, "127.0.0.1") != NULL) {
-            fprintf(stderr, "%s: log line %s\n", name, device.last_log);
-            failed = 1;
-        }
-    }
+    if (!failed) failed = assert_vector_response(name, expect, &device, &response);
     st_connectivity_response_free(&response);
     st_connectivity_checker_free(checker);
     free(input);
     free(expect);
     free(route_raw);
     free(device_raw);
+    return failed;
+}
+
+/* Factory-level shared declarations must agree with the actual admission boundary too. */
+static int run_vector_admission_constants(const char *vector)
+{
+    char *rate = st_json_get_top_level_raw(vector, "rate");
+    int per_route = 0;
+    int per_server = 0;
+    int failed = rate == NULL || st_json_get_int(rate, "maxConcurrentPerRoute", &per_route) != 0
+        || st_json_get_int(rate, "maxConcurrentPerServer", &per_server) != 0
+        || per_route != 1 || per_server < 1 || per_server > 4096;
+    free(rate);
+    if (failed) return 1;
+    fake_device device = {0};
+    st_connectivity_device fake = {fake_presence, fake_probe, fake_now, fake_log, &device};
+    st_connectivity_checker *checker = st_connectivity_checker_new(&fake);
+    if (checker == NULL) return 1;
+    st_connectivity_refusal refusal;
+    failed = st_connectivity_admit(checker, "vector", "owner", 42, 0, &refusal) != 0
+        || st_connectivity_admit(checker, "vector", "other", 42, 0, &refusal) == 0
+        || refusal.status != 429 || strcmp(refusal.code, "CHECK_IN_PROGRESS") != 0;
+    st_connectivity_release(checker, 42);
+    for (int i = 0; !failed && i < per_server; ++i) {
+        char user[32];
+        snprintf(user, sizeof(user), "vector-user-%d", i);
+        failed = st_connectivity_admit(checker, "vector", user, 1000 + i, 0, &refusal) != 0;
+    }
+    if (!failed) failed = st_connectivity_admit(checker, "vector", "overflow", 99999, 0, &refusal) == 0
+        || refusal.status != 503 || strcmp(refusal.code, "CHECK_BUSY") != 0;
+    st_connectivity_checker_free(checker);
+    if (failed) fprintf(stderr, "shared vector admission constants disagree with actual limits\n");
+    else puts("connectivity vector: shared admission constants and boundaries passed");
     return failed;
 }
 
@@ -412,6 +227,13 @@ static int run_rate_events(const char *vector)
             fprintf(stderr, "rate event %zu: handled as %d\n", i, response.status);
             failed = 1;
         }
+        char wanted_body[96];
+        snprintf(wanted_body, sizeof(wanted_body), "{\"code\":\"%s\"}", code);
+        if (admitted ? response.body == NULL || strstr(response.body, "\"code\":\"DEVICE_OFFLINE\"") == NULL
+                     : response.body == NULL || strcmp(response.body, wanted_body) != 0) {
+            fprintf(stderr, "rate event %zu: response body differs\n", i);
+            failed = 1;
+        }
         st_connectivity_response_free(&response);
     }
     /* alice is refused at 1, 9999, 10008 and 40000 -- one line a minute -- and admin once. */
@@ -419,10 +241,118 @@ static int run_rate_events(const char *vector)
         fprintf(stderr, "logged %zu rate refusals, want 2\n", device.refusal_logs);
         failed = 1;
     }
+    if (strcmp(device.refusal_lines[0], "[connectivity-check] tenant=default user=alice route=1 refused code=CHECK_RATE_LIMITED retryAfter=10") != 0
+        || strcmp(device.refusal_lines[1], "[connectivity-check] tenant=default user=admin route=1 refused code=CHECK_RATE_LIMITED retryAfter=10") != 0) {
+        fprintf(stderr, "rate refusal log fields or order differ\n");
+        failed = 1;
+    }
     st_json_free_string_array(events, events_len);
     st_connectivity_checker_free(limiter);
     st_connectivity_checker_free(checker);
     free(rate);
+    return failed;
+}
+
+/* Java aRefusalConsumesNeitherKey: a refused route cannot spend a different user's burst. */
+static int run_refusal_consumes_neither_key(void)
+{
+    fake_device device = {0};
+    st_connectivity_device fake = {fake_presence, fake_probe, fake_now, fake_log, &device};
+    st_connectivity_checker *checker = st_connectivity_checker_new(&fake);
+    if (checker == NULL) return 1;
+    st_connectivity_refusal refusal;
+    int failed = st_connectivity_rate(checker, "bounds", "u1", 1, 0, &refusal) != 0;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        if (st_connectivity_rate(checker, "bounds", "u2", 1, 1 + attempt, &refusal) == 0
+            || refusal.status != 429 || strcmp(refusal.code, "CHECK_RATE_LIMITED") != 0
+            || refusal.limited_by == NULL || strcmp(refusal.limited_by, "route") != 0) failed = 1;
+    }
+    for (long long route = 2; route <= 11; ++route) {
+        if (st_connectivity_rate(checker, "bounds", "u2", route, 100, &refusal) != 0) failed = 1;
+    }
+    if (st_connectivity_rate(checker, "bounds", "u2", 99, 100, &refusal) == 0
+        || refusal.status != 429 || refusal.limited_by == NULL || strcmp(refusal.limited_by, "user") != 0) failed = 1;
+    /* The user refusal must not consume route99 for an unrelated user either. */
+    if (st_connectivity_rate(checker, "bounds", "u3", 99, 100, &refusal) != 0) failed = 1;
+    st_connectivity_checker_free(checker);
+    if (failed) fprintf(stderr, "rate refusal consumed a key or changed refusal fields\n");
+    else printf("connectivity rate boundary: refusal consumes neither key passed\n");
+    return failed;
+}
+
+static int fill_live_rate_tables(st_connectivity_checker *checker)
+{
+    /* The reference bound is 10000, not a reduced test capacity. */
+    for (long long key = 1; key <= 10000; ++key) {
+        char user[32];
+        snprintf(user, sizeof(user), "user-%lld", key);
+        st_connectivity_refusal refusal;
+        if (st_connectivity_rate(checker, "full", user, key, 0, &refusal) != 0) {
+            fprintf(stderr, "live rate table filled before key %lld\n", key);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int run_full_key_table_boundaries(void)
+{
+    fake_device device = {0};
+    st_connectivity_device fake = {fake_presence, fake_probe, fake_now, fake_log, &device};
+    st_connectivity_checker *checker = st_connectivity_checker_new(&fake);
+    if (checker == NULL) return 1;
+    int failed = fill_live_rate_tables(checker);
+    st_connectivity_refusal refusal;
+    if (!failed) {
+        failed = st_connectivity_rate(checker, "full", "new-user", 20000, 1, &refusal) == 0
+            || refusal.status != 503 || strcmp(refusal.code, "CHECK_BUSY") != 0
+            || refusal.retry_after_seconds != 1 || refusal.limited_by != NULL;
+    }
+    if (!failed) {
+        failed = st_connectivity_rate(checker, "full", "user-1", 1, 1, &refusal) == 0
+            || refusal.status != 429 || refusal.limited_by == NULL || strcmp(refusal.limited_by, "route") != 0;
+    }
+    if (!failed) {
+        /* Route entries expire at10s, user entries only at30s: the latter must still refuse. */
+        failed = st_connectivity_rate(checker, "full", "new-user", 20000, 10000, &refusal) == 0
+            || refusal.status != 503 || strcmp(refusal.code, "CHECK_BUSY") != 0;
+    }
+    if (!failed) failed = st_connectivity_rate(checker, "full", "new-user", 20000, 30000, &refusal) != 0;
+    st_connectivity_checker_free(checker);
+    if (failed) fprintf(stderr, "full rate table evicted live keys or expired at the wrong boundary\n");
+    else printf("connectivity rate boundary:10000 keys preserved until expiry passed\n");
+    return failed;
+}
+
+static int run_full_key_table_is_busy(void)
+{
+    fake_device device = {.control_online = 1, .data_online = 1, .capability = 1};
+    st_connectivity_device fake = {fake_presence, fake_probe, fake_now, fake_log, &device};
+    st_connectivity_checker *checker = st_connectivity_checker_new(&fake);
+    if (checker == NULL) return 1;
+    int failed = fill_live_rate_tables(checker);
+    device.now = 1;
+    fake_routes routes = {.readable = 1, .visible = 1};
+    snprintf(routes.route.tenant_id, sizeof(routes.route.tenant_id), "full");
+    snprintf(routes.route.client_name, sizeof(routes.route.client_name), "device");
+    snprintf(routes.route.route, sizeof(routes.route.route), "app");
+    snprintf(routes.route.target_base_url, sizeof(routes.route.target_base_url), "http://127.0.0.1/");
+    routes.route.route_enabled = 1;
+    routes.route.client_enabled = 1;
+    st_connectivity_request request = {1, "full", "new-user", "20000", "", 0U};
+    st_connectivity_response response;
+    if (!failed) {
+        failed = st_connectivity_handle(checker, &request, fake_load, &routes, &response) != 0;
+        if (!failed) {
+            failed = response.status != 503 || response.retry_after_seconds != 1
+                || response.body == NULL || strcmp(response.body, "{\"code\":\"CHECK_BUSY\"}") != 0
+                || device.probes != 0U;
+            st_connectivity_response_free(&response);
+        }
+    }
+    st_connectivity_checker_free(checker);
+    if (failed) fprintf(stderr, "full rate table was not CHECK_BUSY/no-probe in the handler\n");
+    else printf("connectivity rate boundary: full table handler503/no-probe passed\n");
     return failed;
 }
 
@@ -512,7 +442,7 @@ int main(void)
         free(vector);
         return 1;
     }
-    int failed = 0;
+    int failed = assert_minify_bounds();
     size_t passed = 0;
     for (size_t i = 0; i < cases_len; ++i) {
         if (run_case(cases[i]) == 0) {
@@ -523,7 +453,11 @@ int main(void)
     }
     printf("connectivity vector: %zu/%zu cases passed\n", passed, cases_len);
     st_json_free_string_array(cases, cases_len);
+    failed |= run_vector_admission_constants(vector);
     failed |= run_rate_events(vector);
+    failed |= run_refusal_consumes_neither_key();
+    failed |= run_full_key_table_boundaries();
+    failed |= run_full_key_table_is_busy();
     failed |= run_request_rules();
     free(vector);
     return failed ? 1 : 0;

@@ -44,8 +44,6 @@
 /* expectSessionClosed: both connections closed within 5 s (the vector's notes). */
 #define SESSION_CLOSE_TIMEOUT_MS 5000
 #define MAX_ROUTES 16
-#define CREDENTIAL_KEY "ck_route_lifecycle"
-#define CREDENTIAL_SECRET "route-lifecycle-secret"
 
 /* ------------------------------------------------------------------------------------------- */
 /* Vector access                                                                                 */
@@ -97,6 +95,37 @@ static int vec_array(const char *object, const char *key, char ***items, size_t 
     free(wrapped);
     free(raw);
     return rc;
+}
+
+/* These lifecycle fixtures create no TCP mappings. A missing/null list is not an empty snapshot. */
+static int explicit_empty_tcp_snapshot(const char *json)
+{
+    char **items = NULL;
+    size_t count = 0U;
+    int rc = vec_array(json, "specusConfigList", &items, &count);
+    int empty = rc == 0 && count == 0U;
+    st_json_free_string_array(items, count);
+    return empty;
+}
+
+static int check_empty_tcp_snapshot_parser(void)
+{
+    const char *const invalid[] = {
+        "{}", "{\"specusConfigList\":null}", "{\"specusConfigList\":{}}",
+        "{\"specusConfigList\":[{\"port\":42001}]}"
+    };
+    if (!explicit_empty_tcp_snapshot("{\"specusConfigList\":[]}")) {
+        fprintf(stderr, "empty TCP snapshot parser rejects an explicit empty array\n");
+        return 1;
+    }
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        if (explicit_empty_tcp_snapshot(invalid[i])) {
+            fprintf(stderr, "empty TCP snapshot parser accepts invalid case %zu\n", i);
+            return 1;
+        }
+    }
+    printf("NAT snapshot: explicit empty TCP array required; missing/null/object/nonempty controls rejected\n");
+    return 0;
 }
 
 /* A string array under key: 0 with the strings, 1 when it is null, -1 when absent or malformed. */
@@ -390,10 +419,14 @@ static int check_push(replay *r, const char *step, const char *key)
     if (names_ok) {
         join_names(names, item_count, actual_text, sizeof(actual_text));
     }
-    int matches = names_ok && same_name_set(names, item_count, expected, expected_count);
+    int empty_tcp = explicit_empty_tcp_snapshot(json);
+    int matches = names_ok && empty_tcp && same_name_set(names, item_count, expected, expected_count);
     if (!matches) {
         step_fail(r, __LINE__, "%s: NAT_CONTROL routes [%s], expected [%s]; NAT_CONTROL was %s", key,
                   names_ok ? actual_text : "(no httpSpecusConfigList array of routes)", expected_text, json);
+        if (!empty_tcp) {
+            step_fail(r, __LINE__, "NAT_CONTROL must include the explicit empty specusConfigList of this fixture");
+        }
     }
     st_json_free_string_array(names, names == NULL ? 0U : item_count);
     st_json_free_string_array(items, item_count);
@@ -555,9 +588,40 @@ static void parse_response(const char *raw, public_response *response)
  * Sends GET /http/{client}/{route}{path} and reads the answer, while the fake client answers every
  * OPEN its data connection gets in the meantime; *opens counts them.
  */
-static int public_request(replay *r, const char *step, public_response *response, int *opens)
+static int finish_data_observation(replay *r, int *opens, int *nat_frames)
+{
+    if (r->data < 0) return 0;
+    st_buffer heartbeat = st_protocol_encode_empty_packet(ST_CMD_HEARTBEAT_REQUEST);
+    STEP_CHECK(r, send_buffer(r->data, &heartbeat) == 0, "data observation heartbeat could not be sent");
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    for (;;) {
+        long long remaining = deadline - monotonic_ms();
+        st_frame_header header;
+        uint8_t *body = NULL;
+        STEP_CHECK(r, remaining > 0 && read_frame(r->data, (int)remaining, &header, &body) == 1,
+                   "data observation did not reach its heartbeat response");
+        if (header.command == ST_CMD_HEARTBEAT_RESPONSE) {
+            free(body);
+            return 0;
+        }
+        st_nat_message message;
+        int decoded = header.command == ST_CMD_NAT_MESSAGE
+            && st_protocol_decode_nat_message(body, header.length, &message) == 0;
+        free(body);
+        STEP_CHECK(r, decoded, "unexpected data frame before observation heartbeat");
+        ++*nat_frames;
+        if (message.type == ST_NAT_OPEN) {
+            ++*opens;
+            (void)answer_open(r->data, message.stream_id);
+        }
+        st_nat_message_free(&message);
+    }
+}
+
+static int public_request(replay *r, const char *step, public_response *response, int *opens, int *nat_frames)
 {
     *opens = 0;
+    *nat_frames = 0;
     char route[128];
     char path[256];
     char credentials[16];
@@ -640,15 +704,16 @@ static int public_request(replay *r, const char *step, public_response *response
                 continue;
             }
             st_nat_message message;
-            if (header.command == ST_CMD_NAT_MESSAGE
-                && st_protocol_decode_nat_message(body, header.length, &message) == 0) {
-                if (message.type == ST_NAT_OPEN) {
-                    ++*opens;
-                    (void)answer_open(r->data, message.stream_id);
-                }
-                st_nat_message_free(&message);
-            }
+            int decoded = header.command == ST_CMD_NAT_MESSAGE
+                && st_protocol_decode_nat_message(body, header.length, &message) == 0;
             free(body);
+            STEP_CHECK(r, decoded, "unexpected data frame while observing public request");
+            ++*nat_frames;
+            if (message.type == ST_NAT_OPEN) {
+                ++*opens;
+                (void)answer_open(r->data, message.stream_id);
+            }
+            st_nat_message_free(&message);
         }
         if (ready[0].revents != 0) {
             ssize_t received = recv(fd, raw + used, sizeof(raw) - 1U - used, 0);
@@ -670,14 +735,17 @@ static int public_request(replay *r, const char *step, public_response *response
     close(fd);
     parse_response(raw, response);
     STEP_CHECK(r, response->status != 0, "GET %s: no HTTP response (%zu bytes: %s)", target, used, raw);
-    return 0;
+    /* Closing the HTTP socket alone is not a drain of the independent data TCP connection.
+     * Count queued OPENs through an ordered heartbeat, rather than infer zero from a poll race. */
+    return finish_data_observation(r, opens, nat_frames);
 }
 
 static int check_request(replay *r, const char *step)
 {
     public_response response;
     int opens = 0;
-    if (public_request(r, step, &response, &opens) != 0) {
+    int nat_frames = 0;
+    if (public_request(r, step, &response, &opens, &nat_frames) != 0) {
         return 1;
     }
     char *expect = st_json_get_top_level_raw(step, "expect");
@@ -737,6 +805,10 @@ static int check_request(replay *r, const char *step)
         int expected_opens = vec_bool(expect, "forwarded") ? 1 : 0;
         if (opens != expected_opens) {
             snprintf(reason, sizeof(reason), "the fake client received %d OPEN(s), expected %d", opens, expected_opens);
+            failed = 1;
+        }
+        if (!failed && !expected_opens && nat_frames != 0) {
+            snprintf(reason, sizeof(reason), "a refused request sent %d NAT frame(s), expected none", nat_frames);
             failed = 1;
         }
     }
@@ -824,6 +896,31 @@ static int op_set_client_enabled(replay *r, const char *step)
     snprintf(path, sizeof(path), "/api/admin/clients/%lld", r->client_id);
     snprintf(body, sizeof(body), "{\"enabled\":%s}", vec_bool(step, "enabled") ? "true" : "false");
     STEP_CHECK(r, admin_call(r, "PUT", path, body, 200, NULL) == 0, "client %s was not updated", r->client_name);
+    return 0;
+}
+
+/* Keep the already bound client view deliberately stale: no API revocation or route push. */
+static int op_disable_client_in_database(replay *r)
+{
+    st_storage_client client;
+    st_storage_client updated;
+    STEP_CHECK(r, st_storage_get_client(r->server->db_path, r->client_id, &client) == 0
+                   && st_storage_upsert_client(r->server->db_path, r->client_id, client.tenant_id,
+                                               client.client_name, client.owner_username, 0,
+                                               client.connection_rate_limit_per_minute, &updated) == 0
+                   && !updated.enabled,
+               "the bound client's enabled flag could not be changed in the store");
+    return 0;
+}
+
+static int op_delete_route_in_database(replay *r, const char *step)
+{
+    char name[128];
+    vec_text(step, "route", name, sizeof(name));
+    route_record *route = find_route(r, name);
+    STEP_CHECK(r, route != NULL && st_storage_delete_http_route_by_id(r->server->db_path, route->id) == 0,
+               "the bound client's route could not be deleted without an API push");
+    *route = r->routes[--r->route_count];
     return 0;
 }
 
@@ -988,6 +1085,17 @@ static int op_reconnect(replay *r, const char *step)
 /* Closes both connections and waits until the server has the runtime session offline. */
 static int op_disconnect(replay *r)
 {
+    STEP_CHECK(r, r->control >= 0 && r->data >= 0, "disconnect while the fake client is not connected");
+    /* Keep the read sides until the real workers have unbound both channels. Their final
+     * shutdown comes after registry cleanup; a local close plus one DB status is weaker. */
+    STEP_CHECK(r, shutdown(r->data, SHUT_WR) == 0 && shutdown(r->control, SHUT_WR) == 0,
+               "could not half-close both client connections");
+    long long close_deadline = monotonic_ms() + SESSION_CLOSE_TIMEOUT_MS;
+    int control_closed = expect_channel_closed(r->control, SESSION_CLOSE_TIMEOUT_MS);
+    long long remaining = close_deadline - monotonic_ms();
+    int data_closed = expect_channel_closed(r->data, remaining > 0 ? (int)remaining : 1);
+    STEP_CHECK(r, control_closed == 0 && data_closed == 0,
+               "disconnect did not observe both real server EOFs within the original5s");
     close_fd(&r->data);
     close_fd(&r->control);
     long long deadline = monotonic_ms() + SESSION_CLOSE_TIMEOUT_MS;
@@ -1022,6 +1130,10 @@ static int run_step(replay *r, const char *step)
     } else if (strcmp(op, "setClientEnabled") == 0) {
         failed = op_set_client_enabled(r, step);
         closed_reason = vec_bool(step, "enabled") ? NULL : "ADMIN_DISABLED";
+    } else if (strcmp(op, "disableClientInDatabase") == 0) {
+        failed = op_disable_client_in_database(r);
+    } else if (strcmp(op, "deleteRouteInDatabase") == 0) {
+        failed = op_delete_route_in_database(r, step);
     } else if (strcmp(op, "renameClient") == 0) {
         failed = op_rename_client(r, step);
         closed_reason = "ADMIN_RENAMED";
@@ -1079,11 +1191,20 @@ static int replay_current_scenario(test_server *server)
 
     /* A new account of its own: the HTTP login creates it, and connect reuses its runtime token. */
     STEP_CHECK(&r, admin_login(&r) == 0, "admin login");
-    STEP_CHECK(&r, create_credential(server->db_path, CREDENTIAL_KEY, CREDENTIAL_SECRET, 2) == 0,
-               "credential %s not stored", CREDENTIAL_KEY);
-    STEP_CHECK(&r, http_client_login(server, CREDENTIAL_KEY, CREDENTIAL_SECRET, "machine-route-lifecycle",
-                                     "route-owner", &r.runtime) == 0,
-               "client HTTP login (status and body above)");
+    char *created = NULL;
+    STEP_CHECK(&r, admin_call(&r, "POST", "/api/admin/client-credentials",
+                              "{\"enabled\":true,\"maxOnlineInstances\":2}", 201, &created) == 0,
+               "fresh credential was not created through the management API");
+    char *credential = st_json_get_top_level_raw(created, "credential");
+    char *key = credential == NULL ? NULL : st_json_get_top_level_string(credential, "apiKey");
+    char *secret = st_json_get_top_level_string(created, "secret");
+    int logged_in = key != NULL && secret != NULL
+        && http_client_login(server, key, secret, "machine-route-lifecycle", "route-owner", &r.runtime) == 0;
+    free(key);
+    free(secret);
+    free(credential);
+    free(created);
+    STEP_CHECK(&r, logged_in, "client HTTP login with the new API credential (status and body above)");
     r.client_id = r.runtime.client_id;
     snprintf(r.client_name, sizeof(r.client_name), "%s", r.runtime.client_name);
 
@@ -1122,6 +1243,30 @@ static const char account_replaced_scenario[] =
     "\"client\":\"current\",\"expect\":{\"statusAnyOf\":[502,503],\"forwarded\":false}},"
     "{\"op\":\"expectStillConnected\"}"
     "]}";
+
+/* Java HttpSpecusControllerFailClosedTests, with real still-bound control/data sockets.
+ * The initial successful request calibrates OPEN observation; only the store is then changed. */
+static const char deleted_protected_route_scenario[] =
+    "{\"id\":\"protected-route-deleted-with-stale-bound-client\",\"steps\":["
+    "{\"op\":\"createRoute\",\"route\":\"web\",\"auth\":true,\"expectPush\":null},"
+    "{\"op\":\"connect\",\"expectLoginPush\":[\"web\"]},"
+    "{\"op\":\"request\",\"route\":\"web\",\"path\":\"/secret\",\"credentials\":\"valid\",\"expect\":{\"status\":200,\"body\":\"forwarded\",\"forwarded\":true}},"
+    "{\"op\":\"request\",\"route\":\"web\",\"path\":\"/secret\",\"credentials\":\"none\",\"expect\":{\"status\":401,\"basicChallenge\":true,\"forwarded\":false}},"
+    "{\"op\":\"deleteRouteInDatabase\",\"route\":\"web\"},"
+    "{\"op\":\"expectStillConnected\"},"
+    "{\"op\":\"request\",\"route\":\"web\",\"path\":\"/secret\",\"credentials\":\"none\",\"expect\":{\"status\":404,\"noStore\":true,\"forwarded\":false}},"
+    "{\"op\":\"expectStillConnected\"}]}";
+
+static const char disabled_client_scenario[] =
+    "{\"id\":\"client-disabled-with-stale-bound-client\",\"steps\":["
+    "{\"op\":\"createRoute\",\"route\":\"web\",\"auth\":true,\"expectPush\":null},"
+    "{\"op\":\"connect\",\"expectLoginPush\":[\"web\"]},"
+    "{\"op\":\"request\",\"route\":\"web\",\"path\":\"/secret\",\"credentials\":\"valid\",\"expect\":{\"status\":200,\"body\":\"forwarded\",\"forwarded\":true}},"
+    "{\"op\":\"disableClientInDatabase\"},"
+    "{\"op\":\"expectStillConnected\"},"
+    "{\"op\":\"request\",\"route\":\"web\",\"path\":\"/secret\",\"credentials\":\"none\",\"expect\":{\"status\":404,\"noStore\":true,\"forwarded\":false}},"
+    "{\"op\":\"request\",\"route\":\"web\",\"path\":\"/secret\",\"credentials\":\"valid\",\"expect\":{\"status\":404,\"noStore\":true,\"forwarded\":false}},"
+    "{\"op\":\"expectStillConnected\"}]}";
 
 /* Reads what the scenarios share: credentials, target, and the fake client's answer. */
 static int load_vector_constants(void)
@@ -1165,6 +1310,9 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IOLBF, 0);
     signal(SIGPIPE, SIG_IGN);
     srand((unsigned int)wall_clock_ms());
+    if (check_empty_tcp_snapshot_parser() != 0) {
+        return 1;
+    }
 
     vector_json = read_file(ST_ROUTE_LIFECYCLE_VECTOR_FILE);
     if (vector_json == NULL || !st_json_is_valid_object(vector_json) || load_vector_constants() != 0) {
@@ -1194,6 +1342,13 @@ int main(int argc, char **argv)
     current_scenario = account_replaced_scenario;
     int extra_failures = run_on_fresh_server("account-replaced-behind-the-server", replay_current_scenario, NULL);
     failures += extra_failures;
+    const char *const fail_closed[] = {deleted_protected_route_scenario, disabled_client_scenario};
+    for (size_t i = 0; i < sizeof(fail_closed) / sizeof(fail_closed[0]); ++i) {
+        char name[128];
+        current_scenario = fail_closed[i];
+        vec_text(current_scenario, "id", name, sizeof(name));
+        failures += run_on_fresh_server(name, replay_current_scenario, NULL);
+    }
     st_json_free_string_array(scenarios, scenario_count);
     free(server_section);
     free(vector_json);

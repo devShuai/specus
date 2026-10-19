@@ -56,7 +56,8 @@ typedef struct {
 typedef struct {
     char registration_id[65];
     char username[81];
-    char email[255];
+    /* Java accepts 254 UTF-16 units: each can require up to 3 UTF-8 bytes. */
+    char email[254U * 3U + 1U];
     char password_hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
     char code_hash[65];
     int attempts_remaining;
@@ -677,6 +678,8 @@ int st_storage_update_registration_attempts(const char *path,
                                             const char *updated_at);
 int st_storage_delete_registration_challenge(const char *path, const char *registration_id);
 int st_storage_delete_expired_registration_challenges(const char *path, const char *expires_before);
+/* Same strict cutoff used by the transactional nonce consume path. */
+int st_storage_delete_expired_client_auth_nonces(const char *path, const char *before, int *deleted);
 /*
  * Java ClientAuthNonceService.consume on specus_client_auth_nonce, in one write transaction:
  * deletes the rows that expired before now_ms, then inserts (nonce_id, api_key_hash) to expire at
@@ -1001,13 +1004,16 @@ int st_storage_mark_connection_disconnected(const char *path,
                                             const char *disconnected_at);
 /*
  * Ends every connection record that is still open, keeping a reason already stamped on it. Used at
- * startup (SERVER_RESTARTED) for rows a killed process left behind and after the graceful shutdown
- * drain (SERVER_SHUTDOWN) for channels that did not finish in time. closed_count may be NULL.
+ * the graceful shutdown drain (SERVER_SHUTDOWN) for channels that did not finish in time.
+ * Startup uses the strict before-cutoff variant. closed_count may be NULL.
  */
 int st_storage_close_open_connections(const char *path,
                                       const char *disconnect_reason,
                                       const char *disconnected_at,
                                       int *closed_count);
+int st_storage_close_open_connections_before(const char *path, const char *cutoff,
+                                               const char *disconnect_reason, const char *disconnected_at,
+                                               int *closed_count);
 int st_storage_list_connections(const char *path,
                                 long long client_id,
                                 int success_filter,
@@ -1782,5 +1788,19 @@ int st_storage_delete_management_user_audited(const char *path,
                                               long long now_ms,
                                               st_storage_share_ids *revoked,
                                               st_storage_account_owned *owned);
+
+/* Persistent, single-use WebSocket tickets. JSON is allocated on successful consume;
+ * caller frees it. Consume:0 success,1 absent/expired/scope/address mismatch,-1 storage error.
+ * Expiry is inclusive; purge is strict, matching WebSocketTicketRepository. */
+int st_storage_issue_websocket_ticket(const char *path, const char *token_hash, const char *scope,
+    const char *attributes_json, const char *remote_address_hash, const char *created_at, const char *expires_at);
+/* Atomic strict purge + category quota + insert. Management scopes share a quota;
+ * public-transfer has a separate quota.0 success,-2 quota,-1 error. */
+int st_storage_issue_websocket_ticket_limited(const char *path, const char *token_hash, const char *scope,
+    const char *attributes_json, const char *remote_address_hash, const char *created_at,
+    const char *expires_at, unsigned int active_limit);
+int st_storage_consume_websocket_ticket(const char *path, const char *token_hash, const char *scope,
+    const char *remote_address_hash, const char *now, char **attributes_json);
+int st_storage_delete_expired_websocket_tickets(const char *path, const char *before, int *deleted);
 
 #endif

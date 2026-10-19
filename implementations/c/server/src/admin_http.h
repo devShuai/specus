@@ -62,6 +62,9 @@ typedef struct {
      * ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED.
      */
     void (*bind_cancel)(void *ctx, void (*cancel)(void *cancel_ctx), void *cancel_ctx);
+    /* Optional length-aware RST reason. Preferred over on_reset when supplied: JSON strings can
+     * contain embedded NUL, which is data to escape in diagnostics, not the end of the reason. */
+    void (*on_reset_bytes)(void *ctx, uint32_t code, const char *reason, size_t reason_len);
 } st_admin_direct_http_sink;
 
 /*
@@ -88,6 +91,8 @@ typedef struct {
  * NUL-terminates when out_len > 0; returns the length written.
  */
 size_t st_admin_log_safe_reason(const char *reason, char *out, size_t out_len);
+/* The same formatting for a bounded byte string, including embedded NUL. */
+size_t st_admin_log_safe_reason_n(const char *reason, size_t reason_len, char *out, size_t out_len);
 
 /*
  * Forwards one Direct HTTP request: 0 once the response was relayed, -2 when the response head

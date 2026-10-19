@@ -15,6 +15,14 @@
 #define ST_CONNECTIVITY_MAX_BODY_BYTES 4096U
 #define ST_CONNECTIVITY_MAX_PATH_BYTES 256U
 #define ST_CONNECTIVITY_USER_AGENT "specus-connectivity-check/1"
+/* Fixed protocol rate limits, shared by the implementation and conformance assertions.
+ * These are not runtime tuning knobs; each key table keeps its actual 10000-entry bound. */
+#define ST_CONNECTIVITY_ROUTE_INTERVAL_MS 10000LL
+#define ST_CONNECTIVITY_ROUTE_BURST 1LL
+#define ST_CONNECTIVITY_USER_INTERVAL_MS 30000LL
+#define ST_CONNECTIVITY_USER_BURST 10LL
+/* Expired entries may make room; a live entry is never evicted to grant a fresh allowance. */
+#define ST_CONNECTIVITY_MAX_KEYS 10000U
 /* RST value the server sends to end a probe stream; clients do not read it. */
 #define ST_CONNECTIVITY_PROBE_RESET_CODE 1U
 
@@ -25,7 +33,8 @@ enum {
     ST_CONNECTIVITY_PROBE_LINK_LOST,    /* the data connection closed or was replaced first */
     ST_CONNECTIVITY_PROBE_WRITE_FAILED, /* OPEN or the request FIN could not be written */
     ST_CONNECTIVITY_PROBE_STREAM_LIMIT, /* the data connection carries its maximum of streams */
-    ST_CONNECTIVITY_PROBE_TIMEOUT       /* no answer within the time given */
+    ST_CONNECTIVITY_PROBE_TIMEOUT,      /* no answer within the time given */
+    ST_CONNECTIVITY_PROBE_INVALID_HEAD  /* this server rejected the response OPEN before a head */
 };
 
 typedef struct {

@@ -7,6 +7,7 @@
 #include "json.h"
 #include "public_coordination.h"
 #include "public_room.h"
+#include "websocket_ticket.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -28,9 +29,6 @@
 #define MSG_NOSIGNAL 0
 #endif
 
-#define ST_PUBLIC_TICKET_BYTES 32U
-#define ST_PUBLIC_TICKET_TTL_SECONDS 45
-#define ST_PUBLIC_MAX_TICKETS 1024U
 #define ST_PUBLIC_ROOM_ID_BYTES 480U
 #define ST_PUBLIC_PEER_ID_BYTES 480U
 #define ST_PUBLIC_DISPLAY_NAME_BYTES 480U
@@ -42,8 +40,6 @@
 #define ST_PUBLIC_MAX_BINARY_BYTES (64U * 1024U)
 
 typedef struct st_public_ticket {
-    uint8_t token_hash[ST_SHA256_LEN];
-    uint8_t remote_hash[ST_SHA256_LEN];
     char room_id[ST_PUBLIC_ROOM_ID_BYTES + 1U];
     char peer_id[ST_PUBLIC_PEER_ID_BYTES + 1U];
     char display_name[ST_PUBLIC_DISPLAY_NAME_BYTES + 1U];
@@ -52,8 +48,6 @@ typedef struct st_public_ticket {
     char room_role[16];
     int shared_room;
     int discoverable;
-    time_t expires_at;
-    struct st_public_ticket *next;
 } st_public_ticket;
 
 typedef struct st_public_peer {
@@ -80,8 +74,6 @@ typedef struct {
     size_t cap;
 } st_public_builder;
 
-static pthread_mutex_t public_ticket_lock = PTHREAD_MUTEX_INITIALIZER;
-static st_public_ticket *public_tickets = NULL;
 static pthread_mutex_t public_peer_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_public_peer *public_peers = NULL;
 static uint64_t public_roster_revision = 0U;
@@ -482,73 +474,37 @@ static int public_write_response(char *out,
     return written < 0 || (size_t)written >= out_len ? -1 : written;
 }
 
-static size_t public_prune_tickets_locked(time_t now)
+static int public_issue_ticket(const st_public_ticket *ticket, const char *remote_address, char out[64], char expires_at[ST_INSTANT_CAPACITY])
 {
-    size_t count = 0U;
-    st_public_ticket **cursor = &public_tickets;
-    while (*cursor != NULL) {
-        st_public_ticket *ticket = *cursor;
-        if (ticket->expires_at <= now) {
-            *cursor = ticket->next;
-            free(ticket);
-        } else {
-            ++count;
-            cursor = &ticket->next;
-        }
+    if (ticket == NULL) return -1;
+    const char *values[] = {ticket->room_id, ticket->peer_id, ticket->display_name, ticket->public_address, ticket->room_key, ticket->room_role};
+    char *escaped[6] = {0}; size_t capacity = 256U; int valid = 1;
+    for (size_t i = 0; i < 6U; ++i) { escaped[i] = st_json_escape(values[i]); if (escaped[i] == NULL) valid = 0; else capacity += strlen(escaped[i]); }
+    char *json = valid ? malloc(capacity) : NULL;
+    int rc = -1;
+    if (json != NULL) {
+        snprintf(json, capacity, "{\"roomId\":\"%s\",\"peerId\":\"%s\",\"displayName\":\"%s\",\"publicAddress\":\"%s\",\"roomKey\":\"%s\",\"roomRole\":\"%s\",\"sharedRoom\":%s,\"discoverable\":%s}",
+            escaped[0], escaped[1], escaped[2], escaped[3], escaped[4], escaped[5], ticket->shared_room ? "true" : "false", ticket->discoverable ? "true" : "false");
+        rc = st_websocket_ticket_issue("public-transfer", json, remote_address, out, expires_at);
     }
-    return count;
-}
-
-static int public_issue_ticket(st_public_ticket *ticket, char out[64], time_t *expires_at)
-{
-    uint8_t random_bytes[ST_PUBLIC_TICKET_BYTES];
-    if (ticket == NULL || out == NULL || expires_at == NULL
-        || public_random(random_bytes, sizeof(random_bytes)) != 0
-        || public_base64(random_bytes, sizeof(random_bytes), 1, out, 64U) != 0) {
-        return -1;
-    }
-    public_hash_text(out, ticket->token_hash);
-    ticket->expires_at = time(NULL) + ST_PUBLIC_TICKET_TTL_SECONDS;
-    pthread_mutex_lock(&public_ticket_lock);
-    size_t count = public_prune_tickets_locked(time(NULL));
-    if (count >= ST_PUBLIC_MAX_TICKETS) {
-        pthread_mutex_unlock(&public_ticket_lock);
-        return -2;
-    }
-    ticket->next = public_tickets;
-    public_tickets = ticket;
-    *expires_at = ticket->expires_at;
-    pthread_mutex_unlock(&public_ticket_lock);
-    return 0;
+    free(json); for (size_t i = 0; i < 6U; ++i) free(escaped[i]); return rc;
 }
 
 static st_public_ticket *public_consume_ticket(const char *token, const char *remote_address)
 {
-    if (token == NULL || strlen(token) < 32U || strlen(token) > 128U) return NULL;
-    uint8_t token_hash[ST_SHA256_LEN];
-    uint8_t remote_hash[ST_SHA256_LEN];
-    public_hash_text(token, token_hash);
-    public_hash_text(remote_address, remote_hash);
-    pthread_mutex_lock(&public_ticket_lock);
-    public_prune_tickets_locked(time(NULL));
-    st_public_ticket **cursor = &public_tickets;
-    while (*cursor != NULL) {
-        st_public_ticket *ticket = *cursor;
-        if (!st_constant_time_eq(ticket->token_hash, token_hash, sizeof(token_hash))) {
-            cursor = &ticket->next;
-            continue;
-        }
-        if (!st_constant_time_eq(ticket->remote_hash, remote_hash, sizeof(remote_hash))) {
-            pthread_mutex_unlock(&public_ticket_lock);
-            return NULL;
-        }
-        *cursor = ticket->next;
-        ticket->next = NULL;
-        pthread_mutex_unlock(&public_ticket_lock);
-        return ticket;
-    }
-    pthread_mutex_unlock(&public_ticket_lock);
-    return NULL;
+    char *json = NULL;
+    if (st_websocket_ticket_consume("public-transfer", token, remote_address, &json) != 0) return NULL;
+    st_public_ticket *ticket = calloc(1U, sizeof(*ticket));
+    int valid = ticket != NULL
+        && st_websocket_ticket_json_string(json, "roomId", ticket->room_id, sizeof(ticket->room_id), 1) == 0
+        && st_websocket_ticket_json_string(json, "peerId", ticket->peer_id, sizeof(ticket->peer_id), 1) == 0
+        && st_websocket_ticket_json_string(json, "displayName", ticket->display_name, sizeof(ticket->display_name), 1) == 0
+        && st_websocket_ticket_json_string(json, "publicAddress", ticket->public_address, sizeof(ticket->public_address), 1) == 0
+        && st_websocket_ticket_json_string(json, "roomKey", ticket->room_key, sizeof(ticket->room_key), 1) == 0
+        && st_websocket_ticket_json_string(json, "roomRole", ticket->room_role, sizeof(ticket->room_role), 1) == 0
+        && st_json_get_bool(json, "sharedRoom", &ticket->shared_room) == 0 && st_json_get_bool(json, "discoverable", &ticket->discoverable) == 0
+        && (strcmp(ticket->room_role, "OWNER") == 0 || strcmp(ticket->room_role, "EDITOR") == 0 || strcmp(ticket->room_role, "VIEWER") == 0);
+    free(json); if (!valid) { free(ticket); return NULL; } return ticket;
 }
 
 int st_public_discovery_issue_ticket_response(const char *body,
@@ -638,13 +594,11 @@ int st_public_discovery_issue_ticket_response(const char *body,
         snprintf(ticket->room_role, sizeof(ticket->room_role), "EDITOR");
         ticket->shared_room = 0;
     }
-    public_hash_text(remote_address, ticket->remote_hash);
-
     char token[64];
-    time_t expires_at = 0;
-    int issue = public_issue_ticket(ticket, token, &expires_at);
+    char expires_text[ST_INSTANT_CAPACITY];
+    int issue = public_issue_ticket(ticket, remote_address, token, expires_text);
+    free(ticket);
     if (issue != 0) {
-        free(ticket);
         return public_write_response(out,
                                      out_len,
                                      issue == -2 ? 429 : 500,
@@ -652,10 +606,8 @@ int st_public_discovery_issue_ticket_response(const char *body,
                                      issue == -2 ? "{\"error\":\"too many active websocket tickets\"}"
                                                  : "{\"error\":\"ticket generation failed\"}");
     }
-    char expires_text[40];
     char response[256];
-    if (public_iso_time(expires_at, expires_text) != 0
-        || snprintf(response,
+    if (snprintf(response,
                     sizeof(response),
                     "{\"ticket\":\"%s\",\"expiresAt\":\"%s\"}",
                     token,
@@ -1919,13 +1871,7 @@ void st_public_discovery_reset_for_tests(void)
 {
     st_public_discovery_shutdown();
     st_public_room_reset_for_tests();
-    pthread_mutex_lock(&public_ticket_lock);
-    while (public_tickets != NULL) {
-        st_public_ticket *next = public_tickets->next;
-        free(public_tickets);
-        public_tickets = next;
-    }
-    pthread_mutex_unlock(&public_ticket_lock);
+    st_websocket_ticket_reset_memory_scope("public-transfer");
     pthread_mutex_lock(&public_peer_lock);
     public_roster_revision = 0U;
     pthread_mutex_unlock(&public_peer_lock);

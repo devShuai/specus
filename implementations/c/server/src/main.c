@@ -4,6 +4,7 @@
 #include "crypto.h"
 #include "elasticsearch_traffic.h"
 #include "http_share.h"
+#include "instant.h"
 #include "json.h"
 #include "media_capture.h"
 #include "object_storage.h"
@@ -178,6 +179,8 @@ typedef struct direct_http_event {
 typedef struct direct_http_pending {
     uint32_t stream_id;
     int done;
+    /* The probe no longer wants any response frames, even before this pending entry retires. */
+    int abandoned;
     int response_started;
     /* Either side reset the stream; frames the client sent before it saw an RST are dropped. */
     int reset;
@@ -189,6 +192,7 @@ typedef struct direct_http_pending {
     /* metadata.failure of the client's RST, for the connectivity check; "" when absent. */
     char failure[32];
     char *error;
+    size_t error_len;
     direct_http_event *events_head;
     direct_http_event *events_tail;
     size_t event_count;
@@ -244,6 +248,8 @@ struct specus_session {
     uint32_t next_stream_id;
     /* Recently closed NAT streams of this data connection, guarded by map_lock. */
     st_stream_tombstones closed_streams;
+    /* Separate bounded probe history, as Java abandonedHttpStreams; ordinary traffic cannot evict it. */
+    st_stream_tombstones abandoned_http_streams;
     char remote[128];
     long long connection_record_id;
     long long connected_since_ms;
@@ -760,9 +766,9 @@ static int load_database_config(server_config *config, const char *database_path
     return 0;
 }
 
-static int build_nat_control_json(server_config *config)
+static int build_nat_control_json_named(server_config *config, const char *name)
 {
-    char *client_name = st_json_escape(config->client_name);
+    char *client_name = st_json_escape(name);
     char *public_address = st_json_escape(config->public_address);
     if (client_name == NULL || public_address == NULL) {
         free(client_name);
@@ -836,6 +842,11 @@ static int build_nat_control_json(server_config *config)
     return config->nat_control_json == NULL ? -1 : 0;
 }
 
+static int build_nat_control_json(server_config *config)
+{
+    return build_nat_control_json_named(config, config->client_name);
+}
+
 static int load_config(server_config *config)
 {
     const char *name = getenv("SPECUS_CLIENT_NAME");
@@ -903,7 +914,11 @@ static int load_config(server_config *config)
             /* Nothing is connected yet, so every online session and open connection record was
              * left behind by a previous process that never ran its disconnect handlers. */
             (void)st_storage_close_client_sessions_by_status(database_path, "NETTY_ONLINE", startup_time);
-            (void)st_storage_close_open_connections(database_path, "SERVER_RESTARTED", startup_time, NULL);
+            char record_cutoff[ST_INSTANT_CAPACITY], record_closed_at[ST_INSTANT_CAPACITY];
+            if (st_instant_now(record_cutoff) == 0
+                && st_instant_public(record_cutoff, record_closed_at, sizeof(record_closed_at)) == 0)
+                (void)st_storage_close_open_connections_before(database_path, record_cutoff,
+                                                                "SERVER_RESTARTED", record_closed_at, NULL);
         }
     }
     if (access_token_hash != NULL && *access_token_hash != '\0') {
@@ -1378,6 +1393,7 @@ static void direct_pending_fail_all(specus_session *session, const char *message
         if (!pending->done) {
             free(pending->error);
             pending->error = dup_string(message);
+            pending->error_len = pending->error == NULL ? 0U : strlen(pending->error);
             pending->done = 1;
             pthread_cond_broadcast(&pending->cond);
         }
@@ -1540,6 +1556,12 @@ static int process_direct_http_message(specus_session *session, const st_nat_mes
         pthread_mutex_unlock(&session->direct_lock);
         return 0;
     }
+    if (pending->abandoned && (message->type == ST_NAT_OPEN || message->type == ST_NAT_DATA
+        || message->type == ST_NAT_FIN || message->type == ST_NAT_RST
+        || message->type == ST_NAT_WINDOW_UPDATE)) {
+        pthread_mutex_unlock(&session->direct_lock);
+        return 1;
+    }
 
     int violation = 0;
     uint32_t reset_code = 0U;
@@ -1548,9 +1570,12 @@ static int process_direct_http_message(specus_session *session, const st_nat_mes
     if (message->type == ST_NAT_RST) {
         /* A client RST after the server's own reset keeps the server's failure. */
         if (!pending->reset) {
-            char *reason = st_json_get_string(metadata, "reason");
+            size_t reason_len = 0U;
+            char *reason = st_json_get_string_len(metadata, "reason", &reason_len);
             free(pending->error);
             pending->error = reason == NULL ? dup_string("HTTP stream reset by client") : reason;
+            pending->error_len = reason != NULL ? reason_len
+                : pending->error == NULL ? 0U : strlen(pending->error);
             pending->client_reset = 1;
             pending->reset_code = message->value;
             /* Only the connectivity check reads it, and only from a session that announced it. */
@@ -1630,6 +1655,7 @@ static int process_direct_http_message(specus_session *session, const st_nat_mes
     if (reset_code != 0U) {
         free(pending->error);
         pending->error = dup_string(reset_reason);
+        pending->error_len = pending->error == NULL ? 0U : strlen(pending->error);
         pending->done = 1;
         pending->reset = 1;
         pthread_cond_broadcast(&pending->cond);
@@ -1777,9 +1803,11 @@ static void active_session_close_data_locked(specus_session *control)
 /* Hands a client RST reason to the sink for server-side logging; it never reaches the caller. */
 static int direct_report_client_reset(const st_admin_direct_http_sink *sink,
                                       uint32_t code,
-                                      const char *reason)
+                                      const char *reason, size_t reason_len)
 {
-    if (sink->on_reset != NULL) {
+    if (sink->on_reset_bytes != NULL) {
+        sink->on_reset_bytes(sink->ctx, code, reason, reason_len);
+    } else if (sink->on_reset != NULL) {
         sink->on_reset(sink->ctx, code, reason);
     }
     return ST_ADMIN_DIRECT_HTTP_STREAM_RESET;
@@ -2062,10 +2090,20 @@ static void direct_pending_cancel(void *ctx)
     pthread_mutex_unlock(&cancel->session->direct_lock);
 }
 
+/* Every stream allocation clears both histories before publishing the reused id. map_lock held. */
+static void mark_stream_opened_locked(specus_session *session, uint32_t stream_id)
+{
+    st_stream_tombstones_remove(&session->closed_streams, stream_id);
+    st_stream_tombstones_remove(&session->abandoned_http_streams, stream_id);
+}
+
 static void direct_pending_retire(specus_session *session, direct_http_pending *pending)
 {
     pthread_mutex_lock(&session->map_lock);
     st_stream_tombstones_add(&session->closed_streams, pending->stream_id);
+    if (pending->abandoned) {
+        st_stream_tombstones_add(&session->abandoned_http_streams, pending->stream_id);
+    }
     pthread_mutex_unlock(&session->map_lock);
     pthread_mutex_lock(&session->direct_lock);
     direct_pending_remove(session, pending);
@@ -2120,7 +2158,7 @@ static int direct_http_forward(void *ctx,
     if (session->next_stream_id == 0U) {
         session->next_stream_id = 1U;
     }
-    st_stream_tombstones_remove(&session->closed_streams, pending.stream_id);
+    mark_stream_opened_locked(session, pending.stream_id);
     pthread_mutex_unlock(&session->map_lock);
 
     pthread_mutex_lock(&session->direct_lock);
@@ -2212,8 +2250,12 @@ static int direct_http_forward(void *ctx,
         int cancelled = pending.cancelled;
         int already_reset = pending.reset;
         direct_http_event *event = result == 0 && !cancelled ? direct_pending_pop(&pending) : NULL;
-        char *pending_error = !cancelled && event == NULL && pending.error != NULL
-            ? dup_string(pending.error) : NULL;
+        size_t pending_error_len = pending.error_len;
+        char *pending_error = NULL;
+        if (!cancelled && event == NULL && pending.error != NULL) {
+            pending_error = (char *)malloc(pending_error_len + 1U);
+            if (pending_error != NULL) memcpy(pending_error, pending.error, pending_error_len + 1U);
+        }
         int client_reset = pending.client_reset;
         uint32_t reset_code = pending.reset_code;
         pthread_mutex_unlock(&session->direct_lock);
@@ -2232,7 +2274,7 @@ static int direct_http_forward(void *ctx,
         }
         if (pending_error != NULL) {
             result = client_reset
-                ? direct_report_client_reset(sink, reset_code, pending_error) : -1;
+                ? direct_report_client_reset(sink, reset_code, pending_error, pending_error_len) : -1;
             free(pending_error);
             break;
         }
@@ -2326,7 +2368,7 @@ failed:
     /* A client RST while the request body was still uploading is reported like one after it. */
     int failed_result = failed_cancelled ? ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED
         : pending.client_reset && pending.error != NULL
-        ? direct_report_client_reset(sink, pending.reset_code, pending.error) : -1;
+        ? direct_report_client_reset(sink, pending.reset_code, pending.error, pending.error_len) : -1;
     free(pending.error);
     pthread_cond_destroy(&pending.cond);
     session_reference_release(session);
@@ -2354,13 +2396,21 @@ static long long connectivity_now_ms(void *ctx)
 /*
  * Test hook, SPECUS_CONNECTIVITY_PROBE_TEST_AWAIT_END=true: once a response head has come, the
  * probe also waits, within the same deadline, for the stream to end (FIN, or a reset) before it
- * decides whether to reset it. A test can then show that a response its FIN ended is not reset,
+ * decides whether to reset it. The "get" mode waits only on a GET, so a fallback can keep its
+ * HEAD reset and deterministically observe the GET FIN, within the same unchanged budget.
+ * A test can then show that a response its FIN ended is not reset,
  * which otherwise depends on whether the FIN was read before the probe woke up. Off by default.
  */
-static int connectivity_probe_awaits_end(void)
+static int connectivity_probe_awaits_end(const char *metadata_json)
 {
     const char *value = getenv("SPECUS_CONNECTIVITY_PROBE_TEST_AWAIT_END");
-    return value != NULL && strcmp(value, "true") == 0;
+    if (value == NULL) return 0;
+    if (strcmp(value, "true") == 0) return 1;
+    if (strcmp(value, "get") != 0) return 0;
+    char *method = st_json_get_top_level_string(metadata_json, "method");
+    int wait = method != NULL && strcmp(method, "GET") == 0;
+    free(method);
+    return wait;
 }
 
 /*
@@ -2393,13 +2443,22 @@ static void connectivity_probe(void *ctx,
     memset(&pending, 0, sizeof(pending));
     pending.send_credit = ST_STREAM_INITIAL_WINDOW;
     pending.receive_credit = ST_STREAM_INITIAL_WINDOW;
-    pthread_cond_init(&pending.cond, NULL);
+    pthread_condattr_t probe_cond_attr;
+    int attr_ok = pthread_condattr_init(&probe_cond_attr) == 0;
+    int cond_ok = attr_ok && pthread_condattr_setclock(&probe_cond_attr, CLOCK_MONOTONIC) == 0
+        && pthread_cond_init(&pending.cond, &probe_cond_attr) == 0;
+    if (attr_ok) pthread_condattr_destroy(&probe_cond_attr);
+    if (!cond_ok) {
+        session_reference_release(session);
+        answer->kind = ST_CONNECTIVITY_PROBE_WRITE_FAILED;
+        return;
+    }
     pthread_mutex_lock(&session->map_lock);
     pending.stream_id = session->next_stream_id++;
     if (session->next_stream_id == 0U) {
         session->next_stream_id = 1U;
     }
-    st_stream_tombstones_remove(&session->closed_streams, pending.stream_id);
+    mark_stream_opened_locked(session, pending.stream_id);
     pthread_mutex_unlock(&session->map_lock);
 
     pthread_mutex_lock(&session->direct_lock);
@@ -2423,9 +2482,13 @@ static void connectivity_probe(void *ctx,
     }
     if (!written) {
         answer->kind = ST_CONNECTIVITY_PROBE_WRITE_FAILED;
+        pthread_mutex_lock(&session->direct_lock);
+        pending.abandoned = 1;
+        pthread_mutex_unlock(&session->direct_lock);
     } else {
         struct timespec deadline;
-        clock_gettime(CLOCK_REALTIME, &deadline);
+        /* The checker budget is monotonic; wall-clock corrections must not shorten/extend it. */
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
         long long wait_ms = timeout_ms < 0 ? 0 : timeout_ms;
         deadline.tv_sec += (time_t)(wait_ms / 1000LL);
         deadline.tv_nsec += (long)(wait_ms % 1000LL) * 1000000L;
@@ -2439,7 +2502,7 @@ static void connectivity_probe(void *ctx,
                 break;
             }
         }
-        if (connectivity_probe_awaits_end() && pending.events_head != NULL
+        if (connectivity_probe_awaits_end(metadata_json) && pending.events_head != NULL
             && pending.events_head->type == ST_NAT_OPEN) {
             while (!pending.done && pending.error == NULL) {
                 if (pthread_cond_timedwait(&pending.cond, &session->direct_lock, &deadline) == ETIMEDOUT) {
@@ -2455,6 +2518,9 @@ static void connectivity_probe(void *ctx,
         } else if (pending.error != NULL && pending.client_reset) {
             answer->kind = ST_CONNECTIVITY_PROBE_RESET;
             snprintf(answer->failure, sizeof(answer->failure), "%s", pending.failure);
+        } else if (pending.error != NULL && pending.reset) {
+            /* A locally rejected response OPEN is not a lost data connection (Java LOCAL origin). */
+            answer->kind = ST_CONNECTIVITY_PROBE_INVALID_HEAD;
         } else if (pending.error != NULL) {
             /* The data connection closed or was replaced, which fails every pending stream. */
             answer->kind = ST_CONNECTIVITY_PROBE_LINK_LOST;
@@ -2462,6 +2528,8 @@ static void connectivity_probe(void *ctx,
             answer->kind = ST_CONNECTIVITY_PROBE_TIMEOUT;
         }
         int ended = pending.done;
+        /* Stop accepting response frames before sending RST, not after the peer can observe it. */
+        pending.abandoned = 1;
         pthread_mutex_unlock(&session->direct_lock);
         if (!ended) {
             (void)send_reset(session, pending.stream_id, ST_CONNECTIVITY_PROBE_RESET_CODE,
@@ -2470,9 +2538,9 @@ static void connectivity_probe(void *ctx,
     }
 
     /*
-     * Tombstoned like a public stream: the device's own RST may cross the one sent above, or follow
-     * it when the device fails the request it was told to drop. Either is a stale frame then, not an
-     * RST for a never-opened stream that would close the whole data connection.
+     * Also record the abandoned probe independently of ordinary closed streams: a response OPEN,
+     * DATA, FIN or RST still in flight is silently dropped, without WINDOW_UPDATE or another RST.
+     * Both histories stay bounded; reopening an id clears both before it can serve a new stream.
      */
     direct_pending_retire(session, &pending);
     free(pending.error);
@@ -2522,7 +2590,7 @@ static int direct_ws_open(void *ctx, const st_admin_direct_ws_request *request)
     if (session->next_stream_id == 0U) {
         session->next_stream_id = 1U;
     }
-    st_stream_tombstones_remove(&session->closed_streams, conn->stream_id);
+    mark_stream_opened_locked(session, conn->stream_id);
     conn->next = session->ws_conns;
     session->ws_conns = conn;
     pthread_mutex_unlock(&session->map_lock);
@@ -4501,7 +4569,7 @@ static int start_external_conn(specus_session *session,
     if (session->next_stream_id == 0U) {
         session->next_stream_id = 1U;
     }
-    st_stream_tombstones_remove(&session->closed_streams, conn->stream_id);
+    mark_stream_opened_locked(session, conn->stream_id);
     snprintf(conn->channel_id, sizeof(conn->channel_id), "c-%u", conn->stream_id);
     conn->next = session->conns;
     session->conns = conn;
@@ -4830,6 +4898,16 @@ static int process_nat_message(specus_session *session, const st_nat_message *me
             return -1;
         }
         return 0;
+    }
+    if (message->type == ST_NAT_OPEN || message->type == ST_NAT_DATA
+        || message->type == ST_NAT_FIN || message->type == ST_NAT_RST) {
+        pthread_mutex_lock(&session->map_lock);
+        int abandoned = st_stream_tombstones_contains(&session->abandoned_http_streams,
+                                                       message->stream_id);
+        pthread_mutex_unlock(&session->map_lock);
+        if (abandoned) {
+            return 0;
+        }
     }
     switch (message->type) {
         case ST_NAT_REGISTER:

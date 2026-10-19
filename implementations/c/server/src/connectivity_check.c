@@ -2,6 +2,7 @@
 
 #include "connectivity_check.h"
 
+#include <limits.h>
 #include <openssl/rand.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -16,15 +17,6 @@
 #include "json.h"
 
 #define ST_CONNECTIVITY_MAX_CONCURRENT 32U
-#define ST_CONNECTIVITY_ROUTE_INTERVAL_MS 10000LL
-#define ST_CONNECTIVITY_ROUTE_BURST 1LL
-#define ST_CONNECTIVITY_USER_INTERVAL_MS 30000LL
-#define ST_CONNECTIVITY_USER_BURST 10LL
-/*
- * Each key table holds at most this many entries. An entry whose time is not after now is dead and
- * may go at any time; a live one is never evicted, since that would hand it a fresh allowance.
- */
-#define ST_CONNECTIVITY_MAX_KEYS 10000U
 /* A rate-limited caller is logged at most once a minute. */
 #define ST_CONNECTIVITY_REFUSAL_LOG_INTERVAL_MS 60000LL
 #define ST_CONNECTIVITY_KEY_MAX 256U
@@ -698,6 +690,7 @@ static check_answer exchange(st_connectivity_checker *checker,
             }
         }
         break;
+    case ST_CONNECTIVITY_PROBE_INVALID_HEAD:
     case ST_CONNECTIVITY_PROBE_LINK_LOST:
         break;
     default:
@@ -782,6 +775,11 @@ static void run_check(st_connectivity_checker *checker,
         return;
     case ST_CONNECTIVITY_PROBE_LINK_LOST:
         decide(result, "failed", "DEVICE_LINK_LOST", head.at_ms);
+        return;
+    case ST_CONNECTIVITY_PROBE_INVALID_HEAD:
+        /* Locally validated stream protocol, independent of the peer's classification capability. */
+        decide(result, "passed", "DEVICE_ONLINE", head.at_ms);
+        decide(result, "failed", "TARGET_PROTOCOL_ERROR", head.at_ms);
         return;
     case ST_CONNECTIVITY_PROBE_RESET:
         if (head.trusted) {
@@ -905,15 +903,20 @@ static char *result_body(const check_result *result, long long route_id, const c
 
 static int parse_route_id(const char *text, long long *route_id)
 {
-    if (text == NULL || *text == '\0' || strlen(text) > 18U) {
+    if (text == NULL || *text == '\0') {
         return -1;
     }
+    const char *p = text;
+    if (*p == '+') ++p;
+    if (*p == '\0') return -1;
     long long value = 0;
-    for (const char *p = text; *p != '\0'; ++p) {
+    for (; *p != '\0'; ++p) {
         if (*p < '0' || *p > '9') {
             return -1;
         }
-        value = value * 10LL + (*p - '0');
+        int digit = *p - '0';
+        if (value > (LLONG_MAX - digit) / 10LL) return -1;
+        value = value * 10LL + digit;
     }
     if (value <= 0) {
         return -1;

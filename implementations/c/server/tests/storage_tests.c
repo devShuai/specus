@@ -704,7 +704,7 @@ static int test_client_auth_nonce_store(void)
     char sql[512];
     snprintf(sql, sizeof(sql),
              "SELECT COUNT(*) FROM specus_client_auth_nonce WHERE id = '%s' AND api_key_hash = '%s' "
-             "AND expires_at = '2026-10-07T12:02:00.000Z'", nonce_id, api_key_hash);
+             "AND expires_at = '2026-10-07T12:02:00.0000000Z'", nonce_id, api_key_hash);
     if (!failures && query_int(path, sql) != 1) {
         fprintf(stderr, "stored nonce row is not Java's id, api key hash and expiry\n");
         failures = 1;
@@ -722,7 +722,7 @@ static int test_client_auth_nonce_store(void)
         && (st_client_auth_nonce_consume_stored(path, "api-key-c", "other", now + 300000LL)
                 != ST_CLIENT_AUTH_NONCE_ACCEPTED
             || query_int(path, "SELECT COUNT(*) FROM specus_client_auth_nonce WHERE expires_at = "
-                               "'2026-10-07T12:07:00.000Z'") != 1
+                               "'2026-10-07T12:07:00.0000000Z'") != 1
             || query_int(path, "SELECT COUNT(*) FROM specus_client_auth_nonce") != 1)) {
         fprintf(stderr, "stored nonce sweep of expired rows mismatch\n");
         failures = 1;

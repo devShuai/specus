@@ -591,8 +591,14 @@ char *st_json_decode_string(const char *raw, size_t *out_len)
 
 char *st_json_get_string(const char *json, const char *key)
 {
+    return st_json_get_string_len(json, key, NULL);
+}
+
+char *st_json_get_string_len(const char *json, const char *key, size_t *out_len)
+{
+    if (out_len != NULL) *out_len = 0U;
     const char *p = find_value(json, key);
-    return p == NULL ? NULL : parse_json_string_value(&p);
+    return p == NULL ? NULL : parse_json_string_value_len(&p, out_len);
 }
 
 char *st_json_get_top_level_string(const char *json, const char *key)

@@ -26,6 +26,8 @@ add_library(specus_c_core
     src/github_release.c
     src/http_client.c
     src/http_share.c
+    src/instant.c
+    src/instant_storage.c
     src/json.c
     src/login_rate_limiter.c
     src/media_capture.c
@@ -49,12 +51,20 @@ add_library(specus_c_core
     src/traffic_capture.c
     src/turn_auth.c
     src/upstream_browser_headers.c
+    src/unicode_java21.c
     src/url_decode.c
     src/workbench.c
+    src/websocket_ticket.c
 )
 target_include_directories(specus_c_core PUBLIC src PRIVATE ${HIREDIS_INCLUDE_DIR} ${UTF8PROC_INCLUDE_DIR})
 target_link_libraries(specus_c_core PUBLIC ZLIB::ZLIB SQLite::SQLite3 OpenSSL::SSL OpenSSL::Crypto CURL::libcurl ${HIREDIS_LIBRARY} ${UTF8PROC_LIBRARY})
 target_compile_options(specus_c_core PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(specus_c_unicode_java21_tests tests/unicode_java21_tests.c)
+target_link_libraries(specus_c_unicode_java21_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_unicode_java21_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME unicode_java21_tests COMMAND specus_c_unicode_java21_tests
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/java21-root-case-v1.json")
 
 # libbrotlidec is optional: with it, Content-Encoding br is decoded as Java's org.brotli:dec does
 # (traffic detail previews and display, media manifests); without it a br body stays as stored.
@@ -78,6 +88,10 @@ target_link_libraries(specus-server-c PRIVATE specus_c_core)
 target_compile_options(specus-server-c PRIVATE -Wall -Wextra -Wpedantic)
 
 enable_testing()
+add_executable(specus_c_url_decode_tests tests/url_decode_tests.c)
+target_link_libraries(specus_c_url_decode_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_url_decode_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME url_decode_tests COMMAND specus_c_url_decode_tests)
 add_executable(specus_c_connectivity_lifetime_tests tests/connectivity_lifetime_tests.c)
 target_link_libraries(specus_c_connectivity_lifetime_tests PRIVATE specus_c_core pthread)
 target_link_options(specus_c_connectivity_lifetime_tests PRIVATE "-Wl,--wrap=free" "-Wl,--wrap=st_connectivity_checker_new" "-Wl,--wrap=st_connectivity_handle")
@@ -89,10 +103,6 @@ target_link_libraries(specus_c_connectivity_setter_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_connectivity_setter_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME connectivity_setter_tests COMMAND specus_c_connectivity_setter_tests)
 set_tests_properties(connectivity_setter_tests PROPERTIES TIMEOUT 30)
-add_executable(specus_c_url_decode_tests tests/url_decode_tests.c)
-target_link_libraries(specus_c_url_decode_tests PRIVATE specus_c_core)
-target_compile_options(specus_c_url_decode_tests PRIVATE -Wall -Wextra -Wpedantic)
-add_test(NAME url_decode_tests COMMAND specus_c_url_decode_tests)
 add_executable(specus_c_admin_http_tests tests/admin_http_tests.c)
 target_link_libraries(specus_c_admin_http_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_admin_http_tests PRIVATE -Wall -Wextra -Wpedantic)
@@ -147,12 +157,34 @@ target_link_libraries(specus_c_client_auth_nonce_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_client_auth_nonce_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME client_auth_nonce_tests COMMAND specus_c_client_auth_nonce_tests)
 
-add_executable(specus_c_connectivity_check_tests tests/connectivity_check_tests.c)
+add_executable(specus_c_connectivity_check_tests tests/connectivity_check_tests.c tests/connectivity_test_clock.c)
 target_link_libraries(specus_c_connectivity_check_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_connectivity_check_tests PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_definitions(specus_c_connectivity_check_tests PRIVATE
     ST_CONNECTIVITY_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/")
 add_test(NAME connectivity_check_tests COMMAND specus_c_connectivity_check_tests)
+
+add_executable(specus_c_connectivity_http_vector_tests tests/connectivity_http_vector_tests.c tests/connectivity_http_resource_tests.c tests/connectivity_test_clock.c)
+target_link_libraries(specus_c_connectivity_http_vector_tests PRIVATE specus_c_core pthread)
+target_compile_options(specus_c_connectivity_http_vector_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_connectivity_http_vector_tests PRIVATE
+    ST_CONNECTIVITY_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/")
+add_test(NAME connectivity_http_vector_tests COMMAND specus_c_connectivity_http_vector_tests)
+set_tests_properties(connectivity_http_vector_tests PROPERTIES TIMEOUT 120)
+
+add_executable(specus_c_connectivity_resource_wire_tests tests/connectivity_resource_wire_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_connectivity_resource_wire_tests PRIVATE specus_c_core pthread)
+target_compile_options(specus_c_connectivity_resource_wire_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME connectivity_resource_wire_tests COMMAND specus_c_connectivity_resource_wire_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(connectivity_resource_wire_tests PROPERTIES TIMEOUT 120)
+
+add_executable(specus_c_connectivity_rate_http_tests tests/connectivity_rate_http_tests.c tests/connectivity_test_clock.c)
+target_link_libraries(specus_c_connectivity_rate_http_tests PRIVATE specus_c_core pthread)
+target_compile_options(specus_c_connectivity_rate_http_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_connectivity_rate_http_tests PRIVATE
+    ST_CONNECTIVITY_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/")
+add_test(NAME connectivity_rate_http_tests COMMAND specus_c_connectivity_rate_http_tests)
+set_tests_properties(connectivity_rate_http_tests PROPERTIES TIMEOUT 120)
 
 add_executable(specus_c_crypto_tests tests/crypto_tests.c)
 target_link_libraries(specus_c_crypto_tests PRIVATE specus_c_core)
@@ -210,6 +242,10 @@ set_tests_properties(management_lists_tests PROPERTIES TIMEOUT 180)
 add_executable(specus_c_management_crud_tests tests/management_crud_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_management_crud_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_management_crud_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_management_crud_tests PRIVATE
+    ST_MAILBOX_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/registration-mailbox-forms-v1.json"
+    ST_EMAIL_MASK_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/registration-email-mask-v1.json"
+    ST_EMAIL_NUL_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/registration-email-nul-v1.json")
 add_test(NAME management_crud_tests COMMAND specus_c_management_crud_tests)
 
 # The Peer Mesh / Egress management endpoints, Spring-converted parameters, mapping create, times.
@@ -433,6 +469,8 @@ set_tests_properties(client_route_scale_tests PROPERTIES TIMEOUT 180)
 add_executable(specus_c_nat_stream_tests tests/nat_stream_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_nat_stream_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_nat_stream_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_nat_stream_tests PRIVATE
+    ST_CONNECTIVITY_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/")
 add_test(NAME nat_stream_tests
     COMMAND specus_c_nat_stream_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(nat_stream_tests PROPERTIES TIMEOUT 420)
@@ -486,3 +524,128 @@ add_test(NAME tls_deployment_e2e
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/tls_deployment_e2e.sh
                  $<TARGET_FILE:specus-server-c>)
 set_tests_properties(tls_deployment_e2e PROPERTIES TIMEOUT 90)
+
+# Keep the deterministic wall-clock regression separate from the real HTTP package suite.
+add_executable(specus_c_client_package_clock_tests tests/client_package_clock_tests.c)
+target_link_libraries(specus_c_client_package_clock_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_client_package_clock_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME client_package_clock_tests COMMAND specus_c_client_package_clock_tests)
+
+# Process-local adverse clock view; the normal NAT test and its 10s lower bound are unchanged.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_library(specus_c_connectivity_clock_offset SHARED tests/connectivity_clock_offset.c)
+    target_compile_options(specus_c_connectivity_clock_offset PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME nat_connectivity_clock_adjustment
+        COMMAND ${CMAKE_COMMAND} -E env
+            "LD_PRELOAD=$<TARGET_FILE:specus_c_connectivity_clock_offset>"
+            "SPECUS_NAT_STREAM_ONLY=connectivity NAT complete"
+            $<TARGET_FILE:specus_c_nat_stream_tests> $<TARGET_FILE:specus-server-c>)
+    set_tests_properties(nat_connectivity_clock_adjustment PROPERTIES TIMEOUT 60)
+endif()
+
+# Reference tests compile private main.c code without adding switches to the shipped server.
+add_executable(specus_c_control_write_reference_tests tests/control_write_reference_tests.c)
+target_link_libraries(specus_c_control_write_reference_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_control_write_reference_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME control_write_reference_tests COMMAND specus_c_control_write_reference_tests)
+set_tests_properties(control_write_reference_tests PROPERTIES TIMEOUT 30)
+
+# Only this object aliases the three observation points. The helper forwards real I/O, registry
+# and metrics calls; the ordinary specus-server-c target above never links this helper.
+add_library(specus_c_session_reference_main OBJECT src/main.c)
+target_link_libraries(specus_c_session_reference_main PRIVATE specus_c_core)
+target_compile_options(specus_c_session_reference_main PRIVATE -Wall -Wextra -Wpedantic
+    -include "${CMAKE_CURRENT_SOURCE_DIR}/tests/session_reference_recv.h")
+target_compile_definitions(specus_c_session_reference_main PRIVATE
+    st_peer_mesh_push_on_logout=st_fixture_peer_logout
+    st_product_metrics_milestone=st_fixture_milestone)
+add_executable(specus_c_session_reference_server
+    $<TARGET_OBJECTS:specus_c_session_reference_main> tests/session_reference_observer.c)
+target_link_libraries(specus_c_session_reference_server PRIVATE specus_c_core)
+target_compile_options(specus_c_session_reference_server PRIVATE -Wall -Wextra -Wpedantic)
+add_executable(specus_c_session_reference_tests tests/session_reference_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_session_reference_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_session_reference_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME session_reference_tests
+    COMMAND specus_c_session_reference_tests $<TARGET_FILE:specus_c_session_reference_server>)
+set_tests_properties(session_reference_tests PROPERTIES TIMEOUT 120)
+
+# Java HttpSpecusControllerStreamResetTests: pure formatting plus real public HTTP/RST,
+# traffic-detail persistence and continued use of the same client control/data session.
+add_executable(specus_c_http_log_reason_reference_tests tests/http_log_reason_reference_tests.c)
+target_link_libraries(specus_c_http_log_reason_reference_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_http_log_reason_reference_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME http_log_reason_reference_tests COMMAND specus_c_http_log_reason_reference_tests)
+set_tests_properties(http_log_reason_reference_tests PROPERTIES TIMEOUT 30)
+
+add_executable(specus_c_http_reset_reason_reference_tests
+    tests/http_reset_reason_reference_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_http_reset_reason_reference_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_http_reset_reason_reference_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_http_reset_reason_reference_tests PRIVATE
+    ST_CONNECTIVITY_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/")
+add_test(NAME http_reset_reason_reference_tests
+    COMMAND specus_c_http_reset_reason_reference_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(http_reset_reason_reference_tests PROPERTIES TIMEOUT 60)
+
+# TCP_INFO observes a real kernel reset before releasing the held login. These observers
+# belong only to this test server; specus-server-c does not link or enable them.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(specus_c_nat_push_reference_server tests/nat_push_reference_server.c)
+    target_link_libraries(specus_c_nat_push_reference_server PRIVATE specus_c_core)
+    target_compile_options(specus_c_nat_push_reference_server PRIVATE -Wall -Wextra -Wpedantic)
+    add_executable(specus_c_nat_push_reference_tests
+        tests/nat_push_reference_tests.c tests/server_harness.c)
+    target_link_libraries(specus_c_nat_push_reference_tests PRIVATE specus_c_core)
+    target_compile_options(specus_c_nat_push_reference_tests PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_definitions(specus_c_nat_push_reference_tests PRIVATE
+        ST_NAT_CONTROL_SIZE_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/nat-control-size-v1.json")
+    add_test(NAME nat_push_reference_tests
+        COMMAND specus_c_nat_push_reference_tests $<TARGET_FILE:specus_c_nat_push_reference_server>)
+    set_tests_properties(nat_push_reference_tests PROPERTIES TIMEOUT 90)
+endif()
+
+# Exact shared sizing and management vectors use the real JSON builder and normal server.
+add_executable(specus_c_nat_sizing_reference_tests
+    tests/nat_sizing_reference_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_nat_sizing_reference_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_nat_sizing_reference_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_nat_sizing_reference_tests PRIVATE
+    ST_NAT_CONTROL_SIZE_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/nat-control-size-v1.json")
+add_test(NAME nat_sizing_reference_tests
+    COMMAND specus_c_nat_sizing_reference_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(nat_sizing_reference_tests PROPERTIES TIMEOUT 90)
+
+add_executable(specus_c_sqlite_reference_tests tests/sqlite_reference_tests.c)
+target_link_libraries(specus_c_sqlite_reference_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_sqlite_reference_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME sqlite_reference_tests COMMAND specus_c_sqlite_reference_tests)
+set_tests_properties(sqlite_reference_tests PROPERTIES TIMEOUT 60)
+
+foreach(test_name IN ITEMS websocket_ticket_request websocket_ticket_quota websocket_ticket_account)
+    add_executable(specus_c_${test_name}_tests tests/${test_name}_tests.c)
+    target_link_libraries(specus_c_${test_name}_tests PRIVATE specus_c_core pthread)
+    target_compile_options(specus_c_${test_name}_tests PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_options(specus_c_${test_name}_tests PRIVATE -Wl,--wrap=clock_gettime)
+    add_test(NAME ${test_name}_tests COMMAND specus_c_${test_name}_tests)
+    set_tests_properties(${test_name}_tests PROPERTIES TIMEOUT 120)
+endforeach()
+
+add_executable(specus_c_registration_expiry_tests tests/registration_expiry_tests.c)
+target_link_libraries(specus_c_registration_expiry_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_registration_expiry_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(specus_c_registration_expiry_tests PRIVATE -Wl,--wrap=time -Wl,--wrap=clock_gettime)
+add_test(NAME registration_expiry_tests COMMAND specus_c_registration_expiry_tests)
+set_tests_properties(registration_expiry_tests PROPERTIES TIMEOUT 30)
+
+add_test(NAME websocket_ticket_restart_tests
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/websocket_ticket_restart_tests.py $<TARGET_FILE:specus-server-c>)
+set_tests_properties(websocket_ticket_restart_tests PROPERTIES TIMEOUT 60 ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+foreach(test_name IN ITEMS instant instant_migration connection_time_reference auth_expiry_reference websocket_ticket_storage_reference)
+    add_executable(specus_c_${test_name}_tests tests/${test_name}_tests.c)
+    target_link_libraries(specus_c_${test_name}_tests PRIVATE specus_c_core)
+    target_compile_options(specus_c_${test_name}_tests PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME ${test_name}_tests COMMAND specus_c_${test_name}_tests)
+    set_tests_properties(${test_name}_tests PROPERTIES TIMEOUT 60)
+endforeach()

@@ -6,7 +6,8 @@
  *   - a frame one stream cannot take resets only that stream; the data connection and its other
  *     streams carry on (DATA before an HTTP response head, a second head, a second FIN, DATA after
  *     a TCP FIN, a client OPEN for a TCP stream, a response beyond 64 MiB, the 4 MiB TCP queue);
- *   - DATA and FIN for unknown streams are answered with RST 7, a late RST for a recently closed
+ *   - late response frames of abandoned connectivity probes are dropped without any reply;
+ *     DATA and FIN for ordinary unknown streams are answered with RST 7, a late RST for a recently closed
  *     stream is ignored, and an RST for a never-opened stream or a WINDOW_UPDATE that overflows the
  *     send window closes the data connection;
  *   - DATA|END_STREAM is DATA followed by FIN, a response head may leave out trailerNames, a TCP
@@ -176,6 +177,56 @@ static int expect_alive_without_rst(int fd, uint32_t stream_id)
             return 0;
         }
     }
+}
+
+/* A heartbeat on this same ordered socket is a barrier: no frame of this stream may precede it. */
+static int expect_alive_without_stream_reply(int fd, uint32_t stream_id)
+{
+    st_buffer heartbeat = st_protocol_encode_empty_packet(ST_CMD_HEARTBEAT_REQUEST);
+    CHECK(send_buffer(fd, &heartbeat) == 0, "heartbeat barrier");
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    for (;;) {
+        long long remaining = deadline - monotonic_ms();
+        CHECK(remaining > 0, "heartbeat after stale probe frame timed out");
+        st_frame_header header;
+        uint8_t *body = NULL;
+        CHECK(read_frame(fd, (int)remaining, &header, &body) == 1,
+              "data connection closed or silent after stale probe frame");
+        int reply = 0;
+        int malformed = 0;
+        if (header.command == ST_CMD_NAT_MESSAGE) {
+            st_nat_message message;
+            malformed = st_protocol_decode_nat_message(body, header.length, &message) != 0;
+            if (!malformed) {
+                reply = message.stream_id == stream_id;
+                if (reply) fprintf(stderr, "unexpected probe reply type=%d stream=%u value=%u\n",
+                                   message.type, stream_id, message.value);
+                st_nat_message_free(&message);
+            }
+        }
+        free(body);
+        CHECK(!malformed && !reply, "stale probe frame received a reply (including RST/WINDOW_UPDATE)");
+        if (header.command == ST_CMD_HEARTBEAT_RESPONSE) return 0;
+    }
+}
+
+static int check_stale_probe_frames(int data_fd, uint32_t stream_id)
+{
+    static const struct { int type; uint8_t flags; const char *metadata; const char *data; } frames[] = {
+        {ST_NAT_DATA, 0U, NULL, "late"},
+        {ST_NAT_DATA, ST_NAT_FLAG_END_STREAM, NULL, "late-and-ended"},
+        {ST_NAT_FIN, 0U, NULL, NULL},
+        {ST_NAT_RST, 0U, NULL, NULL},
+        {ST_NAT_OPEN, 0U, RESPONSE_HEAD, NULL}
+    };
+    for (size_t i = 0U; i < sizeof(frames) / sizeof(frames[0]); ++i) {
+        CHECK(send_nat(data_fd, frames[i].type, frames[i].flags, stream_id, 0U,
+                       frames[i].metadata, frames[i].data,
+                       frames[i].data == NULL ? 0U : strlen(frames[i].data)) == 0, "stale probe frame");
+        CHECK(expect_alive_without_stream_reply(data_fd, stream_id) == 0,
+              "stale probe frame type %d was not silently discarded", frames[i].type);
+    }
+    return 0;
 }
 
 /* Waits for the server's request OPEN of the next HTTP stream. */
@@ -1344,9 +1395,17 @@ static int check_connectivity_probe_late_rst(test_server *server, client_pair *p
     free(call.body);
     CHECK(expect_alive_without_rst(pair->data, get_stream) == 0,
           "a late RST for a finished probe stream closed the data connection");
-    /* DATA after the reset is a frame for a closed stream: RST 7, as for a public stream. */
-    CHECK(send_nat(pair->data, ST_NAT_DATA, 0U, get_stream, 0U, NULL, "late", 4U) == 0, "late DATA");
-    CHECK(expect_rst(pair->data, get_stream, 7U) == 0, "late DATA on a probe stream did not get RST 7");
+    CHECK(check_stale_probe_frames(pair->data, head_stream) == 0, "reset HEAD's late frames");
+    CHECK(check_stale_probe_frames(pair->data, get_stream) == 0, "reset GET's late frames");
+    /* Ordinary closed-stream churn must not evict the separate bounded abandoned-probe history. */
+    for (uint32_t i = 0U; i <= ST_STREAM_TOMBSTONE_LIMIT; ++i) {
+        uint32_t ordinary = UNKNOWN_STREAM_BASE + 100U + i;
+        CHECK(send_nat(pair->data, ST_NAT_DATA, 0U, ordinary, 0U, NULL, "x", 1U) == 0,
+              "ordinary unknown DATA during tombstone churn");
+        CHECK(expect_rst(pair->data, ordinary, 7U) == 0, "ordinary unknown DATA must still get RST7");
+    }
+    CHECK(check_stale_probe_frames(pair->data, head_stream) == 0, "HEAD after ordinary churn");
+    CHECK(check_stale_probe_frames(pair->data, get_stream) == 0, "GET after ordinary churn");
     return expect_data_connection_served(server, pair);
 }
 
@@ -1380,6 +1439,8 @@ static int check_connectivity_probe_ended_by_fin(test_server *server, client_pai
     free(call.body);
     CHECK(expect_alive_without_rst(pair->data, head_stream) == 0,
           "a probe stream its FIN had ended was reset");
+    CHECK(check_stale_probe_frames(pair->data, head_stream) == 0,
+          "a probe already ended by FIN must also discard late response frames");
     return expect_data_connection_served(server, pair);
 }
 
@@ -2142,6 +2203,9 @@ static const char *const long_idle_probe_awaits_end[] = {
     "SPECUS_CONTROL_READ_IDLE_SECONDS=900", "SPECUS_CONNECTIVITY_PROBE_TEST_AWAIT_END=true", NULL
 };
 
+#include "connectivity_nat_test_cases.h"
+#include "connectivity_nat_complete_cases.h"
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -2153,6 +2217,8 @@ int main(int argc, char **argv)
     srand((unsigned int)wall_clock_ms());
 
     int failures = test_tombstones();
+    failures += run_nat_parity_cases();
+    failures += run_nat_complete_cases();
     failures += run_check("HTTP DATA before the response head resets only that stream", check_http_data_before_head);
     failures += run_check("HTTP second response head resets only that stream", check_http_second_head);
     failures += run_check("HTTP DATA|END_STREAM is DATA then FIN", check_http_end_stream);
@@ -2178,7 +2244,7 @@ int main(int argc, char **argv)
     failures += run_check("RST for a never-opened stream closes the data connection",
                           check_rst_for_never_opened_stream);
     failures += run_check("WINDOW_UPDATE overflow closes the data connection", check_window_overflow);
-    failures += run_check("late RSTs for connectivity probe streams are stale frames",
+    failures += run_check("late frames for connectivity probe streams are silently discarded",
                           check_connectivity_probe_late_rst);
     current_check = check_connectivity_client_reset_failure;
     failures += run_scenario("a client RST hands its failure to the connectivity check",

@@ -1,5 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Reflection;
+using System.Text;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -16,6 +18,128 @@ namespace Specus.IntegrationTests;
 public sealed class RegistrationAuthenticationTests
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+
+    private static JsonDocument LoadRegistrationEmailVectors(string fileName = "registration-email-mask-v1.json")
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null;
+             directory = directory.Parent)
+        {
+            var path = Path.Combine(directory.FullName, "protocol", "test-vectors", fileName);
+            if (File.Exists(path)) return JsonDocument.Parse(File.ReadAllBytes(path));
+        }
+        throw new FileNotFoundException("Shared registration email vector missing");
+    }
+
+    [Fact]
+    public async Task SharedRawEmailNulPolicyRejectsBeforeTrimWithoutSendingOrSaving()
+    {
+        var emailSender = new CapturingEmailSender();
+        await using var server = await TestServerFixture.StartAsync(new Dictionary<string, string?>
+        {
+            ["Specus:Auth:RegistrationEnabled"] = "true",
+            ["Specus:Auth:EmailVerificationEnabled"] = "true",
+        }, services =>
+        {
+            services.RemoveAll<IRegistrationEmailSender>();
+            services.AddSingleton<IRegistrationEmailSender>(emailSender);
+            services.RemoveAll<ITurnstileVerifier>();
+            services.AddSingleton<ITurnstileVerifier>(new FakeTurnstileVerifier());
+        });
+        using var client = server.CreateClient();
+        using var fixture = LoadRegistrationEmailVectors("registration-email-nul-v1.json");
+        Assert.Equal(1, fixture.RootElement.GetProperty("version").GetInt32());
+        var cases = fixture.RootElement.GetProperty("cases");
+        Assert.Equal(14, cases.GetArrayLength());
+        var index = 0;
+        foreach (var item in cases.EnumerateArray())
+        {
+            var username = "nul-wire-" + index++;
+            var beforeSend = emailSender.SendCount;
+            using var response = await client.PostAsJsonAsync("/auth/register", new
+            {
+                username, email = item.GetProperty("email").GetString(), password = "Strong-pass-123",
+                turnstileToken = FakeTurnstileVerifier.ValidToken,
+            });
+            using var decoded = JsonDocument.Parse(new UTF8Encoding(false, true)
+                .GetString(await response.Content.ReadAsByteArrayAsync()));
+            if (item.GetProperty("accepted").GetBoolean())
+            {
+                Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+                Assert.Equal(beforeSend + 1, emailSender.SendCount);
+                Assert.Equal(item.GetProperty("normalized").GetString(), emailSender.LastEmail);
+                Assert.Equal(item.GetProperty("masked").GetString(), decoded.RootElement.GetProperty("emailMasked").GetString());
+            }
+            else
+            {
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("邮箱格式无效", decoded.RootElement.GetProperty("error").GetString());
+                Assert.Equal(beforeSend, emailSender.SendCount);
+                await using var scope = server.HostServices.CreateAsyncScope();
+                var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+                Assert.False(await db.ManagementRegistrationChallenges.AnyAsync(challenge => challenge.Username == username));
+            }
+        }
+    }
+
+    [Fact]
+    public void SharedEmailMasksCountCodePointsAndSerializeWithoutBrokenSurrogates()
+    {
+        using var fixture = LoadRegistrationEmailVectors();
+        Assert.Equal(1, fixture.RootElement.GetProperty("version").GetInt32());
+        var cases = fixture.RootElement.GetProperty("cases");
+        Assert.Equal(24, cases.GetArrayLength());
+        var mask = typeof(RegistrationService).GetMethod("MaskEmail", BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(mask);
+        var strictUtf8 = new UTF8Encoding(false, true);
+        foreach (var item in cases.EnumerateArray())
+        {
+            var actual = Assert.IsType<string>(mask.Invoke(null, [item.GetProperty("email").GetString()]));
+            Assert.Equal(item.GetProperty("masked").GetString(), actual);
+            _ = strictUtf8.GetBytes(actual);
+            var wire = JsonSerializer.SerializeToUtf8Bytes(new RegistrationChallengeResponse(
+                "test-id", actual, "2026-10-18T00:00:00Z", 60), JsonOptions);
+            using var decoded = JsonDocument.Parse(strictUtf8.GetString(wire));
+            Assert.Equal(actual, decoded.RootElement.GetProperty("emailMasked").GetString());
+        }
+    }
+
+    [Fact]
+    public async Task RegistrationHttpResponsesPreserveUnicodeMaskBoundaries()
+    {
+        var emailSender = new CapturingEmailSender();
+        await using var server = await TestServerFixture.StartAsync(new Dictionary<string, string?>
+        {
+            ["Specus:Auth:RegistrationEnabled"] = "true",
+            ["Specus:Auth:EmailVerificationEnabled"] = "true",
+        }, services =>
+        {
+            services.RemoveAll<IRegistrationEmailSender>();
+            services.AddSingleton<IRegistrationEmailSender>(emailSender);
+            services.RemoveAll<ITurnstileVerifier>();
+            services.AddSingleton<ITurnstileVerifier>(new FakeTurnstileVerifier());
+        });
+        using var client = server.CreateClient();
+        using var fixture = LoadRegistrationEmailVectors();
+        string[] names = ["ascii-two", "chinese-one", "chinese-two", "chinese-three", "emoji-one",
+            "ascii-emoji-three", "quoted-chinese", "quoted-emoji"];
+        var tested = 0;
+        foreach (var item in fixture.RootElement.GetProperty("cases").EnumerateArray())
+        {
+            if (!names.Contains(item.GetProperty("name").GetString())) continue;
+            var email = item.GetProperty("email").GetString();
+            using var response = await client.PostAsJsonAsync("/auth/register", new
+            {
+                username = "mask-wire-" + tested++, email, password = "Strong-pass-123",
+                turnstileToken = FakeTurnstileVerifier.ValidToken,
+            });
+            Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+            var bytes = await response.Content.ReadAsByteArrayAsync();
+            using var decoded = JsonDocument.Parse(new UTF8Encoding(false, true).GetString(bytes));
+            Assert.Equal(item.GetProperty("masked").GetString(), decoded.RootElement.GetProperty("emailMasked").GetString());
+            Assert.Equal(email, emailSender.LastEmail);
+        }
+        Assert.Equal(names.Length, tested);
+    }
 
     [Fact]
     public async Task VerifiedEmailRegistrationCreatesUserAndSupportsPasswordLogin()
@@ -177,12 +301,14 @@ public sealed class RegistrationAuthenticationTests
         public bool Configured => true;
         public string? LastEmail { get; private set; }
         public string? LastCode { get; private set; }
+        public int SendCount { get; private set; }
 
         public Task SendVerificationCodeAsync(string email, string username, string code,
             long ttlSeconds, CancellationToken cancellationToken = default)
         {
             LastEmail = email;
             LastCode = code;
+            SendCount++;
             return Task.CompletedTask;
         }
     }
