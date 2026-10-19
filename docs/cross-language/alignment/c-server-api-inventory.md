@@ -20,8 +20,8 @@ Java server 共 **141** 个端点：136 个 HTTP 映射（`/http/**` 与 `/http-
 
 | 状态 | 数量 | 说明 |
 | --- | ---: | --- |
-| 一致 | 127 | 其中 10 个是本分支修正后才一致，2 个是 #191 修正后才一致，2 个是 `fix/c-server-parity-edges` 修正后才一致，12 个是 `fix/c-server-parity-crud` 逐项对照（多数先修正）后才一致，24 个是 `fix/c-server-parity-peer-api` 逐项对照（多数先修正）后才一致（Peer Mesh / Egress 22 个，映射新增，HTTP 明细详情的 `br`） |
-| 有差异 | 14 | 见各节“说明”，可修的列入第 9 节；`fix/c-server-parity-crud` 对照的 14 个里有 2 个（`/auth/register`、`database/initialize`）；`fix/c-server-parity-peer-api` 对照的 27 个里有 5 个（服务新增与更新的名称字节上限、服务审计存库、`stun-config` 与 `ice-config` 不发布没有服务在听的备用地址） |
+| 一致 | 129 | 其中 10 个是本分支修正后才一致，2 个是 #191 修正后才一致，2 个是 `fix/c-server-parity-edges` 修正后才一致，12 个是 `fix/c-server-parity-crud` 逐项对照（多数先修正）后才一致，24 个是 `fix/c-server-parity-peer-api` 逐项对照（多数先修正）后才一致（Peer Mesh / Egress 22 个，映射新增，HTTP 明细详情的 `br`） |
+| 有差异 | 12 | 见各节“说明”，可修的列入第 9 节；`fix/c-server-parity-crud` 对照的 14 个里有 2 个（`/auth/register`、`database/initialize`）；`fix/c-server-parity-peer-api` 对照的 27 个里有 5 个（服务新增与更新的名称字节上限、服务审计存库、`stun-config` 与 `ice-config` 不发布没有服务在听的备用地址） |
 | 没有 | 0 | 每个 Java 端点在 C 都有对应路由 |
 | 未逐项对照 | 0 | 最后 27 个（Peer Mesh / Egress）已由 `fix/c-server-parity-peer-api` 逐项对照 |
 
@@ -45,12 +45,12 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | POST | `/auth/refresh` | Bearer | 续期本地 token；IdP token 400 | 一致 | `AuthControllerRefreshTests` 覆盖 |
 | GET | `/oidc-config` | 公开 | OIDC、注册、Turnstile 配置 | 一致 | `OidcControllerTests` 覆盖 |
 | POST | `/oidc/token` | 公开 | code → 本地 token | 一致 | `OidcControllerTests`、`SecurityConfigOidcTests` 覆盖（ctest `oidc_tests`） |
-| POST | `/api/client/auth/login` | 公开（HMAC 签名） | 客户端 HTTP 登录，返回会话 token 与配置 | 有差异 | 已消费的 nonce 存进程内存，多实例不共享（`ClientAuthNonceServiceIntegrationTests` 部分）。`fix/c-server-parity-rest` 改为存库，合入后复核 |
+| POST | `/api/client/auth/login` | 公开（HMAC 签名） | 客户端 HTTP 登录，返回会话 token 与配置 | 一致 | 原先已消费的 nonce 存进程内存；`fix/c-server-parity-rest` 起配置数据库时存进与 Java 同名同列的 `specus_client_auth_nonce` 表，重启后仍拒绝重放（test-map `ClientAuthNonceServiceTests`、`ClientAuthNonceServiceIntegrationTests` 均为覆盖：`client_auth_nonce_tests`、`session_lifecycle_tests` 真实进程重启） |
 | GET | `/api/admin/me` | Bearer | 当前管理用户 | 一致 | `fix/c-server-parity-crud` 对照 `ManagementUserService.currentUser`（`management_crud_tests`）：内置管理员以配置的用户名、调用者的租户、`ADMIN`、创建与更新时间为当前时刻；数据库用户取其账号行（含 `createdAt`/`updatedAt`）。原先两个时间戳都是空串 |
-| GET | `/api/admin/users` | Bearer | 本租户用户列表 | 有差异 | **本分支**去掉 128 行上限（ctest `management_lists_tests`）。差异同 test-map `ManagementUserServiceTests`：username 是全局主键，不同租户同名用户不存在 |
-| POST | `/api/admin/users` | Bearer（admin） | 创建用户 | 有差异 | 其他租户已有同名用户时 C 回 409，Java 允许（同上） |
-| PUT | `/api/admin/users/{username}` | Bearer（admin） | 改角色、启用、口令 | 有差异 | 其他租户的用户 C 回 404，Java 回 400（`ManagementUserServiceIntegrationTests` 部分） |
-| DELETE | `/api/admin/users/{username}` | Bearer（admin） | 删除用户 | 有差异 | 同上 |
+| GET | `/api/admin/users` | Bearer | 本租户用户列表 | 一致 | **本分支**去掉 128 行上限（ctest `management_lists_tests`）。原记的差异（username 是全局主键、不同租户不能同名）已由 #183 的按租户登录名消除；列表内容与内置管理员的位置由中央向量 `management-accounts-v1.json` 的 `userLists` 校验（ctest `management_accounts_tests`） |
+| POST | `/api/admin/users` | Bearer（admin） | 创建用户 | 有差异 | 其他租户已有同名用户照常创建（#183，原记的差异已消除）。剩余：本租户同名、与内置管理员同名时 C 回 409 `username already exists`，Java 回 400 `用户名不可用`、`内置 admin 用户不能重复创建`（`management-accounts.md` 第 7 节把本租户冲突的状态码明文留作各端现状：Java、Go、.NET 400，C 409）；用户名、口令为空 C 回 `username and password are required`，Java 分别是 `username cannot be blank`、`password cannot be blank`；用户名超过 80 字节 C 也回这句（Java 按 80 个 UTF-16 单元回 `username is too long`），口令 C 不查 Java 的 120 字符上限。请求体按 Jackson 绑定见第 9 节第 9 项 |
+| PUT | `/api/admin/users/{username}` | Bearer（admin） | 改角色、启用、口令 | 有差异 | 其他租户的用户与不存在的用户答复相同（规范第 7 节），C 是 404 `user not found`，Java 400 `用户不存在: <名>`（.NET 同 Java，Go 回 404）；内置管理员 C 409 `built-in admin cannot be updated`，Java 400 `内置 admin 用户只能通过配置文件修改`。各端未统一，待规范定下后再改 |
+| DELETE | `/api/admin/users/{username}` | Bearer（admin） | 删除用户 | 有差异 | 同上一行（内置管理员 Java 为 `内置 admin 用户不能删除`）；仍拥有客户端或凭据时的 409 由中央向量 `accountDeletion` 校验，各端一致 |
 
 ## 2. 客户端账号、凭据与 TCP 映射
 
