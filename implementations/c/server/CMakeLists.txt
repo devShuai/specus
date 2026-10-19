@@ -649,3 +649,32 @@ foreach(test_name IN ITEMS instant instant_migration connection_time_reference a
     add_test(NAME ${test_name}_tests COMMAND specus_c_${test_name}_tests)
     set_tests_properties(${test_name}_tests PROPERTIES TIMEOUT 60)
 endforeach()
+
+add_executable(specus_c_peer_session_expiry_tests tests/peer_session_expiry_tests.c)
+target_link_libraries(specus_c_peer_session_expiry_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_peer_session_expiry_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(specus_c_peer_session_expiry_tests PRIVATE -Wl,--wrap=clock_gettime)
+add_test(NAME peer_session_expiry_tests COMMAND specus_c_peer_session_expiry_tests)
+set_tests_properties(peer_session_expiry_tests PROPERTIES TIMEOUT 60)
+
+add_executable(specus_c_pairing_expiry_tests tests/pairing_expiry_tests.c)
+target_link_libraries(specus_c_pairing_expiry_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_pairing_expiry_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(specus_c_pairing_expiry_tests PRIVATE -Wl,--wrap=time -Wl,--wrap=clock_gettime)
+add_test(NAME pairing_expiry_tests COMMAND specus_c_pairing_expiry_tests)
+set_tests_properties(pairing_expiry_tests PROPERTIES TIMEOUT 60)
+
+add_executable(specus_c_transfer_expiry_tests tests/transfer_expiry_tests.c)
+target_link_libraries(specus_c_transfer_expiry_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_transfer_expiry_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(specus_c_transfer_expiry_tests PRIVATE -Wl,--wrap=time -Wl,--wrap=clock_gettime)
+add_test(NAME transfer_expiry_tests COMMAND specus_c_transfer_expiry_tests)
+set_tests_properties(transfer_expiry_tests PROPERTIES TIMEOUT 90)
+
+add_executable(specus_c_media_expiry_tests tests/media_expiry_tests.c)
+target_link_libraries(specus_c_media_expiry_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_media_expiry_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(specus_c_media_expiry_tests PRIVATE -Wl,--wrap=time -Wl,--wrap=clock_gettime)
+add_test(NAME media_expiry_tests COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/media_capture_test.sh
+    $<TARGET_FILE:specus_c_media_expiry_tests> expiry)
+set_tests_properties(media_expiry_tests PROPERTIES TIMEOUT 90)

@@ -9,5 +9,7 @@
  * concurrent replacement. Caller owns any surrounding transaction and handles a failed migration. */
 int st_instant_migrate_column(sqlite3 *db, const char *table, const char *key, const char *column,
                               long long *rewritten);
+/* Pure SQL helpers preserve100ns precision; invalid/NULL input yields SQL NULL. */
+int st_instant_register_sqlite(sqlite3 *db);
 
 #endif

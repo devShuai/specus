@@ -145,6 +145,17 @@ TESTS += $(WEBSOCKET_TICKET_API_TESTS)
 REGISTRATION_EXPIRY_TESTS := $(BUILD_DIR)/specus_c_registration_expiry_tests
 ALL_TESTS += $(REGISTRATION_EXPIRY_TESTS)
 TESTS += $(REGISTRATION_EXPIRY_TESTS)
+PEER_SESSION_EXPIRY_TESTS := $(BUILD_DIR)/specus_c_peer_session_expiry_tests
+ALL_TESTS += $(PEER_SESSION_EXPIRY_TESTS)
+TESTS += $(PEER_SESSION_EXPIRY_TESTS)
+PAIRING_EXPIRY_TESTS := $(BUILD_DIR)/specus_c_pairing_expiry_tests
+ALL_TESTS += $(PAIRING_EXPIRY_TESTS)
+TESTS += $(PAIRING_EXPIRY_TESTS)
+TRANSFER_EXPIRY_TESTS := $(BUILD_DIR)/specus_c_transfer_expiry_tests
+ALL_TESTS += $(TRANSFER_EXPIRY_TESTS)
+TESTS += $(TRANSFER_EXPIRY_TESTS)
+MEDIA_EXPIRY_TESTS := $(BUILD_DIR)/specus_c_media_expiry_tests
+ALL_TESTS += $(MEDIA_EXPIRY_TESTS)
 
 all: $(SERVER) $(ALL_TESTS)
 
@@ -162,7 +173,7 @@ $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/unicode_java21.o: src/unicode_java21.h src/unicode_java21_data.h
 $(BUILD_DIR)/instant.o: src/instant.h
-$(BUILD_DIR)/instant_storage.o $(BUILD_DIR)/storage.o: src/instant.h src/instant_storage.h
+$(BUILD_DIR)/instant_storage.o $(BUILD_DIR)/storage.o $(BUILD_DIR)/object_storage.o $(BUILD_DIR)/public_room.o $(BUILD_DIR)/media_capture.o: src/instant.h src/instant_storage.h
 
 $(BUILD_DIR)/connectivity_check.o: src/connectivity_check.h
 
@@ -344,6 +355,18 @@ $(MANAGEMENT_OVERVIEW_TESTS): $(CORE_OBJS) tests/management_overview_tests.c tes
 $(REGISTRATION_EXPIRY_TESTS): $(CORE_OBJS) tests/registration_expiry_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/registration_expiry_tests.c $(CORE_OBJS) -Wl,--wrap=time -Wl,--wrap=clock_gettime $(LDFLAGS) -o $@
 
+$(PEER_SESSION_EXPIRY_TESTS): $(CORE_OBJS) tests/peer_session_expiry_tests.c tests/instant_reference_cases.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/peer_session_expiry_tests.c $(CORE_OBJS) -Wl,--wrap=clock_gettime $(LDFLAGS) -o $@
+
+$(PAIRING_EXPIRY_TESTS): $(CORE_OBJS) tests/pairing_expiry_tests.c tests/instant_reference_cases.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/pairing_expiry_tests.c $(CORE_OBJS) -Wl,--wrap=time -Wl,--wrap=clock_gettime $(LDFLAGS) -o $@
+
+$(TRANSFER_EXPIRY_TESTS): $(CORE_OBJS) tests/transfer_expiry_tests.c tests/instant_reference_cases.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/transfer_expiry_tests.c $(CORE_OBJS) -Wl,--wrap=time -Wl,--wrap=clock_gettime $(LDFLAGS) -o $@
+
+$(MEDIA_EXPIRY_TESTS): $(CORE_OBJS) tests/media_expiry_tests.c tests/instant_reference_cases.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/media_expiry_tests.c $(CORE_OBJS) -Wl,--wrap=time -Wl,--wrap=clock_gettime $(LDFLAGS) -o $@
+
 $(SERVER_HARNESS_TESTS): $(CORE_OBJS) tests/server_harness_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/server_harness_tests.c tests/server_harness.c $(CORE_OBJS) -Wl,--wrap=bind $(LDFLAGS) -o $@
 
@@ -420,6 +443,7 @@ test: all
 	bash scripts/elasticsearch_traffic_test.sh $(ELASTICSEARCH_TRAFFIC_TESTS)
 	bash scripts/elasticsearch_traffic_test.sh $(TRAFFIC_DETAIL_API_TESTS) $(SERVER)
 	bash scripts/media_capture_test.sh $(MEDIA_CAPTURE_TESTS)
+	bash scripts/media_capture_test.sh $(MEDIA_EXPIRY_TESTS) expiry
 	$(SESSION_LIFECYCLE_TESTS) $(SERVER)
 	$(SECURITY_RULES_TESTS) $(SERVER)
 	$(HTTP_ROUTE_LIFECYCLE_TESTS) $(SERVER)

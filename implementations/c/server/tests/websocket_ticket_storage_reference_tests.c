@@ -122,6 +122,6 @@ int main(void)
     for (int family = 0; family < 3; ++family) for (int fractional = 0; fractional < 2; ++fractional)
         for (int legacy = 0; legacy < 2; ++legacy) run(family, fractional, legacy);
     process_race();
-    puts("persistent ticket repository:12 actual SQLite expiry scenarios and cross-process atomicity passed; HTTP/WebSocket request paths NOT yet integrated");
+    puts("persistent ticket repository:12 actual SQLite expiry scenarios and cross-process atomicity passed; HTTP/WebSocket acceptance has separate request/quota/account/restart suites");
     return 0;
 }

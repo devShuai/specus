@@ -150,7 +150,9 @@ stdbuf -oL -eL "$SERVER" >"$TMP_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 
 python3 - "$ADMIN_PORT" "$OSS_PORT" "$ADMIN_USER" "$ADMIN_PASSWORD" "$TMP_DIR/specus.db" <<'PY'
+import calendar
 import contextlib
+import datetime
 import http.client
 import json
 import re
@@ -206,14 +208,25 @@ def charged_downloads(month):
                 raise
             return 0
 
+def wire_instant_ns(value):
+    match = re.fullmatch(r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]{3}(?:[0-9]{3}){0,2}))?Z", value)
+    if match is None:
+        raise ValueError(f"not a public UTC Instant: {value!r}")
+    seconds = calendar.timegm(datetime.datetime.strptime(match[1], "%Y-%m-%dT%H:%M:%S").timetuple())
+    return seconds * 1_000_000_000 + int((match[2] or "").ljust(9, "0"))
+
 def capabilities(storage_used, label):
     """Reads the snapshot over HTTP and proves the read touched neither OSS nor the database."""
     oss_before, state_before = oss_request_count(), attachment_state()
     # Selector-looking parameters are ignored: the account comes from the bearer token only.
+    before_ns = time.time_ns()
     status, headers, snapshot = api("GET", CAPABILITIES + "?tenantId=other&username=intruder", token=token)
+    after_ns = time.time_ns()
     if status != 200 or headers.get("Cache-Control") != "private, no-store":
         raise RuntimeError(f"capabilities {label}: {status} {headers} {snapshot}")
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", snapshot.get("checkedAt", "")):
+    # Storage keys have seven fractional digits; the public value follows Instant.toString().
+    checked_ns = wire_instant_ns(snapshot.get("checkedAt", ""))
+    if not before_ns <= checked_ns <= after_ns:
         raise RuntimeError(f"capabilities {label} checkedAt: {snapshot}")
     month = snapshot["checkedAt"][:7]
     year, number = map(int, month.split("-"))

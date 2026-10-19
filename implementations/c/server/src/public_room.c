@@ -3,6 +3,8 @@
 #include "public_room.h"
 
 #include "crypto.h"
+#include "instant.h"
+#include "instant_storage.h"
 #include "json.h"
 #include "public_coordination.h"
 #include "public_discovery.h"
@@ -83,7 +85,7 @@ static int room_open(sqlite3 **db)
         *db = NULL;
         return -1;
     }
-    if (sqlite3_busy_timeout(*db, 5000) != SQLITE_OK) {
+    if (sqlite3_busy_timeout(*db, 5000) != SQLITE_OK || st_instant_register_sqlite(*db) != 0) {
         sqlite3_close(*db);
         *db = NULL;
         return -1;
@@ -896,10 +898,11 @@ static int room_create_pairing(const char *body, char *out, size_t out_len)
     long ttl = room_env_long("SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_TTL_SECONDS", 300);
     if (ttl < 60) ttl = 60;
     if (ttl > 900) ttl = 900;
-    char now[40], expires[40];
+    char now[40], expires[40], expires_public[40];
     sqlite3_stmt *stmt = NULL;
-    if (generated != 0 || room_iso_time(time(NULL), now) != 0
-        || room_iso_time(time(NULL) + ttl, expires) != 0
+    if (generated != 0 || st_instant_now(now) != 0 || st_instant_add_seconds(now, ttl, expires) != 0
+        || st_instant_public(now, now, sizeof(now)) != 0
+        || st_instant_public(expires, expires_public, sizeof(expires_public)) != 0
         || room_prepare(db, &stmt,
             "INSERT INTO public_transfer_room_pairing_code "
             "(room_id,code_hash,role,label,created_at,expires_at,max_uses,used_count,revoked_at) "
@@ -926,7 +929,7 @@ static int room_create_pairing(const char *body, char *out, size_t out_len)
     int written = snprintf(response, sizeof(response),
         "{\"id\":%lld,\"code\":\"%s\",\"role\":\"%s\",\"label\":\"%s\","
         "\"createdAt\":\"%s\",\"expiresAt\":\"%s\",\"maxUses\":%lld,\"usedCount\":0}",
-        id, code, role, escaped_label, now, expires, max_uses);
+        id, code, role, escaped_label, now, expires_public, max_uses);
     free(escaped_label);
     if (written < 0 || (size_t)written >= sizeof(response))
         return room_error(out, out_len, 500, "响应过大");
@@ -973,11 +976,12 @@ static int room_redeem_pairing(const char *body,
     char role[16] = "";
     char label[321] = "";
     char room_name[481] = "";
-    if (room_prepare(db, &stmt,
+    char cutoff[ST_INSTANT_CAPACITY];
+    if (st_instant_now(cutoff) != 0 || room_prepare(db, &stmt,
             "SELECT c.room_id,c.role,c.label,r.room_name FROM public_transfer_room_pairing_code c "
             "JOIN public_transfer_room r ON r.id=c.room_id WHERE c.code_hash=? AND c.revoked_at IS NULL "
-            "AND julianday(c.expires_at)>julianday('now') AND c.used_count<c.max_uses") != 0
-        || room_bind_text(stmt, 1, code_hash) != 0) goto rollback;
+            "AND specus_instant(c.expires_at)>? AND c.used_count<c.max_uses") != 0
+        || room_bind_text(stmt, 1, code_hash) != 0 || room_bind_text(stmt, 2, cutoff) != 0) goto rollback;
     int step = sqlite3_step(stmt);
     if (step != SQLITE_ROW) {
         sqlite3_finalize(stmt);
@@ -1004,10 +1008,12 @@ static int room_redeem_pairing(const char *body,
         message = "房间有效邀请 Token 已达到 20 个上限";
         goto rollback;
     }
+    if (st_instant_now(cutoff) != 0) goto rollback;
     if (room_prepare(db, &stmt,
             "UPDATE public_transfer_room_pairing_code SET used_count=used_count+1 WHERE code_hash=? "
-            "AND revoked_at IS NULL AND julianday(expires_at)>julianday('now') AND used_count<max_uses") != 0
+            "AND revoked_at IS NULL AND specus_instant(expires_at)>? AND used_count<max_uses") != 0
         || room_bind_text(stmt, 1, code_hash) != 0
+        || room_bind_text(stmt, 2, cutoff) != 0
         || sqlite3_step(stmt) != SQLITE_DONE
         || sqlite3_changes(db) != 1) {
         sqlite3_finalize(stmt);
@@ -1020,8 +1026,8 @@ static int room_redeem_pairing(const char *body,
     stmt = NULL;
     char plain_token[64], token_hash[65], now[40], expires[40];
     if (room_new_access_token(role, plain_token, token_hash) != 0
-        || room_iso_time(time(NULL), now) != 0
-        || room_iso_time(time(NULL) + 86400, expires) != 0
+        || st_instant_now(now) != 0 || st_instant_add_seconds(now, 86400, expires) != 0
+        || st_instant_public(now, now, sizeof(now)) != 0 || st_instant_public(expires, expires, sizeof(expires)) != 0
         || room_prepare(db, &stmt,
             "INSERT INTO public_transfer_room_access "
             "(room_id,token_hash,role,label,created_at,expires_at,revoked_at) VALUES(?,?,?,?,?,?,NULL)") != 0

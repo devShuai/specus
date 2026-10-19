@@ -138,6 +138,27 @@ static int add_usage_tenant_column(sqlite3 *db, const char *table)
     return exec_sql(db, sql);
 }
 
+/* PeerMeshService.isExpired treats missing/unparseable expiry as non-expiring, and
+ * otherwise expires at now >= expiry. Keep this predicate inside conditional UPDATEs
+ * as well as reads: datetime() truncates fractions and a prior C check alone races expiry.
+ * This function depends on the clock and must not be registered as deterministic. */
+static void peer_session_expired_sqlite(sqlite3_context *context, int argc, sqlite3_value **argv)
+{
+    (void)argc;
+    const char *value = (const char *)sqlite3_value_text(argv[0]);
+    char expires[ST_INSTANT_CAPACITY], now[ST_INSTANT_CAPACITY];
+    if (value == NULL || strlen(value) != (size_t)sqlite3_value_bytes(argv[0])
+        || st_instant_normalize(value, expires) != 0) {
+        sqlite3_result_int(context, 0);
+    } else if (st_instant_now(now) != 0) {
+        sqlite3_result_error(context, "current instant unavailable", -1);
+    } else {
+        sqlite3_result_int(context, strcmp(expires, now) <= 0);
+    }
+}
+
+#define PEER_SESSION_EXPIRED_SQL "specus_peer_session_expired(expires_at)"
+
 static int open_db(const char *path, sqlite3 **db)
 {
     int rc = sqlite3_open(path, db);
@@ -154,6 +175,12 @@ static int open_db(const char *path, sqlite3 **db)
         fprintf(stderr, "failed to configure sqlite busy timeout for %s: %s\n",
                 path,
                 sqlite3_errmsg(*db));
+        sqlite3_close(*db);
+        *db = NULL;
+        return -1;
+    }
+    if (st_instant_register_sqlite(*db) != 0 || sqlite3_create_function_v2(*db, "specus_peer_session_expired", 1, SQLITE_UTF8,
+            NULL, peer_session_expired_sqlite, NULL, NULL, NULL) != SQLITE_OK) {
         sqlite3_close(*db);
         *db = NULL;
         return -1;
@@ -1696,6 +1723,12 @@ int st_storage_init(const char *path, int seed_demo_client)
     if (rc == 0) rc = st_instant_migrate_column(db, "specus_client_auth_nonce", "id", "expires_at", NULL);
     if (rc == 0) rc = st_instant_migrate_column(db, "specus_management_registration_challenge", "registration_id", "expires_at", NULL);
     if (rc == 0) rc = st_instant_migrate_column(db, "specus_websocket_ticket", "token_hash", "expires_at", NULL);
+    if (rc == 0) rc = st_instant_migrate_column(db, "peer_mesh_session", "id", "expires_at", NULL);
+    if (rc == 0) rc = st_instant_migrate_column(db, "public_transfer_room_pairing_code", "id", "expires_at", NULL);
+    if (rc == 0) rc = st_instant_migrate_column(db, "transfer_attachment", "id", "upload_expires_at", NULL);
+    if (rc == 0) rc = st_instant_migrate_column(db, "transfer_attachment", "id", "expires_at", NULL);
+    if (rc == 0) rc = st_instant_migrate_column(db, "transfer_attachment_download_grant", "id", "expires_at", NULL);
+    if (rc == 0) rc = st_instant_migrate_column(db, "specus_http_media_capture", "id", "expires_at", NULL);
     if (fresh && rc == 0) {
         rc = exec_sql(db, "COMMIT");
     }
@@ -2423,7 +2456,7 @@ static int scan_peer_mesh_session(sqlite3_stmt *stmt, st_storage_peer_mesh_sessi
         || copy_text_column(stmt, 7, session->status, sizeof(session->status)) != 0
         || copy_text_column(stmt, 8, session->started_at, sizeof(session->started_at)) != 0
         || copy_text_column(stmt, 9, session->updated_at, sizeof(session->updated_at)) != 0
-        || copy_text_column(stmt, 10, session->expires_at, sizeof(session->expires_at)) != 0
+        || copy_instant_column(stmt, 10, session->expires_at, sizeof(session->expires_at)) != 0
         || copy_text_column(stmt, 11, session->closed_at, sizeof(session->closed_at)) != 0
         || copy_text_column(stmt, 13, session->local_endpoint, sizeof(session->local_endpoint)) != 0
         || copy_text_column(stmt, 14, session->remote_endpoint, sizeof(session->remote_endpoint)) != 0
@@ -3235,14 +3268,12 @@ static int forget_account_data_on_db(sqlite3 *db,
     rc = account_data_exec(db, "DELETE FROM user_diagram_document WHERE tenant_id = ? AND owner_username = ?",
                            tenant_id, login_name, NULL, NULL);
     if (rc == 0 && account_data_table_exists(db, "transfer_attachment")) {
-        /* Object storage writes these columns in this form, which compares as the time order. */
-        rc = account_data_exec(db,
-            "UPDATE transfer_attachment SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), "
-            "upload_expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), "
-            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') "
-            "WHERE tenant_id = ? AND owner_username = ? AND status <> 'EXPIRED' "
-            "AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
-            tenant_id, login_name, NULL, NULL);
+        char now[ST_INSTANT_CAPACITY], updated[ST_INSTANT_CAPACITY];
+        if (st_instant_now(now) != 0 || st_instant_public(now, updated, sizeof(updated)) != 0) rc = -1;
+        else rc = account_data_exec(db,
+            "UPDATE transfer_attachment SET expires_at=?3,upload_expires_at=?3,updated_at=?4 "
+            "WHERE tenant_id=?1 AND owner_username=?2 AND status<>'EXPIRED' AND specus_instant(expires_at)>?3",
+            tenant_id, login_name, now, updated);
     }
     if (rc == 0 && account_data_table_exists(db, "transfer_attachment_download_grant")) {
         rc = account_data_exec(db,
@@ -8088,7 +8119,7 @@ static int close_expired_peer_mesh_sessions(sqlite3 *db, const char *tenant_id)
     int rc = sqlite3_prepare_v2(db,
         "UPDATE peer_mesh_session SET status = 'CLOSED', "
         "closed_at = COALESCE(NULLIF(closed_at, ''), CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP "
-        "WHERE tenant_id = ? AND status <> 'CLOSED' AND expires_at <= CURRENT_TIMESTAMP",
+        "WHERE tenant_id = ? AND status <> 'CLOSED' AND " PEER_SESSION_EXPIRED_SQL,
         -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
     if (rc == 0) {
         sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
@@ -8616,6 +8647,9 @@ int st_storage_create_peer_mesh_session(const char *path,
                                         st_storage_peer_mesh_session *out_session)
 {
     if (source == NULL || target == NULL || token_hash == NULL || ttl_seconds <= 0) return -1;
+    char now[ST_INSTANT_CAPACITY], expires[ST_INSTANT_CAPACITY];
+    if (st_instant_now(now) != 0 || st_instant_add_seconds(now, ttl_seconds, expires) != 0
+        || st_instant_public(now, now, sizeof(now)) != 0) return -1;
     int allowed = 0;
     if (st_storage_can_peer(path, source, target, &allowed) != 0 || !allowed) return -1;
     sqlite3 *db = NULL;
@@ -8624,10 +8658,8 @@ int st_storage_create_peer_mesh_session(const char *path,
     int rc = sqlite3_prepare_v2(db,
         "INSERT INTO peer_mesh_session(tenant_id,source_client_id,source_client_name,target_client_id,"
         "target_client_name,path_type,status,token_hash,started_at,updated_at,expires_at) "
-        "VALUES(?,?,?,?,?,?, 'NEGOTIATING',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,datetime('now',?))",
+        "VALUES(?1,?2,?3,?4,?5,?6,'NEGOTIATING',?7,?8,?8,?9)",
         -1, &stmt, NULL);
-    char ttl[64];
-    snprintf(ttl, sizeof(ttl), "+%lld seconds", ttl_seconds);
     if (rc == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, source->tenant_id, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(stmt, 2, source->id);
@@ -8636,7 +8668,8 @@ int st_storage_create_peer_mesh_session(const char *path,
         sqlite3_bind_text(stmt, 5, target->client_name, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 6, path_type == NULL || *path_type == '\0' ? "DIRECT" : path_type, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 7, token_hash, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 8, ttl, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 8, now, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 9, expires, -1, SQLITE_TRANSIENT);
         rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
     } else rc = -1;
     sqlite3_finalize(stmt);
@@ -8669,9 +8702,6 @@ typedef struct {
     int expired;
     char token_hash[ST_SHA256_HEX_LEN + 1U];
 } peer_session_state;
-
-#define PEER_SESSION_EXPIRED_SQL \
-    "(datetime(expires_at) IS NOT NULL AND datetime(expires_at) <= CURRENT_TIMESTAMP)"
 
 /* 1 when found, 0 when there is no such session (in the tenant, when one is given), -1 on error. */
 static int read_peer_session_state(sqlite3 *db,
@@ -8893,7 +8923,7 @@ int st_storage_authorize_peer_mesh_relay(const char *path,
         sqlite3_finalize(stmt);
         if (rc != 0) allowed = -1;
         /* Closed or expired between the read and this write: the frame is not covered any more. */
-        else if (account_traffic && sqlite3_changes(db) != 1) allowed = 0;
+        else if (sqlite3_changes(db) != 1) allowed = 0;
     }
     sqlite3_close(db);
     return allowed;

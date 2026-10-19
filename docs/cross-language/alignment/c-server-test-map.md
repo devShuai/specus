@@ -8,6 +8,59 @@
 
 旧记录曾列出基线后新增的 22 类；该清单已不完整。当前提交的完整范围盘点与未完成项见下一节，下文历史表的计数仍只含原基线 79 类。
 
+## 2026-10-19 到期增量的综合测试格式修正
+
+`518f07d` 的冻结全量验证为 CMake 85/88、ASan/UBSan 16/18，Make 也在 Peer 断言失败；失败日志保留。三个综合测试仍把时间当作整秒：`object_storage_e2e` 和 `peer_mesh_tests` 拒绝合法小数秒公开值，`media_capture_tests` 则把数据库固定七位小数的到期值与整秒字符串直接比较。对照当前 Java `Instant.toString()` 与 `SortableInstant.format()` 后，仅修正测试表达，生产精度和授权边界不回退。
+
+Peer 信令断言接受公开格式的 0/3/6/9 位小数，并用正反例继续拒绝旧 SQLite 格式、内部七位格式、非数字小数、非 UTC Z 和后缀。对象存储端到端检查以整数纳秒校验 `checkedAt` 落在实际 HTTP 请求前后之间，原额度、只读及无对象存储调用检查保留。媒体保留期测试同时断言固定七位的精确数据库值与整秒的公开视图，原删除对象与引用清理检查保留。这三个综合测试在未改动的 `518f07d` 生产二进制上重新通过；最终提交仍须重新完成全量门禁。
+
+## 2026-10-19 媒体到期与时间参考方法复核
+
+媒体 `expires_at` 已接入七位小数写入和启动迁移；带去重键/无去重键的复用、列表公开时间、回放缓存片段、严格过期清理、按当前保留期延长以及直播窗口使用同一精度。延长操作保留 `captured_at` 的小数，不再经 SQLite `strftime` 截成整秒。对象存储请求签名格式保持原协议。当前 Java 迁移器列出的十列在 C 对应 schema 中均已接入；连接记录的表名为 C 的 `connection_record`。
+
+`media_expiry_tests` 经实际采集创建、分片写入/完成、管理 HTTP 处理器和清理入口，使用原媒体测试的本地 S3 HTTP 服务。五条路径各有四组整秒/小数、规范/旧格式的七点边界；另有四组保留期延长（含 INCOMPLETE）、真实写入/保留期溢出以及直播清单对自身、引用段、近期段和恰好截止段的处理。启动后明确断言存储宽度，列表按 id 降序逐个核对公开格式；去重与删除分别核对 S3 启动/删除请求次数。八类旧实现负对照分别失败，修复后的专项测试通过。原媒体综合测试默认仍执行 5 MiB+3 字节分片断言；新 expiry 模式只用于这个独立到期测试。冻结提交的全量 CMake/Make/sanitizer 结果另行记录，不以专项结果代替它们。
+
+| 当前 Java 参考方法 | C 生产路径证据及边界 |
+| --- | --- |
+| `SortableTimestampMigratorTests.rewritesLegacyValuesInBatchesUnderNumericAndTextKeys` | `instant_migration_tests`：数字键和文本键各 1007 行、四种小数宽度、无效行跨页、缺失表、幂等；各域测试另经实际 `st_storage_init` 验证对应列迁移。Java 由 Spring 触发，C 由 main 调用初始化。 |
+| `SortableTimestampOrderingTests.clientAuthNoncePurge` | `auth_expiry_reference_tests`：严格早于截止点删除，保留恰好到期及未来的四行；四种时刻/存储组合。 |
+| `webSocketTicketConsumeAndPurge` | `websocket_ticket_storage_reference_tests`：三 scope、到期瞬间仍可消费、严格清理、剩余键集合、实际重启迁移，另有 HTTP 与并发测试。 |
+| `peerSessionExpirySweep` | `peer_session_expiry_tests`：到期瞬间关闭、已关闭记录不重复处理，七个生产入口及精确集合；查询实现不同，不声称返回 Java Repository 的分页对象。 |
+| `pairingCodeRedeem` | `pairing_expiry_tests`：恰好到期拒绝、未来三个码可消费，实际 HTTP 与数据库状态；含读后跨越到期边界。 |
+| `registrationChallengePurge` | `auth_expiry_reference_tests`：严格清理及剩余键集合；`registration_expiry_tests` 另经实际验证与账号写入检查到期拒绝。 |
+| `connectionRateLimitFilterAndStartupClose` | **部分**：`connection_time_reference_tests` 验证上下界、日期输入、公开视图、启动严格截止与退出收尾；该 Java 方法的 `countByTenantIdAndClientIdAndConnectedAtGreaterThanEqual` 及其实际连接限流路径仍欠 C 证据。不能用列表总数替代连接限流计数。 |
+| `mediaCaptureRetentionSweepAndReuse` | `media_expiry_tests`：严格早于当前时刻清理、严格未来才复用、七个公开时间的倒序视图，实际采集/S3/HTTP 路径。 |
+| `TransferExpiryOrderingTests.storageUsageAroundAWholeSecondNow` / `storageUsageAroundAFractionalNow` | `transfer_expiry_tests`：PENDING 用上传有效期、UPLOADED 用保留期，七点加权用量和跨租户/账号隔离，经实际能力快照；补齐规范/旧格式两组。 |
+| `expiryScanAndDownloadGrantsAroundAFractionalNow` | 同上：按时间顺序清理且核对对象删除、严格未来 grant 消费、单次记账与过期清理后的剩余授权集合。 |
+
+因此迁移器一类与附件到期三方法列为候选覆盖；排序类仍为部分，不能把整类七方法计为完成。旧 79 类当前断言、其他新增类、背压/HA 和真实跨 NAT 条件仍待继续完成。
+
+## 2026-10-19 附件与下载授权到期增量
+
+附件的 `upload_expires_at`/`expires_at` 与下载授权的 `expires_at` 接入七位小数写入和实际启动迁移；清理严格早于当前时刻，下载签发/消费要求严格未到期，上传完成保持 Java 的到期瞬间仍可完成语义。额度快照使用同一高精度时刻计算有效用量、`checkedAt` 和月份。对象存储签名的日期格式保持原协议；API 时间使用公开 Instant 格式。删除账号对所属未到期附件的失效写入也使用相同精度。
+
+`transfer_expiry_tests` 对照 `TransferExpiryOrderingTests` 的两类用量边界和清理/消费查询，经实际 HTTP 处理器与清理入口运行五条路径的 20 组矩阵（整秒/小数、规范/旧格式、每组七个到期点）。额外检查跨租户/账号隔离、下载重放与记账次数、三列启动迁移、实际上传/下载签发的 TTL 与公开视图、保留期溢出无写入、删号失效，以及附件或授权在条件消费前跨越 100ns 时不消费、不扣额度。HEAD 与 DELETE 发送到真实本地 HTTP 测试服务，核对调用集合和顺序；这不代表云端 OSS 服务验收。含 NUL 的过期值在实际迁移后保持原字节，且不能因 C 字符串截断获得上传完成、下载签发或消费授权。
+
+原实现分别在上述五个入口失败；单独移除消费前再次取时的负对照会返回 302、消费授权并产生用量行，修复版本拒绝并回滚。原附件综合测试（含八个共享额度向量）已通过。其旧 `checkedAt` 断言只接受整秒，与 Java `Instant.toString()` 不符，现要求公开格式且位于请求前后时刻之间，额度、月份、无网络副作用与数据库只读断言保持不变。测试已接入 CMake/Make，最终冻结源码的整合验证另记。
+
+此批当时剩余的 `specus_http_media_capture.expires_at` 已由上方增量接入；本节不能代替整个 Java 当前测试清单、运行时/HA 和真实跨 NAT 验收，#35 继续保持未完成。
+
+## 2026-10-19 配对码到期增量
+
+`public_transfer_room_pairing_code.expires_at` 接入七位小数写入与实际启动迁移，签发响应保持公开 Instant 格式。兑换读取与条件消费使用 100ns 精度；条件消费重新取当前时刻，跨越有效期时整笔事务回滚，不创建房间访问 Token。SQLite 时间函数明确拒绝非文本时间、嵌入 NUL、非整数秒偏移和日期溢出；这些绑定边界经过实际 SQLite 语句验证。
+
+`pairing_expiry_tests` 同时固定 C 与 SQLite VFS 时钟，经过生产 HTTP 处理器检查整秒/小数和旧/新数据的 28 个到期边界、单次兑换与 no-store、真实签发的 300 秒 TTL、公开响应和启动迁移，以及读后跨越 100ns 到期点时未消费且未签发访问 Token。旧实现分别在未来 1us 的兑换和小数签发上失败；单独删除条件消费前的重新取时后，竞态负对照实际返回 200、消费配对码并签发 Token，修复版本返回 400 且两项数据库状态均未改变。测试已接入 CMake/Make；本轮仅完成专项验证，最终整合验证另记。
+
+此增量对应 `SortableTimestampOrderingTests.pairingCodeRedeem` 及相关 HTTP 路径，不代表房间全部契约或 #35 已完成。当时余下的附件两列与下载授权由上方后续增量接入，媒体仍未完成。
+
+## 2026-10-19 Peer 会话到期增量
+
+在时间与票据增量之后，`peer_mesh_session.expires_at` 也接入七位小数存储和实际启动迁移，读取仍返回公开 Instant 格式。列表/统计清理、路径与流量上报、两种中继授权、探针以及会话复用共用高精度到期判定；空值和无法解析的值保持 Java `isExpired` 的既有非过期语义。条件写入仍再次核验有效期；未经流量记账的首个中继帧在条件激活未成功时也必须拒绝。
+
+`peer_session_expiry_tests` 同时固定 C 时钟与 SQLite VFS 时钟，以相同时间检查七个生产入口的 28 组边界（整秒/小数、旧/新存储），核对到期集合、公开视图、未到期/无效/已关闭/外租户行。另有两组真实创建、两组实际启动迁移和三个读后跨越 100ns 到期边界的条件写入场景。SQL 仅建立夹具与断言；判断和更新均经过生产入口。七个入口在旧实现上分别失败；新增的首帧竞态在时间精度修正但尚未修正更新结果检查的版本上单独失败。
+
+此增量对照 `SortableTimestampOrderingTests.peerSessionExpirySweep` 的到期边界和相关 C 运行路径，不代表整个测试类或 Peer 生命周期、通知、HA 验收完成。当时剩余的配对码由上方后续增量接入；附件两列、下载授权和媒体继续保留为未完成。
+
 ## 2026-10-19 时间与 WebSocket 票据增量
 
 本增量整合 main `7401639e053c0db85f9e53b7ec1311bb354af5ae`，保留已合并的 URL 解码完整性、会话排序、IPv6 能力通告及 connectivity 生命周期修复。下方 128 类/49 类盘点仍锚定其写明的历史提交，不代表这个新 main 的完整测试清单。
@@ -27,7 +80,7 @@
 
 以 JDK 21 的 `JavacTask.parse` 解析上述提交的全部 `src/test/java` 源文件（不解析依赖、不执行测试）：main 有 136 个 Java 源文件，其中 128 个类包含 591 个测试注解方法（565 个 `@Test`、14 个 `@ParameterizedTest`、12 个 `@TestFactory`）。另外 8 个源文件是无上述测试注解的辅助源码。注册分支同样为 128 类，仅 `RegistrationServiceTests` 由 2 个增加到 8 个，总注解方法为 597 个。这里是静态方法声明数，**不是运行次数、参数化/动态用例数、通过数或 C 覆盖数**。
 
-旧表的79类仍保留历史证据；本轮未重新核验它们当前增加或变更后的全部断言，因此不能把历史“覆盖73类”直接当作当前类的完整覆盖。当前main另有下列49类不在旧表中：前批说明4类框架/平台差异；连通性4类20方法、控制写入/会话/离线通知/指标4类8方法、HTTP流重置1类2方法、路由生命周期/失败关闭/NAT推送3类5方法、显式空快照/NAT大小与管理变更3类5方法先后补证；本节新增SQLite二进制列/真实约束2类8方法的候选对照，并逐方法说明Spring/JDBC异常转换1类4方法的平台差异，见相应新节。当前49=5类限定平台差异+17类候选覆盖（48个注解方法）+27类待核验；27也不包括旧79类的当前断言复核。候选类内仍有明确列出的框架API差异，48不是48个独立C运行场景。表中增量是待合并C分支的候选对照状态，不是main完成率；最终提交CI须另行核验。待核验不等于C没有相应能力，同名功能也不等于覆盖已成立。
+旧表的79类仍保留历史证据；本轮未重新核验它们当前增加或变更后的全部断言，因此不能把历史“覆盖73类”直接当作当前类的完整覆盖。当前main另有下列49类不在旧表中：前批说明4类框架/平台差异；连通性4类20方法、控制写入/会话/离线通知/指标4类8方法、HTTP流重置1类2方法、路由生命周期/失败关闭/NAT推送3类5方法、显式空快照/NAT大小与管理变更3类5方法先后补证；本节新增SQLite二进制列/真实约束2类8方法的候选对照，并逐方法说明Spring/JDBC异常转换1类4方法的平台差异，见相应新节。当前49=5类限定平台差异+19类候选覆盖（52个注解方法）+1类部分（7个注解方法，不能计为全部通过）+24类待核验；24也不包括部分排序类的连接限流缺口及旧79类的当前断言复核。候选类内仍有明确列出的框架API差异，52不是52个独立C运行场景。表中增量是待合并C分支的候选对照状态，不是main完成率；最终提交CI须另行核验。待核验不等于C没有相应能力，同名功能也不等于覆盖已成立。
 
 新增“无（平台差异）”只限定到说明的框架断言。不得将其扩展为存储完整性、唯一约束、并发/回滚或 HTTP 契约的豁免；尤其不能把所有 SQLite/MySQL/MariaDB 测试一律排除。关闭 #35 前仍须为当前全部参考断言补齐 C 证据或逐项的书面差异说明，并完成该 issue 的其他运行时及真实环境验收。
 
@@ -41,7 +94,7 @@
 | `database/MariaDbSchemaTests` | 4 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `database/MySqlColumnTypeTests` | 2 | 无（平台差异） | 两项均是 Hibernate `MySQLDialect` 的静态 DDL 类型/utf8mb4 行大小检查；C 只用 SQLite。C 自身的大对象保存与完整读回仍须由相应行为测试核验。 |
 | `database/PostgresSchemaMigrationTests` | 10 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
-| `database/SortableTimestampMigratorTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `database/SortableTimestampMigratorTests` | 1 | 候选覆盖 | 见上方时间参考方法复核：1007 数字键/1007 文本键分页与幂等，实际初始化迁移覆盖对应十列；最终整合 CI 另记。 |
 | `database/SpecusSqliteDialectTests` | 9 | 无（平台差异） | 九项检查 Hibernate/JDBC 异常转换、约束类别/名称及回退；C 直接调用 sqlite3，无该转换层。不豁免 C 的唯一约束、回滚、busy 或 HTTP 错误语义。 |
 | `database/SqliteConstraintTranslationTests` | 3 | 覆盖（行为及限定框架差异；候选） | `sqlite_reference_tests.c:media_unique/raw_constraints` 对生产媒体schema实际重复INSERT核验UNIQUE、table.column及原行保留，真实probe核验唯一约束。Dialect类身份与JPA/Spring异常包装仅作限定差异，不冒称C管理API状态、捕获竞争重试或业务事务回滚已测。 |
 | `database/SqliteDialectConfigurationTests` | 4 | 无（平台差异） | 四项检查 Spring/Hibernate dialect 替换和属性优先级；C 无此配置层。不代表 C 建表或迁移行为已覆盖。 |
@@ -75,8 +128,8 @@
 | `management/service/NatControlSizeLimitHttpTests` | 1 | 覆盖（共享14步；候选） | `nat_sizing_reference_tests.c:sizing_management_steps` 在真实服务端逐步回放原14个HTTP操作，命中精确1MiB边界，6次400解析error并比较两配置表全部行/类型/字段/时间戳；接受的ID与字段另读回，每步实际生成的启用配置均符合预留上限。设置及填充差异见下。 |
 | `management/service/NatControlSizingVectorTests` | 2 | 覆盖（参考2方法；候选；名称仅限编码层） | 同一新程序以生产JSON构造和管理入口共用计算核验5个精确J/body/fits值及varint边界；6类参考名称经真实JSON/compact编码并解码回原值、实际body不超过预留。未据此验收C公共改名、存储或登录对长名称的接受范围。 |
 | `management/service/RegistrationServiceTests` | 2／8 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
-| `management/service/SortableTimestampOrderingTests` | 7 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
-| `management/service/TransferExpiryOrderingTests` | 3 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `management/service/SortableTimestampOrderingTests` | 7 | 部分 | 六个域的到期方法及连接过滤/收尾已有逐方法证据，实际连接限流计数仍欠缺，见上方复核表。 |
+| `management/service/TransferExpiryOrderingTests` | 3 | 候选覆盖 | `transfer_expiry_tests` 实际额度、清理、授权消费路径的四组时间/存储边界及状态集合；最终整合 CI 另记。 |
 | `management/service/WorkbenchItemWriterTests` | 3 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `productmetrics/ProductMetricsModelTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `productmetrics/ProductMetricsSweepTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
@@ -515,7 +568,7 @@ Rate批次结束时，四类连通性中Vector、Resource、Rate三类为候选�
 | `management/service/PublicTransferRoomServiceTests` | 12 | 覆盖 | ctest `public_transfer_tests`：`test_room_credentials`（"the owner token was not stored as a SHA-256 hash"、"an unknown invitation-shaped token created a shadow OWNER room"、"an expired invitation was accepted"、"a revoked invitation was accepted"、"expiresInSeconds %lld answered %d"、"pairing code shape or persisted digest mismatch"、"the redeemed token is not a 24-hour EDITOR token"、"the snapshot was not stored decoded"）；`admin_http_tests.c:test_public_room_access_contract`："public room exhausted pairing code was accepted"、"public room viewer diagram write was not rejected" 等；`security_tests.c` "pairing-code HMAC vector mismatch" | 12 项逐一对应，经 HTTP 与 ws-ticket 入口验证：首次使用的 Token 成为房主且只存 SHA-256；未知的 `st-editor-`/`st-viewer-` Token、已过期与已撤销的邀请都得 `403` 且不创建影子房主房间；不带有效期的邀请 `expiresAt` 为 null；有效期 299 与 604801 秒得 `400`，300 与 604800 秒得 `200` 且到期时间正好晚这么多秒；配对码 8 位、默认一次、只存 64 位摘要；兑换得到 24 小时 EDITOR Token，库中到期时间与响应一致；耗尽的配对码 `400`；VIEWER 不能建版本；快照 base64 解码后入库。 |
 | `management/repository/PublicTransferRoomPairingCodeRepositoryTests` | 1 | 覆盖 | "public room exhausted pairing code was accepted"；"public room atomic pairing code create mismatch" 及其后的双线程并发兑换（恰好一个成功） | — |
 | `management/service/PublicTransferRateLimiterTests` | 1 | 覆盖 | "public room pairing redemption rate limit mismatch" | — |
-| `management/service/TransferAttachmentServiceTests` | 19 | 覆盖 | `object_storage_tests.c`：`test_capabilities_*`、`att_public_paths`、`att_callback_paths`、`att_upload_normalization`、`att_filename_normalization`、`att_id_collision`、`att_pending_download`、`att_expiration_batches`；`object_storage_e2e`（真实进程：直传、grant 一次性、下载计费、限流） | 19 项逐一对应（模块入口 + loopback 假 OSS）：capabilities 三项；房间 PENDING 上限、VIEWER 不能上传、账号存储额度；元数据归一（去路径、SHA-256 存小写、roomId 去空白、关联持久房间与账号）；文件名表（Unicode 码点、点号折叠、长度边界）；ID 冲突时换新 ID 与新 key 重试（为此新增 `st_object_storage_set_ids_for_tests` 接缝）；PENDING 附件下载被拒且不建 grant、不访问 OSS；受邀 VIEWER 下载；月下载额度；grant 只能消费一次；callback 完成后 client complete 幂等且不再 HEAD；complete 时对象缺失被拒，超大或超存储额度先删对象再拒；205 条过期记录分三批先删对象再标 EXPIRED。历史补测记录的文件名修正：超过 180 字符且以点结尾的文件名原先保留了末尾的点（3.2.1 规定末尾的点不构成扩展名）。另有presign-upload检查顺序差异记录：Java先查来源IP窗口再解析房间，先查房间PENDING再查存储额度；当时C先拒VIEWER和无效字段而不计入窗口，`object_storage_e2e` 相应把窗口放宽为2次。这是夹具适配，不是生产检查顺序已修复的证据；该断言的当前状态仍须随旧79类复核，不能由本行历史“覆盖”标签认定对齐。不适用：Java 以定宽 `SortableInstant` 存时间的断言，C 在自己的 SQLite 表中存整秒 ISO-8601，响应中的时间字段一致。差异：C 的错误文本为英文（第 5 节规定客户端只按状态码处理）。 |
+| `management/service/TransferAttachmentServiceTests` | 19 | 覆盖 | `object_storage_tests.c`：`test_capabilities_*`、`att_public_paths`、`att_callback_paths`、`att_upload_normalization`、`att_filename_normalization`、`att_id_collision`、`att_pending_download`、`att_expiration_batches`；`object_storage_e2e`（真实进程：直传、grant 一次性、下载计费、限流） | 19 项逐一对应（模块入口 + loopback 假 OSS）：capabilities 三项；房间 PENDING 上限、VIEWER 不能上传、账号存储额度；元数据归一（去路径、SHA-256 存小写、roomId 去空白、关联持久房间与账号）；文件名表（Unicode 码点、点号折叠、长度边界）；ID 冲突时换新 ID 与新 key 重试（为此新增 `st_object_storage_set_ids_for_tests` 接缝）；PENDING 附件下载被拒且不建 grant、不访问 OSS；受邀 VIEWER 下载；月下载额度；grant 只能消费一次；callback 完成后 client complete 幂等且不再 HEAD；complete 时对象缺失被拒，超大或超存储额度先删对象再拒；205 条过期记录分三批先删对象再标 EXPIRED。历史补测记录的文件名修正：超过 180 字符且以点结尾的文件名原先保留了末尾的点（3.2.1 规定末尾的点不构成扩展名）。另有presign-upload检查顺序差异记录：Java先查来源IP窗口再解析房间，先查房间PENDING再查存储额度；当时C先拒VIEWER和无效字段而不计入窗口，`object_storage_e2e` 相应把窗口放宽为2次。这是夹具适配，不是生产检查顺序已修复的证据；该断言的当前状态仍须随旧79类复核，不能由本行历史“覆盖”标签认定对齐。历史整秒存储差异已由上方附件到期增量修正，不能继续视为不适用；新的存储与公开格式证据见 `transfer_expiry_tests`。差异：C 的错误文本为英文（第 5 节规定客户端只按状态码处理）。 |
 | `management/service/TransferCapabilitiesVectorTests` | 1 | 覆盖 | `object_storage_tests.c:test_capabilities_shared_vector`（`protocol/test-vectors/transfer-capabilities-v1.json`） | — |
 | `management/storage/object/AliyunOssObjectStorageServiceTests` | 3 | 覆盖 | `object_storage_tests.c:test_download_vector`、`test_upload_callback_header`、`att_callback_paths`（"callback key fetched %d times, last from %s"、"second callback key fetched %d times in all"、"a failed callback key fetch was cached"）；`object_storage_e2e` 的 `x-st-grant` | 三项都有对应：下载 V4 向量与 grant 标记、上传 callback header；callback 验签经 `/api/public/transfer/oss-callback` 入口：头里给的是 `http://` 的 gosspublic 地址，公钥只以 `https://gosspublic.alicdn.com/callback_pub_key_v1.pem` 取一次，之后的 callback 复用缓存，另一个 key 路径再取一次，取失败不缓存；首尾带空白的头裁剪后命中同一缓存。补测时修正：C 每次 callback 都重新下载公钥（Java 按固定后的 URL 缓存），也不裁剪 `x-oss-pub-key-url`；测试接缝由“直接给 PEM”改为“替换取公钥的 HTTPS 请求、可见被请求的 URL”。 |
 

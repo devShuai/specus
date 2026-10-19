@@ -57,18 +57,53 @@ static int contains(const char *value, const char *needle)
     return value != NULL && strstr(value, needle) != NULL;
 }
 
-/* The session expiry is an RFC 3339 UTC instant on the wire, "YYYY-MM-DDTHH:MM:SSZ", whatever
- * format the database keeps it in. */
+/* Public Instant strings use UTC Z and zero, three, six or nine fractional digits.
+ * The fixed seven-digit database representation must not escape into a signal. */
 static int has_wire_expiry(const char *message)
 {
-    const char *value = message == NULL ? NULL : strstr(message, "\"expiresAt\":\"");
+    char *value = message == NULL ? NULL : st_json_get_top_level_string(message, "expiresAt");
     if (value == NULL) return 0;
-    value += strlen("\"expiresAt\":\"");
-    static const char shape[] = "dddd-dd-ddTdd:dd:ddZ\"";
-    for (size_t i = 0; shape[i] != '\0'; ++i) {
-        if (shape[i] == 'd' ? (value[i] < '0' || value[i] > '9') : value[i] != shape[i]) return 0;
+    size_t length = strlen(value);
+    int valid = length == 20U || length == 24U || length == 27U || length == 30U;
+    static const char shape[] = "dddd-dd-ddTdd:dd:dd";
+    for (size_t i = 0; valid && shape[i] != '\0'; ++i) {
+        valid = shape[i] == 'd' ? (value[i] >= '0' && value[i] <= '9') : value[i] == shape[i];
     }
-    return 1;
+    if (valid) valid = value[length - 1U] == 'Z' && (length == 20U || value[19] == '.');
+    for (size_t i = 20U; valid && i + 1U < length; ++i) {
+        valid = value[i] >= '0' && value[i] <= '9';
+    }
+    free(value);
+    return valid;
+}
+
+static int test_wire_expiry_format(void)
+{
+    static const struct { const char *value; int valid; } cases[] = {
+        {"2026-10-19T10:00:00Z", 1},
+        {"2026-10-19T10:00:00.123Z", 1},
+        {"2026-10-19T10:00:00.123456Z", 1},
+        {"2026-10-19T10:00:00.123456700Z", 1},
+        {"2026-10-19 10:00:00Z", 0},
+        {"2026-10-19T10:00:00.1234567Z", 0},
+        {"2026-10-19T10:00:00.1234567890Z", 0},
+        {"2026-10-19T10:00:00.12xZ", 0},
+        {"2026-10-19T10:00:00.123+00:00", 0},
+        {"2026-10-19T10:00:00z", 0},
+        {"2026-10-19T10:00:00", 0},
+        {"2026-10-19T10:00:00Zextra", 0},
+        {"", 0}
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        char message[160];
+        snprintf(message, sizeof(message), "{\"expiresAt\":\"%s\"}", cases[i].value);
+        if (has_wire_expiry(message) != cases[i].valid) {
+            fprintf(stderr, "wire expiry format assertion mismatch: %s\n", cases[i].value);
+            return 1;
+        }
+    }
+    return has_wire_expiry(NULL) || has_wire_expiry("{}")
+        || has_wire_expiry("{\"expiresAt\":null}");
 }
 
 /* The catalogue fixture: the consumer and the plain egress stay up, the DNS egress comes and goes. */
@@ -1578,6 +1613,7 @@ static int test_service_report_bounds(void)
 
 int main(void)
 {
+    if (test_wire_expiry_format() != 0) return 1;
     char path[] = "/tmp/specus_c_peer_mesh_tests.XXXXXX";
     int temp_fd = mkstemp(path);
     if (temp_fd < 0) return 1;

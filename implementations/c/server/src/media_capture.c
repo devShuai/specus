@@ -1,6 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "media_capture.h"
+#include "instant.h"
+#include "instant_storage.h"
 
 #include "decompression_limits.h"
 #include "json.h"
@@ -913,7 +915,9 @@ static int media_db_open(const char *path, sqlite3 **db)
         *db = NULL;
         return -1;
     }
-    sqlite3_busy_timeout(*db, 5000);
+    if (sqlite3_busy_timeout(*db, 5000) != SQLITE_OK || st_instant_register_sqlite(*db) != 0) {
+        sqlite3_close(*db); *db = NULL; return -1;
+    }
     return 0;
 }
 
@@ -974,13 +978,16 @@ static int media_row_reusable(sqlite3_stmt *stmt, int offset,
     if (state == NULL) return 0;
     if (strcmp(state, "STARTING") == 0 || strcmp(state, "CAPTURING") == 0) return 1;
     const char *expires = (const char *)sqlite3_column_text(stmt, offset + 4);
+    char stored[ST_INSTANT_CAPACITY];
+    if (expires == NULL || strlen(expires) != (size_t)sqlite3_column_bytes(stmt, offset + 4)
+        || st_instant_normalize(expires, stored) != 0) return 0;
     return strcmp(state, "COMPLETE") == 0
         && sqlite3_column_int64(stmt, offset + 1) == session->expected_bytes
         && sqlite3_column_type(stmt, offset + 2) != SQLITE_NULL
         && sqlite3_column_int64(stmt, offset + 2) == session->range_start
         && sqlite3_column_type(stmt, offset + 3) != SQLITE_NULL
         && sqlite3_column_int64(stmt, offset + 3) == session->range_end
-        && expires != NULL && strcmp(expires, now_text) > 0;
+        && strcmp(stored, now_text) > 0;
 }
 
 /*
@@ -1024,7 +1031,7 @@ static int media_db_find_reusable(sqlite3 *db, const st_media_capture_session *s
         "SELECT 1 FROM specus_http_media_capture WHERE tenant_id=? AND resource_key=? "
         "AND media_kind=? AND content_range_start IS ? AND content_range_end IS ? "
         "AND total_bytes IS ? AND captured_bytes=? AND content_encoding IS ? "
-        "AND state='COMPLETE' AND expires_at>? LIMIT 1",
+        "AND state='COMPLETE' AND specus_instant(expires_at)>? LIMIT 1",
         -1, &stmt, NULL) != SQLITE_OK) return -1;
     sqlite3_bind_text(stmt, 1, session->tenant_id, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, resource_key, -1, SQLITE_TRANSIENT);
@@ -1160,7 +1167,11 @@ st_media_capture_session *st_media_capture_open(const char *database_path,
     }
     time_t now = time(NULL);
     char now_text[64];
-    media_iso_time(now, now_text);
+    char captured_at[64], expires_at[64];
+    if (st_instant_now(now_text) != 0 || st_instant_public(now_text, captured_at, sizeof(captured_at)) != 0
+        || st_instant_add_seconds(now_text, session->cfg.retention_seconds, expires_at) != 0) {
+        sqlite3_close(db); free(session); session = NULL; goto cleanup;
+    }
     /*
      * The duplicate check and the insert share one write transaction, so two responses for the same
      * range cannot both pass the check: the later one sees the first one's STARTING/CAPTURING row
@@ -1212,9 +1223,6 @@ st_media_capture_session *st_media_capture_open(const char *database_path,
     snprintf(session->object_key, sizeof(session->object_key), "%s%s%s/%s/%s/%s%s",
              prefix_start, *prefix_start == '\0' ? "" : "/", safe_tenant, date, safe_route,
              random_hex, media_extension(normalized_source));
-    char captured_at[64], expires_at[64];
-    media_iso_time(now, captured_at);
-    media_iso_time(now + session->cfg.retention_seconds, expires_at);
     long long segment_sequence = 0;
     int has_segment_sequence = media_infer_sequence(normalized_source, &segment_sequence) == 0;
     char *response_headers = media_join_headers(headers, headers_len);
@@ -1670,6 +1678,7 @@ static int media_scan_row(sqlite3_stmt *stmt, st_media_capture_row *row)
     media_row_text(stmt, 25, row->captured_at, sizeof(row->captured_at));
     media_row_text(stmt, 26, row->completed_at, sizeof(row->completed_at));
     media_row_text(stmt, 27, row->expires_at, sizeof(row->expires_at));
+    (void)st_instant_public(row->expires_at, row->expires_at, sizeof(row->expires_at));
     return 0;
 }
 
@@ -1841,18 +1850,20 @@ static int media_load_playback_parts(sqlite3 *db,
         "SELECT object_key,content_range_start,content_range_end,total_bytes,captured_bytes "
         "FROM specus_http_media_capture WHERE tenant_id=? AND client_id=? AND resource_key=? "
         "AND state='COMPLETE' AND captured_bytes>0 "
-        "AND (expires_at IS NULL OR expires_at>strftime('%Y-%m-%dT%H:%M:%SZ','now')) "
+        "AND (expires_at IS NULL OR specus_instant(expires_at)>?) "
         "ORDER BY id DESC LIMIT ?";
     sqlite3_stmt *stmt = NULL;
     st_media_playback_part *parts = NULL;
     size_t len = 0U;
     long long stated_total = 0;
     long long furthest = 0;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    char now[ST_INSTANT_CAPACITY];
+    if (st_instant_now(now) != 0 || sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
     sqlite3_bind_text(stmt, 1, anchor->tenant_id, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt, 2, anchor->client_id);
     sqlite3_bind_text(stmt, 3, anchor->resource_key, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 4, (int)ST_MEDIA_MAX_PLAYBACK_PARTS);
+    sqlite3_bind_text(stmt, 4, now, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 5, (int)ST_MEDIA_MAX_PLAYBACK_PARTS);
     int step;
     while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
         long long captured = sqlite3_column_int64(stmt, 4);
@@ -2209,14 +2220,14 @@ int st_media_capture_cleanup_expired(const char *database_path)
     sqlite3 *db = NULL;
     if (media_db_open(database_path, &db) != 0) return -1;
     char now[64];
-    media_iso_time(current, now);
+    if (st_instant_now(now) != 0) { sqlite3_close(db); return -1; }
     sqlite3_stmt *stmt = NULL;
     const char *extend_sql =
         "UPDATE specus_http_media_capture SET expires_at="
-        "strftime('%Y-%m-%dT%H:%M:%SZ',captured_at,'+'||?||' seconds') "
-        "WHERE live_stream=0 AND state IN ('COMPLETE','INCOMPLETE') AND expires_at<? "
-        "AND strftime('%Y-%m-%dT%H:%M:%SZ',captured_at,'+'||?||' seconds')>? "
-        "AND strftime('%Y-%m-%dT%H:%M:%SZ',captured_at,'+'||?||' seconds')>expires_at";
+        "specus_instant_add_seconds(captured_at,?) "
+        "WHERE live_stream=0 AND state IN ('COMPLETE','INCOMPLETE') AND specus_instant(expires_at)<? "
+        "AND specus_instant_add_seconds(captured_at,?)>? "
+        "AND specus_instant_add_seconds(captured_at,?)>specus_instant(expires_at)";
     if (sqlite3_prepare_v2(db, extend_sql, -1, &stmt, NULL) != SQLITE_OK) {
         sqlite3_close(db);
         return -1;
@@ -2246,7 +2257,7 @@ int st_media_capture_cleanup_expired(const char *database_path)
         "SELECT id,tenant_id,state,object_key,COALESCE(upload_id,'') "
         "FROM specus_http_media_capture WHERE state IN "
         "('STARTING','CAPTURING','COMPLETE','INCOMPLETE','FAILED') "
-        "AND expires_at<? ORDER BY id ASC LIMIT 200";
+        "AND specus_instant(expires_at)<? ORDER BY id ASC LIMIT 200";
     if (sqlite3_prepare_v2(db, select_sql, -1, &stmt, NULL) != SQLITE_OK) {
         sqlite3_close(db);
         return -1;
@@ -3136,11 +3147,13 @@ static void media_record_manifest(st_media_capture_session *session)
         media_parsed_manifest_free(&parsed);
         return;
     }
-    time_t now = time(NULL);
     char created_at[64], live_expires[64], cutoff[64];
-    media_iso_time(now, created_at);
-    media_iso_time(now + session->cfg.live_window_seconds, live_expires);
-    media_iso_time(now - session->cfg.live_window_seconds, cutoff);
+    char now[ST_INSTANT_CAPACITY];
+    if (st_instant_now(now) != 0 || st_instant_public(now, created_at, sizeof(created_at)) != 0
+        || st_instant_add_seconds(now, session->cfg.live_window_seconds, live_expires) != 0
+        || st_instant_add_seconds(now, -session->cfg.live_window_seconds, cutoff) != 0) {
+        media_parsed_manifest_free(&parsed); sqlite3_close(db); return;
+    }
     int ok = sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK;
     sqlite3_stmt *stmt = NULL;
     if (ok && parsed.live) {
@@ -3168,7 +3181,7 @@ static void media_record_manifest(st_media_capture_session *session)
             "UPDATE specus_http_media_capture SET live_stream=1,expires_at=? WHERE id IN ("
             "SELECT id FROM specus_http_media_capture WHERE tenant_id=? AND client_id=? AND route=? "
             "AND media_kind='MEDIA_SEGMENT' AND state='COMPLETE' ORDER BY id DESC LIMIT 1000) "
-            "AND captured_at>?",
+            "AND specus_instant(captured_at)>?",
             live_expires, session, NULL, cutoff) == 0;
     }
     if (ok) {
