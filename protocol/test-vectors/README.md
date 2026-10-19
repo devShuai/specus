@@ -46,6 +46,9 @@ Java、Go、.NET、Android 使用相同字段和字节序；Java、Go、.NET 服
 - `peer-egress-frame-v1.json`：`SPEG1` 帧的固定头、双向 IPv4 样例、控制消息 canonical JSON，
   以及 bad magic、未知 type、保留位非零、截断、尾随字节、IPv6 与二期保留控制类型的拒绝样例。
   所有 `frameHex` 是 SPM2 解密后的明文，不含 SPM2 的 20 字节头和 16 字节 tag。
+- `peer-egress-ipv6-v1.json`（规范已定，尚无实现读取）：消费端 IPv6 数据面——由 mesh IPv4 推出的设备地址、
+  有数据面时 IPv6 规则的 mesh 重叠与出口能力、`SPEG1` 承载的 IPv6 包的解析与拒绝、消费端从 TUN 读到的包的分流、
+  回程校验，以及 IPv6 的 TCP 复位与 ICMPv6 地址不可达。由 `tools/protocol/generate_peer_egress_ipv6_vectors.py` 生成。
 - `peer-egress-authz-v1.json`：出口端授权判定，含固定判定顺序与全部错误码。策略故意包含
   `0.0.0.0/0` 条目，用来证明回环、云元数据、组播和 mesh 网段等强制拒绝目标不随宽泛规则放开。
 

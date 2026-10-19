@@ -1,0 +1,393 @@
+{
+  "name": "peer-egress-ipv6-v1",
+  "version": 1,
+  "spec": "protocol/spec/peer-egress.md#ipv6-数据面",
+  "notes": [
+    "消费端 IPv6 数据面（#245）：设备的 IPv6 地址由 mesh IPv4 推出；SPEG1 原样承载 IPv6 包，只发给声明了 ipv6PacketCapable 的出口；AAAA 仍回 NODATA。",
+    "所有包都由生成器按报文结构造出，校验和按 RFC 8200 的伪首部计算；三端产出的字节必须完全一致。"
+  ],
+  "meshAddress": {
+    "prefix": "fd53:7065:6375:7300::/96",
+    "notes": [
+      "每台设备的 IPv6 地址由它的 mesh IPv4 推出：IPv4 的 32 位填进前缀的低 32 位，写成 RFC 5952 规范形式。",
+      "前缀固定，不随 peerMeshCidr 变；地址只在租户内唯一，与 IPv4 虚拟地址相同。",
+      "反推只认前缀内的地址，比较按数值，写法不影响结果。"
+    ],
+    "derive": [
+      {
+        "meshIpv4": "100.96.0.1",
+        "ipv6": "fd53:7065:6375:7300::6460:1"
+      },
+      {
+        "meshIpv4": "100.64.0.0",
+        "ipv6": "fd53:7065:6375:7300::6440:0"
+      },
+      {
+        "meshIpv4": "100.127.255.255",
+        "ipv6": "fd53:7065:6375:7300::647f:ffff"
+      },
+      {
+        "meshIpv4": "100.96.1.0",
+        "ipv6": "fd53:7065:6375:7300::6460:100"
+      },
+      {
+        "meshIpv4": "10.0.0.1",
+        "ipv6": "fd53:7065:6375:7300::a00:1"
+      }
+    ],
+    "underive": [
+      {
+        "ipv6": "fd53:7065:6375:7300::6460:1",
+        "meshIpv4": "100.96.0.1"
+      },
+      {
+        "ipv6": "fd53:7065:6375:7300::a00:1",
+        "meshIpv4": "10.0.0.1"
+      },
+      {
+        "ipv6": "FD53:7065:6375:7300:0:0:6460:0001",
+        "meshIpv4": "100.96.0.1"
+      },
+      {
+        "ipv6": "fd53:7065:6375:7301::6460:1",
+        "meshIpv4": null
+      },
+      {
+        "ipv6": "fd53:7065:6375:7300:1::6460:1",
+        "meshIpv4": null
+      },
+      {
+        "ipv6": "::ffff:6460:1",
+        "meshIpv4": null
+      },
+      {
+        "ipv6": "2001:db8::6460:1",
+        "meshIpv4": null
+      }
+    ]
+  },
+  "ruleValidation": {
+    "notes": [
+      "只在有 IPv6 数据面的消费端适用；没有数据面的消费端仍按 peer-egress-rules-v1.json 报 EGRESS_RULE_IPV6_UNSUPPORTED。",
+      "推出地址的前缀是 Peer Mesh 网段：与它重叠的 IPv6 规则报 EGRESS_RULE_MESH_OVERLAP，与 IPv4 规则覆盖 mesh 网段相同。",
+      "出口能力只对在线的出口判：不在线时规则仍生效，流量计 egress-unavailable；在线而目录没有 ipv6PacketCapable，报 EGRESS_RULE_EGRESS_NO_IPV6，流量计 egress-no-ipv6。",
+      "检查顺序沿用 peer-egress.md「规则语义」的编号，mesh 重叠先于出口能力。"
+    ],
+    "cases": [
+      {
+        "name": "public-prefix-to-capable-egress",
+        "egressOnline": true,
+        "egressIpv6PacketCapable": true,
+        "code": null,
+        "rule": {
+          "match": "2001:db8:1::/48",
+          "action": "egress",
+          "egressClientId": 2
+        }
+      },
+      {
+        "name": "the-mesh-prefix",
+        "egressOnline": true,
+        "egressIpv6PacketCapable": true,
+        "code": "EGRESS_RULE_MESH_OVERLAP",
+        "rule": {
+          "match": "fd53:7065:6375:7300::/96",
+          "action": "egress",
+          "egressClientId": 2
+        }
+      },
+      {
+        "name": "one-mesh-address",
+        "egressOnline": true,
+        "egressIpv6PacketCapable": true,
+        "code": "EGRESS_RULE_MESH_OVERLAP",
+        "rule": {
+          "match": "fd53:7065:6375:7300::6460:2",
+          "action": "egress",
+          "egressClientId": 2
+        }
+      },
+      {
+        "name": "a-prefix-covering-the-mesh",
+        "egressOnline": true,
+        "egressIpv6PacketCapable": true,
+        "code": "EGRESS_RULE_MESH_OVERLAP",
+        "rule": {
+          "match": "fd00::/8",
+          "action": "egress",
+          "egressClientId": 2
+        }
+      },
+      {
+        "name": "next-to-the-mesh",
+        "egressOnline": true,
+        "egressIpv6PacketCapable": true,
+        "code": null,
+        "rule": {
+          "match": "fd53:7065:6375:7301::/64",
+          "action": "egress",
+          "egressClientId": 2
+        }
+      },
+      {
+        "name": "online-egress-without-ipv6-packets",
+        "egressOnline": true,
+        "egressIpv6PacketCapable": false,
+        "code": "EGRESS_RULE_EGRESS_NO_IPV6",
+        "rule": {
+          "match": "2001:db8:1::/48",
+          "action": "egress",
+          "egressClientId": 2
+        }
+      },
+      {
+        "name": "offline-egress",
+        "egressOnline": false,
+        "egressIpv6PacketCapable": false,
+        "code": null,
+        "rule": {
+          "match": "2001:db8:1::/48",
+          "action": "egress",
+          "egressClientId": 2
+        }
+      }
+    ]
+  },
+  "frames": {
+    "notes": [
+      "带 IPv6 数据面的解析器：type=1 的 body 按首字节高 4 位分流，4 走 peer-egress-frame-v1.json 的 IPv4 规则，6 按本节。",
+      "没有数据面、或没有声明 ipv6PacketCapable 的出口仍按 peer-egress-frame-v1.json 的 ipv6-packet-in-v1 报 EGRESS_IPV6_UNSUPPORTED。",
+      "解析顺序：body 短于 40 字节 → EGRESS_FRAME_TRUNCATED；40 + payloadLength 大于 body → EGRESS_FRAME_TRUNCATED，小于 → EGRESS_FRAME_TRAILING_BYTES。版本既不是 4 也不是 6 沿用一期的 EGRESS_IPV6_UNSUPPORTED。",
+      "next header 不在解析时判：解析只取它与（TCP、UDP 时）端口；出口按协议处理时，TCP、UDP 以外（含任何扩展头、分片头、ICMPv6）以 EGRESS_PROTOCOL_DENIED 拒绝，与 IPv4 的 ICMP 相同。"
+    ],
+    "accept": [
+      {
+        "name": "ipv6-tcp-syn-outbound",
+        "direction": "consumer-to-egress",
+        "frameHex": "53504547310100006000000000140640fd53706563757300000000006460000120010db80001000000000000000000c8d43101bb00000001000000005002ffff02e30000",
+        "innerSourceIp": "fd53:7065:6375:7300::6460:1",
+        "innerDestinationIp": "2001:db8:1::c8",
+        "innerNextHeader": 6,
+        "innerSourcePort": 54321,
+        "innerDestinationPort": 443
+      },
+      {
+        "name": "ipv6-udp-outbound",
+        "direction": "consumer-to-egress",
+        "frameHex": "53504547310100006000000000251140fd53706563757300000000006460000120010db8000100000000000000000035c73800350025cb7babcd01000001000000000000076578616d706c6503636f6d00001c0001",
+        "innerSourceIp": "fd53:7065:6375:7300::6460:1",
+        "innerDestinationIp": "2001:db8:1::35",
+        "innerNextHeader": 17,
+        "innerSourcePort": 51000,
+        "innerDestinationPort": 53
+      },
+      {
+        "name": "ipv6-tcp-synack-return",
+        "direction": "egress-to-consumer",
+        "frameHex": "5350454731010000600000000014064020010db80001000000000000000000c8fd53706563757300000000006460000101bbd43100001b58000000025012ffffe7790000",
+        "innerSourceIp": "2001:db8:1::c8",
+        "innerDestinationIp": "fd53:7065:6375:7300::6460:1",
+        "innerNextHeader": 6,
+        "innerSourcePort": 443,
+        "innerDestinationPort": 54321
+      },
+      {
+        "name": "ipv6-icmpv6-parses",
+        "direction": "consumer-to-egress",
+        "frameHex": "535045473101000060000000000c3a40fd53706563757300000000006460000120010db80001000000000000000000c88000b7a01234000170696e67",
+        "innerSourceIp": "fd53:7065:6375:7300::6460:1",
+        "innerDestinationIp": "2001:db8:1::c8",
+        "innerNextHeader": 58,
+        "innerSourcePort": 0,
+        "innerDestinationPort": 0,
+        "egressCode": "EGRESS_PROTOCOL_DENIED"
+      },
+      {
+        "name": "ipv6-fragment-header-parses",
+        "direction": "consumer-to-egress",
+        "frameHex": "535045473101000060000000001c2c40fd53706563757300000000006460000120010db80001000000000000000000c80600000100001234d43101bb00000001000000005002ffff02e30000",
+        "innerSourceIp": "fd53:7065:6375:7300::6460:1",
+        "innerDestinationIp": "2001:db8:1::c8",
+        "innerNextHeader": 44,
+        "innerSourcePort": 0,
+        "innerDestinationPort": 0,
+        "egressCode": "EGRESS_PROTOCOL_DENIED"
+      },
+      {
+        "name": "ipv6-hop-by-hop-parses",
+        "direction": "consumer-to-egress",
+        "frameHex": "535045473101000060000000001c0040fd53706563757300000000006460000120010db80001000000000000000000c80600010400000000d43101bb00000001000000005002ffff02e30000",
+        "innerSourceIp": "fd53:7065:6375:7300::6460:1",
+        "innerDestinationIp": "2001:db8:1::c8",
+        "innerNextHeader": 0,
+        "innerSourcePort": 0,
+        "innerDestinationPort": 0,
+        "egressCode": "EGRESS_PROTOCOL_DENIED"
+      }
+    ],
+    "reject": [
+      {
+        "name": "ipv6-body-shorter-than-header",
+        "frameHex": "53504547310100006000000000140640fd53706563757300000000006460000120010db80001000000000000000000",
+        "code": "EGRESS_FRAME_TRUNCATED",
+        "reason": "IPv6 固定头 40 字节"
+      },
+      {
+        "name": "ipv6-payload-length-beyond-body",
+        "frameHex": "53504547310100006000000000140640fd53706563757300000000006460000120010db80001000000000000000000c8d43101bb00000001000000005002ffff02e300",
+        "code": "EGRESS_FRAME_TRUNCATED",
+        "reason": "40 + payloadLength 大于 body"
+      },
+      {
+        "name": "ipv6-trailing-bytes",
+        "frameHex": "53504547310100006000000000140640fd53706563757300000000006460000120010db80001000000000000000000c8d43101bb00000001000000005002ffff02e3000000",
+        "code": "EGRESS_FRAME_TRAILING_BYTES",
+        "reason": "40 + payloadLength 必须精确等于 body 长度"
+      },
+      {
+        "name": "ip-version-five",
+        "frameHex": "53504547310100005000000000140640fd53706563757300000000006460000120010db80001000000000000000000c8d43101bb00000001000000005002ffff02e30000",
+        "code": "EGRESS_IPV6_UNSUPPORTED",
+        "reason": "版本既不是 4 也不是 6，沿用一期的码"
+      },
+      {
+        "name": "jumbo-payload-length-zero",
+        "frameHex": "53504547310100006000000000000640fd53706563757300000000006460000120010db80001000000000000000000c8d43101bb00000001000000005002ffff02e30000",
+        "code": "EGRESS_FRAME_TRAILING_BYTES",
+        "reason": "payloadLength 为 0 而 body 长于 40：不承载 jumbogram"
+      }
+    ]
+  },
+  "consumerOutbound": {
+    "consumerMeshIpv4": "100.96.0.1",
+    "notes": [
+      "消费端从 TUN 读到的 IPv6 包，在规则匹配之前按本节分流。forward 之后照常匹配规则，与 IPv4 相同。",
+      "drop-silently 不计数：链路本地源与组播目的是系统自己的邻居发现与组播报告，不是流量。",
+      "其余丢弃计进 blocked，原因名如 expect 所示，不回应应用。",
+      "effectiveMtu 是对端会话的有效 MTU（peer-mesh.md SPMTU2）；TUN 的 MTU 为 1280，peerMeshMtu 低于 1280 的设备没有 IPv6 数据面。"
+    ],
+    "cases": [
+      {
+        "name": "to-a-rule",
+        "packetHex": "6000000000140640fd53706563757300000000006460000120010db80001000000000000000000c8d43101bb00000001000000005002ffff02e30000",
+        "effectiveMtu": 1280,
+        "expect": "forward"
+      },
+      {
+        "name": "router-solicitation",
+        "packetHex": "6000000000083a40fe800000000000000000000000000001ff0200000000000000000000000000028500000000000000",
+        "effectiveMtu": 1280,
+        "expect": "drop-silently",
+        "note": "Link-local source: the system's own neighbour discovery on the TUN, not traffic. Not counted."
+      },
+      {
+        "name": "multicast-listener-report",
+        "packetHex": "6000000000080040fd537065637573000000000064600001ff0200000000000000000000000000163a00050200000100",
+        "effectiveMtu": 1280,
+        "expect": "drop-silently",
+        "note": "Multicast destination: never routed into the TUN by a rule. Not counted."
+      },
+      {
+        "name": "source-is-not-this-device",
+        "packetHex": "600000000014064020010db800ff0000000000000000000120010db80001000000000000000000c8d43101bb00000001000000005002ffff7cba0000",
+        "effectiveMtu": 1280,
+        "expect": "ipv6-source-not-mesh",
+        "note": "An application bound to another address; the egress would refuse it, so it is not sent."
+      },
+      {
+        "name": "to-another-mesh-device",
+        "packetHex": "6000000000140640fd537065637573000000000064600001fd537065637573000000000064600002d431001600000001000000005002ffff8a780000",
+        "effectiveMtu": 1280,
+        "expect": "ipv6-mesh-unsupported",
+        "note": "Mesh traffic between devices stays IPv4; no route sends this prefix into the TUN, so this is only stray traffic."
+      },
+      {
+        "name": "path-below-the-ipv6-minimum",
+        "packetHex": "6000000000140640fd53706563757300000000006460000120010db80001000000000000000000c8d43101bb00000001000000005002ffff02e30000",
+        "effectiveMtu": 1200,
+        "expect": "ipv6-path-mtu",
+        "note": "IPv6 needs 1280 on every link; a peer path that probes lower cannot carry it, and a Packet Too Big below 1280 means nothing to an IPv6 stack."
+      }
+    ]
+  },
+  "returnPath": {
+    "consumerMeshIpv4": "100.96.0.1",
+    "notes": [
+      "出口 → 消费端的 IPv6 包：目的必须是本机推出地址，否则不归消费端（同时是出口的设备交给出口一侧处理），与 IPv4 相同。",
+      "源在推出地址的前缀内拒收，计 return-mesh-source；找不到本机发起的存活流拒收，计 return-no-flow。",
+      "liveFlow 表示本机对这个五元组、这个出口有存活流。"
+    ],
+    "cases": [
+      {
+        "name": "reply-to-a-live-flow",
+        "packetHex": "600000000014064020010db80001000000000000000000c8fd53706563757300000000006460000101bbd43100001b58000000025012ffffe7790000",
+        "liveFlow": true,
+        "expect": "deliver"
+      },
+      {
+        "name": "reply-with-no-flow",
+        "packetHex": "600000000014064020010db80001000000000000000000c8fd53706563757300000000006460000101bbd43100001b58000000025012ffffe7790000",
+        "liveFlow": false,
+        "expect": "return-no-flow"
+      },
+      {
+        "name": "reply-from-a-mesh-address",
+        "packetHex": "6000000000140640fd537065637573000000000064600002fd53706563757300000000006460000101bbd43100001b58000000025012ffff6d6a0000",
+        "liveFlow": true,
+        "expect": "return-mesh-source"
+      },
+      {
+        "name": "addressed-to-another-device",
+        "packetHex": "600000000014064020010db80001000000000000000000c8fd53706563757300000000006460000201bbd43100001b58000000025012ffffe7780000",
+        "liveFlow": true,
+        "expect": "not-for-consumer"
+      }
+    ]
+  },
+  "failure": {
+    "notes": [
+      "与 peer-egress-failure-v1.json 同一时机写回 TUN：出口不可用（离线、尚未在线、流被清掉）时，消费端拒绝转发的段与数据报。",
+      "TCP 复位按 RFC 793，与 IPv4 同一条规则；IPv6 头：traffic class 0、flow label 0、hop limit 64；TCP 窗口 0，无选项。",
+      "UDP 回 ICMPv6 目的不可达、地址不可达（类型 1 代码 3，对应 IPv4 的主机不可达），从原包的目的发回原包的源，引用原包直到整个错误报文不超过 1280 字节。",
+      "resetOnPurge 的规则与 IPv4 相同，只换地址族，不另列用例。"
+    ],
+    "resetOnPacket": {
+      "cases": [
+        {
+          "name": "syn-for-a-new-connection",
+          "packetHex": "6000000000140640fd53706563757300000000006460000120010db80001000000000000000000c89c4001bb000003e8000000005002ffff36ed0000",
+          "expect": {
+            "packetHex": "600000000014064020010db80001000000000000000000c8fd53706563757300000000006460000101bb9c4000000000000003e95014000036da0000"
+          }
+        },
+        {
+          "name": "data-on-a-flow-that-was-purged",
+          "packetHex": "60000000001a0640fd53706563757300000000006460000120010db80001000000000000000000c89c4001bb000003e9000013895018ffff58c10000474554202f20",
+          "expect": {
+            "packetHex": "600000000014064020010db80001000000000000000000c8fd53706563757300000000006460000101bb9c40000013890000000050040000274a0000"
+          }
+        }
+      ]
+    },
+    "unreachableOnDatagram": {
+      "cases": [
+        {
+          "name": "dns-query",
+          "note": "Small enough to quote whole.",
+          "packetHex": "6000000000251140fd53706563757300000000006460000120010db8000100000000000000000035c73800350025cb7babcd01000001000000000000076578616d706c6503636f6d00001c0001",
+          "expect": {
+            "packetHex": "6000000000553a4020010db8000100000000000000000035fd5370656375730000000000646000010103b6be000000006000000000251140fd53706563757300000000006460000120010db8000100000000000000000035c73800350025cb7babcd01000001000000000000076578616d706c6503636f6d00001c0001"
+          }
+        },
+        {
+          "name": "datagram-quoted-to-the-minimum-mtu",
+          "note": "1584 bytes; the quote stops where the error would pass 1280 bytes (RFC 4443 2.4 c).",
+          "packetHex": "6000000006081140fd53706563757300000000006460000120010db8000100000000000000000035c73a01bb0608d2ea000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+          "expect": {
+            "packetHex": "6000000004d83a4020010db8000100000000000000000035fd537065637573000000000064600001010369a2000000006000000006081140fd53706563757300000000006460000120010db8000100000000000000000035c73a01bb0608d2ea000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"
+          }
+        }
+      ]
+    }
+  }
+}
