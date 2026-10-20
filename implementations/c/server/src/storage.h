@@ -249,7 +249,8 @@ typedef struct {
     char resource_type[16];
     char resource_key[256];
     long long resource_id;
-    char resource_name[512];
+    /* Java's whole name: a route (under 128 bytes here) and a target URL (under 512) with " -> ". */
+    char resource_name[1024];
     char usage_date[16];
     long long upload_bytes;
     long long download_bytes;

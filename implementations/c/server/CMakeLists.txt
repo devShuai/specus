@@ -598,6 +598,15 @@ add_test(NAME http_reset_reason_reference_tests
     COMMAND specus_c_http_reset_reason_reference_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(http_reset_reason_reference_tests PROPERTIES TIMEOUT 60)
 
+# Traffic usage of a real server process: what is counted, in which direction, and when it is written.
+add_executable(specus_c_traffic_usage_tests tests/traffic_usage_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_traffic_usage_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_traffic_usage_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_traffic_usage_tests PRIVATE
+    ST_CONNECTIVITY_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/")
+add_test(NAME traffic_usage_tests COMMAND specus_c_traffic_usage_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(traffic_usage_tests PROPERTIES TIMEOUT 120)
+
 # TCP_INFO observes a real kernel reset before releasing the held login. These observers
 # belong only to this test server; specus-server-c does not link or enable them.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

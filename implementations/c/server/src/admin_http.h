@@ -65,6 +65,11 @@ typedef struct {
     /* Optional length-aware RST reason. Preferred over on_reset when supplied: JSON strings can
      * contain embedded NUL, which is data to escape in diagnostics, not the end of the reason. */
     void (*on_reset_bytes)(void *ctx, uint32_t code, const char *reason, size_t reason_len);
+    /*
+     * Optional: the forwarder keeps here how many request body bytes it has sent the client as NAT
+     * DATA, so an exchange cut short still counts the upload it really made.
+     */
+    size_t *request_body_sent;
 } st_admin_direct_http_sink;
 
 /*

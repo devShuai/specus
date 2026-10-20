@@ -3,6 +3,7 @@
 
 #include "client_auth_nonce.h"
 #include "crypto.h"
+#include "instant.h"
 #include "object_storage.h"
 #include "peer_egress.h"
 
@@ -2099,9 +2100,81 @@ static int test_mapping_listen_port_is_unique(void)
     return failures == 0 ? 0 : 1;
 }
 
+/* Java Instant.toString with a fraction: "YYYY-MM-DDTHH:MM:SS." then 3, 6 or 9 digits and "Z". */
+static int is_fractional_instant(const char *text)
+{
+    static const char pattern[] = "dddd-dd-ddTdd:dd:dd.";
+    size_t len = strlen(text);
+    if (len != 24U && len != 27U && len != 30U) return 0;
+    for (size_t i = 0U; i + 1U < len; ++i) {
+        char expected = i < sizeof(pattern) - 1U ? pattern[i] : 'd';
+        if (expected == 'd' ? text[i] < '0' || text[i] > '9' : text[i] != expected) return 0;
+    }
+    return text[len - 1U] == 'Z';
+}
+
+/*
+ * The values TrafficUsageService writes on every flush. updated_at is Instant.now().toString(), so
+ * it carries the fraction of a second (C wrote SQLite's whole-second CURRENT_TIMESTAMP). A
+ * resource row takes the id and name the resource has at that moment: the mapping on port 9000
+ * deleted is a NULL id with "端口 9000", the one created on it later its new id. C kept the first
+ * id it had stored.
+ */
+static int test_traffic_usage_rows(void)
+{
+    char path[256];
+    scratch_db_path(path, sizeof(path), "traffic-rows");
+    st_storage_client client;
+    if (st_storage_init(path, 0) != 0
+        || st_storage_upsert_client(path, 0, "tenant-rows", "rows-client", "owner", 1, 30, &client) != 0) {
+        fprintf(stderr, "traffic rows: setup failed\n");
+        unlink(path);
+        return 1;
+    }
+    char before[ST_INSTANT_CAPACITY];
+    char after[ST_INSTANT_CAPACITY];
+    char stored[ST_INSTANT_CAPACITY];
+    st_storage_traffic_usage day[2];
+    size_t day_count = 0U;
+    int failed = st_instant_now(before) != 0
+        || st_storage_record_traffic_usage(path, client.id, "rows-client", "2026-10-20", 1, 2) != 0
+        || st_instant_now(after) != 0
+        || st_storage_list_traffic_usage(path, client.id, 10, day, 2U, &day_count) != 0 || day_count != 1U;
+    if (!failed && (!is_fractional_instant(day[0].updated_at) || st_instant_normalize(day[0].updated_at, stored) != 0
+                    || strcmp(stored, before) < 0 || strcmp(stored, after) > 0)) {
+        fprintf(stderr, "traffic rows: updatedAt %s is not Instant.toString between %s and %s\n",
+                day[0].updated_at, before, after);
+        failed = 1;
+    }
+    static const long long ids[] = {3, 0, 7};
+    static const char *const names[] = {"9000 -> 10.0.0.1:22", "端口 9000", "9000 -> 10.0.0.2:2222"};
+    for (size_t i = 0U; !failed && i < sizeof(ids) / sizeof(ids[0]); ++i) {
+        st_storage_resource_traffic_usage rows[2];
+        size_t row_count = 0U;
+        failed = st_storage_record_resource_traffic_usage(path, client.id, "rows-client", "TCP_SPECUS", "tcp:9000",
+                                                          ids[i], names[i], "2026-10-20", 10, 20) != 0
+            || st_storage_list_resource_traffic_usage(path, "TCP_SPECUS", client.id, 10, rows, 2U, &row_count) != 0
+            || row_count != 1U || rows[0].resource_id != ids[i] || strcmp(rows[0].resource_name, names[i]) != 0
+            || rows[0].upload_bytes != 10 * (long long)(i + 1U) || rows[0].download_bytes != 20 * (long long)(i + 1U)
+            || !is_fractional_instant(rows[0].updated_at);
+        if (failed) {
+            fprintf(stderr, "traffic rows: after write %zu the resource row is id %lld, %s, %lld/%lld, %s; "
+                            "expected id %lld, %s\n", i, row_count == 1U ? rows[0].resource_id : -1,
+                    row_count == 1U ? rows[0].resource_name : "-", row_count == 1U ? rows[0].upload_bytes : -1,
+                    row_count == 1U ? rows[0].download_bytes : -1, row_count == 1U ? rows[0].updated_at : "-",
+                    ids[i], names[i]);
+        }
+    }
+    unlink(path);
+    return failed ? 1 : 0;
+}
+
 int main(void)
 {
     if (test_client_account_id_migration() != 0) {
+        return 1;
+    }
+    if (test_traffic_usage_rows() != 0) {
         return 1;
     }
     if (test_login_name_migration_backfills_legacy_rows() != 0

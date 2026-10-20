@@ -104,6 +104,21 @@ static int is_instant(const char *text)
     return 1;
 }
 
+/* Any Java Instant.toString: the whole-second form or one with 3, 6 or 9 fractional digits. */
+static int is_java_instant(const char *text)
+{
+    size_t len = strlen(text);
+    if (is_instant(text)) return 1;
+    if ((len != 24U && len != 27U && len != 30U) || text[19] != '.' || text[len - 1U] != 'Z') return 0;
+    char whole[21];
+    memcpy(whole, text, 19U);
+    memcpy(whole + 19U, "Z", 2U);
+    for (size_t i = 20U; i + 1U < len; ++i) {
+        if (!isdigit((unsigned char)text[i])) return 0;
+    }
+    return is_instant(whole);
+}
+
 static int repeat_into(char *out, size_t out_len, const char *unit, size_t times)
 {
     size_t unit_len = strlen(unit);
@@ -1405,8 +1420,9 @@ static int test_traffic_usage(void)
                   "\"resourceType\":\"TCP_SPECUS\"") != 0
         || strstr(last_body, "HTTP_ROUTE") != NULL || strstr(last_body, "\"clientName\":\"crud-gone\"") == NULL;
     if (!failed) {
+        /* TrafficUsageService writes Instant.now().toString(), fraction of a second included. */
         char *updated = st_json_get_string(last_body, "updatedAt");
-        failed = updated == NULL || !is_instant(updated);
+        failed = updated == NULL || !is_java_instant(updated) || is_instant(updated);
         if (failed) fprintf(stderr, "usage updatedAt: %s\n", last_body);
         free(updated);
     }

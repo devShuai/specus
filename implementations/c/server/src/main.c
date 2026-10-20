@@ -1183,6 +1183,7 @@ static void build_tcp_resource_name(const tcp_mapping *mapping, int port, char o
     }
 }
 
+/* Java TrafficUsageService.recordTcpUpload/recordTcpDownload: port 0 counts the client's day only. */
 static void record_tcp_traffic(specus_session *session, int port, long long upload_bytes, long long download_bytes)
 {
     if (session == NULL
@@ -1198,6 +1199,9 @@ static void record_tcp_traffic(specus_session *session, int port, long long uplo
     const char *client_name = session->config.client_name;
     long long client_id = session->config.client_id;
     st_storage_record_traffic_usage(database_path, client_id, client_name, usage_date, upload_bytes, download_bytes);
+    if (port <= 0) {
+        return;
+    }
 
     tcp_mapping mapping_copy;
     const tcp_mapping *mapping = NULL;
@@ -2213,6 +2217,9 @@ static int direct_http_forward(void *ctx,
             goto failed;
         }
         offset += chunk_len;
+        if (sink->request_body_sent != NULL) {
+            *sink->request_body_sent = offset;
+        }
     }
     int fin_failed = 0;
     char *fin_json = json_http_request_fin(request, &fin_failed);
@@ -4087,6 +4094,14 @@ static int process_ws_data(specus_session *session, const st_nat_message *messag
     }
     int end_stream = (message->flags & ST_NAT_FLAG_END_STREAM) != 0U;
     int result = ST_ADMIN_DIRECT_WS_ACCEPTED;
+    /*
+     * Java NatServerHandler.processWsData: every client-to-browser envelope, its 12-byte header
+     * included, is the client's upload, counted before it is checked; listen port 0, so no
+     * resource row. The browser's direction is not counted.
+     */
+    if (message->data_len > 0U) {
+        record_tcp_traffic(session, 0, (long long)message->data_len, 0);
+    }
     /* An empty DATA carries no SWS2 envelope; it is only meaningful as a bare END_STREAM. */
     if (message->data_len > 0U || !end_stream) {
         result = st_admin_direct_ws_send_framed_payload(stream, message->data, message->data_len);
@@ -4439,7 +4454,8 @@ static void *external_writer_thread(void *arg)
                 }
                 break;
             }
-            record_tcp_traffic(session, conn->port, 0, (long long)chunk->len);
+            /* Client to public is the client's upload (Java RemoteSpecusHandler.writeFromClient). */
+            record_tcp_traffic(session, conn->port, (long long)chunk->len, 0);
             if (send_window_update(session, conn->stream_id, chunk->len) != 0) {
                 free(chunk->data);
                 free(chunk);
@@ -4497,7 +4513,8 @@ static void *external_conn_thread(void *arg)
             if (send_data(session, conn->stream_id, buffer, (size_t)read_len) != 0) {
                 break;
             }
-            record_tcp_traffic(session, conn->port, (long long)read_len, 0);
+            /* Public to client is the client's download (Java RemoteSpecusHandler.channelRead). */
+            record_tcp_traffic(session, conn->port, 0, (long long)read_len);
             continue;
         }
         if (read_len < 0 && errno == EINTR) {

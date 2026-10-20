@@ -7436,6 +7436,13 @@ int st_storage_list_connection_stats_visible(const char *path,
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
+/* Java TrafficUsageService's updated_at, Instant.now().toString(): fractional seconds included. */
+static int traffic_usage_updated_at(char out[ST_INSTANT_CAPACITY])
+{
+    char now[ST_INSTANT_CAPACITY];
+    return st_instant_now(now) == 0 && st_instant_public(now, out, ST_INSTANT_CAPACITY) == 0 ? 0 : -1;
+}
+
 int st_storage_record_traffic_usage(const char *path,
                                     long long client_id,
                                     const char *client_name,
@@ -7443,6 +7450,10 @@ int st_storage_record_traffic_usage(const char *path,
                                     long long upload_bytes,
                                     long long download_bytes)
 {
+    char updated_at[ST_INSTANT_CAPACITY];
+    if (traffic_usage_updated_at(updated_at) != 0) {
+        return -1;
+    }
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
         return -1;
@@ -7451,7 +7462,7 @@ int st_storage_record_traffic_usage(const char *path,
     int rc = sqlite3_prepare_v2(db,
         "INSERT INTO traffic_usage(client_id, client_name, usage_date, upload_bytes, download_bytes, updated_at, "
         "tenant_id) "
-        "VALUES(?1,?2,?3,?4,?5,CURRENT_TIMESTAMP,(SELECT tenant_id FROM client_account WHERE client_name = ?2)) "
+        "VALUES(?1,?2,?3,?4,?5,?6,(SELECT tenant_id FROM client_account WHERE client_name = ?2)) "
         "ON CONFLICT(client_name, usage_date) DO UPDATE SET "
         "client_id = COALESCE(traffic_usage.client_id, excluded.client_id), "
         "tenant_id = COALESCE(traffic_usage.tenant_id, excluded.tenant_id), "
@@ -7471,6 +7482,7 @@ int st_storage_record_traffic_usage(const char *path,
         sqlite3_bind_text(stmt, 3, usage_date, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(stmt, 4, upload_bytes);
         sqlite3_bind_int64(stmt, 5, download_bytes);
+        sqlite3_bind_text(stmt, 6, updated_at, -1, SQLITE_TRANSIENT);
         rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
     } else {
         rc = -1;
@@ -7604,20 +7616,25 @@ int st_storage_record_resource_traffic_usage(const char *path,
                                              long long upload_bytes,
                                              long long download_bytes)
 {
+    char updated_at[ST_INSTANT_CAPACITY];
+    if (traffic_usage_updated_at(updated_at) != 0) {
+        return -1;
+    }
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
         return -1;
     }
     sqlite3_stmt *stmt = NULL;
+    /* Java writes the resource's id and name as resolved now: a mapping gone is a NULL id. */
     int rc = sqlite3_prepare_v2(db,
         "INSERT INTO resource_traffic_usage(client_id, client_name, resource_type, resource_key, resource_id, "
         "resource_name, usage_date, upload_bytes, download_bytes, updated_at, tenant_id) "
-        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,CURRENT_TIMESTAMP,"
+        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,"
         "(SELECT tenant_id FROM client_account WHERE client_name = ?2)) "
         "ON CONFLICT(client_name, resource_type, resource_key, usage_date) DO UPDATE SET "
         "client_id = COALESCE(resource_traffic_usage.client_id, excluded.client_id), "
         "tenant_id = COALESCE(resource_traffic_usage.tenant_id, excluded.tenant_id), "
-        "resource_id = COALESCE(resource_traffic_usage.resource_id, excluded.resource_id), "
+        "resource_id = excluded.resource_id, "
         "resource_name = excluded.resource_name, "
         "upload_bytes = upload_bytes + excluded.upload_bytes, "
         "download_bytes = download_bytes + excluded.download_bytes, "
@@ -7647,6 +7664,7 @@ int st_storage_record_resource_traffic_usage(const char *path,
         sqlite3_bind_text(stmt, 7, usage_date, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(stmt, 8, upload_bytes);
         sqlite3_bind_int64(stmt, 9, download_bytes);
+        sqlite3_bind_text(stmt, 10, updated_at, -1, SQLITE_TRANSIENT);
         rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
     } else {
         rc = -1;
@@ -9394,7 +9412,8 @@ int st_storage_report_peer_mesh_session(const char *path,
                 /* Java: every path-report is a keepalive; a traffic report is one when it counts bytes. */
                 "last_keepalive_at=CASE WHEN ?4<>'' OR ?1>0 OR ?2>0 THEN CURRENT_TIMESTAMP "
                 "ELSE last_keepalive_at END,"
-                "updated_at=CURRENT_TIMESTAMP "
+                /* Java applyTraffic returns before touching updatedAt when no byte is counted. */
+                "updated_at=CASE WHEN ?4<>'' OR ?1>0 OR ?2>0 THEN CURRENT_TIMESTAMP ELSE updated_at END "
                 "WHERE id=?8 AND status<>'CLOSED' AND NOT " PEER_SESSION_EXPIRED_SQL,
                 -1, &stmt, NULL);
             if (rc == SQLITE_OK) {

@@ -3771,8 +3771,9 @@ static void record_direct_http_traffic(const char *client_name,
     if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return;
     }
+    /* Java findClientByName: the account only has to exist, enabled or not. */
     st_storage_client client;
-    if (st_storage_get_client_by_name(database_path, client_name, &client) != 0 || !client.enabled) {
+    if (st_storage_get_client_by_name(database_path, client_name, &client) != 0) {
         return;
     }
     char usage_date[11];
@@ -3788,14 +3789,11 @@ static void record_direct_http_traffic(const char *client_name,
 
     st_storage_http_route http_route;
     long long resource_id = 0;
-    char resource_name[512];
+    /* Java's whole "route -> targetBaseUrl": both fields fit, so nothing is cut. */
+    char resource_name[sizeof(http_route.route) + sizeof(" -> ") + sizeof(http_route.target_base_url)];
     if (st_storage_get_http_route_by_client_route(database_path, client_name, route, &http_route) == 0) {
         resource_id = http_route.id;
-        snprintf(resource_name,
-                 sizeof(resource_name),
-                 "%.127s -> %.380s",
-                 http_route.route,
-                 http_route.target_base_url);
+        snprintf(resource_name, sizeof(resource_name), "%s -> %s", http_route.route, http_route.target_base_url);
     } else {
         snprintf(resource_name, sizeof(resource_name), "%s", route);
     }
@@ -7958,20 +7956,23 @@ static int build_resource_traffic_usage_response(const st_admin_context *context
             *cursor = (char)toupper((unsigned char)*cursor);
         }
     }
-    st_storage_resource_traffic_usage items[ST_ADMIN_MAX_TRAFFIC_ITEMS];
+    /* About 1.6 KiB a row with Java's whole resource name: on the heap, not the request thread's stack. */
+    st_storage_resource_traffic_usage *items = calloc(ST_ADMIN_MAX_TRAFFIC_ITEMS, sizeof(*items));
     size_t item_count = 0;
-    int rc = st_storage_list_resource_traffic_usage_visible(database_path,
-                                                           type,
-                                                           filter_client_id,
-                                                           context->tenant_id,
-                                                           context->username,
-                                                           context->admin,
-                                                           limit,
-                                                           items,
-                                                           ST_ADMIN_MAX_TRAFFIC_ITEMS,
-                                                           &item_count);
+    int rc = items == NULL ? -1
+        : st_storage_list_resource_traffic_usage_visible(database_path,
+                                                         type,
+                                                         filter_client_id,
+                                                         context->tenant_id,
+                                                         context->username,
+                                                         context->admin,
+                                                         limit,
+                                                         items,
+                                                         ST_ADMIN_MAX_TRAFFIC_ITEMS,
+                                                         &item_count);
     free(type);
     if (rc != 0) {
+        free(items);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"resource traffic list failed\"}");
     }
     st_admin_string_builder builder = {0};
@@ -7982,6 +7983,7 @@ static int build_resource_traffic_usage_response(const st_admin_context *context
             rc = append_resource_traffic_usage_view(&builder, &items[i]);
         }
     }
+    free(items);
     if (rc == 0) {
         rc = admin_sb_append(&builder, "]");
     }
@@ -19045,6 +19047,7 @@ static void admin_forward_direct_http(st_admin_server *server,
     }
     snprintf(source_url, source_len, "%s%s%s", relative_path,
              *raw_query == '\0' ? "" : "?", raw_query);
+    size_t request_body_sent = 0U;
     admin_direct_http_sink_state sink_state = {
         .fd = fd,
         .include_body = admin_ascii_casecmp(method, "HEAD") != 0,
@@ -19063,7 +19066,8 @@ static void admin_forward_direct_http(st_admin_server *server,
         .on_end = direct_sink_on_end,
         .on_reset = direct_sink_on_reset,
         .bind_cancel = share == NULL ? NULL : direct_sink_bind_cancel,
-        .on_reset_bytes = direct_sink_on_reset_bytes
+        .on_reset_bytes = direct_sink_on_reset_bytes,
+        .request_body_sent = &request_body_sent
     };
     char remote_address[128];
     admin_fd_remote_text(fd, remote_address);
@@ -19073,9 +19077,14 @@ static void admin_forward_direct_http(st_admin_server *server,
     if (elapsed_ms < 0) {
         elapsed_ms = 0;
     }
+    /*
+     * Java relay() counts in its finally block whatever the outcome: a reset, a timeout, a public
+     * caller that went away or a share that ended still count the request body bytes that reached
+     * the client and the response bytes it sent. Nothing moved, nothing is counted.
+     */
+    record_direct_http_traffic(client_name, route, (long long)request_body_sent,
+                               (long long)sink_state.response_bytes);
     if (rc == 0) {
-        record_direct_http_traffic(client_name, route, (long long)body_len,
-                                   (long long)sink_state.response_bytes);
         record_direct_http_exchange(client_name, route, &direct, &sink_state.response,
                                     sink_state.response_bytes, sink_state.response_externalized,
                                     remote_address, elapsed_ms);
