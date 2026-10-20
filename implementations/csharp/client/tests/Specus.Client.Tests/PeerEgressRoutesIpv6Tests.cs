@@ -519,7 +519,7 @@ public sealed class PeerEgressRoutesIpv6Tests : IDisposable
         Assert.False(_mesh.Ipv6State().Carries);
 
         // The noop device itself says nothing about IPv6, and the host reads that as no.
-        Assert.False(new NoopPeerVirtualDevice("specus0") is IPeerVirtualDeviceIpv6);
+        Assert.False(typeof(IPeerVirtualDeviceIpv6).IsAssignableFrom(typeof(NoopPeerVirtualDevice)));
     }
 
     // ---- the bypass resolver and the catalogue --------------------------------------------------------
