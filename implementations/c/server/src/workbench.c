@@ -28,7 +28,10 @@ static int workbench_kind_valid(const char *text, size_t len)
     return 0;
 }
 
-/* Decimal ASCII digits, no sign, no leading zero, 1..2^53-1 -- taken from the raw path text. */
+/*
+ * Decimal ASCII digits, no sign, no leading zero, 1..2^53-1 -- checked on the segment's text (which
+ * the listener has percent-decoded, as Spring decodes a path variable), never converted as a Long.
+ */
 static int workbench_parse_id(const char *text, size_t len, long long *out)
 {
     if (len == 0U || len > 16U || text[0] == '0') {
