@@ -139,6 +139,10 @@ struct st_stun_turn_server {
     int general_relay_max_allocations;
     int general_relay_max_allocations_per_address;
     long long general_relay_max_bytes;
+    /* Java configureUdpSocket: buffer sizes (<= 0 keeps the kernel's) and IP_TOS (outside 0..255 keeps it). */
+    int udp_receive_buffer;
+    int udp_send_buffer;
+    int udp_traffic_class;
     pthread_t thread;
     /*
      * Every allocation, without a fixed limit (Java keeps them in an unbounded map: the relay
@@ -233,6 +237,18 @@ static long long env_i64_value(const char *name, long long default_value)
     char *end = NULL;
     long long parsed = strtoll(value, &end, 10);
     return end != value && *end == '\0' ? parsed : default_value;
+}
+
+/* A Java int property: any decimal int, negative values included (they switch a setting off). */
+static int env_signed_int_value(const char *name, int default_value)
+{
+    const char *value = getenv(name);
+    if (value == NULL || *value == '\0') return default_value;
+    char *end = NULL;
+    errno = 0;
+    long long parsed = strtoll(value, &end, 10);
+    return end != value && *end == '\0' && errno == 0 && parsed >= INT_MIN && parsed <= INT_MAX
+        ? (int)parsed : default_value;
 }
 
 static int env_int_alias(const char *name, const char *legacy_name, int default_value)
@@ -495,11 +511,40 @@ static int builder_error(stun_builder *builder,
 }
 
 /*
+ * Java configureUdpSocket, before every listening and relay socket is bound: buffers of at least
+ * one maximal datagram so bursts on the main port and the relays are not dropped by the kernel,
+ * and the traffic class. A platform that refuses either keeps its default and the socket is used.
+ */
+static void configure_udp_socket(const st_stun_turn_server *server, int fd)
+{
+    if (server->udp_receive_buffer > 0) {
+        int size = server->udp_receive_buffer < 65507 ? 65507 : server->udp_receive_buffer;
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)) != 0) {
+            fprintf(stderr, "[peer-mesh] unable to configure UDP receive buffer: %s\n", strerror(errno));
+        }
+    }
+    if (server->udp_send_buffer > 0) {
+        int size = server->udp_send_buffer < 65507 ? 65507 : server->udp_send_buffer;
+        if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size)) != 0) {
+            fprintf(stderr, "[peer-mesh] unable to configure UDP send buffer: %s\n", strerror(errno));
+        }
+    }
+    if (server->udp_traffic_class >= 0 && server->udp_traffic_class <= 255) {
+        int traffic_class = server->udp_traffic_class;
+        (void)setsockopt(fd, IPPROTO_IP, IP_TOS, &traffic_class, sizeof(traffic_class));
+    }
+}
+
+/*
  * reuse_address is for the listening endpoints only. A relay socket must fail to bind a port
  * another relay holds: on Linux SO_REUSEADDR lets two UDP sockets share one, and the second
  * allocation would then take the first one's datagrams (Java's DatagramSocket does not set it).
  */
-static int create_udp_socket(const char *bind_address, int port, int reuse_address, int *actual_port)
+static int create_udp_socket(const st_stun_turn_server *server,
+                             const char *bind_address,
+                             int port,
+                             int reuse_address,
+                             int *actual_port)
 {
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
@@ -508,6 +553,7 @@ static int create_udp_socket(const char *bind_address, int port, int reuse_addre
     if (inet_pton(AF_INET, bind_address, &address.sin_addr) != 1) return -1;
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     int reuse = 1;
+    if (fd >= 0) configure_udp_socket(server, fd);
     if (fd < 0
         || (reuse_address && setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0)
         || bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
@@ -551,7 +597,7 @@ static int add_stun_endpoint(st_stun_turn_server *server,
 {
     if (server->endpoint_count >= STUN_MAX_ENDPOINTS) return -1;
     int actual_port = 0;
-    int fd = create_udp_socket(bind_address, port, 1, &actual_port);
+    int fd = create_udp_socket(server, bind_address, port, 1, &actual_port);
     if (fd < 0) return -1;
     stun_server_endpoint *endpoint = &server->endpoints[server->endpoint_count];
     memset(endpoint, 0, sizeof(*endpoint));
@@ -1067,7 +1113,8 @@ static turn_allocation *create_allocation(st_stun_turn_server *server,
     if (RAND_bytes((unsigned char *)&random, (int)sizeof(random)) != 1) random = (unsigned int)time(NULL);
     int first = (int)(random % (unsigned int)range);
     for (int i = 0; i < attempts && relay_fd < 0; ++i) {
-        relay_fd = create_udp_socket(bind_address, server->relay_min_port + (first + i) % range, 0, &relay_port);
+        relay_fd = create_udp_socket(server, bind_address, server->relay_min_port + (first + i) % range, 0,
+                                     &relay_port);
     }
     if (relay_fd < 0) return NULL;
     turn_allocation *slot = (turn_allocation *)calloc(1, sizeof(*slot));
@@ -1758,6 +1805,9 @@ int st_stun_turn_server_start(st_stun_turn_server **out_server)
         "SPECUS_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS_PER_ADDRESS", 4);
     server->general_relay_max_bytes = env_i64_value(
         "SPECUS_PEER_MESH_GENERAL_RELAY_MAX_BYTES", 512LL * 1024LL * 1024LL);
+    server->udp_receive_buffer = env_signed_int_value("SPECUS_PEER_MESH_UDP_RECEIVE_BUFFER_BYTES", 4 * 1024 * 1024);
+    server->udp_send_buffer = env_signed_int_value("SPECUS_PEER_MESH_UDP_SEND_BUFFER_BYTES", 4 * 1024 * 1024);
+    server->udp_traffic_class = env_signed_int_value("SPECUS_PEER_MESH_UDP_TRAFFIC_CLASS", 0x10);
     if (server->relay_min_port <= 0 || server->relay_max_port < server->relay_min_port) {
         discard_server(server);
         return -1;

@@ -6,11 +6,13 @@
 #include "turn_auth.h"
 
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sqlite3.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
@@ -1166,6 +1168,97 @@ static int test_expiry(void)
     return failed || retry ? -1 : 0;
 }
 
+/* The UDP socket this process holds on a local port: the server runs in-process. */
+static int udp_socket_on_port(unsigned port)
+{
+    struct rlimit limit;
+    int highest = getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur < 65536U ? (int)limit.rlim_cur : 65536;
+    for (int fd = 0; fd < highest; ++fd) {
+        struct sockaddr_in address;
+        socklen_t address_len = sizeof(address);
+        int type = 0;
+        socklen_t type_len = sizeof(type);
+        if (getsockname(fd, (struct sockaddr *)&address, &address_len) == 0 && address.sin_family == AF_INET
+            && ntohs(address.sin_port) == port
+            && getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &type_len) == 0 && type == SOCK_DGRAM) return fd;
+    }
+    return -1;
+}
+
+static int int_option(int fd, int level, int name)
+{
+    int value = -1;
+    socklen_t len = sizeof(value);
+    return getsockopt(fd, level, name, &value, &len) == 0 ? value : -1;
+}
+
+/* Linux reports twice what was asked for (the kernel's bookkeeping share); elsewhere it is as set. */
+static int buffer_is(int actual, int requested)
+{
+    return actual == 2 * requested || actual == requested;
+}
+
+static int socket_options_are(int fd, const char *label, int receive, int send, int tos)
+{
+    int actual_receive = int_option(fd, SOL_SOCKET, SO_RCVBUF);
+    int actual_send = int_option(fd, SOL_SOCKET, SO_SNDBUF);
+    int actual_tos = int_option(fd, IPPROTO_IP, IP_TOS);
+    if (fd >= 0 && buffer_is(actual_receive, receive) && buffer_is(actual_send, send) && actual_tos == tos) return 0;
+    fprintf(stderr, "%s socket %d: SO_RCVBUF %d (want %d), SO_SNDBUF %d (want %d), IP_TOS %d (want %d)\n",
+            label, fd, actual_receive, receive, actual_send, send, actual_tos, tos);
+    return -1;
+}
+
+/*
+ * Java configureUdpSocket, on every listening and relay socket: SO_RCVBUF and SO_SNDBUF of
+ * max(65507, configured) unless configured <= 0, and the traffic class (IP_TOS) unless it lies
+ * outside 0..255; 4 MiB, 4 MiB and 0x10 by default.
+ */
+static int test_udp_socket_options(void)
+{
+    int probe = socket(AF_INET, SOCK_DGRAM, 0);
+    int default_receive = int_option(probe, SOL_SOCKET, SO_RCVBUF);
+    int default_send = int_option(probe, SOL_SOCKET, SO_SNDBUF);
+    if (probe >= 0) close(probe);
+    int failed = 0;
+    for (int round = 0; round < 2 && !failed; ++round) {
+        if (round == 0) {
+            /* Below the 65507-byte floor, inside the kernel's default maximum, default class. */
+            setenv("SPECUS_PEER_MESH_UDP_RECEIVE_BUFFER_BYTES", "4096", 1);
+            setenv("SPECUS_PEER_MESH_UDP_SEND_BUFFER_BYTES", "100000", 1);
+            unsetenv("SPECUS_PEER_MESH_UDP_TRAFFIC_CLASS");
+        } else {
+            /* Switched off: the kernel's defaults stay. */
+            setenv("SPECUS_PEER_MESH_UDP_RECEIVE_BUFFER_BYTES", "0", 1);
+            setenv("SPECUS_PEER_MESH_UDP_SEND_BUFFER_BYTES", "-1", 1);
+            setenv("SPECUS_PEER_MESH_UDP_TRAFFIC_CLASS", "256", 1);
+        }
+        turn_fixture fixture;
+        turn_credential credential;
+        struct sockaddr_in client_address, relay;
+        int client = -1;
+        failed = turn_fixture_start(&fixture, 1, "55400", "55499", NULL) != 0;
+        failed = failed || issue_credential("public-transfer-socket", &credential) != 0
+            || (client = udp_socket(&client_address)) < 0
+            || allocate(client, &fixture, &credential, 1600U + (unsigned)round, &relay) != 0;
+        int listener = failed ? -1 : udp_socket_on_port((unsigned)st_stun_turn_server_port(fixture.server));
+        int relayed_fd = failed ? -1 : udp_socket_on_port(ntohs(relay.sin_port));
+        if (!failed && round == 0) {
+            failed = socket_options_are(listener, "listening", 65507, 100000, 0x10) != 0
+                || socket_options_are(relayed_fd, "relay", 65507, 100000, 0x10) != 0;
+        } else if (!failed) {
+            failed = socket_options_are(listener, "listening (defaults)", default_receive, default_send, 0) != 0
+                || socket_options_are(relayed_fd, "relay (defaults)", default_receive, default_send, 0) != 0;
+        }
+        if (client >= 0) close(client);
+        if (fixture.server != NULL) st_stun_turn_server_stop(fixture.server);
+    }
+    unsetenv("SPECUS_PEER_MESH_UDP_RECEIVE_BUFFER_BYTES");
+    unsetenv("SPECUS_PEER_MESH_UDP_SEND_BUFFER_BYTES");
+    unsetenv("SPECUS_PEER_MESH_UDP_TRAFFIC_CLASS");
+    return failed ? -1 : 0;
+}
+
 #define SLOT_PEERS 32U
 
 static void slot_peers(unsigned subnet, struct sockaddr_in peers[SLOT_PEERS])
@@ -2166,6 +2259,7 @@ int main(void)
         || test_default_private_peer_refusal() != 0
         || test_private_peers_allowed_by_switch() != 0
         || test_expiry() != 0
+        || test_udp_socket_options() != 0
         || test_expired_permissions_and_channels_recycled() != 0
         || test_channel_rebind_moves_peer() != 0
         || test_unidentified_relay_without_turn_auth() != 0
