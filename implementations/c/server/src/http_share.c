@@ -28,6 +28,13 @@ const char *const st_http_share_audit_actions[ST_HTTP_SHARE_AUDIT_ACTION_COUNT] 
     "share.created", "share.revoked", "share.expired", "route.created",
     "route.exposure-changed", "route.credentials-changed", "route.deleted"
 };
+const char *const st_http_share_codes[ST_HTTP_SHARE_CODE_COUNT] = {
+    ST_HTTP_SHARE_CODE_REQUEST_INVALID, ST_HTTP_SHARE_CODE_UNAVAILABLE, ST_HTTP_SHARE_CODE_ROUTE_NOT_FOUND,
+    ST_HTTP_SHARE_CODE_ROUTE_DISABLED, ST_HTTP_SHARE_CODE_CLIENT_DISABLED, ST_HTTP_SHARE_CODE_ROUTE_PUBLIC,
+    ST_HTTP_SHARE_CODE_LIMIT_REACHED, ST_HTTP_SHARE_CODE_NOT_FOUND, ST_HTTP_SHARE_CODE_RATE_LIMITED,
+    ST_HTTP_SHARE_CODE_REVOKED, ST_HTTP_SHARE_CODE_EXPIRED, ST_HTTP_SHARE_CODE_METHOD_NOT_ALLOWED,
+    ST_HTTP_SHARE_CODE_SCOPE_DENIED, ST_HTTP_SHARE_CODE_BUSY, ST_HTTP_SHARE_CODE_FORBIDDEN
+};
 
 static atomic_llong share_fixed_now_ms;
 static pthread_mutex_t share_random_lock = PTHREAD_MUTEX_INITIALIZER;

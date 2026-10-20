@@ -303,6 +303,11 @@ int st_admin_semver_compare_for_testing(const char *left, const char *right, int
 /* Test hooks: placeholder streams that count against the 64-stream admission limit. */
 int st_admin_http_share_occupy_for_testing(const char *share_id, size_t count);
 void st_admin_http_share_release_for_testing(void);
+/*
+ * Test hook: the "Name:value" headers of a raw request as a share relays them to the device (the
+ * share cookie removed, every Cookie header joined into one); free with st_http_share_free_strings.
+ */
+int st_admin_http_share_forward_headers_for_testing(const char *raw_request, char ***headers, size_t *headers_len);
 /* One SWS2 envelope (protocol/spec/http-route.md section 7); payload points into the encoding. */
 typedef struct {
     uint8_t opcode;
