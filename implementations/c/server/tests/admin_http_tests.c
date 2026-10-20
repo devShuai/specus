@@ -14,6 +14,7 @@
 #include "storage.h"
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <limits.h>
 #include <pthread.h>
 #include <signal.h>
@@ -65,6 +66,13 @@ static void sign_client_auth(const char *api_key,
 static int contains(const char *haystack, const char *needle)
 {
     return strstr(haystack, needle) != NULL;
+}
+
+/* The body of a response, after its header. */
+static const char *response_body(const char *response)
+{
+    const char *body = strstr(response, "\r\n\r\n");
+    return body == NULL ? "" : body + 4;
 }
 
 /* Logs a stored management user in and returns "Bearer <token>" in authorization. */
@@ -1137,6 +1145,7 @@ static int test_public_room_access_contract(void)
                                              sizeof(response));
     char *pairing_code = st_json_get_string(response, "code");
     if (len <= 0 || !contains(response, "200 OK") || pairing_code == NULL
+        || !contains(response, "\r\nCache-Control: no-store\r\n")
         || strlen(pairing_code) != 8U || strspn(pairing_code, "0123456789") != 8U
         || !contains(response, "\"maxUses\":2") || !contains(response, "\"usedCount\":0")) {
         fprintf(stderr, "public room pairing code create mismatch: %s\n", response);
@@ -1161,6 +1170,7 @@ static int test_public_room_access_contract(void)
         if (attempt < 2) {
             char *current = st_json_get_string(response, "roomToken");
             if (len <= 0 || !contains(response, "200 OK") || current == NULL
+                || !contains(response, "\r\nCache-Control: no-store\r\n")
                 || strncmp(current, "st-editor-", 10U) != 0
                 || !contains(response, "\"role\":\"EDITOR\"")) {
                 fprintf(stderr, "public room pairing redemption mismatch: %s\n", response);
@@ -1173,7 +1183,8 @@ static int test_public_room_access_contract(void)
             free(redeemed_token);
             redeemed_token = current;
         } else if (len <= 0 || !contains(response, "400 Bad Request")
-                   || !contains(response, "配对码无效或已过期")) {
+                   /* GlobalExceptionHandlerTests: the ResponseStatusException reason, alone. */
+                   || strcmp(response_body(response), "{\"error\":\"配对码无效或已过期\"}") != 0) {
             fprintf(stderr, "public room exhausted pairing code was accepted: %s\n", response);
             free(redeemed_token);
             free(invite_token);
@@ -1611,6 +1622,57 @@ static int test_public_room_access_contract(void)
     }
     if (!capacity_ok) {
         fprintf(stderr, "public room active invitation capacity mismatch: %s\n", response);
+        free(redeemed_token);
+        free(invite_token);
+        free(pairing_code);
+        return 1;
+    }
+
+    /*
+     * PublicTransferRateLimiterTests.pairingCodeRedeemHasIndependentTenPerFiveMinuteIpLimit: by
+     * default ten redemptions per address in five minutes, the eleventh is 429, and they leave the
+     * separate presign quota (here one per address) untouched.
+     */
+    unsetenv("SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP");
+    unsetenv("SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_WINDOW_SECONDS");
+    st_public_room_reset_for_tests();
+    int default_limit = 1;
+    for (int attempt = 0; default_limit && attempt < 11; ++attempt) {
+        len = st_admin_build_response_with_remote("POST",
+                                                   "/api/public/transfer/rooms/pairing-codes/redeem",
+                                                   "{\"code\":\"00000000\",\"peerId\":\"x\"}",
+                                                   "203.0.113.8",
+                                                   response,
+                                                   sizeof(response));
+        default_limit = len > 0 && contains(response, attempt < 10 ? "400 Bad Request" : "429 Too Many Requests");
+    }
+    setenv("SPECUS_OBJECT_STORAGE_PROVIDER", "aliyun-oss", 1);
+    setenv("SPECUS_OBJECT_STORAGE_ENDPOINT", "https://oss-cn-hangzhou.aliyuncs.com", 1);
+    setenv("SPECUS_OBJECT_STORAGE_REGION", "cn-hangzhou", 1);
+    setenv("SPECUS_OBJECT_STORAGE_BUCKET", "examplebucket", 1);
+    setenv("SPECUS_OBJECT_STORAGE_ACCESS_KEY_ID", "test-access-key", 1);
+    setenv("SPECUS_OBJECT_STORAGE_ACCESS_KEY_SECRET", "test-secret-key", 1);
+    setenv("SPECUS_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_PER_IP", "1", 1);
+    char presign_first[512] = "";
+    for (int attempt = 0; default_limit && attempt < 2; ++attempt) {
+        len = st_admin_build_response_with_remote("POST",
+                                                   "/api/public/transfer/attachments/presign-upload",
+                                                   "{}",
+                                                   "203.0.113.8",
+                                                   response,
+                                                   sizeof(response));
+        if (attempt == 0) snprintf(presign_first, sizeof(presign_first), "%.500s", response);
+        default_limit = len > 0 && (attempt == 0) != (contains(response, "429 Too Many Requests") != 0);
+    }
+    static const char *const object_settings[] = {
+        "SPECUS_OBJECT_STORAGE_PROVIDER", "SPECUS_OBJECT_STORAGE_ENDPOINT", "SPECUS_OBJECT_STORAGE_REGION",
+        "SPECUS_OBJECT_STORAGE_BUCKET", "SPECUS_OBJECT_STORAGE_ACCESS_KEY_ID",
+        "SPECUS_OBJECT_STORAGE_ACCESS_KEY_SECRET", "SPECUS_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_PER_IP",
+    };
+    for (size_t i = 0; i < sizeof(object_settings) / sizeof(object_settings[0]); ++i) unsetenv(object_settings[i]);
+    if (!default_limit) {
+        fprintf(stderr, "public room default pairing limit or its independence from presign mismatch: %s / %s\n",
+                presign_first, response);
         free(redeemed_token);
         free(invite_token);
         free(pairing_code);
@@ -2563,6 +2625,16 @@ static int endpoint_body_equals(int len, const char *response, const char *body,
     return ok ? 0 : -1;
 }
 
+/* The response has exactly this status line prefix (such as "HTTP/1.1 400 ") and exactly this body. */
+static int endpoint_answer_equals(int len, const char *response, const char *status, const char *body,
+                                  const char *label)
+{
+    const char *actual = len > 0 ? strstr(response, "\r\n\r\n") : NULL;
+    int ok = actual != NULL && strncmp(response, status, strlen(status)) == 0 && strcmp(actual + 4, body) == 0;
+    if (!ok) fprintf(stderr, "%s: expected %s%s, got %s\n", label, status, body, len > 0 ? response : "(none)");
+    return ok ? 0 : -1;
+}
+
 static long long endpoint_exchange_id(const char *database_path, const char *client_name)
 {
     sqlite3 *db = NULL;
@@ -2785,9 +2857,13 @@ static int test_admin_endpoint_contracts(void)
                             response, sizeof(response));
         failed = endpoint_body_equals(len, response, "[]", "egress activity before any report") != 0;
     }
-    failed = failed || endpoint_seed_activity(db_path, "tenant-a", &bravo, 1, "{}") != 0
-        || endpoint_seed_activity(db_path, "tenant-a", &alpha, 2, "{\"EGRESS_POLICY_DENIED\":4}") != 0
-        || endpoint_seed_activity(db_path, "tenant-b", &charlie, 3, "{}") != 0;
+    /*
+     * PeerEgressServiceTests.unreadableStoredCountersReadAsEmpty: stored counters are decoded, so
+     * unreadable text reads as {} and readable text is answered in compact form.
+     */
+    failed = failed || endpoint_seed_activity(db_path, "tenant-a", &bravo, 1, "not json") != 0
+        || endpoint_seed_activity(db_path, "tenant-a", &alpha, 2, " { \"EGRESS_POLICY_DENIED\" : 4 } ") != 0
+        || endpoint_seed_activity(db_path, "tenant-b", &charlie, 3, "[1,2]") != 0;
     endpoint_runtime_client_id = alpha.id;
     st_admin_set_client_runtime_status_handler(endpoint_runtime_status, NULL);
     if (!failed) {
@@ -2809,6 +2885,7 @@ static int test_admin_endpoint_contracts(void)
                             response, sizeof(response));
         failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"egressClientName\":\"endpoint-charlie\"",
                                  "egress activity of another tenant") != 0
+            || !contains(response, "\"rejectedFlows\":{},")
             || contains(response, "endpoint-alpha") || contains(response, "endpoint-bravo");
         if (failed) fprintf(stderr, "egress activity leaked across tenants: %s\n", response);
     }
@@ -3054,7 +3131,7 @@ static int test_tenant_scoped_admin_mutations(void)
         }
         if (failed) fprintf(stderr, "tenant scope resource fixture setup failed\n");
     }
-    /* Credentials and mappings answer as Java, 400 "<kind> not found: <id>"; routes and Peer services 404. */
+    /* Every kind answers as Java, 400 "<kind> not found: <id>". */
     struct {
         const char *prefix;
         long long id;
@@ -3068,7 +3145,7 @@ static int test_tenant_scoped_admin_mutations(void)
         {"/api/admin/specus-mappings/", 0, "{\"targetPort\":9999}", "TCP mapping",
          "HTTP/1.1 400 ", "mapping not found: "},
         {"/api/admin/http-routes/", 0, "{\"targetBaseUrl\":\"http://203.0.113.9\"}", "HTTP route",
-         "HTTP/1.1 404 ", NULL},
+         "HTTP/1.1 400 ", "http route not found: "},
         {"/api/admin/peer-mesh/services/", 0, "{\"name\":\"taken-over\",\"enabled\":false}", "peer service",
          "HTTP/1.1 400 ", "service not found: "},
     };
@@ -3974,20 +4051,66 @@ static int test_http_route_service_rules(void)
             || !contains(response, "\"insecureSkipVerify\":true");
         if (failed) fprintf(stderr, "a partial update changed the flags: %s\n", response);
     }
-    /* firstEnableRequiresUsernameAndPassword (C's message for the colon differs, the 400 does not) */
-    if (!failed) {
-        len = route_rules_create(client_b.id, "root-a", "tenant-a",
-                                 "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
-                                 "\"authEnabled\":true,\"authUsername\":\"viewer\"}",
-                                 response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", "authPassword", "authentication without a password") != 0;
+    /*
+     * firstEnableRequiresUsernameAndPassword and the rest of Java applyAuthentication, each with
+     * Java's exact message: lengths count UTF-16 units (256 CJK characters are a valid password),
+     * CR and LF are refused like ':', and a duplicate name is reported before the credentials.
+     */
+    char long_user[160];
+    char cjk_password[256 * 3 + 4];
+    memset(long_user, 'u', 121U);
+    long_user[121] = '\0';
+    cjk_password[0] = '\0';
+    for (int i = 0; i < 256; ++i) strcat(cjk_password, "\xE5\xAF\x86");
+    char auth_body[1400];
+    const struct {
+        const char *fields;
+        const char *answer;
+    } refused_auth[] = {
+        {"\"authEnabled\":true,\"authUsername\":\"viewer\"",
+         "{\"error\":\"authPassword is required when route authentication is first enabled\"}"},
+        {"\"authEnabled\":true,\"authUsername\":\"  \",\"authPassword\":\"secret\"",
+         "{\"error\":\"authUsername cannot be blank when route authentication is enabled\"}"},
+        {"\"authEnabled\":true,\"authPassword\":\"secret\"",
+         "{\"error\":\"authUsername cannot be blank when route authentication is enabled\"}"},
+        {"\"authEnabled\":true,\"authUsername\":\"bad:user\",\"authPassword\":\"secret\"",
+         "{\"error\":\"authUsername must not contain ':', CR, or LF\"}"},
+        {"\"authEnabled\":false,\"authUsername\":\"bad\\r\\nuser\"",
+         "{\"error\":\"authUsername must not contain ':', CR, or LF\"}"},
+        {long_user, "{\"error\":\"authUsername is too long (max 120)\"}"},
+        {cjk_password, "{\"error\":\"authPassword is too long (max 256)\"}"},
+    };
+    for (size_t i = 0; !failed && i < sizeof(refused_auth) / sizeof(refused_auth[0]); ++i) {
+        if (refused_auth[i].fields == long_user) {
+            snprintf(auth_body, sizeof(auth_body), "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+                     "\"authEnabled\":true,\"authUsername\":\"%s\",\"authPassword\":\"secret\"}", long_user);
+        } else if (refused_auth[i].fields == cjk_password) {
+            snprintf(auth_body, sizeof(auth_body), "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+                     "\"authEnabled\":true,\"authUsername\":\"viewer\",\"authPassword\":\"%s\xE5\xAF\x86\"}",
+                     cjk_password);
+        } else {
+            snprintf(auth_body, sizeof(auth_body),
+                     "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\",%s}", refused_auth[i].fields);
+        }
+        len = route_rules_create(client_b.id, "root-a", "tenant-a", auth_body, response, sizeof(response));
+        failed = endpoint_answer_equals(len, response, "HTTP/1.1 400 ", refused_auth[i].answer,
+                                        refused_auth[i].answer) != 0;
     }
     if (!failed) {
         len = route_rules_create(client_b.id, "root-a", "tenant-a",
-                                 "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+                                 "{\"route\":\"web\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
                                  "\"authEnabled\":true,\"authUsername\":\"bad:user\",\"authPassword\":\"secret\"}",
                                  response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", NULL, "a username with ':'") != 0;
+        failed = endpoint_answer_equals(len, response, "HTTP/1.1 400 ", "{\"error\":\"route web 已存在于该客户端下\"}",
+                                        "a duplicate name is reported before the credentials") != 0;
+    }
+    /* 256 UTF-16 units of CJK text (768 UTF-8 bytes) are a valid password, stored as their SHA-256. */
+    if (!failed) {
+        snprintf(auth_body, sizeof(auth_body), "{\"route\":\"cjk\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+                 "\"authEnabled\":true,\"authUsername\":\"viewer\",\"authPassword\":\"%s\"}", cjk_password);
+        len = route_rules_create(client_b.id, "root-a", "tenant-a", auth_body, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", "\"authPasswordConfigured\":true",
+                                 "a 256-character CJK password") != 0;
     }
     /* createProtectedRouteHashesPassword..., blankPasswordUpdatePreservesCredentialsAcrossDisableAndReenable */
     st_storage_http_route private_route;
@@ -4003,14 +4126,25 @@ static int test_http_route_service_rules(void)
             || !found || strcmp(private_route.auth_password_hash, "secret:with-spaces ") == 0;
         snprintf(stored_hash, sizeof(stored_hash), "%s", found ? private_route.auth_password_hash : "");
     }
+    /* PasswordService.matches: the hash is SHA-256 hex of the password as given, trailing space kept. */
+    if (!failed) {
+        uint8_t digest[ST_SHA256_LEN];
+        char expected_hash[ST_SHA256_HEX_LEN + 1];
+        st_sha256((const uint8_t *)"secret:with-spaces ", strlen("secret:with-spaces "), digest);
+        st_hex_encode(digest, sizeof(digest), expected_hash);
+        failed = strcmp(stored_hash, expected_hash) != 0;
+        if (failed) fprintf(stderr, "route password hash %s, expected %s\n", stored_hash, expected_hash);
+    }
+    /* A blank username on an update keeps the stored one, as Java's normalizeAuthUsername. */
     if (!failed) {
         snprintf(path, sizeof(path), "/api/admin/http-routes/%lld", private_route.id);
         len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
                                 "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
-                                "\"authEnabled\":false,\"authPassword\":\"   \"}",
+                                "\"authEnabled\":false,\"authUsername\":\" \",\"authPassword\":\"   \"}",
                                 response, sizeof(response));
         failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"authEnabled\":false", "authentication off") != 0
-            || !contains(response, "\"authPasswordConfigured\":true");
+            || !contains(response, "\"authPasswordConfigured\":true")
+            || !contains(response, "\"authUsername\":\"viewer\"");
     }
     if (!failed) {
         len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
@@ -4022,18 +4156,70 @@ static int test_http_route_service_rules(void)
             || !found || strcmp(private_route.auth_password_hash, stored_hash) != 0;
         if (failed) fprintf(stderr, "re-enabling authentication lost the credentials: %s\n", response);
     }
-    /* unknownClientIsRejectedOnCreate (C answers 404, Java's IllegalArgumentException maps to 400) */
+    /* unknownClientIsRejectedOnCreate: Java's IllegalArgumentException, 400 naming the id. */
     if (!failed) {
         len = route_rules_create(424242, "root-a", "tenant-a",
                                  "{\"route\":\"web\",\"targetBaseUrl\":\"http://127.0.0.1:8080\"}",
                                  response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", "client not found", "route of an unknown client") != 0;
+        failed = endpoint_answer_equals(len, response, "HTTP/1.1 400 ", "{\"error\":\"client not found: 424242\"}",
+                                        "route of an unknown client") != 0;
     }
-    /* deleteUnknownRouteThrows */
+    /* deleteUnknownRouteThrows, and the update of an unknown route, 400 naming the id. */
     if (!failed) {
         len = tenant_scope_call("DELETE", "/api/admin/http-routes/999999999", "root-a", "tenant-a", "ADMIN", NULL,
                                 response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", "http route not found", "delete of an unknown route") != 0;
+        failed = endpoint_answer_equals(len, response, "HTTP/1.1 400 ",
+                                        "{\"error\":\"http route not found: 999999999\"}",
+                                        "delete of an unknown route") != 0;
+    }
+    if (!failed) {
+        len = tenant_scope_call("PUT", "/api/admin/http-routes/999999999", "root-a", "tenant-a", "ADMIN",
+                                "{\"route\":\"web\",\"targetBaseUrl\":\"http://127.0.0.1:8080\"}",
+                                response, sizeof(response));
+        failed = endpoint_answer_equals(len, response, "HTTP/1.1 400 ",
+                                        "{\"error\":\"http route not found: 999999999\"}",
+                                        "update of an unknown route") != 0;
+    }
+    /* listRoutesFiltersByClient: ?clientId=B lists client B's routes and nothing of client A. */
+    if (!failed) {
+        snprintf(path, sizeof(path), "/api/admin/http-routes?clientId=%lld", client_b.id);
+        len = tenant_scope_call("GET", path, "root-a", "tenant-a", "ADMIN", NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"clientName\":\"RouteClientB\"",
+                                 "route list of client B") != 0
+            || contains(response, "\"clientName\":\"RouteClientA\"")
+            || count_occurrences(response, "\"route\":")
+                   != count_occurrences(response, "\"clientName\":\"RouteClientB\"");
+        if (failed) fprintf(stderr, "route list of client B: %s\n", response);
+    }
+    /* createAndUpdateRoutePersistMediaCaptureFlag: a full update turns media capture off again. */
+    if (!failed) {
+        len = route_rules_create(client_a.id, "root-a", "tenant-a",
+                                 "{\"route\":\"media\",\"targetBaseUrl\":\"http://127.0.0.1:8080\",\"enabled\":true,"
+                                 "\"detailCaptureEnabled\":false,\"mediaCaptureEnabled\":true,"
+                                 "\"pathRewriteEnabled\":false}",
+                                 response, sizeof(response));
+        long long media_a_id = 0;
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", "\"mediaCaptureEnabled\":true", "media route") != 0
+            || st_json_get_i64(response_body(response), "id", &media_a_id) != 0;
+        if (!failed) {
+            snprintf(path, sizeof(path), "/api/admin/http-routes/%lld", media_a_id);
+            len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                    "{\"route\":\"media\",\"targetBaseUrl\":\"http://127.0.0.1:9090\",\"enabled\":true,"
+                                    "\"detailCaptureEnabled\":false,\"mediaCaptureEnabled\":false,"
+                                    "\"pathRewriteEnabled\":false}",
+                                    response, sizeof(response));
+            failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"mediaCaptureEnabled\":false",
+                                     "media capture off") != 0;
+        }
+        /* deleteRouteRemovesRow: after the API delete the row is gone. */
+        if (!failed) {
+            len = tenant_scope_call("DELETE", path, "root-a", "tenant-a", "ADMIN", NULL, response, sizeof(response));
+            st_storage_http_route deleted;
+            int still_there = 1;
+            failed = endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "route delete") != 0
+                || st_storage_find_http_route_by_id(db_path, media_a_id, &deleted, &still_there) != 0 || still_there;
+            if (failed) fprintf(stderr, "the deleted route row is still stored\n");
+        }
     }
     /* tenantScopedQueriesDoNotLeakClientsOrRoutes */
     if (!failed) {
@@ -4046,8 +4232,10 @@ static int test_http_route_service_rules(void)
         len = route_rules_create(client_tenant_b.id, "root-a", "tenant-a",
                                  "{\"route\":\"stolen\",\"targetBaseUrl\":\"http://127.0.0.1:9090\"}",
                                  response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", "client not found",
-                                 "route on another tenant's client") != 0;
+        char expected[96];
+        snprintf(expected, sizeof(expected), "{\"error\":\"client not found: %lld\"}", client_tenant_b.id);
+        failed = endpoint_answer_equals(len, response, "HTTP/1.1 400 ", expected,
+                                        "route on another tenant's client") != 0;
     }
     if (!failed) {
         len = tenant_scope_call("GET", "/api/admin/http-routes", "root-b", "tenant-b", "ADMIN", NULL,
@@ -4586,20 +4774,26 @@ static int test_connectivity_check_endpoint(void)
     return failed ? 1 : 0;
 }
 
-static long long route_auth_exchange_count(const char *database_path)
+static long long route_exchange_count(const char *database_path, const char *route)
 {
     sqlite3 *db = NULL;
     sqlite3_stmt *stmt = NULL;
     long long count = -1;
     if (sqlite3_open(database_path, &db) == SQLITE_OK
-        && sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM specus_http_traffic_exchange WHERE route = 'api'", -1,
+        && sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM specus_http_traffic_exchange WHERE route = ?", -1,
                               &stmt, NULL) == SQLITE_OK
+        && sqlite3_bind_text(stmt, 1, route, -1, SQLITE_STATIC) == SQLITE_OK
         && sqlite3_step(stmt) == SQLITE_ROW) {
         count = sqlite3_column_int64(stmt, 0);
     }
     sqlite3_finalize(stmt);
     sqlite3_close(db);
     return count;
+}
+
+static long long route_auth_exchange_count(const char *database_path)
+{
+    return route_exchange_count(database_path, "api");
 }
 
 static int route_auth_detail_is_sanitized(const char *database_path)
@@ -4765,6 +4959,144 @@ static int test_direct_http_route_fails_closed(const char *database_path,
         return -1;
     }
     return 0;
+}
+
+/* SHA-256 hex of len bytes of text, the form a route stores its Basic password in. */
+static void route_auth_hash(const char *text, size_t len, char out[ST_SHA256_HEX_LEN + 1])
+{
+    uint8_t digest[ST_SHA256_LEN];
+    st_sha256((const uint8_t *)text, len, digest);
+    st_hex_encode(digest, sizeof(digest), out);
+}
+
+/* One request whose whole answer must hold every one of the needles (NULL-terminated). */
+static int route_auth_answer_has(int port, route_auth_test_context *context, const char *label,
+                                 const char *request, const char *const *needles)
+{
+    char response[8192];
+    route_auth_test_context_reset(context);
+    int failed = route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0;
+    for (size_t i = 0; !failed && needles[i] != NULL; ++i) {
+        failed = !contains(response, needles[i]);
+    }
+    failed = failed || !route_auth_test_context_matches(context, 0, 0, 0);
+    if (failed) fprintf(stderr, "%s: unexpected answer %.300s\n", label, response);
+    return failed ? -1 : 0;
+}
+
+/*
+ * HttpRouteAuthenticationServiceTests and WebSocketSpecusHandshakeInterceptorAuthenticationTests
+ * cases the main route test leaves out: a Bearer token is not Basic, a password may itself hold
+ * ':', credentials that are not UTF-8 are refused (Java decodes them strictly), a stored hash that
+ * is not 64 hex digits fails closed with 503 on HTTP and WebSocket alike (upper-case hex is still
+ * a hash), the WebSocket challenge carries Java's headers, an encoded route segment is decoded
+ * while %2F after it stays raw, and with global detail capture on a route whose own detail capture
+ * is off records no exchange (TrafficInspectionServiceTests).
+ */
+static int test_direct_http_route_credentials(const char *database_path,
+                                              int port,
+                                              route_auth_test_context *context)
+{
+    st_storage_client managed;
+    st_storage_http_route colon;
+    st_storage_http_route latin1;
+    st_storage_http_route open_route;
+    st_storage_http_route changed;
+    char colon_hash[ST_SHA256_HEX_LEN + 1];
+    char latin1_hash[ST_SHA256_HEX_LEN + 1];
+    route_auth_hash("secret:tail", strlen("secret:tail"), colon_hash);
+    /* "café" in ISO-8859-1, as a browser may send it; never a valid UTF-8 password. */
+    route_auth_hash("caf\xe9", 4U, latin1_hash);
+    if (st_storage_get_client_by_name(database_path, "C managed 2", &managed) != 0
+        || st_storage_create_http_route_for_client(database_path, managed.id, "colon", "http://127.0.0.1:8080",
+                                                   1, 0, 0, 0, 0, 1, "viewer", colon_hash, &colon) != 0
+        || st_storage_create_http_route_for_client(database_path, managed.id, "latin1", "http://127.0.0.1:8080",
+                                                   1, 0, 0, 0, 0, 1, "viewer", latin1_hash, &latin1) != 0
+        || st_storage_create_http_route_for_client(database_path, managed.id, "ws route", "http://127.0.0.1:8080",
+                                                   1, 0, 0, 0, 0, 0, NULL, NULL, &open_route) != 0) {
+        fprintf(stderr, "route credential fixtures failed\n");
+        return -1;
+    }
+    static const char bearer[] =
+        "GET /http/C%20managed%202/colon/ HTTP/1.1\r\nHost: localhost\r\n"
+        "Authorization: Bearer upstream-token\r\n\r\n";
+    static const char colon_password[] =
+        "GET /http/C%20managed%202/colon/ HTTP/1.1\r\nHost: localhost\r\n"
+        "Authorization: Basic dmlld2VyOnNlY3JldDp0YWls\r\n\r\n";
+    static const char latin1_password[] =
+        "GET /http/C%20managed%202/latin1/ HTTP/1.1\r\nHost: localhost\r\n"
+        "Authorization: Basic dmlld2VyOmNhZuk=\r\n\r\n";
+    static const char colon_websocket[] =
+        "GET /http/C%20managed%202/colon/socket HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n"
+        "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Authorization: Basic dmlld2VyOnNlY3JldDp0YWls\r\n\r\n";
+    static const char anonymous_websocket[] =
+        "GET /http/C%20managed%202/colon/socket HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n"
+        "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    static const char encoded_websocket[] =
+        "GET /http/C%20managed%202/ws%20route/socket%2Fraw HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n"
+        "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    static const char *const challenge[] = {
+        "401 Unauthorized", "\r\nWWW-Authenticate: Basic realm=\"Specus HTTP Route\", charset=\"UTF-8\"\r\n",
+        "\r\nCache-Control: no-store\r\n", NULL
+    };
+    static const char *const unavailable[] = {"503 Service Unavailable", "\r\nCache-Control: no-store\r\n", NULL};
+    if (route_auth_expect(port, context, "Bearer on a protected route", bearer, "401 Unauthorized", 0, 0, 0) != 0
+        || route_auth_expect(port, context, "a password holding ':'", colon_password, "200 OK", 1, 0, 0) != 0
+        || route_auth_expect(port, context, "credentials that are not UTF-8", latin1_password,
+                             "401 Unauthorized", 0, 0, 0) != 0
+        || route_auth_answer_has(port, context, "protected WebSocket without credentials", anonymous_websocket,
+                                 challenge) != 0
+        || route_auth_expect(port, context, "encoded route segment on a WebSocket", encoded_websocket,
+                             "404 Not Found", 0, 1, 0) != 0
+        || !route_auth_test_paths_match(context, "", "/socket%2Fraw")) {
+        return -1;
+    }
+    /* Upper-case hex is still a SHA-256 (Java lower-cases it before comparing). */
+    char upper_hash[ST_SHA256_HEX_LEN + 1];
+    for (size_t i = 0; i <= ST_SHA256_HEX_LEN; ++i) {
+        upper_hash[i] = (char)toupper((unsigned char)colon_hash[i]);
+    }
+    if (st_storage_update_http_route_by_id(database_path, colon.id, colon.route, colon.target_base_url, 1, 0, 0, 0,
+                                           0, 1, "viewer", upper_hash, &changed) != 0
+        || route_auth_expect(port, context, "an upper-case stored hash", colon_password, "200 OK", 1, 0, 0) != 0) {
+        return -1;
+    }
+    /* disabledOrMisconfiguredManagedRouteFailsClosed: "not-a-sha256-hash" is a broken policy. */
+    if (st_storage_update_http_route_by_id(database_path, colon.id, colon.route, colon.target_base_url, 1, 0, 0, 0,
+                                           0, 1, "viewer", "not-a-sha256-hash", &changed) != 0
+        || route_auth_answer_has(port, context, "a malformed stored hash", colon_password, unavailable) != 0
+        || route_auth_answer_has(port, context, "a malformed stored hash on a WebSocket", colon_websocket,
+                                 unavailable) != 0) {
+        return -1;
+    }
+    char sixty_three[ST_SHA256_HEX_LEN + 1];
+    snprintf(sixty_three, sizeof(sixty_three), "%.63s", colon_hash);
+    if (st_storage_update_http_route_by_id(database_path, colon.id, colon.route, colon.target_base_url, 1, 0, 0, 0,
+                                           0, 1, "viewer", sixty_three, &changed) != 0
+        || route_auth_answer_has(port, context, "a 63-digit stored hash", colon_password, unavailable) != 0) {
+        return -1;
+    }
+
+    /* httpDetailCaptureIsDisabledByDefaultForChannel: global capture on, the route's own off. */
+    const char *capture = getenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED");
+    long long media_before = route_exchange_count(database_path, "media");
+    st_storage_http_route media;
+    if (capture == NULL || strcmp(capture, "true") != 0 || media_before != 0
+        || st_storage_get_http_route_by_client_route(database_path, "C managed 2", "media", &media) != 0
+        || media.detail_capture_enabled
+        || route_auth_expect(port, context, "a route without detail capture",
+                             "GET /http/C%20managed%202/media/clip HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                             "200 OK", 1, 0, 0) != 0
+        || route_exchange_count(database_path, "media") != 0
+        || route_exchange_count(database_path, "api") <= 0) {
+        fprintf(stderr, "a route with detail capture off was recorded, or the fixture is not as expected\n");
+        return -1;
+    }
+    /* The rest of the suite counts this client's routes; the fixtures go again. */
+    return st_storage_delete_http_route_by_id(database_path, colon.id) == 0
+        && st_storage_delete_http_route_by_id(database_path, latin1.id) == 0
+        && st_storage_delete_http_route_by_id(database_path, open_route.id) == 0 ? 0 : -1;
 }
 
 static int test_direct_http_route_authentication(const char *database_path)
@@ -5116,6 +5448,11 @@ static int test_direct_http_route_authentication(const char *database_path)
     }
 
     setenv("SPECUS_DATABASE_PATH", database_path, 1);
+    if (test_direct_http_route_credentials(database_path, port, &context) != 0) {
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
     int closed_ok = test_direct_http_route_fails_closed(database_path, port, &context, &route);
     unsetenv("SPECUS_HTTP_ROUTES");
     setenv("SPECUS_DATABASE_PATH", database_path, 1);
@@ -5143,13 +5480,16 @@ static int test_peer_mesh_egress_policy_validation(int egress_client_id)
              "{\"cidr\":\" 10.0.0.0/8 \",\"protocols\":[\" TCP \",\"udp\",\"tcp\"],"
              "\"portRanges\":[[80,80],[8000,8100]]},{\"cidr\":\"198.51.100.0/24\"}]}",
              egress_client_id);
+    /* PeerEgressResourceTests: every accepted save pushes the tenant's egress exactly once, a refusal never. */
+    int refreshes = peer_mesh_refresh_calls;
     int len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
     int policy_id = 0;
     if (len <= 0 || !contains(response, "200 OK") || !contains(response, stored)
         || !contains(response, "\"maxConcurrentFlows\":10")
         || !contains(response, "\"domainRules\":[]")
-        || st_json_get_int(response, "id", &policy_id) != 0 || policy_id <= 0) {
-        fprintf(stderr, "egress policy save did not store the normalised rules: %s\n", response);
+        || st_json_get_int(response, "id", &policy_id) != 0 || policy_id <= 0
+        || peer_mesh_refresh_calls != ++refreshes) {
+        fprintf(stderr, "egress policy save did not store the normalised rules or push once: %s\n", response);
         return 1;
     }
 
@@ -5183,8 +5523,8 @@ static int test_peer_mesh_egress_policy_validation(int egress_client_id)
     }
     len = st_admin_build_response("GET", path, response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK") || !contains(response, stored)
-        || !contains(response, "\"maxConcurrentFlows\":10")) {
-        fprintf(stderr, "a refused egress policy request changed what was stored: %s\n", response);
+        || !contains(response, "\"maxConcurrentFlows\":10") || peer_mesh_refresh_calls != refreshes) {
+        fprintf(stderr, "a refused egress policy request changed what was stored or pushed: %s\n", response);
         return 1;
     }
 
@@ -5194,7 +5534,7 @@ static int test_peer_mesh_egress_policy_validation(int egress_client_id)
              egress_client_id);
     len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK") || !contains(response, stored)
-        || !contains(response, "\"maxConcurrentFlows\":30")) {
+        || !contains(response, "\"maxConcurrentFlows\":30") || peer_mesh_refresh_calls != ++refreshes) {
         fprintf(stderr, "null destinationRules did not keep the stored rules: %s\n", response);
         return 1;
     }
@@ -5211,7 +5551,8 @@ static int test_peer_mesh_egress_policy_validation(int egress_client_id)
              egress_client_id);
     len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK") || !contains(response, stored_names)
-        || !contains(response, stored) || !contains(response, "\"maxConcurrentFlows\":30")) {
+        || !contains(response, stored) || !contains(response, "\"maxConcurrentFlows\":30")
+        || peer_mesh_refresh_calls != ++refreshes) {
         fprintf(stderr, "egress policy save did not store the normalised domain rules: %s\n", response);
         return 1;
     }
@@ -5240,8 +5581,9 @@ static int test_peer_mesh_egress_policy_validation(int egress_client_id)
              "{\"egressClientId\":%d,\"maxConcurrentFlows\":31,\"domainRules\":null}", egress_client_id);
     len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK") || !contains(response, stored_names)
-        || !contains(response, "\"maxConcurrentFlows\":31")) {
-        fprintf(stderr, "null domainRules did not keep the stored rules: %s\n", response);
+        || !contains(response, "\"maxConcurrentFlows\":31") || peer_mesh_refresh_calls != ++refreshes) {
+        fprintf(stderr, "null domainRules did not keep the stored rules or the refused ones pushed: %s\n",
+                response);
         return 1;
     }
     len = st_admin_build_response("GET", path, response, sizeof(response));
@@ -5273,26 +5615,59 @@ static int test_peer_mesh_egress_policy_validation(int egress_client_id)
         return 1;
     }
 
+    if (peer_mesh_refresh_calls != refreshes) {
+        fprintf(stderr, "a refused egress request pushed the tenant's egress\n");
+        return 1;
+    }
+
     char delete_path[128];
     snprintf(delete_path, sizeof(delete_path), "%s/%d", path, policy_id);
     len = st_admin_build_response("DELETE", delete_path, response, sizeof(response));
-    if (len <= 0 || !contains(response, "200 OK")) {
-        fprintf(stderr, "egress policy delete failed: %s\n", response);
+    if (len <= 0 || !contains(response, "200 OK") || peer_mesh_refresh_calls != ++refreshes) {
+        fprintf(stderr, "egress policy delete failed or did not push once: %s\n", response);
         return 1;
     }
     len = st_admin_build_response("DELETE", delete_path, response, sizeof(response));
-    if (len <= 0 || !contains(response, "404 Not Found")) {
-        fprintf(stderr, "deleting a missing egress policy was not 404: %s\n", response);
+    if (len <= 0 || !contains(response, "404 Not Found") || peer_mesh_refresh_calls != refreshes) {
+        fprintf(stderr, "deleting a missing egress policy was not 404 or pushed: %s\n", response);
+        return 1;
+    }
+
+    /*
+     * domainRulesAreKeptWhenOmittedAndEmptyOnANewPolicy, the other way round: a new policy given only
+     * domain rules stores and answers an empty destination list, never null.
+     */
+    snprintf(body, sizeof(body),
+             "{\"egressClientId\":%d,\"domainRules\":[{\"match\":\"example.com\",\"protocols\":[\"tcp\"],"
+             "\"portRanges\":[[443,443]]}]}", egress_client_id);
+    len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
+    int domain_policy_id = 0;
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"destinationRules\":[]")
+        || !contains(response, "\"domainRules\":[{\"match\":\"example.com\",\"protocols\":[\"tcp\"],"
+                               "\"portRanges\":[[443,443]]}]")
+        || st_json_get_int(response, "id", &domain_policy_id) != 0 || domain_policy_id == policy_id
+        || peer_mesh_refresh_calls != ++refreshes) {
+        fprintf(stderr, "a new domain-only egress policy mismatch: %s\n", response);
+        return 1;
+    }
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int stored_empty = sqlite3_open(getenv("SPECUS_DATABASE_PATH"), &db) == SQLITE_OK
+        && sqlite3_prepare_v2(db, "SELECT destination_rules FROM peer_mesh_egress_policy WHERE id = ?", -1, &stmt,
+                              NULL) == SQLITE_OK
+        && sqlite3_bind_int(stmt, 1, domain_policy_id) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW
+        && sqlite3_column_text(stmt, 0) != NULL
+        && strcmp((const char *)sqlite3_column_text(stmt, 0), "[]") == 0;
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    snprintf(delete_path, sizeof(delete_path), "%s/%d", path, domain_policy_id);
+    len = st_admin_build_response("DELETE", delete_path, response, sizeof(response));
+    if (!stored_empty || len <= 0 || !contains(response, "200 OK") || peer_mesh_refresh_calls != ++refreshes) {
+        fprintf(stderr, "the new domain-only policy did not store [] destination rules\n");
         return 1;
     }
     return 0;
-}
-
-/* The body of a response, after its header. */
-static const char *response_body(const char *response)
-{
-    const char *body = strstr(response, "\r\n\r\n");
-    return body == NULL ? "" : body + 4;
 }
 
 /*
@@ -5695,6 +6070,23 @@ static int test_public_stun_config_endpoints(void)
         fprintf(stderr, "standalone RFC 5780 nat-probe-config mismatch: %s\n", response_body(response));
         failed = 1;
     }
+    /* containsExactly: these four endpoints, in this order, and no other. */
+    static const char *const rfc5780_endpoints =
+        "[{\"id\":\"A1P1\",\"url\":\"stun:stun-a.example.com:34780\",\"host\":\"stun-a.example.com\",\"port\":34780,"
+        "\"addressSlot\":\"PRIMARY\",\"portSlot\":\"PRIMARY\"},"
+        "{\"id\":\"A1P2\",\"url\":\"stun:stun-a.example.com:34781\",\"host\":\"stun-a.example.com\",\"port\":34781,"
+        "\"addressSlot\":\"PRIMARY\",\"portSlot\":\"ALTERNATE\"},"
+        "{\"id\":\"A2P1\",\"url\":\"stun:203.0.113.20:34780\",\"host\":\"203.0.113.20\",\"port\":34780,"
+        "\"addressSlot\":\"ALTERNATE\",\"portSlot\":\"PRIMARY\"},"
+        "{\"id\":\"A2P2\",\"url\":\"stun:203.0.113.20:34781\",\"host\":\"203.0.113.20\",\"port\":34781,"
+        "\"addressSlot\":\"ALTERNATE\",\"portSlot\":\"ALTERNATE\"}]";
+    char *endpoints = len > 0 ? st_json_get_top_level_raw(response_body(response), "endpoints") : NULL;
+    if (!failed && (endpoints == NULL || strcmp(endpoints, rfc5780_endpoints) != 0)) {
+        fprintf(stderr, "RFC 5780 endpoints are not exactly A1P1, A1P2, A2P1, A2P2: %s\n",
+                endpoints == NULL ? "(none)" : endpoints);
+        failed = 1;
+    }
+    free(endpoints);
     /* Without the second port the NAT probe alternate port stands in, as in Java. */
     unsetenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT");
     len = st_admin_build_response("GET", "/api/public/peer-mesh/nat-probe-config", response, sizeof(response));
@@ -5747,6 +6139,109 @@ static int test_public_page_entry_paths(void)
         }
     }
     return 0;
+}
+
+/*
+ * Logs in once through /api/client/auth/login with the given environment members and reads back
+ * what the session stored: egress version, domain targets, IPv6 targets, IPv6 packets and the HTTP
+ * route capability version, in that order.
+ */
+static int egress_login_session(const char *db_path, const char *environment_fields, int index, int columns[5])
+{
+    static char response[65536];
+    char timestamp[32];
+    char nonce[48];
+    char signature[ST_SHA256_HEX_LEN + 1];
+    char body[2048];
+    snprintf(timestamp, sizeof(timestamp), "%lld", test_now_millis());
+    snprintf(nonce, sizeof(nonce), "nonce-egress-%d-%ld", index, (long)getpid());
+    sign_client_auth("egress-key", timestamp, nonce, "fp-office", "ops", "egress-secret", signature);
+    snprintf(body, sizeof(body),
+             "{\"apiKey\":\"egress-key\",\"timestamp\":\"%s\",\"nonce\":\"%s\",\"signature\":\"%s\","
+             "\"environment\":{\"machineFingerprint\":\"fp-office\",\"osUser\":\"ops\",\"hostname\":\"office\",%s}}",
+             timestamp, nonce, signature, environment_fields);
+    int len = st_admin_build_response_with_body("POST", "/api/client/auth/login", body, response, sizeof(response));
+    long long session_id = 0;
+    if (len <= 0 || !contains(response, "200 OK")
+        || st_json_get_i64(response_body(response), "clientSessionId", &session_id) != 0) {
+        fprintf(stderr, "egress login with %s failed: %s\n", environment_fields, response);
+        return -1;
+    }
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int found = sqlite3_open(db_path, &db) == SQLITE_OK
+        && sqlite3_prepare_v2(db,
+            "SELECT client_egress_version, client_egress_domain_targets, client_egress_ipv6_targets, "
+            "client_egress_ipv6_packets, client_http_route_version FROM specus_client_session WHERE id = ?",
+            -1, &stmt, NULL) == SQLITE_OK
+        && sqlite3_bind_int64(stmt, 1, session_id) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW;
+    for (int i = 0; found && i < 5; ++i) {
+        columns[i] = sqlite3_column_int(stmt, i);
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return found ? 0 : -1;
+}
+
+/*
+ * ClientAuthServiceEgressLoginTests through the real login, on a database of its own: an explicit
+ * null egress object logs in without egress, the IPv6 packet and target claims are stored each in
+ * its own column only, a domain claim without an egress version is not kept, and the HTTP route
+ * capability version is 0 for {version:0}, {version:-3}, null, {} and an absent object.
+ */
+static int test_client_login_egress_capabilities(void)
+{
+    char db_path[256];
+    const char *previous = getenv("SPECUS_DATABASE_PATH");
+    char saved[256] = "";
+    if (previous != NULL) snprintf(saved, sizeof(saved), "%s", previous);
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-egress-login-%ld.db", (long)getpid());
+    unlink(db_path);
+    char secret_hash[ST_SHA256_HEX_LEN + 1];
+    uint8_t digest[ST_SHA256_LEN];
+    st_sha256((const uint8_t *)"egress-secret", strlen("egress-secret"), digest);
+    st_hex_encode(digest, sizeof(digest), secret_hash);
+    st_storage_client_credential credential;
+    int failed = st_storage_init(db_path, 0) != 0
+        || st_storage_upsert_client_credential(db_path, 0, "t1", "admin", "egress-key", secret_hash, 1, 50,
+                                               &credential) != 0;
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    static const struct {
+        const char *fields;
+        int columns[5];
+    } cases[] = {
+        {"\"clientEgressCapabilities\":null", {0, 0, 0, 0, 0}},
+        {"\"clientEgressCapabilities\":{\"version\":1,\"egressCapable\":true,\"ipv6PacketCapable\":true}",
+         {1, 0, 0, 1, 0}},
+        {"\"clientEgressCapabilities\":{\"version\":1,\"egressCapable\":true,\"ipv6TargetCapable\":true}",
+         {1, 0, 1, 0, 0}},
+        {"\"clientEgressCapabilities\":{\"version\":0,\"domainTargetCapable\":true}", {0, 0, 0, 0, 0}},
+        {"\"clientEgressCapabilities\":{\"version\":1,\"egressCapable\":true,\"domainTargetCapable\":true}",
+         {1, 1, 0, 0, 0}},
+        {"\"clientHttpRouteCapabilities\":{\"version\":1}", {0, 0, 0, 0, 1}},
+        {"\"clientHttpRouteCapabilities\":{\"version\":0}", {0, 0, 0, 0, 0}},
+        {"\"clientHttpRouteCapabilities\":{\"version\":-3}", {0, 0, 0, 0, 0}},
+        {"\"clientHttpRouteCapabilities\":null", {0, 0, 0, 0, 0}},
+        {"\"clientHttpRouteCapabilities\":{}", {0, 0, 0, 0, 0}},
+        {"\"clientVersion\":\"0.9.0\"", {0, 0, 0, 0, 0}},
+    };
+    for (size_t i = 0; !failed && i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        int columns[5] = {-1, -1, -1, -1, -1};
+        failed = egress_login_session(db_path, cases[i].fields, (int)i, columns) != 0
+            || memcmp(columns, cases[i].columns, sizeof(columns)) != 0;
+        if (failed) {
+            fprintf(stderr, "login with %s stored %d/%d/%d/%d/%d\n", cases[i].fields, columns[0], columns[1],
+                    columns[2], columns[3], columns[4]);
+        }
+    }
+    if (saved[0] != '\0') {
+        setenv("SPECUS_DATABASE_PATH", saved, 1);
+    } else {
+        unsetenv("SPECUS_DATABASE_PATH");
+    }
+    unlink(db_path);
+    return failed ? 1 : 0;
 }
 
 int main(void)
@@ -6002,6 +6497,14 @@ int main(void)
             return 1;
         }
     }
+    /* The window is per address: another address still reaches the credential check. */
+    len = st_admin_build_response_with_remote("POST", "/auth/login",
+                                              "{\"username\":\"missing-four\",\"password\":\"wrong\"}",
+                                              "192.0.2.99", response, sizeof(response));
+    if (len <= 0 || !contains(response, "401 Unauthorized")) {
+        fprintf(stderr, "a limited address also limited another one: %s\n", response);
+        return 1;
+    }
 
     setenv("SPECUS_AUTH_LOGIN_RATE_LIMIT_PER_IP", "100", 1);
     setenv("SPECUS_AUTH_LOGIN_RATE_LIMIT_PER_ACCOUNT", "1", 1);
@@ -6025,6 +6528,33 @@ int main(void)
     if (len <= 0 || !contains(response, "429 Too Many Requests")
         || !contains(response, "Retry-After:")) {
         fprintf(stderr, "per-account login rate limit response mismatch\n");
+        return 1;
+    }
+    char unknown_limited[512];
+    snprintf(unknown_limited, sizeof(unknown_limited), "%s", response_body(response));
+    /* The window is per account: another account is not limited by this one. */
+    len = st_admin_build_response_with_remote("POST", "/auth/login",
+                                              "{\"username\":\"other-account\",\"password\":\"wrong\"}",
+                                              "192.0.2.13", response, sizeof(response));
+    if (len <= 0 || !contains(response, "401 Unauthorized")) {
+        fprintf(stderr, "a limited account also limited another one: %s\n", response);
+        return 1;
+    }
+    /* A known account is limited with exactly the answer of an unknown one, so neither is told apart. */
+    len = st_admin_build_response_with_remote("POST", "/auth/login",
+                                              "{\"username\":\"admin\",\"password\":\"wrong\"}",
+                                              "192.0.2.14", response, sizeof(response));
+    if (len <= 0 || !contains(response, "401 Unauthorized")) {
+        fprintf(stderr, "a known account's first wrong password was not 401: %s\n", response);
+        return 1;
+    }
+    len = st_admin_build_response_with_remote("POST", "/auth/login",
+                                              "{\"username\":\"admin\",\"password\":\"wrong\"}",
+                                              "192.0.2.15", response, sizeof(response));
+    if (len <= 0 || !contains(response, "429 Too Many Requests") || !contains(response, "\r\nRetry-After: ")
+        || strcmp(response_body(response), unknown_limited) != 0) {
+        fprintf(stderr, "a known account was limited unlike an unknown one: %s, unknown %s\n", response,
+                unknown_limited);
         return 1;
     }
 
@@ -6307,6 +6837,9 @@ int main(void)
             fprintf(stderr, "HTTP login lost the declared IPv6 packet capability\n");
             return 1;
         }
+    }
+    if (test_client_login_egress_capabilities() != 0) {
+        return 1;
     }
     if (st_storage_mark_client_session_online(auth_db_path,
                                               runtime_client_session_id,

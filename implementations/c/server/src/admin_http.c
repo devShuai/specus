@@ -6109,6 +6109,80 @@ static int append_peer_mesh_egress_policy_view(st_admin_string_builder *builder,
     return rc;
 }
 
+static const char *admin_skip_json_space(const char *cursor)
+{
+    while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n') ++cursor;
+    return cursor;
+}
+
+/*
+ * Appends one stored refusal-counter member, the name at *cursor and its integer or null value,
+ * advancing *cursor past it. -1 when the text there is not such a member.
+ */
+static int admin_append_rejected_flow_member(st_admin_string_builder *builder, const char **cursor)
+{
+    const char *start = *cursor;
+    if (*start != '"') return -1;
+    const char *end = start + 1;
+    while (*end != '\0' && *end != '"') {
+        if (*end == '\\' && end[1] != '\0') ++end;
+        ++end;
+    }
+    if (*end != '"') return -1;
+    char *raw = admin_dup_range(start, (size_t)(end - start) + 1U);
+    size_t name_len = 0U;
+    char *name = raw == NULL ? NULL : st_json_decode_string(raw, &name_len);
+    free(raw);
+    int rc = name == NULL || strlen(name) != name_len ? -1 : admin_sb_append_json_string(builder, name);
+    free(name);
+    const char *value = admin_skip_json_space(end + 1);
+    if (rc != 0 || *value != ':') return -1;
+    value = admin_skip_json_space(value + 1);
+    if (strncmp(value, "null", 4U) == 0) {
+        *cursor = value + 4;
+        return admin_sb_append(builder, ":null");
+    }
+    /* An integer in JSON's own form: no leading zero, fraction or exponent, within a long. */
+    const char *digits = *value == '-' ? value + 1 : value;
+    if (!isdigit((unsigned char)*digits) || (*digits == '0' && isdigit((unsigned char)digits[1]))) return -1;
+    errno = 0;
+    char *number_end = NULL;
+    long long count = strtoll(value, &number_end, 10);
+    if (errno != 0 || *number_end == '.' || *number_end == 'e' || *number_end == 'E') return -1;
+    *cursor = number_end;
+    return admin_sb_appendf(builder, ":%lld", count);
+}
+
+/*
+ * Java PeerEgressService.decodeRejectedFlows: the stored refusal counters read as a JSON object of
+ * names to integers and written back in compact form; blank or unreadable text reads as {}.
+ */
+static int admin_append_rejected_flows(st_admin_string_builder *builder, const char *stored)
+{
+    st_admin_string_builder decoded = {0};
+    const char *cursor = admin_skip_json_space(stored == NULL ? "" : stored);
+    int rc = *cursor == '{' ? admin_sb_append(&decoded, "{") : -1;
+    if (rc == 0) cursor = admin_skip_json_space(cursor + 1);
+    if (rc == 0 && *cursor != '}') {
+        for (;;) {
+            rc = admin_append_rejected_flow_member(&decoded, &cursor);
+            cursor = rc == 0 ? admin_skip_json_space(cursor) : cursor;
+            if (rc != 0 || *cursor != ',') break;
+            cursor = admin_skip_json_space(cursor + 1);
+            rc = admin_sb_append(&decoded, ",");
+            if (rc != 0) break;
+        }
+    }
+    if (rc == 0 && *cursor == '}' && *admin_skip_json_space(cursor + 1) == '\0') {
+        rc = admin_sb_append(&decoded, "}");
+    } else {
+        rc = -1;
+    }
+    int written = admin_sb_append(builder, rc == 0 && decoded.data != NULL ? decoded.data : "{}");
+    free(decoded.data);
+    return written;
+}
+
 /*
  * Latest counters each egress device reported about itself. Counters only: the report carries no
  * destination, domain or request content, and refusals arrive aggregated by result code.
@@ -6142,11 +6216,14 @@ static int build_peer_mesh_egress_activity_response(const st_admin_context *cont
              * offline instead of frozen at its last counters. */
             rc = admin_sb_appendf(&builder,
                 ",\"online\":%s,\"revision\":%lld,\"activeFlows\":%lld,\"totalFlows\":%lld,"
-                "\"rejectedFlows\":%s,\"bytesIn\":%lld,\"bytesOut\":%lld,\"reportedAt\":",
+                "\"rejectedFlows\":",
                 online ? "true" : "false",
-                rows[i].revision, rows[i].active_flows, rows[i].total_flows,
-                rows[i].rejected_flows[0] == '\0' ? "{}" : rows[i].rejected_flows,
-                rows[i].bytes_in, rows[i].bytes_out);
+                rows[i].revision, rows[i].active_flows, rows[i].total_flows);
+        }
+        if (rc == 0) rc = admin_append_rejected_flows(&builder, rows[i].rejected_flows);
+        if (rc == 0) {
+            rc = admin_sb_appendf(&builder, ",\"bytesIn\":%lld,\"bytesOut\":%lld,\"reportedAt\":",
+                                  rows[i].bytes_in, rows[i].bytes_out);
         }
         if (rc == 0) rc = admin_sb_append_json_string(&builder, rows[i].reported_at);
         if (rc == 0) rc = admin_sb_append(&builder, "}");
@@ -9352,48 +9429,68 @@ static int handle_specus_delete(const st_admin_context *context, long long id, c
     return write_response(out, out_len, 204, "No Content", "");
 }
 
-static int http_route_auth_text_present(const char *value)
+/*
+ * Java HttpRouteService.applyAuthentication for a create (existing NULL) or an update of existing.
+ * The username given is trimmed in place; a blank or absent one is none on a create and the stored
+ * one on an update. A password with text is hashed as given (never trimmed), else the stored hash
+ * stays. Lengths count UTF-16 code units like Java's String.length(). NULL when the result may be
+ * stored, with *username_out (NULL for none) and hash_out set, else the message Java answers 400 with.
+ */
+static const char *http_route_auth_apply(int auth_enabled,
+                                         char *username,
+                                         const char *password,
+                                         const st_storage_http_route *existing,
+                                         const char **username_out,
+                                         char hash_out[ST_SHA256_HEX_LEN + 1])
 {
-    if (value == NULL) {
-        return 0;
-    }
-    for (const unsigned char *cursor = (const unsigned char *)value; *cursor != '\0'; ++cursor) {
-        if (!isspace(*cursor)) {
-            return 1;
+    *username_out = NULL;
+    if (admin_java_has_text(username)) {
+        admin_java_trim(username);
+        if (admin_utf16_length(username) > 120U) {
+            return "authUsername is too long (max 120)";
         }
+        if (strpbrk(username, ":\r\n") != NULL) {
+            return "authUsername must not contain ':', CR, or LF";
+        }
+        *username_out = username;
+    } else if (existing != NULL && admin_java_has_text(existing->auth_username)) {
+        *username_out = existing->auth_username;
     }
-    return 0;
+    snprintf(hash_out, ST_SHA256_HEX_LEN + 1U, "%s", existing == NULL ? "" : existing->auth_password_hash);
+    if (admin_java_has_text(password)) {
+        if (admin_utf16_length(password) > 256U) {
+            return "authPassword is too long (max 256)";
+        }
+        (void)password_hash_hex(password, hash_out);
+    }
+    if (auth_enabled && *username_out == NULL) {
+        return "authUsername cannot be blank when route authentication is enabled";
+    }
+    if (auth_enabled && !admin_java_has_text(hash_out)) {
+        return "authPassword is required when route authentication is first enabled";
+    }
+    return NULL;
 }
 
-static int normalize_http_route_auth_username(char *username)
+/* Java HttpRouteService's 400 for a route that does not exist or that the caller cannot see. */
+static int write_http_route_not_found(long long id, char *out, size_t out_len)
 {
-    if (username == NULL) {
-        return 0;
-    }
-    char *trimmed = admin_trim(username);
-    size_t len = strlen(trimmed);
-    if (len > 120U || strchr(trimmed, ':') != NULL
-        || strchr(trimmed, '\r') != NULL || strchr(trimmed, '\n') != NULL) {
-        return -1;
-    }
-    if (trimmed != username) {
-        memmove(username, trimmed, len + 1U);
-    }
-    return 0;
+    char body[96];
+    snprintf(body, sizeof(body), "{\"error\":\"http route not found: %lld\"}", id);
+    return write_response(out, out_len, 400, "Bad Request", body);
 }
 
-static int http_route_auth_password_hash(const char *password,
-                                         const char *existing_hash,
-                                         char out[ST_SHA256_HEX_LEN + 1])
+/*
+ * Whether route is the name of another route of the client (Java checks this before the
+ * authentication fields, so a duplicate is reported first). exclude_id is the route being updated.
+ */
+static int http_route_name_taken(const char *database_path, const char *client_name, const char *route,
+                                 long long exclude_id)
 {
-    snprintf(out, ST_SHA256_HEX_LEN + 1U, "%s", existing_hash == NULL ? "" : existing_hash);
-    if (!http_route_auth_text_present(password)) {
-        return 0;
-    }
-    if (strlen(password) > 256U) {
-        return -1;
-    }
-    return password_hash_hex(password, out);
+    st_storage_http_route taken;
+    int found = 0;
+    return st_storage_find_http_route_by_client_route(database_path, client_name, route, &taken, &found) == 0
+        && found && taken.id != exclude_id;
 }
 
 static int handle_http_route_create(const st_admin_context *context, long long client_id, const char *body, char *out, size_t out_len)
@@ -9412,7 +9509,8 @@ static int handle_http_route_create(const st_admin_context *context, long long c
     }
     st_storage_client owner;
     if (!admin_load_accessible_client(database_path, context, client_id, &owner)) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
+        /* Java findClient: an unknown, foreign or not-owned client is the same 400. */
+        return write_client_not_found(client_id, out, out_len);
     }
     char *route_name = st_json_get_string(body, "route");
     char *target_base_url = st_json_get_string(body, "targetBaseUrl");
@@ -9421,6 +9519,12 @@ static int handle_http_route_create(const st_admin_context *context, long long c
         free(route_name);
         free(target_base_url);
         return write_http_route_invalid(invalid, out, out_len);
+    }
+    if (http_route_name_taken(database_path, owner.client_name, route_name, 0)) {
+        int exists_len = write_http_route_exists(route_name, out, out_len);
+        free(route_name);
+        free(target_base_url);
+        return exists_len;
     }
     int enabled = 1;
     (void)admin_jackson_boolean(body, "enabled", &enabled);
@@ -9437,20 +9541,15 @@ static int handle_http_route_create(const st_admin_context *context, long long c
     char *auth_username = st_json_get_string(body, "authUsername");
     char *auth_password = st_json_get_string(body, "authPassword");
     char auth_password_hash[ST_SHA256_HEX_LEN + 1] = {0};
-    if (normalize_http_route_auth_username(auth_username) != 0
-        || http_route_auth_password_hash(auth_password, NULL, auth_password_hash) != 0) {
+    const char *stored_auth_username = NULL;
+    const char *auth_invalid = http_route_auth_apply(auth_enabled, auth_username, auth_password, NULL,
+                                                     &stored_auth_username, auth_password_hash);
+    if (auth_invalid != NULL) {
         free(route_name);
         free(target_base_url);
         free(auth_username);
         free(auth_password);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"invalid HTTP route authentication credentials\"}");
-    }
-    if (auth_enabled && (auth_username == NULL || *auth_username == '\0' || auth_password_hash[0] == '\0')) {
-        free(route_name);
-        free(target_base_url);
-        free(auth_username);
-        free(auth_password);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"authUsername and authPassword are required when authentication is enabled\"}");
+        return write_http_route_invalid(auth_invalid, out, out_len);
     }
     /* A route name the client already has is refused below, so a new route never replaces one. */
     int refused = admin_check_http_route_change(database_path, owner.client_name, NULL, enabled, route_name,
@@ -9475,9 +9574,9 @@ static int handle_http_route_create(const st_admin_context *context, long long c
                                                   path_rewrite_enabled,
                                                   insecure_skip_verify,
                                                   auth_enabled,
-                                                  auth_username,
+                                                  stored_auth_username,
                                                   auth_password_hash,
-                                                  http_route_auth_text_present(auth_password),
+                                                  admin_java_has_text(auth_password),
                                                   context->username,
                                                   st_http_share_now_ms(),
                                                   &route,
@@ -9518,7 +9617,7 @@ static int handle_http_route_update(const st_admin_context *context, long long i
     st_storage_client owner;
     if (st_storage_get_http_route(database_path, id, &existing) != 0
         || !admin_load_accessible_client(database_path, context, existing.client_id, &owner)) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"http route not found\"}");
+        return write_http_route_not_found(id, out, out_len);
     }
     /* A field left out keeps its value; one that is given is validated as on creation. */
     char *route_name = st_json_get_string(body, "route");
@@ -9536,6 +9635,12 @@ static int handle_http_route_update(const st_admin_context *context, long long i
         free(target_base_url);
         return write_http_route_invalid(invalid, out, out_len);
     }
+    if (http_route_name_taken(database_path, owner.client_name, route_name, id)) {
+        int exists_len = write_http_route_exists(route_name, out, out_len);
+        free(route_name);
+        free(target_base_url);
+        return exists_len;
+    }
     const char *next_route = route_name;
     const char *next_target = target_base_url;
     int enabled = existing.enabled;
@@ -9551,23 +9656,17 @@ static int handle_http_route_update(const st_admin_context *context, long long i
     int auth_enabled = existing.auth_enabled;
     (void)admin_jackson_boolean(body, "authEnabled", &auth_enabled);
     char *auth_username = st_json_get_string(body, "authUsername");
-    const char *next_auth_username = auth_username == NULL ? existing.auth_username : auth_username;
     char *auth_password = st_json_get_string(body, "authPassword");
     char auth_password_hash[ST_SHA256_HEX_LEN + 1];
-    if (normalize_http_route_auth_username(auth_username) != 0
-        || http_route_auth_password_hash(auth_password, existing.auth_password_hash, auth_password_hash) != 0) {
+    const char *next_auth_username = NULL;
+    const char *auth_invalid = http_route_auth_apply(auth_enabled, auth_username, auth_password, &existing,
+                                                     &next_auth_username, auth_password_hash);
+    if (auth_invalid != NULL) {
         free(route_name);
         free(target_base_url);
         free(auth_username);
         free(auth_password);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"invalid HTTP route authentication credentials\"}");
-    }
-    if (auth_enabled && (*next_auth_username == '\0' || auth_password_hash[0] == '\0')) {
-        free(route_name);
-        free(target_base_url);
-        free(auth_username);
-        free(auth_password);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"authUsername and a configured authPassword are required when authentication is enabled\"}");
+        return write_http_route_invalid(auth_invalid, out, out_len);
     }
     int refused = admin_check_http_route_change(database_path, owner.client_name, existing.enabled ? &existing : NULL,
                                                 enabled, next_route, next_target, insecure_skip_verify, out, out_len);
@@ -9596,7 +9695,7 @@ static int handle_http_route_update(const st_admin_context *context, long long i
                                                   auth_enabled,
                                                   next_auth_username,
                                                   auth_password_hash,
-                                                  http_route_auth_text_present(auth_password),
+                                                  admin_java_has_text(auth_password),
                                                   context->username,
                                                   st_http_share_now_ms(),
                                                   &route,
@@ -9765,7 +9864,7 @@ static int handle_http_route_delete(const st_admin_context *context, long long i
     st_storage_client owner;
     if (st_storage_get_http_route(database_path, id, &existing) != 0
         || !admin_load_accessible_client(database_path, context, existing.client_id, &owner)) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"http route not found\"}");
+        return write_http_route_not_found(id, out, out_len);
     }
     st_storage_share_ids revoked = {0};
     int rc = st_storage_delete_http_route_audited(database_path, id, context->username, st_http_share_now_ms(),
@@ -9773,7 +9872,7 @@ static int handle_http_route_delete(const st_admin_context *context, long long i
     admin_share_cut_revoked(&revoked);
     st_storage_share_ids_free(&revoked);
     if (rc != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"http route not found\"}");
+        return write_http_route_not_found(id, out, out_len);
     }
     admin_notify_nat_control(&owner);
     return write_response(out, out_len, 204, "No Content", "");
@@ -15480,7 +15579,7 @@ static int admin_decode_basic_credentials(const char *encoded,
 {
     size_t len = encoded == NULL ? 0U : strlen(encoded);
     *out_len = 0U;
-    if (len == 0U || len > 1024U || len % 4U != 0U) {
+    if (len == 0U || len > 2048U || len % 4U != 0U) {
         return -1;
     }
     for (size_t i = 0; i < len; i += 4U) {
@@ -15691,6 +15790,41 @@ static int admin_direct_route_captured(const char *path)
     return captured;
 }
 
+static size_t admin_log_utf8_sequence(const unsigned char *text, size_t remaining, uint32_t *code_point);
+
+/* Whether text is well-formed UTF-8: no overlong forms, surrogates or code points past U+10FFFF. */
+static int admin_is_valid_utf8(const uint8_t *text, size_t len)
+{
+    size_t i = 0U;
+    while (i < len) {
+        if (text[i] < 0x80U) {
+            ++i;
+            continue;
+        }
+        uint32_t code_point = 0U;
+        size_t sequence = admin_log_utf8_sequence(text + i, len - i, &code_point);
+        if (sequence == 0U) {
+            return 0;
+        }
+        i += sequence;
+    }
+    return 1;
+}
+
+/* Java HttpRouteAuthenticationService.isSha256Hex: exactly 64 hexadecimal digits. */
+static int admin_is_sha256_hex(const char *value)
+{
+    if (value == NULL || strlen(value) != ST_SHA256_HEX_LEN) {
+        return 0;
+    }
+    for (const unsigned char *cursor = (const unsigned char *)value; *cursor != '\0'; ++cursor) {
+        if (!isxdigit(*cursor)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int send_http_route_not_found(int fd)
 {
     send_text_http_error(fd, 404, ADMIN_ROUTE_NOT_FOUND_TEXT);
@@ -15794,7 +15928,8 @@ static int authorize_direct_http_route(int fd,
     if (!route.auth_enabled) {
         return 0;
     }
-    if (route.auth_username[0] == '\0' || route.auth_password_hash[0] == '\0') {
+    /* Java isSha256Hex: a stored hash that is not 64 hex digits is a broken policy, never public. */
+    if (!admin_java_has_text(route.auth_username) || !admin_is_sha256_hex(route.auth_password_hash)) {
         return refuse_direct_http_route(fd, method, path, 503, started_ms);
     }
 
@@ -15808,11 +15943,14 @@ static int authorize_direct_http_route(int fd,
         encoded += 5;
         while (isspace((unsigned char)*encoded)) ++encoded;
     }
-    uint8_t decoded[512];
+    /* Room for the longest credentials a route accepts: 120 + 256 UTF-16 units, 3 bytes each. */
+    uint8_t decoded[1600];
     size_t decoded_len = 0;
+    /* Java decodes the credentials as strict UTF-8 (CodingErrorAction.REPORT): malformed is 401. */
     int valid = scheme_ok
         && admin_decode_basic_credentials(encoded, decoded, sizeof(decoded), &decoded_len) == 0
-        && memchr(decoded, '\0', decoded_len) == NULL;
+        && memchr(decoded, '\0', decoded_len) == NULL
+        && admin_is_valid_utf8(decoded, decoded_len);
     uint8_t *colon = valid ? memchr(decoded, ':', decoded_len) : NULL;
     if (colon == NULL) {
         valid = 0;
@@ -15821,8 +15959,7 @@ static int authorize_direct_http_route(int fd,
         const char *password = (const char *)(colon + 1);
         int username_matches = admin_constant_time_text_equals((const char *)decoded,
                                                                route.auth_username);
-        int password_matches = strlen(password) <= 256U
-            && password_hash_matches(password, route.auth_password_hash);
+        int password_matches = password_hash_matches(password, route.auth_password_hash);
         valid = username_matches & password_matches;
     }
     memset(decoded, 0, sizeof(decoded));
