@@ -65,10 +65,42 @@ class EgressTestPreviewTests {
                     "ADDRESS is not a name a domain rule can match: use labels of a-z, 0-9 and -, with punycode (xn--)"
                             + " for international names.");
         }
-        // Neither a name nor an IPv4 address.
-        for (String value : List.of("1.2.3", "300.1.1.1", "203.0.113.0/24", "fe80::1", "example.com:443", "", "1-2.3")) {
+        // An IPv6 address is previewed as an address, written as a rule's match is.
+        for (String value : List.of("2001:db8::1", "2001:DB8:0::1", "fe80::1")) {
+            assertThat(EgressEdit.addressProblem(value)).as(value).isNull();
+            assertThat(EgressEdit.isAddress(value)).as(value).isTrue();
+        }
+        // Neither a name nor an address: a zone, brackets, a dotted tail or a prefix are not one, and
+        // they are still told it must be an IPv4 address, the wording the three clients share.
+        for (String value : List.of("1.2.3", "300.1.1.1", "203.0.113.0/24", "fe80::1%eth0", "[2001:db8::1]",
+                "::ffff:192.0.2.1", "2001:db8::/32", "example.com:443", "", "1-2.3")) {
             assertThat(EgressEdit.addressProblem(value)).as(value).isEqualTo("ADDRESS must be an IPv4 address.");
         }
+    }
+
+    /**
+     * An IPv6 address previews by the IPv6 rules, where this client carries IPv6, in the same lines;
+     * at a peerMeshMtu below 1280 no IPv6 rule is in force and the address stays local.
+     */
+    @Test
+    void anIpv6AddressPreviewsByTheIpv6Rules() throws Exception {
+        String rules = ",\"peerEgressEnabled\":true,\"peerEgressRules\":["
+                + "{\"match\":\"203.0.113.0/24\",\"action\":\"egress\",\"egressClientId\":7},"
+                + "{\"match\":\"2001:db8::/32\",\"action\":\"egress\",\"egressClientId\":42}]";
+        var preview = preview(rules + ",\"peerMeshMtu\":1280", "2001:DB8::9");
+        String first = "Preview for 2001:DB8::9 from the configuration (no connection is made; --connect PORT tests one)";
+        if (com.theshuai.specusclient.peer.PeerEgressRouteCommanders.consumerCarriesIpv6(1280)) {
+            assertThat(preview.lines()).containsExactly(first, "  takeover: on", "  rule: [1] 2001:db8::/32 egress 42",
+                    "  result: through egress 42");
+        } else {
+            // A platform without the IPv6 data plane: the rule is not in force.
+            assertThat(preview.lines()).containsExactly(first, "  takeover: on", "  rule: none",
+                    "  result: not covered by any rule; stays local (direct)");
+        }
+        assertThat(preview.data()).containsEntry("kind", "address").containsEntry("address", "2001:DB8::9");
+
+        preview = preview(rules + ",\"peerMeshMtu\":1200", "2001:db8::9");
+        assertThat(preview.lines().get(2)).as("below 1280 an IPv6 rule steered the preview").isEqualTo("  rule: none");
     }
 
     @Test
