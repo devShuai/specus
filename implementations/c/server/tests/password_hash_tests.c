@@ -1,5 +1,9 @@
 #include "password_hash.h"
 
+#include "crypto.h"
+
+#include <ctype.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -11,6 +15,108 @@ static int expect_rejected(const char *stored_hash)
         || verification.needs_upgrade) {
         fprintf(stderr, "malformed password hash was accepted: %s\n", stored_hash);
         return 1;
+    }
+    return 0;
+}
+
+static int verifies(const char *plaintext, const char *stored_hash)
+{
+    st_password_verification verification;
+    return st_password_verify(plaintext, stored_hash, &verification) == 0 && verification.matches;
+}
+
+static size_t count_dollars(const char *text)
+{
+    size_t count = 0U;
+    for (; *text != '\0'; ++text) {
+        count += *text == '$' ? 1U : 0U;
+    }
+    return count;
+}
+
+/* The remaining Java PasswordServiceTests cases, with Java's inputs. */
+static int test_password_service_parity(void)
+{
+    /* hashesAreSaltedAndCarryTheirOwnParameters */
+    char first[ST_PASSWORD_HASH_MAX_LEN + 1U];
+    char second[ST_PASSWORD_HASH_MAX_LEN + 1U];
+    if (st_password_hash("correct horse battery staple", first) != 0
+        || st_password_hash("correct horse battery staple", second) != 0
+        || strcmp(first, second) == 0
+        || strncmp(first, "$pbkdf2-sha256$v=1$i=210000$", strlen("$pbkdf2-sha256$v=1$i=210000$")) != 0
+        || count_dollars(first) != 5U
+        || !verifies("correct horse battery staple", first)
+        || verifies("correct horse battery stapl", first)) {
+        fprintf(stderr, "fresh password hashes are not salted, self-describing and verifiable\n");
+        return 1;
+    }
+
+    /* currentCostHashesAreNotRewritten */
+    st_password_verification verification;
+    if (st_password_hash("s3cret", first) != 0
+        || st_password_verify("s3cret", first, &verification) != 0
+        || !verification.matches || verification.needs_upgrade || verification.stored_is_legacy
+        || verification.upgraded_hash[0] != '\0') {
+        fprintf(stderr, "a current-cost hash was scheduled for rewrite\n");
+        return 1;
+    }
+
+    /* legacyHashesVerifyAndAreScheduledForUpgrade: the upgrade is final, hex case is ignored. */
+    uint8_t digest[ST_SHA256_LEN];
+    char legacy[ST_SHA256_HEX_LEN + 1U];
+    char legacy_upper[ST_SHA256_HEX_LEN + 1U];
+    st_sha256((const uint8_t *)"legacy-password", strlen("legacy-password"), digest);
+    st_hex_encode(digest, sizeof(digest), legacy);
+    for (size_t i = 0U; i <= ST_SHA256_HEX_LEN; ++i) {
+        legacy_upper[i] = (char)toupper((unsigned char)legacy[i]);
+    }
+    if (st_password_verify("legacy-password", legacy, &verification) != 0
+        || !verification.matches || !verification.needs_upgrade || !verification.stored_is_legacy) {
+        fprintf(stderr, "legacy digest did not verify for upgrade\n");
+        return 1;
+    }
+    char upgraded[ST_PASSWORD_HASH_MAX_LEN + 1U];
+    memcpy(upgraded, verification.upgraded_hash, sizeof(upgraded));
+    if (st_password_verify("legacy-password", upgraded, &verification) != 0
+        || !verification.matches || verification.needs_upgrade) {
+        fprintf(stderr, "the upgraded legacy hash is not final\n");
+        return 1;
+    }
+    if (strcmp(legacy, legacy_upper) == 0 || !verifies("legacy-password", legacy_upper)
+        || verifies("wrong", legacy)) {
+        fprintf(stderr, "legacy digest comparison mismatch (uppercase or wrong password)\n");
+        return 1;
+    }
+
+    /* malformedStoredHashesNeverVerify: the cases the shared list above does not hold. */
+    char repeated_a[64];
+    char repeated_z[65];
+    memset(repeated_a, 'a', sizeof(repeated_a) - 1U);
+    repeated_a[sizeof(repeated_a) - 1U] = '\0';
+    memset(repeated_z, 'z', sizeof(repeated_z) - 1U);
+    repeated_z[sizeof(repeated_z) - 1U] = '\0';
+    const char *never[] = { "", "   ", "$", "$argon2id$v=1$i=210000$c2FsdA$a2V5", repeated_a, repeated_z, NULL };
+    for (size_t i = 0U; i < sizeof(never) / sizeof(never[0]); ++i) {
+        if (verifies("anything", never[i])) {
+            fprintf(stderr, "malformed stored hash verified: %s\n", never[i] == NULL ? "(null)" : never[i]);
+            return 1;
+        }
+    }
+    if (st_password_verify(NULL, "anything", &verification) == 0 && verification.matches) {
+        fprintf(stderr, "a NULL password verified\n");
+        return 1;
+    }
+
+    /* sharedCrossLanguageVectorVerifies: one extra character must fail against either vector. */
+    const char *vectors[] = {
+        "$pbkdf2-sha256$v=1$i=1000$AAECAwQFBgcICQoLDA0ODw$vnwYtUA8UXxNgCLy7OdAY+f7T+TtG4qdlahTjY1KU5g",
+        "$pbkdf2-sha256$v=1$i=210000$AAECAwQFBgcICQoLDA0ODw$BiTFCvEUdO2zrZt0s1Zd0ipbGH5+WaSosMi6WavHxbI",
+    };
+    for (size_t i = 0U; i < sizeof(vectors) / sizeof(vectors[0]); ++i) {
+        if (!verifies("specus-shared-password", vectors[i]) || verifies("specus-shared-passwordx", vectors[i])) {
+            fprintf(stderr, "shared vector %zu mismatch\n", i);
+            return 1;
+        }
     }
     return 0;
 }
@@ -90,5 +196,5 @@ int main(void)
         }
     }
 
-    return 0;
+    return test_password_service_parity();
 }
