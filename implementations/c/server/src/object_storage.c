@@ -230,10 +230,15 @@ static void object_load_limits(st_object_config *config)
     config->upload_ttl = object_clamp_ttl(object_env_i64("SPECUS_OBJECT_STORAGE_UPLOAD_URL_TTL_SECONDS", 900), 900);
     config->download_ttl = object_clamp_ttl(object_env_i64("SPECUS_OBJECT_STORAGE_DOWNLOAD_URL_TTL_SECONDS", 600), 600);
     config->direct_download_ttl = object_clamp_ttl(object_env_i64("SPECUS_OBJECT_STORAGE_DOWNLOAD_OBJECT_URL_TTL_SECONDS", 30), 30);
+    /*
+     * Java TransferAttachmentService: a nonpositive retention is one hour (Math.max(1, hours)) for
+     * an upload's expiry and the snapshot alike, and a nonpositive size limit is kept, so every
+     * positive-size upload is too large and the snapshot reports zero.
+     */
     config->retention_hours = object_env_i64("SPECUS_OBJECT_STORAGE_RETENTION_HOURS", 72);
-    if (config->retention_hours <= 0) config->retention_hours = 72;
+    if (config->retention_hours <= 0) config->retention_hours = 1;
     config->max_attachment_bytes = object_env_i64("SPECUS_OBJECT_STORAGE_MAX_ATTACHMENT_BYTES", ST_OBJECT_DEFAULT_MAX_BYTES);
-    if (config->max_attachment_bytes <= 0) config->max_attachment_bytes = ST_OBJECT_DEFAULT_MAX_BYTES;
+    if (config->max_attachment_bytes < 0) config->max_attachment_bytes = 0;
     config->storage_quota_bytes = object_env_i64("SPECUS_OBJECT_STORAGE_PER_USER_STORAGE_QUOTA_BYTES", ST_OBJECT_DEFAULT_QUOTA_BYTES);
     if (config->storage_quota_bytes <= 0) config->storage_quota_bytes = ST_OBJECT_DEFAULT_QUOTA_BYTES;
     config->download_quota_bytes = object_env_i64("SPECUS_OBJECT_STORAGE_PER_USER_MONTHLY_DOWNLOAD_QUOTA_BYTES", ST_OBJECT_DEFAULT_QUOTA_BYTES);
@@ -2299,9 +2304,9 @@ static int object_capabilities(const st_object_storage_identity *identity,
     }
     if (storage_used < 0) storage_used = 0;
     if (download_used < 0) download_used = 0;
-    /* object_load_limits already resolved nonpositive settings to the defaults that upload and
-     * download enforce (512 MiB, 72 h, 1 GiB), so these are the effective limits; the clamps only
-     * keep the contract's floors should that resolution ever change. */
+    /* object_load_limits already resolved nonpositive settings the way upload and download
+     * enforce them (no positive size, one hour, 1 GiB quotas), so these are the effective limits;
+     * the clamps only keep the contract's floors should that resolution ever change. */
     long long max_bytes = config.max_attachment_bytes > 0 ? config.max_attachment_bytes : 0;
     long long retention = config.retention_hours > 0 ? config.retention_hours : 1;
     long long storage_quota = config.storage_quota_bytes > 0

@@ -22,6 +22,9 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Java GlobalExceptionHandler for a DataIntegrityViolationException. */
+#define ST_CLIENT_PACKAGE_DUPLICATE_REFUSAL "客户端名称已存在或数据不符合约束"
+
 #define ST_PACKAGE_DEFAULT_MAX_BYTES (512ULL * 1024ULL * 1024ULL)
 #define ST_PACKAGE_DEFAULT_MAX_REQUEST_BYTES (513ULL * 1024ULL * 1024ULL)
 #define ST_PACKAGE_BOUNDARY_MAX 200U
@@ -841,14 +844,18 @@ int st_client_package_upload(const char *database_path,
     metadata.file_size = (long long)form.file_len;
     package_download_name(&metadata, metadata.package_file_name);
     st_storage_client_download_link pending;
-    if (st_storage_upsert_client_download_link_extended(database_path, 0,
+    int inserted = st_storage_upsert_client_download_link_extended(database_path, 0,
             metadata.implementation, metadata.platform, metadata.arch, metadata.display_name,
             "pending", metadata.description, metadata.display_order, 0, metadata.version,
             metadata.sha256, metadata.file_size, 0, metadata.changelog_url,
-            metadata.min_supported_version, 1, NULL, metadata.package_file_name, &pending) != 0) {
+            metadata.min_supported_version, 1, NULL, metadata.package_file_name, &pending);
+    if (inserted != 0) {
         unlink(temporary);
-        if (http_status != NULL) *http_status = 409;
-        package_error(error, error_len, "client package catalogue create failed");
+        /* Java: a target that already lists the version fails the catalogue's unique key (400). */
+        int duplicate = inserted == ST_STORAGE_CLIENT_DOWNLOAD_DUPLICATE;
+        if (http_status != NULL) *http_status = duplicate ? 400 : 409;
+        package_error(error, error_len, duplicate ? ST_CLIENT_PACKAGE_DUPLICATE_REFUSAL
+                                                  : "client package catalogue create failed");
         return -1;
     }
     char final_path[PATH_MAX];
@@ -876,16 +883,19 @@ int st_client_package_upload(const char *database_path,
         return -1;
     }
     st_storage_client_download_link published;
-    if (st_storage_upsert_client_download_link_extended(database_path, pending.id,
+    int publish = st_storage_upsert_client_download_link_extended(database_path, pending.id,
             metadata.implementation, metadata.platform, metadata.arch, metadata.display_name,
             download_url, metadata.description, metadata.display_order, metadata.enabled,
             metadata.version, metadata.sha256, metadata.file_size, latest,
             metadata.changelog_url, metadata.min_supported_version, 1, final_path,
-            metadata.package_file_name, &published) != 0) {
+            metadata.package_file_name, &published);
+    if (publish != 0) {
         unlink(final_path);
         (void)st_storage_delete_client_download_link(database_path, pending.id);
-        if (http_status != NULL) *http_status = 409;
-        package_error(error, error_len, "client package publish failed");
+        int duplicate = publish == ST_STORAGE_CLIENT_DOWNLOAD_DUPLICATE;
+        if (http_status != NULL) *http_status = duplicate ? 400 : 409;
+        package_error(error, error_len, duplicate ? ST_CLIENT_PACKAGE_DUPLICATE_REFUSAL
+                                                  : "client package publish failed");
         return -1;
     }
     if (out_link != NULL) *out_link = published;
