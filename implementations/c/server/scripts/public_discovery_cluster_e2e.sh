@@ -52,7 +52,7 @@ SERVER_ONE_PID=$!
 start_server "$CONTROL_TWO" "$ADMIN_TWO" "$TMP_DIR/server-two.log"
 SERVER_TWO_PID=$!
 
-if ! python3 - "$ADMIN_ONE" "$ADMIN_TWO" "$REDIS_PORT" <<'PY'
+if ! python3 - "$ADMIN_ONE" "$ADMIN_TWO" "$REDIS_PORT" "$SERVER_BINARY" "$TMP_DIR" <<'PY'
 import base64
 import hashlib
 import http.client
@@ -65,7 +65,13 @@ import sys
 import time
 import urllib.parse
 
-ADMIN_ONE, ADMIN_TWO, REDIS_PORT = map(int, sys.argv[1:])
+ADMIN_ONE, ADMIN_TWO, REDIS_PORT = map(int, sys.argv[1:4])
+SERVER_BINARY, TMP_DIR = sys.argv[4:6]
+
+def free_port():
+    with socket.socket() as channel:
+        channel.bind(("127.0.0.1", 0))
+        return channel.getsockname()[1]
 
 def request(port, method, path, body=None):
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
@@ -156,6 +162,53 @@ class WebSocket:
                 raise EOFError(f"websocket closed: {payload!r}")
         raise TimeoutError("matching websocket JSON was not received")
 
+def server_environment(admin_port, **settings):
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("SPECUS_")}
+    environment.update(SPECUS_ENV="dev", SPECUS_DB_SEED_DEMO_CLIENT="false",
+                       SPECUS_CLIENT_NAME=f"binding-{admin_port}",
+                       SPECUS_CLIENT_ACCESS_TOKEN=f"binding-test-token-{admin_port}",
+                       SPECUS_NETTY_PORT=str(free_port()), SPECUS_ADMIN_PORT=str(admin_port))
+    environment.update(settings)
+    return environment
+
+def startup_binding_checks():
+    # Spring binds SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED: an unknown value fails startup, and
+    # " Off " is false, so the server runs standalone without any Redis URI.
+    log_path = os.path.join(TMP_DIR, "binding-maybe.log")
+    with open(log_path, "wb") as log:
+        result = subprocess.run([SERVER_BINARY], stdout=log, stderr=log, timeout=20,
+                                env=server_environment(free_port(),
+                                                       SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED="maybe"))
+    with open(log_path, "rb") as log:
+        output = log.read()
+    if result.returncode != 1 or b"invalid boolean SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED" not in output:
+        raise RuntimeError(f"an unknown cluster switch was accepted: {result.returncode} {output[-400:]!r}")
+    port = free_port()
+    with open(os.path.join(TMP_DIR, "binding-off.log"), "wb") as log:
+        standalone = subprocess.Popen([SERVER_BINARY], stdout=log, stderr=log,
+                                      env=server_environment(port, SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED=" Off "))
+    try:
+        deadline = time.time() + 15
+        while True:
+            if standalone.poll() is not None:
+                raise RuntimeError(f"' Off ' did not start standalone (exit {standalone.returncode})")
+            try:
+                status, _ = request(port, "GET", "/api/public/transfer/clients/name-availability?clientName=probe")
+                if status == 200:
+                    break
+            except OSError:
+                pass
+            if time.time() > deadline:
+                raise RuntimeError("the standalone server did not become ready")
+            time.sleep(0.1)
+    finally:
+        standalone.terminate()
+        try:
+            standalone.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            standalone.kill()
+            standalone.wait(timeout=5)
+
 def wait_ready():
     deadline = time.time() + 15
     while time.time() < deadline:
@@ -169,6 +222,7 @@ def wait_ready():
         time.sleep(0.1)
     raise RuntimeError("cluster servers did not become ready")
 
+startup_binding_checks()
 wait_ready()
 one = WebSocket(ADMIN_ONE, issue_ticket(ADMIN_ONE, "peer-a", "Alice"))
 two = WebSocket(ADMIN_TWO, issue_ticket(ADMIN_TWO, "peer-b", "Bob"))

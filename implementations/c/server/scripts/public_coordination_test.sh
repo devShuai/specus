@@ -8,6 +8,8 @@ PORT="${SPECUS_TEST_REDIS_PORT:-16389}"
 cleanup() {
   set +e
   if [[ -n "${REDIS_PID:-}" ]]; then kill "$REDIS_PID" 2>/dev/null || true; fi
+  # The reconnect test restarts redis-server on the same port; stop whichever instance is left.
+  redis-cli -h 127.0.0.1 -p "$PORT" shutdown nosave >/dev/null 2>&1 || true
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
@@ -22,6 +24,8 @@ for _ in $(seq 1 60); do
 done
 redis-cli -h 127.0.0.1 -p "$PORT" ping >/dev/null
 
+SPECUS_TEST_REDIS_PORT="$PORT" \
+SPECUS_TEST_REDIS_DIR="$TMP_DIR" \
 SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED=true \
 SPECUS_PUBLIC_TRANSFER_REDIS_URI="redis://127.0.0.1:$PORT/0" \
 SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX="specus:test:coordination" \

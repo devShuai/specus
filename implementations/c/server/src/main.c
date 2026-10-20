@@ -11,6 +11,7 @@
 #include "peer_mesh.h"
 #include "product_metrics.h"
 #include "protocol.h"
+#include "public_coordination.h"
 #include "public_discovery.h"
 #include "security_baseline.h"
 #include "storage.h"
@@ -5606,6 +5607,10 @@ int main(void)
         return 1;
     }
     if (configure_login_test_gate() != 0) {
+        return 1;
+    }
+    /* Spring binds these settings, and fails startup on bad values, whether or not clustering is on. */
+    if (st_public_coordination_validate_config() != 0) {
         return 1;
     }
     if (st_public_discovery_initialize() != 0) {

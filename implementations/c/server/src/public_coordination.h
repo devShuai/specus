@@ -58,7 +58,17 @@ typedef struct {
 typedef void (*st_public_cluster_event_handler)(const st_public_cluster_event *event,
                                                 void *context);
 
+/*
+ * SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED as Spring binds it: trimmed, case-insensitive
+ * true/on/yes/1 or false/off/no/0; unset or blank is false. Any other value is a configuration
+ * error that st_public_coordination_validate_config() reports, and reads as disabled here.
+ */
 int st_public_coordination_enabled(void);
+/*
+ * Startup check of the cluster settings Spring binds whether or not clustering is on: the switch
+ * must be a boolean and the lease, refresh and timeout values must be numbers. 0 or -1 (logged).
+ */
+int st_public_coordination_validate_config(void);
 int st_public_coordination_initialize(st_public_cluster_event_handler handler, void *context);
 void st_public_coordination_shutdown(void);
 int st_public_coordination_available(void);

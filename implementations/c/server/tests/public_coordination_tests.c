@@ -2,8 +2,14 @@
 
 #include "public_coordination.h"
 
+#include "crypto.h"
+
+#include <errno.h>
+#include <hiredis/hiredis.h>
 #include <pthread.h>
 #include <signal.h>
+#include <spawn.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +27,8 @@ typedef struct {
     char target[ST_PUBLIC_CLUSTER_EVENT_ID_BYTES + 1U];
     char payload[256];
 } event_capture;
+
+extern char **environ;
 
 static event_capture capture = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
@@ -41,6 +49,44 @@ static void capture_event(const st_public_cluster_event *event, void *context)
     capture.received = 1;
     pthread_cond_broadcast(&capture.cond);
     pthread_mutex_unlock(&capture.lock);
+}
+
+static long long now_ms(void)
+{
+    struct timespec now;
+    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000L;
+}
+
+static void sleep_ms(long milliseconds)
+{
+    struct timespec pause = {.tv_sec = milliseconds / 1000L, .tv_nsec = (milliseconds % 1000L) * 1000000L};
+    while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {
+    }
+}
+
+static int fixture_port(void)
+{
+    const char *port = getenv("SPECUS_TEST_REDIS_PORT");
+    return port == NULL ? 16389 : atoi(port);
+}
+
+/* One command of the fixture itself, on its own short-lived connection. */
+static redisReply *fixture_command(const char *format, ...)
+{
+    struct timeval timeout = {.tv_sec = 2, .tv_usec = 0};
+    redisContext *redis = redisConnectWithTimeout("127.0.0.1", fixture_port(), timeout);
+    if (redis == NULL || redis->err) {
+        if (redis != NULL) redisFree(redis);
+        return NULL;
+    }
+    (void)redisSetTimeout(redis, timeout);
+    va_list arguments;
+    va_start(arguments, format);
+    redisReply *reply = (redisReply *)redisvCommand(redis, format, arguments);
+    va_end(arguments);
+    redisFree(redis);
+    return reply;
 }
 
 static int wait_for_event(void)
@@ -211,6 +257,177 @@ static int test_unidentifiable_addresses(void)
     return 0;
 }
 
+/* ---- Spring binding of the cluster settings, each in a fresh process ------------------------- */
+
+static int probe_presence(void)
+{
+    if (st_public_coordination_initialize(NULL, NULL) != 0) return 20;
+    char peer_id[64];
+    snprintf(peer_id, sizeof(peer_id), "probe-%ld", (long)getpid());
+    st_public_cluster_participant probe;
+    uint64_t revision = 0U;
+    if (participant(&probe, peer_id, peer_id, "probe-room", "room:probe", "192.0.2.77") != 0
+        || st_public_coordination_register(&probe, 10, &revision) != 0) return 21;
+    uint8_t digest[ST_SHA256_LEN];
+    char member[ST_SHA256_LEN * 2U + 1U];
+    st_sha256((const uint8_t *)peer_id, strlen(peer_id), digest);
+    st_hex_encode(digest, sizeof(digest), member);
+    const char *prefix = getenv("SPECUS_TEST_EXPECT_PREFIX");
+    long long lease = atoll(getenv("SPECUS_TEST_EXPECT_LEASE_MS"));
+    redisReply *ttl = fixture_command("PTTL %s:presence:%s:%s", prefix, probe.group_id, member);
+    int result = ttl != NULL && ttl->type == REDIS_REPLY_INTEGER && ttl->integer > lease - 1000
+        && ttl->integer <= lease ? 0 : 22;
+    if (result != 0) fprintf(stderr, "presence PTTL under prefix '%s': %lld, expected %lld\n", prefix,
+                             ttl == NULL ? -9LL : ttl->integer, lease);
+    freeReplyObject(ttl);
+    (void)st_public_coordination_unregister(&probe, &revision);
+    st_public_coordination_shutdown();
+    return result;
+}
+
+static int probe_timeout(void)
+{
+    if (st_public_coordination_initialize(NULL, NULL) != 0) return 30;
+    redisReply *paused = fixture_command("CLIENT PAUSE %d", 400);
+    freeReplyObject(paused);
+    long long started = now_ms();
+    int available = 0;
+    int failed = st_public_coordination_name_available("Timeout Probe", "", &available) == -1;
+    long long elapsed = now_ms() - started;
+    sleep_ms(500);
+    st_public_coordination_shutdown();
+    if (!failed || elapsed > 350) {
+        fprintf(stderr, "command timeout 0 did not mean 100 ms (%lld ms)\n", elapsed);
+        return 31;
+    }
+    return 0;
+}
+
+static int run_probe(const char *probe)
+{
+    if (strcmp(probe, "disabled") == 0)
+        return !st_public_coordination_enabled() && st_public_coordination_validate_config() == 0 ? 0 : 10;
+    if (strcmp(probe, "enabled") == 0)
+        return st_public_coordination_enabled() && st_public_coordination_validate_config() == 0 ? 0 : 11;
+    if (strcmp(probe, "invalid") == 0)
+        return !st_public_coordination_enabled() && st_public_coordination_validate_config() == -1 ? 0 : 12;
+    if (strcmp(probe, "invalid-number") == 0) return st_public_coordination_validate_config() == -1 ? 0 : 13;
+    if (strcmp(probe, "refused") == 0) {
+        int refused = st_public_coordination_validate_config() == 0
+            && st_public_coordination_initialize(NULL, NULL) == -1;
+        st_public_coordination_shutdown();
+        return refused ? 0 : 14;
+    }
+    if (strcmp(probe, "presence") == 0) return probe_presence();
+    if (strcmp(probe, "timeout") == 0) return probe_timeout();
+    return 99;
+}
+
+/* Runs one probe in a fresh process whose environment differs by the NAME, VALUE pairs. */
+static int probe_with(const char *probe, const char *const *settings, size_t count)
+{
+    size_t inherited = 0U;
+    while (environ[inherited] != NULL) ++inherited;
+    char **environment = (char **)calloc(inherited + count / 2U + 1U, sizeof(*environment));
+    if (environment == NULL) return -1;
+    size_t used = 0U;
+    for (size_t i = 0U; i < inherited; ++i) {
+        int replaced = 0;
+        for (size_t s = 0U; s + 1U < count && !replaced; s += 2U) {
+            size_t len = strlen(settings[s]);
+            replaced = strncmp(environ[i], settings[s], len) == 0 && environ[i][len] == '=';
+        }
+        if (!replaced) environment[used++] = strdup(environ[i]);
+    }
+    for (size_t s = 0U; s + 1U < count; s += 2U) {
+        size_t len = strlen(settings[s]) + strlen(settings[s + 1U]) + 2U;
+        environment[used] = (char *)malloc(len);
+        if (environment[used] != NULL) snprintf(environment[used], len, "%s=%s", settings[s], settings[s + 1U]);
+        ++used;
+    }
+    char *const argv[] = {"public_coordination_tests", "--probe", (char *)probe, NULL};
+    pid_t child = -1;
+    int rc = posix_spawn(&child, "/proc/self/exe", NULL, NULL, argv, environment);
+    for (size_t i = 0U; i < used; ++i) free(environment[i]);
+    free(environment);
+    int status = 0;
+    if (rc != 0 || waitpid(child, &status, 0) != child || !WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+
+#define PROBE(name, ...) \
+    probe_with((name), (const char *const[]){__VA_ARGS__}, \
+               sizeof((const char *const[]){__VA_ARGS__}) / sizeof(const char *))
+
+/*
+ * PublicTransferProperties as Spring binds them: the switch takes true/false, on/off, yes/no or 1/0
+ * in any case and with blanks, the numbers fail startup unless they parse (with or without
+ * clustering), the lease and timeout have floors of 5 s and 100 ms, refresh must be positive and
+ * under half the lease, and the key prefix is trimmed of blanks and trailing colons, a blank one
+ * meaning the default.
+ */
+static int test_spring_binding(void)
+{
+    char uri[128];
+    snprintf(uri, sizeof(uri), "  redis://127.0.0.1:%d/0 ", fixture_port());
+    struct {
+        const char *label;
+        int result;
+    } checks[] = {
+        {"' OFF ' is false", PROBE("disabled", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", " OFF ")},
+        {"'No' is false", PROBE("disabled", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", "No")},
+        {"blank is unset", PROBE("disabled", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", "   ")},
+        {"' On ' is true", PROBE("enabled", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", " On ")},
+        {"'YES' is true", PROBE("enabled", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", "YES")},
+        {"'maybe' fails", PROBE("invalid", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", "maybe")},
+        {"'enabled' fails", PROBE("invalid", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", "enabled")},
+        {"a word lease fails even standalone",
+         PROBE("invalid-number", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", "false",
+               "SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS", "abc")},
+        {"a fractional refresh fails", PROBE("invalid-number", "SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", "1.5")},
+        {"a unit on the timeout fails", PROBE("invalid-number", "SPECUS_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS", "2s")},
+        {"a blank number fails", PROBE("invalid-number", "SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS", " ")},
+        {"refresh 0 refuses to start", PROBE("refused", "SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", "0")},
+        {"a negative refresh refuses to start",
+         PROBE("refused", "SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", "-5")},
+        {"lease 0 is 5 s, too short for the default refresh",
+         PROBE("refused", "SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS", "0")},
+        {"lease 0 is 5 s", PROBE("presence", "SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS", "0",
+                                 "SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", "1000",
+                                 "SPECUS_TEST_EXPECT_PREFIX", "specus:test:coordination",
+                                 "SPECUS_TEST_EXPECT_LEASE_MS", "5000")},
+        {"whitespace inside a number is removed",
+         PROBE("presence", "SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS", " 1 0 ",
+               "SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", "1000",
+               "SPECUS_TEST_EXPECT_PREFIX", "specus:test:coordination", "SPECUS_TEST_EXPECT_LEASE_MS", "10000")},
+        {"a hexadecimal lease", PROBE("presence", "SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS", "0x1E",
+                                      "SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", "1000",
+                                      "SPECUS_TEST_EXPECT_PREFIX", "specus:test:coordination",
+                                      "SPECUS_TEST_EXPECT_LEASE_MS", "30000")},
+        {"a blank prefix is the default",
+         PROBE("presence", "SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX", "   ",
+               "SPECUS_TEST_EXPECT_PREFIX", "specus:v2:public-transfer", "SPECUS_TEST_EXPECT_LEASE_MS", "30000")},
+        {"a prefix of colons is empty",
+         PROBE("presence", "SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX", "::",
+               "SPECUS_TEST_EXPECT_PREFIX", "", "SPECUS_TEST_EXPECT_LEASE_MS", "30000")},
+        {"trim, then the trailing colons",
+         PROBE("presence", "SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX", " probe tail ::\t",
+               "SPECUS_TEST_EXPECT_PREFIX", "probe tail ", "SPECUS_TEST_EXPECT_LEASE_MS", "30000")},
+        {"the URI is trimmed",
+         PROBE("presence", "SPECUS_PUBLIC_TRANSFER_REDIS_URI", uri,
+               "SPECUS_TEST_EXPECT_PREFIX", "specus:test:coordination", "SPECUS_TEST_EXPECT_LEASE_MS", "30000")},
+        {"timeout 0 is 100 ms", PROBE("timeout", "SPECUS_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS", "0")}
+    };
+    int failed = 0;
+    for (size_t i = 0U; i < sizeof(checks) / sizeof(checks[0]); ++i) {
+        if (checks[i].result != 0) {
+            fprintf(stderr, "Spring binding: %s (probe exit %d)\n", checks[i].label, checks[i].result);
+            failed = 1;
+        }
+    }
+    return failed;
+}
+
 /*
  * The second instance of PublicTransferCoordinationRedisIT.twoInstancesSharePresenceEventsNamesAndRateLimits,
  * run as a separate process over the same Redis while the first still holds Alice and Bob in
@@ -264,6 +481,7 @@ int main(int argc, char **argv)
     /* hiredis writes without MSG_NOSIGNAL; a dropped Redis connection must fail a call, not the run. */
     (void)signal(SIGPIPE, SIG_IGN);
     if (argc > 1 && strcmp(argv[1], "--second-instance") == 0) return second_instance();
+    if (argc > 2 && strcmp(argv[1], "--probe") == 0) return run_probe(argv[2]);
     if (!st_public_coordination_enabled()
         || st_public_coordination_initialize(capture_event, NULL) != 0) {
         fprintf(stderr, "Redis coordination did not initialize\n");
@@ -383,7 +601,9 @@ int main(int argc, char **argv)
     (void)st_public_coordination_unregister(&p3, &revision);
     (void)st_public_coordination_unregister(&unicode_name, &revision);
     if (test_merged_roster_and_revision() != 0 || test_unidentifiable_addresses() != 0) return 1;
+    int failed = test_spring_binding() != 0;
     st_public_coordination_shutdown();
+    if (failed) return 1;
     puts("public coordination tests passed");
     return 0;
 }

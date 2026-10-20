@@ -59,6 +59,8 @@ static st_cluster_state cluster_state = {
     .command_lock = PTHREAD_MUTEX_INITIALIZER
 };
 
+static int cluster_java_whitespace(utf8proc_int32_t codepoint);
+
 static const char cluster_register_script[] =
     "local members = redis.call('SMEMBERS', KEYS[3])\n"
     "local count = 0\n"
@@ -131,27 +133,138 @@ static const char cluster_rate_script[] =
     "if count > tonumber(ARGV[1]) then return 0 end\n"
     "return 1";
 
-static int cluster_env_bool(const char *name, int fallback)
+#define ST_CLUSTER_ENABLED_ENV "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED"
+#define ST_CLUSTER_LEASE_ENV "SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS"
+#define ST_CLUSTER_REFRESH_ENV "SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS"
+#define ST_CLUSTER_TIMEOUT_ENV "SPECUS_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS"
+
+/* Java String.trim(): drops code units up to U+0020 at both ends. */
+static const char *cluster_java_trim(const char *value, size_t *len)
 {
-    const char *value = getenv(name);
-    if (value == NULL || *value == '\0') return fallback;
-    return strcmp(value, "0") != 0 && strcasecmp(value, "false") != 0
-        && strcasecmp(value, "no") != 0;
+    const char *start = value == NULL ? "" : value;
+    while (*start != '\0' && (unsigned char)*start <= 0x20U) ++start;
+    size_t end = strlen(start);
+    while (end > 0U && (unsigned char)start[end - 1U] <= 0x20U) --end;
+    *len = end;
+    return start;
 }
 
-static long cluster_env_long(const char *name, long fallback)
+/*
+ * Spring's StringToBooleanConverter: the trimmed value, case-insensitive, is one of
+ * true/on/yes/1 (1) or false/off/no/0 (0). Unset or blank binds nothing (-2); anything else
+ * fails the binding (-1).
+ */
+static int cluster_spring_bool(const char *value)
 {
-    const char *value = getenv(name);
-    if (value == NULL || *value == '\0') return fallback;
-    char *end = NULL;
-    errno = 0;
-    long parsed = strtol(value, &end, 10);
-    return errno == 0 && end != value && *end == '\0' && parsed > 0 ? parsed : fallback;
+    if (value == NULL) return -2;
+    size_t len = 0U;
+    const char *start = cluster_java_trim(value, &len);
+    if (len == 0U) return -2;
+    char lowered[8];
+    if (len >= sizeof(lowered)) return -1;
+    for (size_t i = 0U; i < len; ++i) lowered[i] = (char)tolower((unsigned char)start[i]);
+    lowered[len] = '\0';
+    static const char *const true_values[] = {"true", "on", "yes", "1"};
+    static const char *const false_values[] = {"false", "off", "no", "0"};
+    for (size_t i = 0U; i < 4U; ++i) {
+        if (strcmp(lowered, true_values[i]) == 0) return 1;
+        if (strcmp(lowered, false_values[i]) == 0) return 0;
+    }
+    return -1;
+}
+
+/*
+ * Spring's StringToNumberConverterFactory for a long: an empty value binds nothing (-2); otherwise
+ * NumberUtils.parseNumber removes every whitespace character and reads Long.valueOf (an optional
+ * sign and decimal digits) or, after an optional '-', a 0x, 0X or # prefix, Long.decode's
+ * hexadecimal. Anything else, including overflow, fails the binding (-1).
+ */
+static int cluster_spring_long(const char *value, long long *out)
+{
+    if (value == NULL || *value == '\0') return -2;
+    size_t source_len = strlen(value);
+    char *compact = (char *)malloc(source_len + 1U);
+    if (compact == NULL) return -1;
+    size_t len = 0U;
+    size_t offset = 0U;
+    while (offset < source_len) {
+        utf8proc_int32_t codepoint = 0;
+        utf8proc_ssize_t consumed = utf8proc_iterate((const utf8proc_uint8_t *)value + offset,
+                                                     (utf8proc_ssize_t)(source_len - offset),
+                                                     &codepoint);
+        if (consumed <= 0) {
+            free(compact);
+            return -1;
+        }
+        if (!cluster_java_whitespace(codepoint)) {
+            memcpy(compact + len, value + offset, (size_t)consumed);
+            len += (size_t)consumed;
+        }
+        offset += (size_t)consumed;
+    }
+    compact[len] = '\0';
+    const char *cursor = compact;
+    int negative = 0;
+    int hex = 0;
+    if (*cursor == '-' || *cursor == '+') {
+        negative = *cursor == '-';
+        ++cursor;
+    }
+    if (compact[0] != '+' && (strncmp(cursor, "0x", 2U) == 0 || strncmp(cursor, "0X", 2U) == 0)) {
+        hex = 1;
+        cursor += 2;
+    } else if (compact[0] != '+' && *cursor == '#') {
+        hex = 1;
+        ++cursor;
+    }
+    int base = hex ? 16 : 10;
+    unsigned long long magnitude = 0U;
+    unsigned long long limit = negative ? (unsigned long long)LLONG_MAX + 1U : (unsigned long long)LLONG_MAX;
+    int valid = *cursor != '\0';
+    for (; valid && *cursor != '\0'; ++cursor) {
+        int digit = isdigit((unsigned char)*cursor) ? *cursor - '0'
+            : hex && isxdigit((unsigned char)*cursor) ? tolower((unsigned char)*cursor) - 'a' + 10 : -1;
+        if (digit < 0 || magnitude > (limit - (unsigned long long)digit) / (unsigned long long)base) {
+            valid = 0;
+        } else {
+            magnitude = magnitude * (unsigned long long)base + (unsigned long long)digit;
+        }
+    }
+    free(compact);
+    if (!valid) return -1;
+    *out = negative ? (magnitude == (unsigned long long)LLONG_MAX + 1U ? LLONG_MIN : -(long long)magnitude)
+                    : (long long)magnitude;
+    return 0;
 }
 
 int st_public_coordination_enabled(void)
 {
-    return cluster_env_bool("SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", 0);
+    return cluster_spring_bool(getenv(ST_CLUSTER_ENABLED_ENV)) == 1;
+}
+
+int st_public_coordination_validate_config(void)
+{
+    if (cluster_spring_bool(getenv(ST_CLUSTER_ENABLED_ENV)) == -1) {
+        fprintf(stderr, "invalid boolean %s; use true/false, on/off, yes/no or 1/0\n", ST_CLUSTER_ENABLED_ENV);
+        return -1;
+    }
+    static const char *const numbers[] = {ST_CLUSTER_LEASE_ENV, ST_CLUSTER_REFRESH_ENV, ST_CLUSTER_TIMEOUT_ENV};
+    for (size_t i = 0U; i < sizeof(numbers) / sizeof(numbers[0]); ++i) {
+        long long ignored = 0;
+        if (cluster_spring_long(getenv(numbers[i]), &ignored) == -1) {
+            fprintf(stderr, "invalid number %s\n", numbers[i]);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* The bound value, or fallback when the variable binds nothing; -1 when it is not a number. */
+static int cluster_env_long(const char *name, long long fallback, long long *out)
+{
+    int parsed = cluster_spring_long(getenv(name), out);
+    if (parsed == -2) *out = fallback;
+    return parsed == -1 ? -1 : 0;
 }
 
 static int cluster_percent_decode(const char *source, size_t len, char *out, size_t out_len)
@@ -174,11 +287,39 @@ static int cluster_percent_decode(const char *source, size_t len, char *out, siz
     return 0;
 }
 
+/* Java's StringUtils.hasText: some character that is not Character.isWhitespace. */
+static int cluster_has_text(const char *value)
+{
+    if (value == NULL) return 0;
+    size_t len = strlen(value);
+    size_t offset = 0U;
+    while (offset < len) {
+        utf8proc_int32_t codepoint = 0;
+        utf8proc_ssize_t consumed = utf8proc_iterate((const utf8proc_uint8_t *)value + offset,
+                                                     (utf8proc_ssize_t)(len - offset),
+                                                     &codepoint);
+        if (consumed <= 0 || !cluster_java_whitespace(codepoint)) return 1;
+        offset += (size_t)consumed;
+    }
+    return 0;
+}
+
 static int cluster_parse_uri(st_cluster_config *config)
 {
-    const char *uri = getenv("SPECUS_PUBLIC_TRANSFER_REDIS_URI");
+    /* Java: RedisURI.create(redisUri.trim()). */
+    size_t uri_len = 0U;
+    const char *raw_uri = getenv("SPECUS_PUBLIC_TRANSFER_REDIS_URI");
+    const char *trimmed_uri = cluster_java_trim(raw_uri, &uri_len);
+    char uri_buffer[2048];
     static const char scheme[] = "redis://";
-    if (uri == NULL || strncmp(uri, scheme, sizeof(scheme) - 1U) != 0) {
+    if (raw_uri == NULL || uri_len >= sizeof(uri_buffer)) {
+        fprintf(stderr, "public transfer Redis URI must use redis://\n");
+        return -1;
+    }
+    memcpy(uri_buffer, trimmed_uri, uri_len);
+    uri_buffer[uri_len] = '\0';
+    const char *uri = uri_buffer;
+    if (strncmp(uri, scheme, sizeof(scheme) - 1U) != 0) {
         fprintf(stderr, "public transfer Redis URI must use redis://\n");
         return -1;
     }
@@ -254,29 +395,38 @@ static int cluster_parse_uri(st_cluster_config *config)
         if (end == database_text || *end != '\0' || parsed < 0 || parsed > 15) return -1;
         config->database = (int)parsed;
     }
+    /*
+     * Java keyPrefix(): a value without text means the default; otherwise trim() and drop the
+     * trailing colons, which may leave an empty prefix ("::").
+     */
     const char *prefix = getenv("SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX");
-    if (prefix == NULL || *prefix == '\0') prefix = "specus:v2:public-transfer";
-    while (isspace((unsigned char)*prefix)) ++prefix;
-    size_t prefix_len = strlen(prefix);
-    while (prefix_len > 0U && (isspace((unsigned char)prefix[prefix_len - 1U])
-            || prefix[prefix_len - 1U] == ':')) --prefix_len;
-    if (prefix_len == 0U || prefix_len >= sizeof(config->key_prefix)) return -1;
+    if (!cluster_has_text(prefix)) prefix = "specus:v2:public-transfer";
+    size_t prefix_len = 0U;
+    prefix = cluster_java_trim(prefix, &prefix_len);
+    while (prefix_len > 0U && prefix[prefix_len - 1U] == ':') --prefix_len;
+    if (prefix_len >= sizeof(config->key_prefix)) return -1;
     memcpy(config->key_prefix, prefix, prefix_len);
     config->key_prefix[prefix_len] = '\0';
-    config->lease_seconds = cluster_env_long("SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS", 30L);
-    if (config->lease_seconds < 5L) config->lease_seconds = 5L;
-    config->refresh_interval_ms = cluster_env_long(
-        "SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", 10000L);
-    config->command_timeout_ms = cluster_env_long(
-        "SPECUS_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS", 2000L);
-    if (config->command_timeout_ms < 100L) config->command_timeout_ms = 100L;
-    if (config->lease_seconds > LONG_MAX / 1000L
-        || config->refresh_interval_ms > LONG_MAX / 2L
-        || config->refresh_interval_ms <= 0L
-        || config->refresh_interval_ms * 2L >= config->lease_seconds * 1000L) {
+    long long lease = 0;
+    long long refresh = 0;
+    long long timeout = 0;
+    if (cluster_env_long(ST_CLUSTER_LEASE_ENV, 30, &lease) != 0
+        || cluster_env_long(ST_CLUSTER_REFRESH_ENV, 10000, &refresh) != 0
+        || cluster_env_long(ST_CLUSTER_TIMEOUT_ENV, 2000, &timeout) != 0) {
+        fprintf(stderr, "public transfer cluster settings must be numbers\n");
+        return -1;
+    }
+    /* Java leaseMillis() = max(5, lease) * 1000 and commandTimeoutMillis() = max(100, timeout). */
+    if (lease < 5) lease = 5;
+    if (timeout < 100) timeout = 100;
+    if (lease > LONG_MAX / 1000L || timeout > LONG_MAX || refresh > LONG_MAX / 2L
+        || refresh <= 0 || refresh * 2 >= lease * 1000) {
         fprintf(stderr, "public transfer presence refresh must be positive and less than half the lease TTL\n");
         return -1;
     }
+    config->lease_seconds = (long)lease;
+    config->refresh_interval_ms = (long)refresh;
+    config->command_timeout_ms = (long)timeout;
     return 0;
 }
 
