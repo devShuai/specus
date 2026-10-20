@@ -166,6 +166,19 @@ final class PeerEgressMesh implements AutoCloseable {
         }
 
         /**
+         * Whether the device carries IPv6: up with its derived address assigned, and why not when it
+         * is not ({@link PeerVirtualDevice#ipv6Readiness}). None by default.
+         */
+        default PeerVirtualDevice.Ipv6Readiness deviceIpv6() {
+            return PeerVirtualDevice.Ipv6Readiness.no("the virtual device carries no IPv6");
+        }
+
+        /** The Peer Mesh MTU this device runs with, which decides whether it can carry IPv6 at all. */
+        default int peerMeshMtu() {
+            return PeerVirtualDeviceOptions.DEFAULT_MTU;
+        }
+
+        /**
          * The hosts the tunnel's transport talks to, as URLs, host:port pairs or bare hosts: the
          * control connection, the login server, STUN and TURN, the relay. Resolved by the plane,
          * so a hostname is fine here.
@@ -296,6 +309,15 @@ final class PeerEgressMesh implements AutoCloseable {
     private long repairAtMillis;
     private boolean repairTroubled;
     private String tableErrorLogged = "";
+    /**
+     * Overrides what the platform and peerMeshMtu say about the IPv6 data plane
+     * ({@link PeerEgressRouteCommanders#consumerCarriesIpv6}); the device must still carry IPv6.
+     * Null means the real answer; tests set it so the IPv6 paths run on every platform the suite
+     * runs on.
+     */
+    Boolean ipv6Platform;
+    /** The last reason logged for IPv6 rules being out of force. Under {@link #planLock}. */
+    private String ipv6Logged = "";
 
     PeerEgressMesh(Host host) {
         this(host, new PeerEgressSocketDialer(PeerEgressSocketBinder.forPlatform(() -> host.tunName())),
@@ -436,6 +458,9 @@ final class PeerEgressMesh implements AutoCloseable {
             if (consumer == null) {
                 PeerEgressConsumer built = new PeerEgressConsumer(host::sendToPeer, host::writeToDevice);
                 built.setLocalAddresses(this::isLocalAddress);
+                // Whether this device carries IPv6 is given with every configuration, since it
+                // depends on the device as well as on the platform.
+                built.setPathMtu(this::pathMtu);
                 consumer = built;
             }
             return consumer;
@@ -510,7 +535,10 @@ final class PeerEgressMesh implements AutoCloseable {
         if (outcome == PeerEgressConsumer.Outcome.NOT_MINE) {
             return false;
         }
-        if (outcome != PeerEgressConsumer.Outcome.FORWARDED && outcome != PeerEgressConsumer.Outcome.DNS) {
+        // Nor is the system's own IPv6 chatter on the TUN -- neighbour discovery, multicast reports --
+        // which arrives on its own schedule and is no one's traffic.
+        if (outcome != PeerEgressConsumer.Outcome.FORWARDED && outcome != PeerEgressConsumer.Outcome.DNS
+                && outcome != PeerEgressConsumer.Outcome.IGNORED) {
             // Logged without the destination: a per-destination record of what a user was blocked
             // from reaching is their own browsing history.
             log.debug("[peer-egress-consumer] packet not forwarded: {}", outcome);
@@ -568,8 +596,9 @@ final class PeerEgressMesh implements AutoCloseable {
             return;
         }
         log.info("[peer-egress-consumer] egress catalogue applied revision={} listed={} egressVersion={}"
-                        + " domainTargetCapable={}",
-                catalog.revision(), catalog.listedIds(), catalog.egressVersions(), catalog.domainCapableIds());
+                        + " domainTargetCapable={} ipv6PacketCapable={}",
+                catalog.revision(), catalog.listedIds(), catalog.egressVersions(), catalog.domainCapableIds(),
+                catalog.ipv6CapableIds());
         pushCatalogToConsumer();
     }
 
@@ -939,13 +968,20 @@ final class PeerEgressMesh implements AutoCloseable {
         // A consumer that exists is reconfigured even with nothing left for it to do: phase two
         // stopping (the mesh network moving over the pool, say) with no rules would otherwise leave
         // it holding the pool and a stopped responder, steering by a pool nothing routes any more.
+        //
+        // Whether the device carries IPv6 is read once for this whole reconcile: the consumer, the
+        // plan and the bypass list all act on the same answer.
+        PeerVirtualDevice.Ipv6Readiness ipv6 = ipv6State();
         Map<Long, List<String>> purge = rules.isEmpty() && pool == null && consumer == null ? Map.of()
-                : configureConsumer(rules, meshCidrOrDefault(), pool, dns, nowMs);
+                : configureConsumer(rules, meshCidrOrDefault(), pool, dns, ipv6.ready(), nowMs);
         synchronized (planLock) {
             if (closed.get()) {
                 return;
             }
-            reconcileLocked(rules, pool == null ? null : pool.cidr(), nowMs);
+            if (!rules.isEmpty()) {
+                logIpv6State(ipv6, rules);
+            }
+            reconcileLocked(rules, pool == null ? null : pool.cidr(), ipv6.ready(), nowMs);
             reconcileTakeoverLocked(phase, pool, dns, nowMs);
         }
         // Delivered outside the plan lock. A purge reaches a peer through the mesh, and nothing
@@ -954,8 +990,72 @@ final class PeerEgressMesh implements AutoCloseable {
         syncEgressAvailability(host.egressAvailability());
     }
 
-    /** @param fakeIpCidr the pool phase two runs with, whose route the plan then carries; or null */
-    private void reconcileLocked(List<PeerEgressRule> rules, String fakeIpCidr, long nowMs) {
+    /**
+     * Whether this device has the IPv6 data plane now, and why not when it has none.
+     *
+     * <p>The platform and peerMeshMtu have to allow it, and then the TUN has to be up and actually
+     * carry its derived IPv6 address. A device whose address could not be assigned -- a host with
+     * IPv6 disabled, say -- has no IPv6 data plane: its IPv6 rules report
+     * {@code EGRESS_RULE_IPV6_UNSUPPORTED} and nothing IPv6 is planned, so the IPv6 route installs
+     * that would fail cannot roll the IPv4 routes back with them. A device that is not up, or a noop
+     * one, carries no IPv6 either. The answer is read on every reconcile, so a TUN recreated with its
+     * address enables the data plane on the next one.
+     */
+    PeerVirtualDevice.Ipv6Readiness ipv6State() {
+        Boolean platform = ipv6Platform;
+        if (platform != null ? !platform : !PeerEgressRouteCommanders.consumerCarriesIpv6(host.peerMeshMtu())) {
+            return PeerVirtualDevice.Ipv6Readiness.no("this platform or peerMeshMtu has no IPv6 data plane");
+        }
+        if (!host.deviceReady()) {
+            return PeerVirtualDevice.Ipv6Readiness.no("the virtual device is " + host.deviceStatus());
+        }
+        PeerVirtualDevice.Ipv6Readiness device = host.deviceIpv6();
+        return device == null ? PeerVirtualDevice.Ipv6Readiness.no("the virtual device carries no IPv6") : device;
+    }
+
+    /**
+     * Says once per distinct reason why IPv6 rules are not in force, when the platform would have
+     * carried them -- the device is what is missing. Under the plan lock.
+     */
+    private void logIpv6State(PeerVirtualDevice.Ipv6Readiness ipv6, List<PeerEgressRule> rules) {
+        boolean anyIpv6 = false;
+        for (PeerEgressRule rule : rules) {
+            anyIpv6 |= PeerEgressRules.isIpv6(rule);
+        }
+        Boolean platform = ipv6Platform;
+        boolean platformCarries = platform != null ? platform
+                : PeerEgressRouteCommanders.consumerCarriesIpv6(host.peerMeshMtu());
+        String logged = !ipv6.ready() && platformCarries && anyIpv6 ? ipv6.reason() : "";
+        if (logged.equals(ipv6Logged)) {
+            return;
+        }
+        ipv6Logged = logged;
+        if (!logged.isEmpty()) {
+            log.warn("[peer-egress-consumer] IPv6 rules not in force ({}): {}; IPv4 rules are unaffected",
+                    PeerEgressCodes.RULE_IPV6_UNSUPPORTED, logged);
+        } else if (ipv6.ready() && anyIpv6) {
+            log.info("[peer-egress-consumer] the virtual device carries IPv6; IPv6 rules are in force");
+        }
+    }
+
+    /**
+     * The effective MTU of the session to an egress, the SPMTU2 answer the IPv4 path clamps to, or
+     * the configured MTU while there is no session or no probe yet.
+     */
+    private int pathMtu(long egress) {
+        Integer measured = host.pathMtuForPeer(egress);
+        if (measured != null) {
+            return measured;
+        }
+        int configured = host.peerMeshMtu();
+        return configured <= 0 ? PeerVirtualDeviceOptions.DEFAULT_MTU : configured;
+    }
+
+    /**
+     * @param fakeIpCidr  the pool phase two runs with, whose route the plan then carries; or null
+     * @param carriesIpv6 whether the device has the IPv6 data plane, read once for the reconcile
+     */
+    private void reconcileLocked(List<PeerEgressRule> rules, String fakeIpCidr, boolean carriesIpv6, long nowMs) {
         String meshCidr = meshCidrOrDefault();
 
         // Without a device there is nothing to route into. A rule's route pointed at an interface
@@ -965,8 +1065,8 @@ final class PeerEgressMesh implements AutoCloseable {
         List<PeerEgressRoutePlanner.Route> desired = List.of();
         if (host.deviceReady()) {
             deviceWaitLogged = false;
-            PeerEgressRoutePlanner.Plan plan =
-                    PeerEgressRoutePlanner.plan(rules, bypassAddresses(nowMs), meshCidr, fakeIpCidr);
+            PeerEgressRoutePlanner.Plan plan = PeerEgressRoutePlanner.plan(rules, bypassAddresses(nowMs, carriesIpv6),
+                    meshCidr, fakeIpCidr, carriesIpv6);
             logRefusals(plan.refused());
             desired = plan.routes();
         } else if ((!rules.isEmpty() || fakeIpCidr != null) && !deviceWaitLogged) {
@@ -1092,11 +1192,15 @@ final class PeerEgressMesh implements AutoCloseable {
      * what has to happen.
      */
     private Map<Long, List<String>> configureConsumer(List<PeerEgressRule> rules, String meshCidr,
-            PeerEgressFakeIpPool pool, PeerEgressDnsResponder dns, long nowMs) {
+            PeerEgressFakeIpPool pool, PeerEgressDnsResponder dns, boolean carriesIpv6, long nowMs) {
         String virtualIp = host.virtualIp() == null ? "" : host.virtualIp().trim();
+        // The IPv6 data plane is part of the configuration: a device that stops carrying IPv6 takes
+        // the IPv6 rules out of force and closes their flows, and one that starts carrying it puts
+        // them back.
         StringBuilder key = new StringBuilder(meshCidr).append('|').append(virtualIp)
                 .append('|').append(pool == null ? "" : pool.cidr())
-                .append('|').append(dns == null ? 0 : System.identityHashCode(dns));
+                .append('|').append(dns == null ? 0 : System.identityHashCode(dns))
+                .append('|').append(carriesIpv6);
         for (PeerEgressRule rule : rules) {
             key.append('|').append(rule.getMatch()).append(' ').append(rule.getAction())
                     .append(' ').append(rule.getEgressClientId()).append(' ').append(rule.getPort());
@@ -1108,7 +1212,7 @@ final class PeerEgressMesh implements AutoCloseable {
             Map<Long, List<String>> purge = consumerRole.setCatalog(catalog.snapshot(), nowMs);
             if (key.toString().equals(consumerKey)) { return purge; }
             consumerKey = key.toString();
-            return mergePurges(purge, consumerRole.configure(rules, meshCidr, virtualIp, pool, dns, nowMs));
+            return mergePurges(purge, consumerRole.configure(rules, meshCidr, virtualIp, pool, dns, carriesIpv6, nowMs));
         }
     }
 
@@ -1157,7 +1261,7 @@ final class PeerEgressMesh implements AutoCloseable {
      * resolved, and every peer's own endpoint. Without them a rule broad enough to cover one would
      * route the tunnel's transport into the tunnel.
      */
-    private List<String> bypassAddresses(long nowMs) {
+    private List<String> bypassAddresses(long nowMs, boolean carriesIpv6) {
         PeerEgressBypassResolver.Resolution resolution = bypass.resolve(host.bypassHosts(), nowMs);
         String failed = String.join(",", resolution.failed());
         if (!failed.equals(bypassFailedLogged)) {
@@ -1170,6 +1274,11 @@ final class PeerEgressMesh implements AutoCloseable {
             }
         }
         List<String> addresses = new ArrayList<>(resolution.addresses());
+        if (carriesIpv6) {
+            // The IPv6 answers too, only once this device routes IPv6 at all; the plan pins one only
+            // when an IPv6 rule covers it.
+            addresses.addAll(bypass.resolve6(host.bypassHosts(), nowMs));
+        }
         addresses.addAll(host.peerEndpointAddresses());
         return addresses;
     }

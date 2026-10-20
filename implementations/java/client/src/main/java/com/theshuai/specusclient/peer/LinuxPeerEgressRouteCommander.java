@@ -42,7 +42,7 @@ public final class LinuxPeerEgressRouteCommander implements PeerEgressRouteInsta
     public PeerEgressRouteInstaller.Conflict conflict(Route route) {
         String output;
         try {
-            output = runForOutput(List.of("ip", "route", "show", "exact", route.cidr()));
+            output = runForOutput(PeerEgressRouteCommands.routeArgs(route.cidr(), "show", "exact", route.cidr()));
         } catch (IOException unableToAsk) {
             // Reporting no conflict lets the add proceed, and `ip route add` refuses an existing
             // prefix anyway, so the install path still fails safe.
@@ -63,16 +63,15 @@ public final class LinuxPeerEgressRouteCommander implements PeerEgressRouteInsta
         if (tun == null || tun.trim().isEmpty()) {
             throw new IOException("no TUN interface to route into");
         }
-        run(List.of("ip", "route", "add", route.cidr(), "dev", tun));
+        run(PeerEgressRouteCommands.routeArgs(route.cidr(), "add", route.cidr(), "dev", tun));
     }
 
     private void installBypass(Route route) throws IOException {
-        String address = route.cidr().endsWith("/32")
-                ? route.cidr().substring(0, route.cidr().length() - 3)
-                : route.cidr();
+        String address = PeerEgressRoutePlanner.bypassAddress(route.cidr());
+        boolean ipv6 = PeerEgressRoutePlanner.isIpv6(route);
         PeerEgressRouteCommands.Hop hop = hops.get(address);
         if (hop == null) {
-            String output = runForOutput(List.of("ip", "route", "get", address));
+            String output = runForOutput(PeerEgressRouteCommands.routeArgs(route.cidr(), "get", address));
             hop = PeerEgressRouteCommands.parseRouteGet(output);
             if (hop == null) {
                 throw new IOException("no route to " + address + " to bypass through");
@@ -83,29 +82,42 @@ public final class LinuxPeerEgressRouteCommander implements PeerEgressRouteInsta
                 // table, read with the tunnel left out, says where it went before. Only the main
                 // table: the query followed policy routing and this reading does not.
                 PeerEgressSocketBinding.Route fallback = PeerEgressSocketBinding.bypassHopFromTable(address, tun,
-                        () -> PeerEgressRouteCommands.parseRouteTable(
-                                runForOutput(PeerEgressRouteCommands.showMainTableArgs())));
+                        ipv6 ? this::readMainTable6 : this::readMainTable);
                 hop = new PeerEgressRouteCommands.Hop(fallback.gateway(), fallback.iface());
             }
             hops.put(address, hop);
         }
         if (hop.gateway().isEmpty()) {
-            run(List.of("ip", "route", "add", route.cidr(), "dev", hop.device()));
+            run(PeerEgressRouteCommands.routeArgs(route.cidr(), "add", route.cidr(), "dev", hop.device()));
             return;
         }
-        run(List.of("ip", "route", "add", route.cidr(), "via", hop.gateway(), "dev", hop.device()));
+        run(PeerEgressRouteCommands.routeArgs(route.cidr(), "add", route.cidr(), "via", hop.gateway(),
+                "dev", hop.device()));
+    }
+
+    private List<PeerEgressSocketBinding.Route> readMainTable() throws IOException {
+        return PeerEgressRouteCommands.parseRouteTable(runForOutput(PeerEgressRouteCommands.showMainTableArgs()));
+    }
+
+    /** The IPv6 main table, for an IPv6 bypass hop and the IPv6 repair. */
+    private List<PeerEgressSocketBinding.Route> readMainTable6() throws IOException {
+        return PeerEgressRouteCommands.parseRouteTable6(runForOutput(PeerEgressRouteCommands.showMainTableArgs6()));
     }
 
     @Override
     public PeerEgressRouteInstaller.Table table() throws IOException {
-        return new PeerEgressRouteInstaller.Table(
-                PeerEgressRouteCommands.parseRouteTable(runForOutput(PeerEgressRouteCommands.showMainTableArgs())), tun);
+        return new PeerEgressRouteInstaller.Table(readMainTable(), tun);
+    }
+
+    @Override
+    public PeerEgressRouteInstaller.Table table6() throws IOException {
+        return new PeerEgressRouteInstaller.Table(readMainTable6(), tun);
     }
 
     @Override
     public void remove(Route route) throws IOException {
-        hops.remove(route.cidr().endsWith("/32") ? route.cidr().substring(0, route.cidr().length() - 3) : route.cidr());
-        run(List.of("ip", "route", "del", route.cidr()));
+        hops.remove(PeerEgressRoutePlanner.bypassAddress(route.cidr()));
+        run(PeerEgressRouteCommands.routeArgs(route.cidr(), "del", route.cidr()));
     }
 
     private void run(List<String> command) throws IOException {

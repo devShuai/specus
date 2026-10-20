@@ -53,6 +53,11 @@ public final class PeerEgressCodes {
     public static final String RULE_FAKE_IP_OVERLAP = "EGRESS_RULE_FAKE_IP_OVERLAP";
     public static final String FAKE_IP_POOL_INVALID = "EGRESS_FAKE_IP_POOL_INVALID";
     public static final String RULE_EGRESS_NO_DOMAIN = "EGRESS_RULE_EGRESS_NO_DOMAIN";
+    /**
+     * The IPv6 data plane ({@code protocol/spec/peer-egress.md}, IPv6 数据面): an IPv6 rule to an
+     * online egress whose catalogue entry does not say {@code ipv6PacketCapable}.
+     */
+    public static final String RULE_EGRESS_NO_IPV6 = "EGRESS_RULE_EGRESS_NO_IPV6";
     /** The system DNS takeover's checks refused it; the status names the reason. */
     public static final String DNS_TAKEOVER_REFUSED = "EGRESS_DNS_TAKEOVER_REFUSED";
     /** A takeover command failed and everything was given back. */
@@ -74,7 +79,7 @@ public final class PeerEgressCodes {
             FRAME_BAD_MAGIC, FRAME_UNKNOWN_TYPE, FRAME_RESERVED_SET, FRAME_TRUNCATED,
             FRAME_TRAILING_BYTES, IPV6_UNSUPPORTED, FRAME_MALFORMED_CONTROL, CONTROL_UNSUPPORTED,
             NAME_UNRESOLVED, NAME_UNSUPPORTED, RULE_FAKE_IP_OVERLAP, FAKE_IP_POOL_INVALID, RULE_EGRESS_NO_DOMAIN,
-            DNS_TAKEOVER_REFUSED, DNS_TAKEOVER_FAILED);
+            RULE_EGRESS_NO_IPV6, DNS_TAKEOVER_REFUSED, DNS_TAKEOVER_FAILED);
 
     /**
      * Reports whether a code is one this build defines.

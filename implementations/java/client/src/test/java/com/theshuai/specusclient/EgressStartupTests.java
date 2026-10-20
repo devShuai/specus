@@ -180,14 +180,15 @@ class EgressStartupTests {
         assertThat(capabilities.path("domainTargetCapable").asBoolean()).isTrue();
         assertThat(capabilities.path("ipv6TargetCapable").isBoolean()).isTrue();
         assertThat(capabilities.path("ipv6TargetCapable").asBoolean()).isTrue();
-        // The egress side of the IPv6 data plane is here; the consumer side is not, and announcing
-        // the packet capability must not have switched it on.
+        // The packet capability is the egress side of the IPv6 data plane. Whether this device also
+        // carries IPv6 as a consumer is a separate answer, which no route takeover means no.
         assertThat(capabilities.path("ipv6PacketCapable").isBoolean()).isTrue();
         assertThat(capabilities.path("ipv6PacketCapable").asBoolean())
                 .as("the egress accepts IPv6 packets in SPEG1")
                 .isTrue();
-        assertThat(com.theshuai.common.peeregress.PeerEgressRules.CONSUMER_CARRIES_IPV6)
-                .as("only the egress side of the data plane exists")
+        assertThat(PeerEgressRouteCommanders.platformCarriesIpv6()
+                && !PeerEgressRouteCommanders.takeoverSupported())
+                .as("the consumer carries IPv6 on a platform with no route takeover")
                 .isFalse();
     }
 }

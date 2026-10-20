@@ -58,6 +58,9 @@ public final class WindowsPeerEgressRouteCommander implements PeerEgressRouteIns
     /** One read of the whole routing table, and when it was taken. */
     private String table = "";
     private long tableAtNanos;
+    /** The same for the IPv6 table, which a separate query reads. */
+    private String table6 = "";
+    private long table6AtNanos;
 
     /**
      * Where each bypass address goes, resolved before any tunnel route exists.
@@ -76,6 +79,9 @@ public final class WindowsPeerEgressRouteCommander implements PeerEgressRouteIns
 
     @Override
     public PeerEgressRouteInstaller.Conflict conflict(Route route) {
+        if (PeerEgressRoutePlanner.isIpv6(route)) {
+            return conflict6(route);
+        }
         if (table.isEmpty()
                 || System.nanoTime() - tableAtNanos > TABLE_CACHE_LIFETIME.toNanos()) {
             String output;
@@ -96,12 +102,44 @@ public final class WindowsPeerEgressRouteCommander implements PeerEgressRouteIns
                 : PeerEgressRouteInstaller.Conflict.none();
     }
 
+    /** The IPv6 conflict check, out of one read of the IPv6 table cached the same way. */
+    private PeerEgressRouteInstaller.Conflict conflict6(Route route) {
+        if (table6.isEmpty()
+                || System.nanoTime() - table6AtNanos > TABLE_CACHE_LIFETIME.toNanos()) {
+            String output;
+            try {
+                output = run(PeerEgressWindowsRouteCommands.showAllRoutesScript6());
+            } catch (IOException unableToAsk) {
+                return PeerEgressRouteInstaller.Conflict.none();
+            }
+            table6 = output;
+            table6AtNanos = System.nanoTime();
+        }
+        PeerEgressRouteCommands.ExistingRoute existing =
+                PeerEgressWindowsRouteCommands.conflictFromTable6(table6, route.cidr());
+        return existing.present()
+                ? new PeerEgressRouteInstaller.Conflict(true, existing.description())
+                : PeerEgressRouteInstaller.Conflict.none();
+    }
+
+    /** Whether the IPv6 table has been read, and when: for the test that it is read apart. */
+    long table6ReadAtNanos() {
+        return table6.isEmpty() ? 0 : table6AtNanos;
+    }
+
+    /** Whether the IPv4 table has been read. */
+    boolean tableRead() {
+        return !table.isEmpty();
+    }
+
     @Override
     public void install(Route route) throws IOException {
         // Checked before anything is run: an argument the script builder would refuse must
         // not cost a process first, and on this platform that refusal is what keeps a prefix
         // from becoming a second command.
-        if (!PeerEgressWindowsRouteCommands.validPrefix(route.cidr())) {
+        boolean ipv6 = PeerEgressRoutePlanner.isIpv6(route);
+        if (ipv6 ? !PeerEgressWindowsRouteCommands.validPrefix6(route.cidr())
+                : !PeerEgressWindowsRouteCommands.validPrefix(route.cidr())) {
             throw new IOException(
                     "refusing to build a route command from this argument: " + route.cidr());
         }
@@ -112,17 +150,22 @@ public final class WindowsPeerEgressRouteCommander implements PeerEgressRouteIns
         if (tun == null || tun.trim().isEmpty()) {
             throw new IOException("no TUN interface to route into");
         }
-        apply(PeerEgressWindowsRouteCommands.installRouteScript(route.cidr(), tunnelIndex(), ""),
-                "install " + route.cidr());
+        apply(installScript(ipv6, route.cidr(), tunnelIndex(), ""), "install " + route.cidr());
+    }
+
+    /** The builder of the route's family. */
+    private static String installScript(boolean ipv6, String cidr, int interfaceIndex, String gateway) {
+        return ipv6 ? PeerEgressWindowsRouteCommands.installRouteScript6(cidr, interfaceIndex, gateway)
+                : PeerEgressWindowsRouteCommands.installRouteScript(cidr, interfaceIndex, gateway);
     }
 
     private void installBypass(Route route) throws IOException {
-        String address = route.cidr().endsWith("/32")
-                ? route.cidr().substring(0, route.cidr().length() - 3)
-                : route.cidr();
+        boolean ipv6 = PeerEgressRoutePlanner.isIpv6(route);
+        String address = PeerEgressRoutePlanner.bypassAddress(route.cidr());
         PeerEgressWindowsRouteCommands.Hop hop = hops.get(address);
         if (hop == null) {
-            String output = run(PeerEgressWindowsRouteCommands.findRoutesScript(List.of(address)));
+            String output = run(ipv6 ? PeerEgressWindowsRouteCommands.findRoutesScript6(List.of(address))
+                    : PeerEgressWindowsRouteCommands.findRoutesScript(List.of(address)));
             hop = PeerEgressWindowsRouteCommands.parseRouteFind(output);
             if (hop == null) {
                 throw new IOException("no route to " + address + " to bypass through");
@@ -133,7 +176,8 @@ public final class WindowsPeerEgressRouteCommander implements PeerEgressRouteIns
                 // back out of PowerShell intact. The native table, read with the tunnel left out,
                 // says where it went before.
                 PeerEgressSocketBinding.Route fallback = PeerEgressSocketBinding.bypassHopFromTable(address,
-                        Integer.toString(tunIndex), PeerEgressSocketBinder.Windows::routes);
+                        Integer.toString(tunIndex),
+                        ipv6 ? PeerEgressSocketBinder.Windows::routes6 : PeerEgressSocketBinder.Windows::routes);
                 try {
                     hop = new PeerEgressWindowsRouteCommands.Hop(fallback.gateway(), Integer.parseInt(fallback.iface()));
                 } catch (NumberFormatException notAnIndex) {
@@ -143,8 +187,7 @@ public final class WindowsPeerEgressRouteCommander implements PeerEgressRouteIns
             }
             hops.put(address, hop);
         }
-        apply(PeerEgressWindowsRouteCommands.installRouteScript(
-                        route.cidr(), hop.interfaceIndex(), hop.gateway()),
+        apply(installScript(ipv6, route.cidr(), hop.interfaceIndex(), hop.gateway()),
                 "install bypass " + route.cidr());
     }
 
@@ -158,14 +201,24 @@ public final class WindowsPeerEgressRouteCommander implements PeerEgressRouteIns
         return new PeerEgressRouteInstaller.Table(PeerEgressSocketBinder.Windows.routes(), Integer.toString(index));
     }
 
+    /** The native IPv6 forwarding table, with the tunnel as its index. */
+    @Override
+    public PeerEgressRouteInstaller.Table table6() throws IOException {
+        int index = tunnelIndex();
+        return new PeerEgressRouteInstaller.Table(PeerEgressSocketBinder.Windows.routes6(), Integer.toString(index));
+    }
+
     @Override
     public void remove(Route route) throws IOException {
-        hops.remove(route.cidr().endsWith("/32") ? route.cidr().substring(0, route.cidr().length() - 3) : route.cidr());
-        if (!PeerEgressWindowsRouteCommands.validPrefix(route.cidr())) {
+        hops.remove(PeerEgressRoutePlanner.bypassAddress(route.cidr()));
+        boolean ipv6 = PeerEgressRoutePlanner.isIpv6(route);
+        if (ipv6 ? !PeerEgressWindowsRouteCommands.validPrefix6(route.cidr())
+                : !PeerEgressWindowsRouteCommands.validPrefix(route.cidr())) {
             throw new IOException(
                     "refusing to build a route command from this argument: " + route.cidr());
         }
-        apply(PeerEgressWindowsRouteCommands.removeRouteScript(route.cidr()),
+        apply(ipv6 ? PeerEgressWindowsRouteCommands.removeRouteScript6(route.cidr())
+                        : PeerEgressWindowsRouteCommands.removeRouteScript(route.cidr()),
                 "remove " + route.cidr());
     }
 
@@ -226,6 +279,14 @@ public final class WindowsPeerEgressRouteCommander implements PeerEgressRouteIns
      * the shared vector asserts rather than a coincidence.
      */
     private String run(String script) throws IOException {
+        return runPowerShell(script);
+    }
+
+    /**
+     * {@link #run}, shared with the Wintun device, which gives the TUN its IPv6 address through the
+     * same kind of script.
+     */
+    static String runPowerShell(String script) throws IOException {
         ProcessBuilder builder = new ProcessBuilder(
                 "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script);
         Process process = builder.start();

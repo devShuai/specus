@@ -134,7 +134,10 @@ public class NettyClient {
         PeerVirtualDeviceOptions peerOptions = new PeerVirtualDeviceOptions(
                 specusBean.getPeerMeshDevice(),
                 specusBean.getPeerMeshTunName(),
-                specusBean.getPeerMeshMtu());
+                specusBean.getPeerMeshMtu(),
+                // The TUN is given its derived IPv6 address only for the egress consumer, and only
+                // where the platform and the MTU allow the IPv6 data plane (PeerDeviceIpv6).
+                specusBean.isPeerEgressEnabled());
         if (specusBean.getPeerMeshMtu() != peerOptions.mtu()) {
             log.warn("Peer mesh MTU normalized: configured={}, effective={}, reason=reserve-udp-encapsulation-overhead",
                     specusBean.getPeerMeshMtu(), peerOptions.mtu());

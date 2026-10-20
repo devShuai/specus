@@ -2,6 +2,7 @@ package com.theshuai.specusclient.peer;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.theshuai.common.peeregress.Ipv6Cidr;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -419,6 +420,164 @@ public final class PeerEgressWindowsRouteCommands {
         return "'" + value + "'";
     }
 
+    // ---- IPv6 --------------------------------------------------------------------------------
+    //
+    // The IPv6 counterparts (protocol/spec/peer-egress.md, IPv6 数据面). Separate builders rather
+    // than a family argument on the IPv4 ones, so those stay exactly what the shared vector pins --
+    // including refusing an IPv6 address -- and an IPv6 value can only reach a script written for
+    // IPv6.
+
+    /** How Get-NetRoute -AddressFamily IPv6 writes on-link, and how an on-link IPv6 route is added. */
+    public static final String ON_LINK_NEXT_HOP6 = "::";
+
+    /**
+     * Accepts an IPv6 prefix in the form this feature writes it and nothing else: RFC 5952 hex groups
+     * and colons, a slash, and a decimal length. The same whitelist argument as for IPv4 -- no quote
+     * can be in it -- and the canonical form is required so the text checked is the text sent, never
+     * a second spelling of it.
+     */
+    public static boolean validPrefix6(String value) {
+        Ipv6Cidr.Parsed parsed = Ipv6Cidr.parseWithLength(value);
+        return parsed != null && parsed.hadLength() && parsed.cidr().toString().equals(value);
+    }
+
+    /**
+     * Accepts an IPv6 address of hex groups and colons: what a next hop or a bypass address is. No
+     * zone, no brackets, no dotted tail -- {@link Ipv6Cidr#parseAddress} refuses each of them -- so
+     * nothing but [0-9A-Fa-f:] can reach the script.
+     */
+    public static boolean validAddress6(String value) {
+        return Ipv6Cidr.parseAddress(value) != null;
+    }
+
+    /**
+     * Resolves IPv6 bypass addresses in one process, in the same shape as the IPv4 query.
+     *
+     * @throws IllegalArgumentException if any address is not a plain IPv6 address
+     */
+    public static String findRoutesScript6(List<String> addresses) {
+        StringBuilder joined = new StringBuilder();
+        for (String address : addresses) {
+            if (!validAddress6(address)) {
+                throw new IllegalArgumentException("refusing to build a route command from this argument");
+            }
+            if (joined.length() > 0) {
+                joined.append(',');
+            }
+            joined.append('\'').append(address).append('\'');
+        }
+        return "foreach($a in @(" + joined + ")){ConvertTo-Json -Compress "
+                + "-InputObject @(Find-NetRoute -RemoteIPAddress $a "
+                + "-ErrorAction SilentlyContinue|Select-Object "
+                + "InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)}\nexit 0";
+    }
+
+    /**
+     * Adds one IPv6 route to ActiveStore, for the same reason as IPv4. An empty gateway is on-link,
+     * written as {@code -NextHop '::'}, as the spec's command names it.
+     *
+     * @throws IllegalArgumentException if the prefix, gateway or interface index is not usable
+     */
+    public static String installRouteScript6(String cidr, int interfaceIndex, String gateway) {
+        String hop = gateway == null || gateway.isEmpty() ? ON_LINK_NEXT_HOP6 : gateway;
+        if (!validPrefix6(cidr) || interfaceIndex <= 0 || !validAddress6(hop)) {
+            throw new IllegalArgumentException("refusing to build a route command from this argument");
+        }
+        return "try{New-NetRoute -AddressFamily IPv6 -DestinationPrefix '" + cidr + "' -NextHop '" + hop
+                + "' -InterfaceIndex " + interfaceIndex
+                + " -PolicyStore ActiveStore -ErrorAction Stop|Out-Null}catch{ConvertTo-Json -Compress "
+                + "-InputObject @{errorId=$_.FullyQualifiedErrorId};exit 1}";
+    }
+
+    /**
+     * Withdraws one IPv6 route, with {@code -Confirm:$false} as for IPv4.
+     *
+     * @throws IllegalArgumentException if the prefix is not an IPv6 prefix in canonical form
+     */
+    public static String removeRouteScript6(String cidr) {
+        if (!validPrefix6(cidr)) {
+            throw new IllegalArgumentException("refusing to build a route command from this argument");
+        }
+        return "try{Remove-NetRoute -AddressFamily IPv6 -DestinationPrefix '" + cidr
+                + "' -Confirm:$false -PolicyStore ActiveStore -ErrorAction Stop|Out-Null}catch{"
+                + "ConvertTo-Json -Compress -InputObject @{errorId=$_.FullyQualifiedErrorId};exit 1}";
+    }
+
+    /** Reads the whole IPv6 table in one query, for the IPv6 conflict check. */
+    public static String showAllRoutesScript6() {
+        return "ConvertTo-Json -Compress -InputObject @(Get-NetRoute -AddressFamily IPv6 "
+                + "-ErrorAction SilentlyContinue|Select-Object "
+                + "InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)";
+    }
+
+    /**
+     * Gives the TUN the device's derived IPv6 address, a /128 with no on-link route, and sets the
+     * interface's IPv6 MTU, which on Windows is separate from the IPv4 one netsh sets. Both go to
+     * ActiveStore: nothing here outlives a reboot.
+     *
+     * <p>An address that is already there -- the adapter was reopened rather than created -- is not
+     * a failure: the outcome asked for holds. Anything else is written as {errorId} on stdout, as the
+     * route scripts write theirs. Only the index and the address go in, and nothing comes back but
+     * that JSON.
+     *
+     * @throws IllegalArgumentException if the index, the address or the MTU is not usable
+     */
+    public static String assignAddress6Script(int interfaceIndex, String address, int mtu) {
+        if (interfaceIndex <= 0 || mtu <= 0 || !validAddress6(address)) {
+            throw new IllegalArgumentException("refusing to build an address command from this argument");
+        }
+        String index = Integer.toString(interfaceIndex);
+        String quoted = "'" + address + "'";
+        return "try{if(-not(Get-NetIPAddress -AddressFamily IPv6 -InterfaceIndex " + index + " -IPAddress " + quoted
+                + " -PolicyStore ActiveStore -ErrorAction SilentlyContinue)){New-NetIPAddress -AddressFamily IPv6"
+                + " -IPAddress " + quoted + " -PrefixLength 128 -InterfaceIndex " + index
+                + " -PolicyStore ActiveStore -ErrorAction Stop|Out-Null};Set-NetIPInterface -AddressFamily IPv6"
+                + " -InterfaceIndex " + index + " -NlMtuBytes " + mtu + " -PolicyStore ActiveStore -ErrorAction Stop}"
+                + "catch{ConvertTo-Json -Compress -InputObject @{errorId=$_.FullyQualifiedErrorId};exit 1}";
+    }
+
+    /**
+     * {@link #conflictFromTable} for the IPv6 table. The prefixes are compared by value, each side
+     * written the way this feature writes its own: Windows writes them lower case and compressed, but
+     * a comparison of text would turn any other spelling into "no conflict, install it".
+     */
+    public static PeerEgressRouteCommands.ExistingRoute conflictFromTable6(String table, String prefix) {
+        String wanted = canonicalPrefix6(prefix == null ? "" : prefix.trim());
+        if (wanted == null) {
+            return new PeerEgressRouteCommands.ExistingRoute(false, "");
+        }
+        List<JsonNode> matching = new ArrayList<>();
+        for (JsonNode route : routesWithPrefix(table)) {
+            if (wanted.equals(canonicalPrefix6(prefixOf(route)))) {
+                matching.add(route);
+            }
+        }
+        return describeRoutes(matching);
+    }
+
+    /**
+     * An IPv6 DestinationPrefix in canonical form, host bits masked rather than refused: the question
+     * is which prefix the row routes, not whether it was written tidily. Null when it is not one.
+     */
+    private static String canonicalPrefix6(String text) {
+        int slash = text.indexOf('/');
+        if (slash < 0) {
+            return null;
+        }
+        long[] address = Ipv6Cidr.parseAddress(text.substring(0, slash));
+        String length = text.substring(slash + 1);
+        if (address == null || length.isEmpty() || length.length() > 3 || !digitsOnly(length)) {
+            return null;
+        }
+        int bits = Integer.parseInt(length);
+        if (bits > Ipv6Cidr.MAX_PREFIX) {
+            return null;
+        }
+        long highMask = bits <= 0 ? 0 : bits >= 64 ? -1L : -1L << (64 - bits);
+        long lowMask = bits <= 64 ? 0 : bits >= 128 ? -1L : -1L << (128 - bits);
+        return Ipv6Cidr.formatAddress(address[0] & highMask, address[1] & lowMask) + "/" + bits;
+    }
+
     /** One line an operator can match against their own Get-NetRoute output. */
     private static String describe(JsonNode route) {
         String gateway = gatewayOf(route);
@@ -457,6 +616,7 @@ public final class PeerEgressWindowsRouteCommands {
             return "";
         }
         String gateway = hop.asText().trim();
-        return ON_LINK_NEXT_HOP.equals(gateway) ? "" : gateway;
+        // "::" is the IPv6 spelling of on-link, as Get-NetRoute -AddressFamily IPv6 writes it.
+        return ON_LINK_NEXT_HOP.equals(gateway) || ON_LINK_NEXT_HOP6.equals(gateway) ? "" : gateway;
     }
 }

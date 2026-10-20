@@ -63,12 +63,14 @@ public final class PeerEgressStatus {
      * @param standings     what the catalogue says about each egress a rule names or the mesh
      *                      reported: unknown, not-offered, unsupported or offered
      * @param catalog       {@code consumer.catalog}: waiting, none or received
+     * @param carriesIpv6   whether this consumer has the IPv6 data plane now
+     * @param ipv6Capable   the egresses the catalogue says take IPv6 packets
      */
     public record ConsumerSnapshot(List<PeerEgressRule> rules, String meshCidr,
             Map<Long, Boolean> online, int flows, Map<String, Long> blocked,
             Map<Long, Integer> flowsByEgress, Map<Long, String> paths,
             String fakeIpCidr, Set<Long> domainCapable, int mappings, int quarantined,
-            Map<Long, String> standings, String catalog) {
+            Map<Long, String> standings, String catalog, boolean carriesIpv6, Set<Long> ipv6Capable) {
 
         /**
          * The same view with the path each egress peer's traffic takes now, which the mesh knows
@@ -76,7 +78,7 @@ public final class PeerEgressStatus {
          */
         public ConsumerSnapshot withPaths(Map<Long, String> paths) {
             return new ConsumerSnapshot(rules, meshCidr, online, flows, blocked, flowsByEgress, paths,
-                    fakeIpCidr, domainCapable, mappings, quarantined, standings, catalog);
+                    fakeIpCidr, domainCapable, mappings, quarantined, standings, catalog, carriesIpv6, ipv6Capable);
         }
 
         /**
@@ -86,7 +88,7 @@ public final class PeerEgressStatus {
          */
         public ConsumerSnapshot withCatalog(String catalog) {
             return new ConsumerSnapshot(rules, meshCidr, online, flows, blocked, flowsByEgress, paths,
-                    fakeIpCidr, domainCapable, mappings, quarantined, standings, catalog);
+                    fakeIpCidr, domainCapable, mappings, quarantined, standings, catalog, carriesIpv6, ipv6Capable);
         }
     }
 
@@ -264,9 +266,14 @@ public final class PeerEgressStatus {
             // In phase two a domain rule's egress also has to resolve names, but only an online
             // egress is judged: offline, the catalogue says false for every egress, and the rule is
             // right and waiting like any rule to an offline egress.
+            //
+            // And with the IPv6 data plane and which egresses take IPv6 packets, for the same reason:
+            // an IPv6 rule reads as in force exactly when the data plane would act on it.
             Set<Long> capable = consumer.domainCapable() == null ? Set.of() : consumer.domainCapable();
+            Set<Long> capable6 = consumer.ipv6Capable() == null ? Set.of() : consumer.ipv6Capable();
             String refusal = PeerEgressDns.ruleStatus(rule, consumer.meshCidr(), consumer.fakeIpCidr(),
-                    egress -> Boolean.TRUE.equals(consumer.online().get(egress)), capable::contains);
+                    consumer.carriesIpv6(), egress -> Boolean.TRUE.equals(consumer.online().get(egress)),
+                    capable::contains, capable6::contains);
             String code = refusal == null ? "" : refusal;
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("index", index);

@@ -135,15 +135,35 @@ public final class PeerEgressDns {
      */
     public static String ruleStatus(PeerEgressRule rule, String meshCidr, String fakeIpCidr,
             LongPredicate online, LongPredicate domainCapable) {
-        String code = PeerEgressRules.validate(rule, meshCidr, fakeIpCidr);
+        return ruleStatus(rule, meshCidr, fakeIpCidr, false, online, domainCapable, egress -> false);
+    }
+
+    /**
+     * As above, with the consumer's IPv6 data plane stated, and ipv6Capable the egresses the
+     * catalogue says take IPv6 packets ({@code protocol/spec/peer-egress.md}, IPv6 数据面).
+     *
+     * <p>An IPv6 rule to an online egress that does not is {@code EGRESS_RULE_EGRESS_NO_IPV6}, by the
+     * same rule as {@code EGRESS_RULE_EGRESS_NO_DOMAIN}: the capability only counts for an egress that
+     * is online. Like that code it is about the egress at this moment, not about the rule, so it is
+     * never a validation code: the rule's route stays installed and its destinations are blocked as
+     * {@code egress-no-ipv6} rather than falling through to a shorter rule or out of the local
+     * interface.
+     */
+    public static String ruleStatus(PeerEgressRule rule, String meshCidr, String fakeIpCidr, boolean carriesIpv6,
+            LongPredicate online, LongPredicate domainCapable, LongPredicate ipv6Capable) {
+        String code = PeerEgressRules.validate(rule, meshCidr, fakeIpCidr, carriesIpv6);
         if (code != null) {
             return code;
         }
-        if (PeerEgressRules.isDomain(rule) && PeerEgressRule.ACTION_EGRESS.equals(rule.getAction().trim())) {
-            long egress = rule.getEgressClientId();
-            if (online.test(egress) && !domainCapable.test(egress)) {
-                return PeerEgressCodes.RULE_EGRESS_NO_DOMAIN;
-            }
+        if (!PeerEgressRule.ACTION_EGRESS.equals(rule.getAction().trim())) {
+            return null;
+        }
+        long egress = rule.getEgressClientId();
+        if (PeerEgressRules.isDomain(rule) && online.test(egress) && !domainCapable.test(egress)) {
+            return PeerEgressCodes.RULE_EGRESS_NO_DOMAIN;
+        }
+        if (PeerEgressRules.isIpv6(rule) && online.test(egress) && !ipv6Capable.test(egress)) {
+            return PeerEgressCodes.RULE_EGRESS_NO_IPV6;
         }
         return null;
     }

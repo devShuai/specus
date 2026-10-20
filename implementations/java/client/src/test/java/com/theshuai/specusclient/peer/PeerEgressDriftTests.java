@@ -56,6 +56,11 @@ class PeerEgressDriftTests {
                 new PeerEgressSocketBinding.Route("0.0.0.0/0", "eth0", "192.0.2.1", 100, true)));
         final Map<String, PeerEgressSocketBinding.Route> hops = new HashMap<>();
         IOException tableError;
+        /** The same for the IPv6 table, and how often it was read. */
+        List<PeerEgressSocketBinding.Route> physical6 = new ArrayList<>(List.of(
+                new PeerEgressSocketBinding.Route("::/0", "eth0", "fe80::1", 100, true)));
+        IOException table6Error;
+        int table6Reads;
 
         @Override
         public PeerEgressRouteInstaller.Conflict conflict(Route route) {
@@ -74,8 +79,9 @@ class PeerEgressDriftTests {
             }
             if (route.kind() == Kind.BYPASS) {
                 // Resolved the way the real commanders resolve it: from the physical routes, now.
-                PeerEgressSocketBinding.Route hop = PeerEgressSocketBinding.selectBypassHop(physical, tunnel,
-                        List.of(), route.cidr().substring(0, route.cidr().length() - 3));
+                PeerEgressSocketBinding.Route hop = PeerEgressSocketBinding.selectBypassHop(
+                        PeerEgressRoutePlanner.isIpv6(route) ? physical6 : physical, tunnel,
+                        List.of(), PeerEgressRoutePlanner.bypassAddress(route.cidr()));
                 if (hop == null) {
                     throw new PeerEgressSocketBinder.NoPhysicalRouteException(route.cidr());
                 }
@@ -97,8 +103,25 @@ class PeerEgressDriftTests {
             if (tableError != null) {
                 throw tableError;
             }
-            List<PeerEgressSocketBinding.Route> rows = new ArrayList<>(physical);
+            return tableOf(physical, false);
+        }
+
+        @Override
+        public PeerEgressRouteInstaller.Table table6() throws IOException {
+            table6Reads++;
+            if (table6Error != null) {
+                throw table6Error;
+            }
+            return tableOf(physical6, true);
+        }
+
+        /** One family's table: its physical routes, then the installed routes of that family. */
+        private PeerEgressRouteInstaller.Table tableOf(List<PeerEgressSocketBinding.Route> physicalRows, boolean ipv6) {
+            List<PeerEgressSocketBinding.Route> rows = new ArrayList<>(physicalRows);
             for (Map.Entry<String, Route> entry : table.entrySet()) {
+                if (PeerEgressRoutePlanner.isIpv6(entry.getValue()) != ipv6) {
+                    continue;
+                }
                 if (entry.getValue().kind() == Kind.BYPASS) {
                     PeerEgressSocketBinding.Route hop = hops.get(entry.getKey());
                     rows.add(new PeerEgressSocketBinding.Route(entry.getKey(), hop.iface(), hop.gateway(), 0, true));

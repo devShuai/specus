@@ -17,9 +17,9 @@ final class PeerEgressIpv6Packet {
 
     /**
      * This egress accepts IPv6 packets in SPEG1 type=1 frames, and so announces
-     * {@code ipv6PacketCapable} at login. The consumer side is separate:
-     * {@link com.theshuai.common.peeregress.PeerEgressRules#CONSUMER_CARRIES_IPV6} says whether this
-     * device sends IPv6 to an egress, and stays false until the consumer data plane exists.
+     * {@code ipv6PacketCapable} at login. The consumer side is separate: whether this device sends
+     * IPv6 to an egress depends on its platform, its MTU and its TUN
+     * ({@link PeerEgressRouteCommanders#consumerCarriesIpv6}, and the mesh's own state).
      */
     static final boolean PACKET_CAPABLE = true;
 
@@ -217,6 +217,42 @@ final class PeerEgressIpv6Packet {
         packet[7] = (byte) HOP_LIMIT;
         source.write(packet, 8);
         destination.write(packet, 24);
+    }
+
+    /** ICMPv6 destination unreachable. */
+    static final int ICMP_DESTINATION_UNREACHABLE = 1;
+    /**
+     * Address unreachable, the counterpart of IPv4's host unreachable: the stack reports EHOSTUNREACH
+     * on the socket.
+     */
+    static final int ICMP_ADDRESS_UNREACHABLE = 3;
+    static final int ICMP_HEADER_BYTES = 8;
+    /** The smallest MTU IPv6 allows on any link (RFC 8200 5), which no ICMPv6 error may pass. */
+    static final int MINIMUM_MTU = 1280;
+
+    /**
+     * Builds an ICMPv6 destination unreachable, code 3, for a packet the consumer refused to
+     * forward: from the packet's destination back to its source, hop limit 64, quoting as much of
+     * the packet as fits without the whole error passing the IPv6 minimum MTU (RFC 4443 2.4 c). The
+     * checksum covers the RFC 8200 pseudo-header, as every ICMPv6 checksum does. Null for anything
+     * that is not IPv6. Pinned by the failure section of {@code peer-egress-ipv6-v1.json}.
+     */
+    static byte[] icmpAddressUnreachable(byte[] packet) {
+        if (packet == null || packet.length < HEADER_BYTES || ((packet[0] >>> 4) & 0x0F) != 6) {
+            return null;
+        }
+        int original = Math.min(packet.length, HEADER_BYTES + PeerEgressSegment.readShort(packet, 4));
+        int quoted = Math.min(original, MINIMUM_MTU - HEADER_BYTES - ICMP_HEADER_BYTES);
+        Address source = Address.read(packet, 24);
+        Address destination = Address.read(packet, 8);
+        byte[] response = new byte[HEADER_BYTES + ICMP_HEADER_BYTES + quoted];
+        writeHeader(response, NEXT_HEADER_ICMP, ICMP_HEADER_BYTES + quoted, source, destination);
+        response[HEADER_BYTES] = (byte) ICMP_DESTINATION_UNREACHABLE;
+        response[HEADER_BYTES + 1] = (byte) ICMP_ADDRESS_UNREACHABLE;
+        System.arraycopy(packet, 0, response, HEADER_BYTES + ICMP_HEADER_BYTES, quoted);
+        PeerEgressSegment.writeShort(response, HEADER_BYTES + 2, checksum(source, destination, NEXT_HEADER_ICMP,
+                response, HEADER_BYTES, ICMP_HEADER_BYTES + quoted));
+        return response;
     }
 
     /**

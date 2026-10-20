@@ -124,6 +124,14 @@ public record Ipv6Cidr(long high, long low, int prefixLength) {
     }
 
     /**
+     * Whether two prefixes share an address, which for prefixes is the same as one containing the
+     * other's network.
+     */
+    public boolean overlaps(Ipv6Cidr other) {
+        return contains(new long[] {other.high, other.low}) || other.contains(new long[] {high, low});
+    }
+
+    /**
      * Whether the prefix lies in {@code ::ffff:0:0/96}, where IPv4 destinations are spelled in IPv6
      * APIs. No packet carries one, so a consumer rule there would never match anything.
      */

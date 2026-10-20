@@ -58,7 +58,17 @@ final class PeerEgressConsumer {
         /** A DNS query to the responder, which took it. */
         DNS,
         /** A DNS query to the responder from an address that is not this machine's: dropped. */
-        BLOCKED_NOT_LOCAL;
+        BLOCKED_NOT_LOCAL,
+        /**
+         * An IPv6 packet the system sends on any interface of its own accord -- neighbour
+         * discovery, router solicitation, multicast reports -- dropped without a count.
+         */
+        IGNORED,
+        /**
+         * An IPv6 packet the data plane cannot carry whatever the rules say: from an address that
+         * is not this device's, to another device's, or over a path below 1280.
+         */
+        BLOCKED_IPV6;
 
         @Override
         public String toString() {
@@ -70,6 +80,8 @@ final class PeerEgressConsumer {
                 case BLOCKED_FAKE_IP -> "blocked-fake-ip";
                 case DNS -> "dns";
                 case BLOCKED_NOT_LOCAL -> "blocked-not-local";
+                case IGNORED -> "ignored";
+                case BLOCKED_IPV6 -> "blocked-ipv6";
                 default -> "not-mine";
             };
         }
@@ -83,6 +95,14 @@ final class PeerEgressConsumer {
     /** Writes one packet to the local stack. */
     interface TunWriter {
         void write(byte[] packet);
+    }
+
+    /**
+     * The effective MTU of the session to an egress (protocol/spec/peer-mesh.md, SPMTU2), the one the
+     * IPv4 path clamps to, or the configured MTU while there is none.
+     */
+    interface PathMtu {
+        int of(long egress);
     }
 
     private static final int IPV4_MIN_HEADER_BYTES = 20;
@@ -204,6 +224,13 @@ final class PeerEgressConsumer {
          */
         void noteApplicationProgress(byte[] packet) {
             int ihl = (packet[0] & 0x0f) * 4;
+            int stated = ((packet[2] & 0xff) << 8) | (packet[3] & 0xff);
+            if (((packet[0] & 0xff) >>> 4) == 6) {
+                // The fixed header, and the payload length it states: the data plane carries TCP only
+                // directly behind it.
+                ihl = PeerEgressIpv6Packet.HEADER_BYTES;
+                stated = packet.length < ihl ? packet.length : ihl + readShort(packet, 4);
+            }
             if (packet.length < ihl + 20) {
                 return;
             }
@@ -211,7 +238,7 @@ final class PeerEgressConsumer {
             if (dataOffset < 20) {
                 return;
             }
-            int total = Math.min(((packet[2] & 0xff) << 8) | (packet[3] & 0xff), packet.length);
+            int total = Math.min(stated, packet.length);
             int payload = Math.max(total - ihl - dataOffset, 0);
             int flags = packet[ihl + 13] & 0xff;
             int next = readInt(packet, ihl + 4) + payload;
@@ -283,6 +310,18 @@ final class PeerEgressConsumer {
      */
     private java.util.function.IntPredicate localAddress = address -> false;
 
+    /*
+     * The IPv6 data plane (protocol/spec/peer-egress.md, IPv6 数据面). carriesIpv6 is whether the
+     * device carries IPv6 now, given with each configuration (the mesh's ipv6State); without it every
+     * IPv6 packet is left alone, as before the data plane existed. virtualIp6 is the address derived
+     * from virtualIp, the only source an IPv6 packet may leave with and the only destination a reply
+     * may come back to. Which egresses take IPv6 packets is the catalogue's to say, and pathMtu the
+     * effective MTU of the session to one.
+     */
+    private boolean carriesIpv6;
+    private PeerEgressIpv6Packet.Address virtualIp6;
+    private PathMtu pathMtu;
+
     PeerEgressConsumer(Sender sender, TunWriter tunWriter) {
         this(sender, tunWriter, DEFAULT_FLOW_CAPACITY);
     }
@@ -329,7 +368,7 @@ final class PeerEgressConsumer {
                 new java.util.TreeMap<>(blocked), byEgress, Map.of(),
                 pool == null ? null : pool.cidr(), domainCapable,
                 pool == null ? 0 : pool.mappings(), pool == null ? 0 : pool.quarantined(nowMs),
-                standings, catalogState);
+                standings, catalogState, carriesIpv6, ipv6Capable());
     }
 
     /**
@@ -354,18 +393,49 @@ final class PeerEgressConsumer {
         return configure(newRules, newMeshCidr, newVirtualIp, pool, null, nowMs);
     }
 
-    /** As above, with the DNS responder that answers from the pool (step four), or null. */
+    /**
+     * As above, with the DNS responder that answers from the pool (step four), or null. Whether the
+     * device carries IPv6 stays what the last configuration said.
+     */
     Map<Long, List<String>> configure(List<PeerEgressRule> newRules, String newMeshCidr,
             String newVirtualIp, PeerEgressFakeIpPool pool, PeerEgressDnsResponder responder, long nowMs) {
+        return configure(newRules, newMeshCidr, newVirtualIp, pool, responder, carriesIpv6, nowMs);
+    }
+
+    /**
+     * As above with the IPv6 data plane stated: whether the device carries IPv6 now. Turned off,
+     * every IPv6 flow is closed like any flow whose rule stopped applying; turned on, the IPv6 rules
+     * take effect.
+     */
+    Map<Long, List<String>> configure(List<PeerEgressRule> newRules, String newMeshCidr,
+            String newVirtualIp, PeerEgressFakeIpPool pool, PeerEgressDnsResponder responder, boolean ipv6,
+            long nowMs) {
         rules = newRules == null ? List.of() : List.copyOf(newRules);
         if (newMeshCidr != null && !newMeshCidr.trim().isEmpty()) {
             meshCidr = newMeshCidr.trim();
         }
         virtualIp = newVirtualIp == null ? "" : newVirtualIp.trim();
         virtualAddress = Ipv4Cidr.parseAddress(virtualIp);
+        virtualIp6 = PeerEgressIpv6Packet.deviceAddress(virtualIp);
+        carriesIpv6 = ipv6;
         fakeIps = pool;
         dnsResponder = pool == null ? null : responder;
         return purgeInvalidated(nowMs);
+    }
+
+    /** How the effective MTU of the session to an egress is read, for the IPv6 path check; or null. */
+    void setPathMtu(PathMtu mtu) {
+        pathMtu = mtu;
+    }
+
+    /** Whether this consumer has the IPv6 data plane now. */
+    boolean carriesIpv6() {
+        return carriesIpv6;
+    }
+
+    /** The egresses the catalogue says take IPv6 packets. */
+    private Set<Long> ipv6Capable() {
+        return catalog.ipv6Capable() == null ? Set.of() : catalog.ipv6Capable();
     }
 
     /** How to tell this machine's interface addresses, for the DNS responder's source check. */
@@ -474,7 +544,16 @@ final class PeerEgressConsumer {
             PeerEgressFlowTable.Key key = entry.getKey();
             Flow flow = entry.getValue();
             boolean stillOurs;
-            if (pool != null && pool.contains(key.remoteIp())) {
+            if (key.ipv6()) {
+                // An IPv6 flow is re-examined by the same decision a new IPv6 packet gets, and it
+                // also goes when the catalogue stops saying its egress takes IPv6 packets.
+                PeerEgressRules.Match match = steer6(key.remoteIp6());
+                stillOurs = PeerEgressRule.ACTION_EGRESS.equals(match.action())
+                        && match.egressClientId() != null
+                        && match.egressClientId() == flow.egress
+                        && canTake(flow.egress)
+                        && ipv6Capable().contains(flow.egress);
+            } else if (pool != null && pool.contains(key.remoteIp())) {
                 // The same decision a packet gets, from the name the address stands for, but
                 // without refreshing the mapping: a rule change is not traffic.
                 String name = pool.nameOf(key.remoteIp());
@@ -497,7 +576,7 @@ final class PeerEgressConsumer {
             }
             dropped.add(key);
             purge.computeIfAbsent(flow.egress, unused -> new TreeSet<>())
-                    .add(Ipv4Cidr.format(key.remoteIp()) + "/32");
+                    .add(key.ipv6() ? key.remoteIp6().format() + "/128" : Ipv4Cidr.format(key.remoteIp()) + "/32");
             byte[] reset = flowResetPacket(key, flow);
             if (reset != null) {
                 resets.add(reset);
@@ -532,8 +611,10 @@ final class PeerEgressConsumer {
         if (packet == null || packet.length < IPV4_MIN_HEADER_BYTES) {
             return Outcome.NOT_MINE;
         }
+        if (((packet[0] & 0xff) >>> 4) == 6) {
+            return handleOutbound6(packet, nowMs);
+        }
         if (((packet[0] & 0xff) >>> 4) != 4) {
-            // IPv6 has no rules in this version, so nothing can claim it and it is not ours.
             return Outcome.NOT_MINE;
         }
         String destination = PeerIpPacket.destinationIpv4(packet);
@@ -766,10 +847,11 @@ final class PeerEgressConsumer {
         if (key.protocol() != PeerEgressSegment.IPV4_PROTOCOL_TCP || !flow.appAckKnown) {
             return null;
         }
+        // An IPv6 flow is reset by the same rule, only in its own family.
         return PeerEgressSegment.build(new PeerEgressSegment.Segment(
                 key.remoteIp(), key.consumerIp(), key.remotePort(), key.consumerPort(),
                 flow.appAck, flow.appSeqNext, PeerEgressSegment.FLAG_RST | PeerEgressSegment.FLAG_ACK,
-                0, 0, new byte[0]));
+                0, 0, new byte[0], key.remoteIp6(), key.consumerIp6()));
     }
 
     /**
@@ -798,8 +880,15 @@ final class PeerEgressConsumer {
         return ((data[offset] & 0xff) << 8) | (data[offset + 1] & 0xff);
     }
 
-    /** The flags of an IPv4 TCP segment, or none for anything else or a header cut short. */
+    /**
+     * The flags of a TCP segment, IPv4 or IPv6 with TCP as its next header, or none for anything else
+     * or a header cut short.
+     */
     private static int tcpFlags(byte[] packet) {
+        if (packet.length >= PeerEgressIpv6Packet.HEADER_BYTES + 14 && ((packet[0] & 0xff) >>> 4) == 6
+                && (packet[6] & 0xff) == PeerEgressSegment.IPV4_PROTOCOL_TCP) {
+            return packet[PeerEgressIpv6Packet.HEADER_BYTES + 13] & 0xff;
+        }
         if (packet.length < IPV4_MIN_HEADER_BYTES
                 || (packet[9] & 0xff) != PeerEgressSegment.IPV4_PROTOCOL_TCP) {
             return 0;
@@ -904,7 +993,9 @@ final class PeerEgressConsumer {
         if (!PeerEgressFrame.looksLikeFrame(frame)) {
             return false;
         }
-        PeerEgressFrame.Decoded parsed = PeerEgressFrame.parse(frame);
+        // A consumer with the IPv6 data plane reads an IPv6 body; one without leaves it, refused, to
+        // the egress role, as before.
+        PeerEgressFrame.Decoded parsed = PeerEgressFrame.parse(frame, carriesIpv6);
         if (!parsed.accepted()) {
             // A frame nobody can read is not claimed. The egress runtime refuses it with its own
             // code, which is the one an operator needs, and counting it here as well would report
@@ -921,6 +1012,9 @@ final class PeerEgressConsumer {
         }
         if (parsed.type() != PeerEgressFrame.TYPE_IP_PACKET) {
             return false;
+        }
+        if (parsed.inner().ipv6()) {
+            return handleInbound6(parsed, fromEgress, nowMs);
         }
 
         if (virtualIp.isEmpty() || !virtualIp.equals(parsed.inner().destinationIp())) {
@@ -975,13 +1069,10 @@ final class PeerEgressConsumer {
      * reset locally and is kept for the egress's RST instead.
      */
     private void handleFlowReject(PeerEgressFrame.Control control, long fromEgress, long nowMs) {
-        Integer remote = Ipv4Cidr.parseAddress(control.destinationIp());
-        Integer local = Ipv4Cidr.parseAddress(control.sourceIp());
-        if (remote == null || local == null) {
+        PeerEgressFlowTable.Key key = flowKeyForReject(control);
+        if (key == null) {
             return;
         }
-        var key = new PeerEgressFlowTable.Key(protocolNumberFor(control.protocol()),
-                local, control.sourcePort(), remote, control.destinationPort());
         // A flow already forgotten has nothing left to reset.
         Flow flow = liveFlow(key, nowMs);
         if (flow == null || flow.egress != fromEgress) {
@@ -1009,6 +1100,241 @@ final class PeerEgressConsumer {
             tunWriter.write(reset);
         }
         log.info("[peer-egress-consumer] egress={} refused flow code={}", fromEgress, control.code());
+    }
+
+    /**
+     * The flow a flow-reject names: its source is the consumer's side and its destination the
+     * target's. An egress writes IPv6 addresses for an IPv6 flow, and both must then be IPv6; a family
+     * mix names no flow.
+     */
+    private static PeerEgressFlowTable.Key flowKeyForReject(PeerEgressFrame.Control control) {
+        String source = control.sourceIp() == null ? "" : control.sourceIp().trim();
+        String destination = control.destinationIp() == null ? "" : control.destinationIp().trim();
+        int protocol = protocolNumberFor(control.protocol());
+        if (source.indexOf(':') >= 0 || destination.indexOf(':') >= 0) {
+            PeerEgressIpv6Packet.Address local = PeerEgressIpv6Packet.Address.parse(source);
+            PeerEgressIpv6Packet.Address remote = PeerEgressIpv6Packet.Address.parse(destination);
+            if (local == null || remote == null) {
+                return null;
+            }
+            return new PeerEgressFlowTable.Key(protocol, 0, control.sourcePort(), 0, control.destinationPort(),
+                    local, remote);
+        }
+        Integer remote = Ipv4Cidr.parseAddress(control.destinationIp());
+        Integer local = Ipv4Cidr.parseAddress(control.sourceIp());
+        if (remote == null || local == null) {
+            return null;
+        }
+        return new PeerEgressFlowTable.Key(protocol, local, control.sourcePort(), remote, control.destinationPort());
+    }
+
+    // ---- IPv6 ----------------------------------------------------------------------------------
+    //
+    // The consumer side of the IPv6 data plane (protocol/spec/peer-egress.md, IPv6 数据面, 消费端).
+    // The same rule as for IPv4 shapes it: a destination an egress rule claims never goes out
+    // locally. What IPv6 adds is a few checks before the rules are asked, because the TUN sees more of
+    // the system's own IPv6 than it ever saw of IPv4: neighbour discovery and multicast reports on
+    // every interface, and applications that bound some other address. Pinned by
+    // protocol/test-vectors/peer-egress-ipv6-v1.json (consumerOutbound, returnPath, failure).
+
+    /**
+     * Decides what happens to one IPv6 packet read from the TUN.
+     *
+     * <p>In order, before the rules: a link-local source or a multicast destination is the system's
+     * own traffic and is dropped without a count; a source that is not this device's derived address
+     * would be refused by the egress, which checks it against the session, so it is not sent
+     * ({@code ipv6-source-not-mesh}); a destination inside the derived prefix is another device's,
+     * and device-to-device traffic stays IPv4 ({@code ipv6-mesh-unsupported}). Then the rules, as for
+     * IPv4, and for a packet that would be sent to an egress the effective MTU of the session to it:
+     * below 1280 it cannot carry IPv6 at all ({@code ipv6-path-mtu}).
+     *
+     * <p>The path check runs once the rules have named the egress rather than strictly before them,
+     * since the session whose MTU it reads is the one to the egress the rule names; a packet a block
+     * rule drops, or one to an egress that is not there, has no session to ask about. None of these
+     * drops is answered: they are not an egress being unavailable but traffic this data plane cannot
+     * carry. {@code egress-no-ipv6} is answered, like {@code egress-no-domain}.
+     */
+    private Outcome handleOutbound6(byte[] packet, long nowMs) {
+        if (!carriesIpv6 || packet.length < PeerEgressIpv6Packet.HEADER_BYTES) {
+            // Without the data plane no IPv6 rule is in force, so nothing can claim the packet.
+            return Outcome.NOT_MINE;
+        }
+        PeerEgressIpv6Packet.Address source = PeerEgressIpv6Packet.Address.read(packet, 8);
+        PeerEgressIpv6Packet.Address destination = PeerEgressIpv6Packet.Address.read(packet, 24);
+        if (linkLocal(source) || multicast(destination)) {
+            return Outcome.IGNORED;
+        }
+        if (virtualIp6 == null || !virtualIp6.equals(source)) {
+            recordBlocked("ipv6-source-not-mesh");
+            return Outcome.BLOCKED_IPV6;
+        }
+        if (PeerEgressRules.meshPrefix6().contains(destination.halves())) {
+            recordBlocked("ipv6-mesh-unsupported");
+            return Outcome.BLOCKED_IPV6;
+        }
+        PeerEgressRules.Match match = steer6(destination);
+        if (!match.matched()
+                || (!PeerEgressRule.ACTION_EGRESS.equals(match.action())
+                        && !PeerEgressRule.ACTION_BLOCK.equals(match.action()))) {
+            return Outcome.NOT_MINE;
+        }
+        if (PeerEgressRule.ACTION_BLOCK.equals(match.action())) {
+            // A block rule is a drop, as for IPv4.
+            recordBlocked("rule");
+            return Outcome.BLOCKED_BY_RULE;
+        }
+        // The next header is the protocol: TCP and UDP are carried, and anything else -- ICMPv6, an
+        // extension header, a fragment header -- is dropped as ICMP is for IPv4.
+        int nextHeader = packet[6] & 0xff;
+        if (nextHeader != PeerEgressSegment.IPV4_PROTOCOL_TCP && nextHeader != PeerEgressDatagram.IPV4_PROTOCOL_UDP) {
+            recordBlocked("unsupported-protocol");
+            return Outcome.UNSUPPORTED;
+        }
+        Long egress = match.egressClientId();
+        if (egress == null || !Boolean.TRUE.equals(online.get(egress))) {
+            return refuseAnswered6(packet, nextHeader, "egress-unavailable");
+        }
+        String standingRefusal = catalog.standing(egress).blockedReason();
+        if (standingRefusal != null) {
+            return refuseAnswered6(packet, nextHeader, standingRefusal);
+        }
+        if (!ipv6Capable().contains(egress)) {
+            // Online and not ruled out by the catalogue, but not said to take IPv6 packets: sent
+            // anyway it would be refused there with EGRESS_IPV6_UNSUPPORTED. Answered like an egress
+            // that is not there, as egress-no-domain is, so the application fails now.
+            return refuseAnswered6(packet, nextHeader, "egress-no-ipv6");
+        }
+        PathMtu mtu = pathMtu;
+        if (mtu != null && mtu.of(egress) < PeerEgressRouteCommanders.IPV6_MINIMUM_MTU) {
+            recordBlocked("ipv6-path-mtu");
+            return Outcome.BLOCKED_IPV6;
+        }
+
+        PeerEgressFlowTable.Key key = flowKeyFor6(packet, nextHeader);
+        int tcpFlags = tcpFlags(packet);
+        if (key != null) {
+            sweepIfDue(nowMs);
+            Flow flow = liveFlow(key, nowMs);
+            if (flow != null && flow.closed
+                    && (tcpFlags & (PeerEgressSegment.FLAG_SYN | PeerEgressSegment.FLAG_ACK))
+                            == PeerEgressSegment.FLAG_SYN) {
+                // A new connection reusing the five-tuple of one that closed.
+                flows.remove(key);
+                flow = null;
+            }
+            if (flow == null) {
+                makeRoom(nowMs);
+                flow = new Flow(nextHeader, egress, ++registrations, nowMs);
+            }
+            touch(key, flow, tcpFlags, true, nowMs);
+            if (nextHeader == PeerEgressSegment.IPV4_PROTOCOL_TCP) {
+                flow.noteApplicationProgress(packet);
+            }
+        }
+        if (sender == null) {
+            return Outcome.BLOCKED_NO_EGRESS;
+        }
+        // The packet goes as it is: SPEG1 carries an IPv6 packet unchanged, its version telling the
+        // two families apart. hop stays clear, as for IPv4.
+        if (!sender.send(egress, PeerEgressFrame.encode(PeerEgressFrame.TYPE_IP_PACKET, false, packet))) {
+            recordBlocked("send-failed");
+            return Outcome.BLOCKED_NO_EGRESS;
+        }
+        return Outcome.FORWARDED;
+    }
+
+    /**
+     * Decides an IPv6 destination by the IPv6 rules alone. There is no fake-IP pool in IPv6 -- names
+     * are answered with IPv4 fake addresses only -- so only address rules apply.
+     */
+    private PeerEgressRules.Match steer6(PeerEgressIpv6Packet.Address destination) {
+        return PeerEgressRules.match(rules, destination.format(), meshCidr, poolCidr(), carriesIpv6);
+    }
+
+    /** Counts a refused IPv6 packet and answers it with a reset or an ICMPv6 address unreachable. */
+    private Outcome refuseAnswered6(byte[] packet, int nextHeader, String reason) {
+        recordBlocked(reason);
+        byte[] answer = failurePacket6(packet, nextHeader);
+        if (answer != null && tunWriter != null) {
+            tunWriter.write(answer);
+        }
+        return Outcome.BLOCKED_NO_EGRESS;
+    }
+
+    /**
+     * Answers an IPv6 packet the consumer refused to forward, the same way as IPv4: a TCP segment
+     * with a reset by RFC 793, a UDP datagram with an ICMPv6 address unreachable. Pinned by the
+     * failure section of {@code protocol/test-vectors/peer-egress-ipv6-v1.json}.
+     */
+    static byte[] failurePacket6(byte[] packet, int nextHeader) {
+        if (nextHeader == PeerEgressSegment.IPV4_PROTOCOL_TCP) {
+            PeerEgressSegment.Segment segment = PeerEgressIpv6Packet.parseSegment(packet);
+            return segment == null ? null : PeerEgressSegment.buildReset(segment);
+        }
+        if (nextHeader == PeerEgressDatagram.IPV4_PROTOCOL_UDP) {
+            return PeerEgressIpv6Packet.icmpAddressUnreachable(packet);
+        }
+        return null;
+    }
+
+    /**
+     * Takes an IPv6 packet an egress sent back. A packet not addressed to this device's derived
+     * address is not the consumer's, and is left for the egress role of a device that is both. One
+     * whose source is inside the derived prefix would let an egress speak as another device, and one
+     * that matches no live flow this device opened through this egress was never asked for.
+     */
+    private boolean handleInbound6(PeerEgressFrame.Decoded parsed, long fromEgress, long nowMs) {
+        byte[] packet = parsed.body();
+        if (packet.length < PeerEgressIpv6Packet.HEADER_BYTES) {
+            return false;
+        }
+        PeerEgressIpv6Packet.Address source = PeerEgressIpv6Packet.Address.read(packet, 8);
+        PeerEgressIpv6Packet.Address destination = PeerEgressIpv6Packet.Address.read(packet, 24);
+        if (virtualIp6 == null || !virtualIp6.equals(destination)) {
+            return false;
+        }
+        if (PeerEgressRules.meshPrefix6().contains(source.halves())) {
+            recordBlocked("return-mesh-source");
+            return true;
+        }
+        sweepIfDue(nowMs);
+        var key = new PeerEgressFlowTable.Key(parsed.inner().protocol(), 0, parsed.inner().destinationPort(),
+                0, parsed.inner().sourcePort(), destination, source);
+        Flow flow = liveFlow(key, nowMs);
+        if (flow == null || flow.egress != fromEgress) {
+            recordBlocked("return-no-flow");
+            return true;
+        }
+        flow.replied = true;
+        touch(key, flow, tcpFlags(packet), false, nowMs);
+        if (tunWriter != null) {
+            tunWriter.write(packet);
+        }
+        return true;
+    }
+
+    /**
+     * The five-tuple of an IPv6 packet as the consumer sees it, the mirror of what the egress
+     * records. Only a TCP or UDP header directly behind the fixed header is read: the data plane
+     * carries nothing else.
+     */
+    private static PeerEgressFlowTable.Key flowKeyFor6(byte[] packet, int nextHeader) {
+        int header = PeerEgressIpv6Packet.HEADER_BYTES;
+        if (packet.length < header + 4) {
+            return null;
+        }
+        return new PeerEgressFlowTable.Key(nextHeader, 0, readShort(packet, header), 0, readShort(packet, header + 2),
+                PeerEgressIpv6Packet.Address.read(packet, 8), PeerEgressIpv6Packet.Address.read(packet, 24));
+    }
+
+    /** An address in fe80::/10. */
+    private static boolean linkLocal(PeerEgressIpv6Packet.Address address) {
+        return (address.high() >>> 54) == (0xfe80L >>> 6);
+    }
+
+    /** An address in ff00::/8. */
+    private static boolean multicast(PeerEgressIpv6Packet.Address address) {
+        return (address.high() >>> 56) == 0xffL;
     }
 
     private static int protocolNumberFor(String name) {

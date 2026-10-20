@@ -363,9 +363,8 @@ public final class PeerEgressMacosRouteCommands {
     }
 
     /**
-     * Reads the whole table. IPv4 only: the IPv6 section has a different column layout and this
-     * feature does not route IPv6 yet. The egress socket binder reads the IPv6 table with
-     * {@link PeerEgressSocketBinding#macosShowTableArgs6()}.
+     * Reads the whole table. IPv4 only: the IPv6 section has a different column layout and is read
+     * apart, with {@link PeerEgressSocketBinding#macosShowTableArgs6()}.
      */
     public static List<String> showTableArgs() {
         return List.of("netstat", "-rn", "-f", "inet");
@@ -422,6 +421,178 @@ public final class PeerEgressMacosRouteCommands {
             throw new IllegalArgumentException(REFUSAL + ": " + prefix);
         }
         return List.of("route", "-n", "delete", "-net", prefix);
+    }
+
+    // ---- IPv6 --------------------------------------------------------------------------------
+    //
+    // The IPv6 commands (protocol/spec/peer-egress.md, IPv6 数据面): `route -n ... -inet6`, read back
+    // from `netstat -rn -f inet6`. Separate builders, so the IPv4 ones stay what the shared vector
+    // pins -- including refusing an IPv6 value -- and an IPv6 value can only reach a command written
+    // for IPv6.
+
+    /**
+     * Whether this is an IPv6 prefix in the form this feature writes it: RFC 5952 address, slash,
+     * decimal length. Requiring the canonical form keeps the text checked the text sent: {@code route}
+     * has its own reading of an address, and one spelling leaves it nothing to read differently.
+     */
+    public static boolean validPrefix6(String value) {
+        com.theshuai.common.peeregress.Ipv6Cidr.Parsed parsed =
+                com.theshuai.common.peeregress.Ipv6Cidr.parseWithLength(value);
+        return parsed != null && parsed.hadLength() && parsed.cidr().toString().equals(value);
+    }
+
+    /**
+     * Whether this is an IPv6 address, optionally with a zone naming an interface -- a link-local
+     * next hop means nothing without one -- and nothing else: no brackets, no dotted tail, and a
+     * zone that passes the same whitelist as an interface name.
+     */
+    public static boolean validAddress6(String value) {
+        if (value == null) {
+            return false;
+        }
+        int zone = value.indexOf('%');
+        if (zone >= 0 && !validInterfaceName(value.substring(zone + 1))) {
+            return false;
+        }
+        return com.theshuai.common.peeregress.Ipv6Cidr.parseAddress(zone < 0 ? value : value.substring(0, zone))
+                != null;
+    }
+
+    /** Asks where an IPv6 address would go right now. A zoned address is not one a bypass pins. */
+    public static List<String> findRouteArgs6(String address) {
+        if (!validAddress6(address) || address.indexOf('%') >= 0) {
+            throw new IllegalArgumentException(REFUSAL + ": " + address);
+        }
+        return List.of("route", "-n", "get", "-inet6", address);
+    }
+
+    /** Sends an IPv6 prefix out of an interface: a rule's route into the TUN, or an on-link bypass. */
+    public static List<String> installInterfaceArgs6(String prefix, String name) {
+        if (!validPrefix6(prefix)) {
+            throw new IllegalArgumentException(REFUSAL + ": " + prefix);
+        }
+        if (!validInterfaceName(name)) {
+            throw new IllegalArgumentException(REFUSAL + ": " + name);
+        }
+        return List.of("route", "-n", "add", "-inet6", "-net", prefix, "-interface", name);
+    }
+
+    /**
+     * Sends an IPv6 prefix to a next hop, which for IPv6 is usually link-local and so carries its
+     * zone: {@code fe80::1%en0}.
+     */
+    public static List<String> installGatewayArgs6(String prefix, String gateway) {
+        if (!validPrefix6(prefix)) {
+            throw new IllegalArgumentException(REFUSAL + ": " + prefix);
+        }
+        if (!validAddress6(gateway)) {
+            throw new IllegalArgumentException(REFUSAL + ": " + gateway);
+        }
+        return List.of("route", "-n", "add", "-inet6", "-net", prefix, gateway);
+    }
+
+    /** Withdraws an IPv6 prefix, unscoped like the install. */
+    public static List<String> removeArgs6(String prefix) {
+        if (!validPrefix6(prefix)) {
+            throw new IllegalArgumentException(REFUSAL + ": " + prefix);
+        }
+        return List.of("route", "-n", "delete", "-inet6", "-net", prefix);
+    }
+
+    /**
+     * The spec's {@code ifconfig <utun> inet6 <address> prefixlen 128}, which gives the TUN the
+     * device's derived address. The same whitelists as the route commands: an interface name that
+     * cannot read as an option, and an address in the form this feature writes.
+     */
+    public static List<String> assignAddress6Args(String device, String address) {
+        if (!validInterfaceName(device)) {
+            throw new IllegalArgumentException(REFUSAL + ": " + device);
+        }
+        if (com.theshuai.common.peeregress.Ipv6Cidr.parseAddress(address) == null) {
+            throw new IllegalArgumentException(REFUSAL + ": " + address);
+        }
+        return List.of("ifconfig", device, "inet6", address, "prefixlen", "128");
+    }
+
+    /**
+     * Reads {@code route -n get -inet6 <address>}. The same shape as IPv4; the gateway is an IPv6
+     * address, a link-local one with its zone -- {@code gateway: fe80::1%en0} -- and anything that is
+     * not one (a link#N, a MAC) is read as on-link, as for IPv4.
+     */
+    public static PeerEgressRouteCommands.Hop parseRouteGet6(String stdout, String stderr) {
+        if (stderr != null && !stderr.trim().isEmpty()) {
+            return null;
+        }
+        String gateway = "";
+        String device = "";
+        for (String line : (stdout == null ? "" : stdout).split("\n", -1)) {
+            int separator = line.indexOf(':');
+            if (separator < 0) {
+                continue;
+            }
+            String key = line.substring(0, separator).trim();
+            String value = line.substring(separator + 1).trim();
+            if (key.equals("gateway")) {
+                gateway = value;
+            } else if (key.equals("interface")) {
+                device = value;
+            }
+        }
+        if (device.isEmpty()) {
+            return null;
+        }
+        return new PeerEgressRouteCommands.Hop(validAddress6(gateway) ? gateway : "", device);
+    }
+
+    /**
+     * The rows of the Internet6 section of {@code netstat -rn}, each destination written the way this
+     * feature writes a prefix.
+     */
+    public static List<NetstatRoute> parseTable6(String stdout) {
+        List<NetstatRoute> routes = new ArrayList<>();
+        boolean inside = false;
+        for (String line : (stdout == null ? "" : stdout).split("\n", -1)) {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            if (trimmed.endsWith(":") && !trimmed.contains(" ")) {
+                inside = trimmed.equals("Internet6:");
+                continue;
+            }
+            if (!inside || trimmed.startsWith("Destination")) {
+                continue;
+            }
+            String[] fields = trimmed.split("\\s+");
+            if (fields.length < 4) {
+                continue;
+            }
+            String prefix = PeerEgressSocketBinding.normaliseMacosPrefix6(fields[0]);
+            if (prefix.isEmpty()) {
+                continue;
+            }
+            routes.add(new NetstatRoute(prefix, fields[0], fields[1], fields[2], fields[3]));
+        }
+        return routes;
+    }
+
+    /**
+     * Whether anything already owns this exact IPv6 prefix, from the Internet6 section, with the same
+     * exclusion of kernel-generated rows as IPv4: neighbour entries are host routes the kernel makes
+     * for every address it has talked to.
+     */
+    public static PeerEgressRouteCommands.ExistingRoute conflictFromTable6(String table, String prefix) {
+        String wanted = PeerEgressSocketBinding.normaliseMacosPrefix6(prefix);
+        if (wanted.isEmpty() || prefix == null || prefix.indexOf(':') < 0) {
+            return new PeerEgressRouteCommands.ExistingRoute(false, "");
+        }
+        List<NetstatRoute> matching = new ArrayList<>();
+        for (NetstatRoute route : parseTable6(table)) {
+            if (route.prefix().equals(wanted) && !route.flags().contains(KERNEL_GENERATED_FLAG)) {
+                matching.add(route);
+            }
+        }
+        return describeRoutes(matching);
     }
 
     /**

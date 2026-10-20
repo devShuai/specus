@@ -66,6 +66,16 @@ public final class PeerEgressRouteInstaller {
         default Table table() throws IOException {
             throw new IOException("this commander cannot read the routing table");
         }
+
+        /**
+         * {@link #table} for the IPv6 table, read only when this feature owns an IPv6 route
+         * ({@code protocol/spec/peer-egress.md}, IPv6 数据面).
+         *
+         * @throws IOException when the table cannot be read, in which case nothing is repaired
+         */
+        default Table table6() throws IOException {
+            throw new IOException("this commander cannot read the IPv6 routing table");
+        }
     }
 
     /** The routing table as read for a repair, and how the tunnel appears in it. */
@@ -326,9 +336,24 @@ public final class PeerEgressRouteInstaller {
         if (installed.isEmpty()) {
             return new RepairResult(null, List.of(), List.of(), null);
         }
-        Table table;
+        // Each family is compared with its own table, and a table is read only when a route of its
+        // family is owned: a machine that owns no IPv6 route reads exactly what it read before IPv6
+        // routes existed.
+        List<Route> owned4 = new ArrayList<>();
+        List<Route> owned6 = new ArrayList<>();
+        for (Route route : installed) {
+            (PeerEgressRoutePlanner.isIpv6(route) ? owned6 : owned4).add(route);
+        }
+        List<PeerEgressSocketBinding.Drift> drifts = new ArrayList<>();
         try {
-            table = commander.table();
+            if (!owned4.isEmpty()) {
+                Table table = commander.table();
+                drifts.addAll(PeerEgressSocketBinding.drifts(owned4, table.routes(), table.tunnel()));
+            }
+            if (!owned6.isEmpty()) {
+                Table table = commander.table6();
+                drifts.addAll(PeerEgressSocketBinding.drifts(owned6, table.routes(), table.tunnel()));
+            }
         } catch (Exception unreadable) {
             return new RepairResult(unreadable, List.of(), List.of(), null);
         }
@@ -336,7 +361,7 @@ public final class PeerEgressRouteInstaller {
         List<RouteConflict> lost = new ArrayList<>();
         Exception error = null;
         boolean changed = false;
-        for (PeerEgressSocketBinding.Drift drift : PeerEgressSocketBinding.drifts(installed(), table.routes(), table.tunnel())) {
+        for (PeerEgressSocketBinding.Drift drift : drifts) {
             Route route = drift.route();
             if (PeerEgressSocketBinding.DRIFT_CONFLICT.equals(drift.action())) {
                 Conflict conflict = commander.conflict(route);
