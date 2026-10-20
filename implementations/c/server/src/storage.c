@@ -4233,14 +4233,15 @@ int st_storage_upsert_client_download_link_extended(const char *path,
         sqlite3_bind_text(stmt, 3, arch, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 4, display_name, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 5, download_url, -1, SQLITE_TRANSIENT);
-        bind_nullable_text_limit(stmt, 6, description, 512);
+        /* The service bounds these in UTF-16 units (512 and 1024); in UTF-8 they are up to three times that. */
+        bind_nullable_text_limit(stmt, 6, description, 1536);
         sqlite3_bind_int(stmt, 7, display_order);
         sqlite3_bind_int(stmt, 8, enabled ? 1 : 0);
         bind_nullable_text_limit(stmt, 9, version, 80);
         bind_nullable_text_limit(stmt, 10, sha256, 64);
         sqlite3_bind_int64(stmt, 11, file_size < 0 ? 0 : file_size);
         sqlite3_bind_int(stmt, 12, is_latest ? 1 : 0);
-        bind_nullable_text_limit(stmt, 13, changelog_url, 1024);
+        bind_nullable_text_limit(stmt, 13, changelog_url, 3072);
         bind_nullable_text_limit(stmt, 14, min_supported_version, 80);
         sqlite3_bind_int(stmt, 15, hosted ? 1 : 0);
         bind_nullable_text_limit(stmt, 16, package_path, 1024);
