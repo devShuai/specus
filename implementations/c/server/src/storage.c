@@ -2288,7 +2288,7 @@ int st_storage_issue_websocket_ticket(const char *path, const char *token_hash, 
 
 int st_storage_issue_websocket_ticket_limited(const char *path, const char *token_hash, const char *scope,
     const char *attributes_json, const char *remote_address_hash, const char *created_at,
-    const char *expires_at, unsigned int active_limit)
+    const char *expires_at, unsigned int active_limit, unsigned int source_limit)
 {
     char expires[ST_INSTANT_CAPACITY], created[ST_INSTANT_CAPACITY], cutoff[ST_INSTANT_CAPACITY];
     if (active_limit == 0U || websocket_ticket_values(token_hash, scope, attributes_json, remote_address_hash, created_at, expires_at, created, expires) != 0
@@ -2303,12 +2303,19 @@ int st_storage_issue_websocket_ticket_limited(const char *path, const char *toke
     sqlite3_finalize(stmt); stmt = NULL;
     int result = -1;
     if (rc == SQLITE_DONE) {
-        rc = sqlite3_prepare_v2(db, "SELECT count(*) FROM specus_websocket_ticket WHERE "
+        rc = sqlite3_prepare_v2(db, "SELECT count(*),coalesce(sum(remote_address_hash IS ?2),0) "
+            "FROM specus_websocket_ticket WHERE "
             "(?1='public-transfer' AND scope='public-transfer' COLLATE BINARY) OR "
             "(?1<>'public-transfer' AND scope COLLATE BINARY IN('connections','client-messages'))", -1, &stmt, NULL);
         if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 1, scope, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = remote_address_hash == NULL ? sqlite3_bind_null(stmt, 2)
+            : sqlite3_bind_text(stmt, 2, remote_address_hash, -1, SQLITE_TRANSIENT);
         if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
-        if (rc == SQLITE_ROW) result = sqlite3_column_int64(stmt, 0) >= (long long)active_limit ? -2 : 0;
+        if (rc == SQLITE_ROW) {
+            int full = sqlite3_column_int64(stmt, 0) >= (long long)active_limit
+                || (source_limit > 0U && sqlite3_column_int64(stmt, 1) >= (long long)source_limit);
+            result = full ? -2 : 0;
+        }
         sqlite3_finalize(stmt);
     }
     if (result == 0) result = insert_websocket_ticket_on_db(db, token_hash, scope, attributes_json, remote_address_hash, created, expires);

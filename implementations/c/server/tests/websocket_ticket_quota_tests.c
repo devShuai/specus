@@ -69,6 +69,10 @@ static void quota_scenarios(void)
             CHECK(st_websocket_ticket_issue("public-transfer", public_attributes, "127.16.0.1", token, expiry) == 0);
         }
         CHECK(issue_status(2) == 429);
+        /* The public limit is per source: one full source does not lock out another browser. */
+        char other_source[8192];
+        CHECK(http("POST", "/api/public/transfer/ws-tickets", "127.16.0.2",
+                   "{\"roomId\":\"quota-room\",\"peerId\":\"other-peer\",\"displayName\":\"other\"}", other_source) == 200);
         /* Free one management slot while the public group remains completely full. */
         char path[256];
         snprintf(path, sizeof(path), "%s?ticket=%s", ws_paths[results[winner].scope], results[winner].ticket);
@@ -87,6 +91,31 @@ static void quota_scenarios(void)
     }
     st_websocket_ticket_reset_memory_scope(NULL); clear_persistent();
 }
+/* Public tickets: a per-source limit, and a total one that bounds memory across sources. */
+static void public_limit_scenarios(void)
+{
+    const char *attributes = "{\"roomId\":\"limit-room\",\"peerId\":\"limit-peer\",\"displayName\":\"limit\",\"publicAddress\":\"127.16.0.9\",\"roomKey\":\"\",\"roomRole\":\"member\",\"sharedRoom\":false,\"discoverable\":true}";
+    st_websocket_ticket_set_public_limits_for_tests(4U, 6U);
+    for (int persistent = 0; persistent < 2; ++persistent) {
+        st_websocket_ticket_reset_memory_scope(NULL); clear_persistent();
+        if (persistent) CHECK(setenv("SPECUS_DATABASE_PATH", database, 1) == 0);
+        else CHECK(unsetenv("SPECUS_DATABASE_PATH") == 0);
+        set_clock(base_seconds, 0L);
+        char token[64], expiry[40];
+        for (unsigned i = 0U; i < 4U; ++i)
+            CHECK(st_websocket_ticket_issue("public-transfer", attributes, "198.51.100.1", token, expiry) == 0);
+        CHECK(st_websocket_ticket_issue("public-transfer", attributes, "198.51.100.1", token, expiry) == -2);
+        CHECK(st_websocket_ticket_issue("public-transfer", attributes, "198.51.100.2", token, expiry) == 0);
+        CHECK(st_websocket_ticket_issue("public-transfer", attributes, NULL, token, expiry) == 0);
+        /* Six active public tickets: the total limit now refuses every source. */
+        CHECK(st_websocket_ticket_issue("public-transfer", attributes, "198.51.100.3", token, expiry) == -2);
+        CHECK(st_websocket_ticket_issue("public-transfer", attributes, NULL, token, expiry) == -2);
+        printf("public ticket limits: persistent%d per-source4 refused the fifth, other sources admitted until total6\n",
+               persistent);
+    }
+    st_websocket_ticket_set_public_limits_for_tests(1024U, 16384U);
+    st_websocket_ticket_reset_memory_scope(NULL); clear_persistent();
+}
 int main(void)
 {
     CHECK(atexit(cleanup) == 0);
@@ -98,7 +127,7 @@ int main(void)
     CHECK(st_storage_init(database, 0) == 0 && setenv("SPECUS_DATABASE_PATH", database, 1) == 0);
     char bearer[2200]; CHECK(st_security_issue_local_token("admin", "default", "ADMIN", "ticket-test-jwt-key", 600, bearer, sizeof(bearer)) == 0);
     CHECK(snprintf(auth, sizeof(auth), "Bearer %s", bearer) > 0);
-    static st_admin_server server; start_api(&server); quota_scenarios();
+    static st_admin_server server; start_api(&server); quota_scenarios(); public_limit_scenarios();
     puts("ticket quota:2 actual TCP memory/database scenarios passed; prefilling uses real shared service, not1024 simultaneous HTTP requests; account lifecycle and main restart have separate suites");
     return 0;
 }

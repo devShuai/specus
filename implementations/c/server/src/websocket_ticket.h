@@ -4,7 +4,8 @@
 #include <stddef.h>
 #include "instant.h"
 
-/*45 seconds, inclusive expiry;1024 management tickets combined and1024 public tickets.
+/*45 seconds, inclusive expiry;1024 management tickets combined; public tickets 1024 per source
+ * address and 16384 in total (Java caps neither).
  * The server initializes its configured database schema at startup; errors fail closed.
  * No database configuration uses volatile memory.
  * Issue:0 success,-2 quota,-1 error. Consume:0 success,1 refused,-1 error; caller frees JSON. */
@@ -17,5 +18,7 @@ int st_websocket_ticket_identity_matches(const char *json, const char *tenant_id
 void st_websocket_ticket_revoke_memory_identity(const char *tenant_id, const char *username);
 /* Used by existing test-fixture reset APIs; never removes persistent tickets. NULL clears all. */
 void st_websocket_ticket_reset_memory_scope(const char *scope);
+/* Tests only: the public per-source and total limits (defaults 1024 and 16384). */
+void st_websocket_ticket_set_public_limits_for_tests(unsigned int per_source, unsigned int total);
 
 #endif

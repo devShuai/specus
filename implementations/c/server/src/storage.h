@@ -1808,10 +1808,12 @@ int st_storage_delete_management_user_audited(const char *path,
 int st_storage_issue_websocket_ticket(const char *path, const char *token_hash, const char *scope,
     const char *attributes_json, const char *remote_address_hash, const char *created_at, const char *expires_at);
 /* Atomic strict purge + category quota + insert. Management scopes share a quota;
- * public-transfer has a separate quota.0 success,-2 quota,-1 error. */
+ * public-transfer has a separate quota. A nonzero source_limit also caps the active tickets of
+ * the category with this remote address hash (NULL counts the tickets without one).
+ * 0 success,-2 quota,-1 error. */
 int st_storage_issue_websocket_ticket_limited(const char *path, const char *token_hash, const char *scope,
     const char *attributes_json, const char *remote_address_hash, const char *created_at,
-    const char *expires_at, unsigned int active_limit);
+    const char *expires_at, unsigned int active_limit, unsigned int source_limit);
 int st_storage_consume_websocket_ticket(const char *path, const char *token_hash, const char *scope,
     const char *remote_address_hash, const char *now, char **attributes_json);
 int st_storage_delete_expired_websocket_tickets(const char *path, const char *before, int *deleted);

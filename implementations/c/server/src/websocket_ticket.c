@@ -9,7 +9,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Unconsumed management tickets of both scopes together. */
 #define ST_WS_TICKET_LIMIT 1024U
+/*
+ * Java caps no ticket category. Public tickets are anonymous, so C bounds them per source address
+ * (one source cannot lock everybody else out) and, for memory, in total.
+ */
+static unsigned int public_source_limit = 1024U;
+static unsigned int public_total_limit = 16384U;
 typedef struct memory_ticket {
     char hash[65], remote_hash[65], scope[32], expires[ST_INSTANT_CAPACITY];
     char *json;
@@ -101,9 +108,14 @@ int st_websocket_ticket_issue(const char *scope, const char *attributes_json, co
         || st_instant_public(expires, expires_at, ST_INSTANT_CAPACITY) != 0 || random_token(token) != 0) return -1;
     hash_text(token, strlen(token), hash); remote_hash(remote_address, address);
     const char *path = database_path();
+    int is_public = strcmp(scope, "public-transfer") == 0;
+    pthread_mutex_lock(&ticket_lock);
+    unsigned int total_limit = is_public ? public_total_limit : ST_WS_TICKET_LIMIT;
+    unsigned int source_limit = is_public ? public_source_limit : 0U;
+    pthread_mutex_unlock(&ticket_lock);
     if (path != NULL) {
         return st_storage_issue_websocket_ticket_limited(path, hash, scope, attributes_json,
-            *address == '\0' ? NULL : address, now, expires, ST_WS_TICKET_LIMIT);
+            *address == '\0' ? NULL : address, now, expires, total_limit, source_limit);
     }
     memory_ticket *ticket = calloc(1U, sizeof(*ticket));
     if (ticket == NULL) return -1;
@@ -112,13 +124,16 @@ int st_websocket_ticket_issue(const char *scope, const char *attributes_json, co
     memcpy(ticket->hash, hash, sizeof(hash)); memcpy(ticket->remote_hash, address, sizeof(address));
     strcpy(ticket->scope, scope); strcpy(ticket->expires, expires);
     pthread_mutex_lock(&ticket_lock); prune_locked(now);
-    unsigned int count = 0U;
-    int is_public = strcmp(scope, "public-transfer") == 0, collision = 0;
+    unsigned int count = 0U, same_source = 0U;
+    int collision = 0;
     for (memory_ticket *existing = memory_tickets; existing != NULL; existing = existing->next) {
-        count += (strcmp(existing->scope, "public-transfer") == 0) == is_public;
+        int same_category = (strcmp(existing->scope, "public-transfer") == 0) == is_public;
+        count += same_category;
+        same_source += same_category && strcmp(existing->remote_hash, address) == 0;
         collision |= st_constant_time_eq((const uint8_t *)hash, (const uint8_t *)existing->hash, 64U);
     }
-    int result = collision ? -1 : count >= ST_WS_TICKET_LIMIT ? -2 : 0;
+    int result = collision ? -1
+        : count >= total_limit || (source_limit > 0U && same_source >= source_limit) ? -2 : 0;
     if (result == 0) { ticket->next = memory_tickets; memory_tickets = ticket; }
     pthread_mutex_unlock(&ticket_lock);
     if (result != 0) free_ticket(ticket);
@@ -166,6 +181,13 @@ void st_websocket_ticket_revoke_memory_identity(const char *tenant_id, const cha
             *cursor = ticket->next; free_ticket(ticket);
         } else cursor = &ticket->next;
     }
+    pthread_mutex_unlock(&ticket_lock);
+}
+void st_websocket_ticket_set_public_limits_for_tests(unsigned int per_source, unsigned int total)
+{
+    pthread_mutex_lock(&ticket_lock);
+    public_source_limit = per_source;
+    public_total_limit = total;
     pthread_mutex_unlock(&ticket_lock);
 }
 void st_websocket_ticket_reset_memory_scope(const char *scope)
