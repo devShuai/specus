@@ -673,86 +673,104 @@ static int admin_path_equals(const char *path, const char *expected)
     return len == strlen(expected) && memcmp(path, expected, len) == 0;
 }
 
-static int admin_query_i64(const char *path, const char *key, long long *out)
+static int admin_query_hex_digit(char c)
 {
-    const char *query = strchr(path, '?');
-    if (query == NULL) {
-        return -1;
-    }
-    ++query;
-    size_t key_len = strlen(key);
-    while (*query != '\0') {
-        const char *next = strchr(query, '&');
-        size_t part_len = next == NULL ? strlen(query) : (size_t)(next - query);
-        if (part_len > key_len + 1U && memcmp(query, key, key_len) == 0 && query[key_len] == '=') {
-            char *end = NULL;
-            long long parsed = strtoll(query + key_len + 1U, &end, 10);
-            if (end != query + key_len + 1U && parsed > 0
-                && (end == query + part_len || *end == '&' || *end == '\0')) {
-                *out = parsed;
-                return 0;
-            }
-        }
-        if (next == NULL) {
-            break;
-        }
-        query = next + 1;
-    }
-    return -1;
+    return c >= '0' && c <= '9' ? c - '0'
+        : (c >= 'a' && c <= 'f' ? c - 'a' + 10 : (c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1));
 }
 
-static char *admin_query_string(const char *path, const char *key)
+/* len bytes of a query name or value percent-decoded, '+' as a space; an escape that is not one stays. */
+static char *admin_query_decode(const char *text, size_t len)
 {
-    const char *query = strchr(path, '?');
-    if (query == NULL) {
+    char *copy = (char *)malloc(len + 1U);
+    if (copy == NULL) {
         return NULL;
     }
-    ++query;
-    size_t key_len = strlen(key);
-    while (*query != '\0') {
-        const char *next = strchr(query, '&');
-        size_t part_len = next == NULL ? strlen(query) : (size_t)(next - query);
-        if (part_len >= key_len + 1U && memcmp(query, key, key_len) == 0 && query[key_len] == '=') {
-            size_t value_len = part_len - key_len - 1U;
-            char *copy = (char *)malloc(value_len + 1U);
-            if (copy == NULL) {
-                return NULL;
-            }
-            const char *value = query + key_len + 1U;
-            size_t w = 0;
-            for (size_t i = 0; i < value_len; ++i) {
-                if (value[i] == '%' && i + 2U < value_len) {
-                    int high = value[i + 1U] >= '0' && value[i + 1U] <= '9'
-                        ? value[i + 1U] - '0'
-                        : (value[i + 1U] >= 'a' && value[i + 1U] <= 'f'
-                            ? value[i + 1U] - 'a' + 10
-                            : (value[i + 1U] >= 'A' && value[i + 1U] <= 'F'
-                                ? value[i + 1U] - 'A' + 10
-                                : -1));
-                    int low = value[i + 2U] >= '0' && value[i + 2U] <= '9'
-                        ? value[i + 2U] - '0'
-                        : (value[i + 2U] >= 'a' && value[i + 2U] <= 'f'
-                            ? value[i + 2U] - 'a' + 10
-                            : (value[i + 2U] >= 'A' && value[i + 2U] <= 'F'
-                                ? value[i + 2U] - 'A' + 10
-                                : -1));
-                    if (high >= 0 && low >= 0) {
-                        copy[w++] = (char)((high << 4) | low);
-                        i += 2U;
-                        continue;
-                    }
-                }
-                copy[w++] = value[i] == '+' ? ' ' : value[i];
-            }
-            copy[w] = '\0';
-            return copy;
+    size_t w = 0U;
+    for (size_t i = 0U; i < len; ++i) {
+        int high = 0;
+        int low = 0;
+        if (text[i] == '%' && i + 2U < len
+            && (high = admin_query_hex_digit(text[i + 1U])) >= 0 && (low = admin_query_hex_digit(text[i + 2U])) >= 0) {
+            copy[w++] = (char)((high << 4) | low);
+            i += 2U;
+        } else {
+            copy[w++] = text[i] == '+' ? ' ' : text[i];
         }
-        if (next == NULL) {
-            break;
-        }
-        query = next + 1;
     }
-    return NULL;
+    copy[w] = '\0';
+    return copy;
+}
+
+/*
+ * The values of request parameter key as Tomcat parses the query: '&'-separated pairs whose name and
+ * value are percent-decoded, a pair without '=' an empty value. Returns how many there are, with
+ * *joined (when asked) their comma-joined text, which is what Spring binds to a String parameter
+ * given several, and *first (when asked) the first. -1 when memory runs out.
+ */
+static int admin_query_values(const char *path, const char *key, char **joined, char **first)
+{
+    if (joined != NULL) *joined = NULL;
+    if (first != NULL) *first = NULL;
+    const char *query = strchr(path, '?');
+    if (query == NULL) {
+        return 0;
+    }
+    ++query;
+    int count = 0;
+    char *text = NULL;
+    size_t text_len = 0U;
+    while (*query != '\0') {
+        size_t part_len = strcspn(query, "&");
+        size_t name_len = strcspn(query, "=&");
+        char *name = part_len == 0U ? NULL : admin_query_decode(query, name_len);
+        if (part_len != 0U && name == NULL) {
+            free(text);
+            return -1;
+        }
+        if (name != NULL && strcmp(name, key) == 0) {
+            size_t value_start = name_len < part_len ? name_len + 1U : part_len;
+            char *value = admin_query_decode(query + value_start, part_len - value_start);
+            size_t value_len = value == NULL ? 0U : strlen(value);
+            char *grown = value == NULL ? NULL : (char *)realloc(text, text_len + value_len + 2U);
+            if (grown == NULL) {
+                free(value);
+                free(name);
+                free(text);
+                if (first != NULL) {
+                    free(*first);
+                    *first = NULL;
+                }
+                return -1;
+            }
+            text = grown;
+            if (count > 0) text[text_len++] = ',';
+            memcpy(text + text_len, value, value_len + 1U);
+            text_len += value_len;
+            if (count == 0 && first != NULL) {
+                *first = value;
+                value = NULL;
+            }
+            free(value);
+            ++count;
+        }
+        free(name);
+        query += part_len;
+        if (*query == '&') ++query;
+    }
+    if (joined != NULL) {
+        *joined = text;
+    } else {
+        free(text);
+    }
+    return count;
+}
+
+/* A String request parameter as Spring binds it: its values comma-joined, NULL when absent. */
+static char *admin_query_string(const char *path, const char *key)
+{
+    char *joined = NULL;
+    return admin_query_values(path, key, &joined, NULL) > 0 ? joined : NULL;
 }
 
 /*
@@ -875,17 +893,56 @@ static int admin_spring_number(const char *raw, int wrapper, long long minimum, 
     return rc;
 }
 
-/* A Long or Integer request parameter (admin_spring_number): 0 when absent, 1 with *out, -1 otherwise. */
+/*
+ * A long or int request parameter (a Long or Integer when wrapper) as Spring binds it, given once
+ * or several times: 0 when absent, 1 with *out, -1 when it does not convert. One value converts as
+ * admin_spring_number. Of several, Spring's ConversionService converts the first alone (an empty
+ * one is null, which a primitive does not take, and a blank one does not convert); when that fails
+ * the property editor gets them all comma-joined, which no number is, and its message names them.
+ */
+static int admin_query_spring_number(const char *path, const char *key, int wrapper, long long minimum,
+                                     long long maximum, long long *out)
+{
+    char *joined = NULL;
+    char *first = NULL;
+    int count = admin_query_values(path, key, &joined, &first);
+    int rc = 0;
+    if (count < 0) {
+        admin_conversion_failed(NULL);
+        rc = -1;
+    } else if (count == 1) {
+        rc = admin_spring_number(joined, wrapper, minimum, maximum, out);
+    } else if (count > 1) {
+        if (*first == '\0' && wrapper) {
+            rc = 0;
+        } else if (st_unicode_java21_has_text(first, strlen(first)) > 0
+                   && admin_spring_number(first, 1, minimum, maximum, out) == 1) {
+            rc = 1;
+        } else {
+            rc = admin_spring_number(joined, wrapper, minimum, maximum, out) == 1 ? 1 : -1;
+        }
+    }
+    free(joined);
+    free(first);
+    return rc;
+}
+
+/* A Long or Integer request parameter (admin_query_spring_number): 0 when absent, 1 with *out, else -1. */
 static int admin_query_number_param(const char *path, const char *key, long long minimum, long long maximum,
                                     long long *out)
 {
-    char *raw = admin_query_string(path, key);
-    if (raw == NULL) {
-        return 0;
+    return admin_query_spring_number(path, key, 1, minimum, maximum, out);
+}
+
+/* A Long request parameter that converts to a positive id; -1 when it is absent, not one or not positive. */
+static int admin_query_i64(const char *path, const char *key, long long *out)
+{
+    long long value = 0;
+    if (admin_query_number_param(path, key, LLONG_MIN, LLONG_MAX, &value) != 1 || value <= 0) {
+        return -1;
     }
-    int rc = admin_spring_number(raw, 1, minimum, maximum, out);
-    free(raw);
-    return rc;
+    *out = value;
+    return 0;
 }
 
 /* An int request parameter as Spring converts it; -1 when it is absent, empty or does not convert. */
@@ -900,23 +957,20 @@ static int admin_query_int_any(const char *path, const char *key, int *out)
 }
 
 /*
- * A boolean (a Boolean when wrapper) request parameter as Spring's CustomBooleanEditor binds it:
- * trimmed of the characters String.trim drops, true, on, yes or 1 and false, off, no or 0 in any
- * case. An empty value is absent (Spring takes the default value instead); a blank one is absent too
- * for a wrapper. 0 when absent, 1 with *out set, -1 when it does not convert, with
+ * A boolean (a Boolean when wrapper) as Spring's CustomBooleanEditor binds it: trimmed of the
+ * characters String.trim drops, true, on, yes or 1 and false, off, no or 0 in any case. An empty
+ * value is absent (Spring takes the default value instead); a blank one is absent too for a
+ * wrapper. 0 when absent, 1 with *out set, -1 when it does not convert, with
  * admin_conversion_message set.
  */
-static int admin_query_boolean_value(const char *path, const char *key, int wrapper, int *out)
+static int admin_spring_boolean(const char *raw, int wrapper, int *out)
 {
     static const char *const truths[] = {"true", "on", "yes", "1"};
     static const char *const falsehoods[] = {"false", "off", "no", "0"};
-    char *raw = admin_query_string(path, key);
-    if (raw == NULL || *raw == '\0') {
-        free(raw);
+    if (*raw == '\0') {
         return 0;
     }
     if (st_unicode_java21_has_text(raw, strlen(raw)) < 0) {
-        free(raw);
         admin_conversion_failed(NULL);
         return -1;
     }
@@ -937,7 +991,41 @@ static int admin_query_boolean_value(const char *path, const char *key, int wrap
     if (rc == -1) {
         admin_conversion_failed("Invalid boolean value [%s]", raw);
     }
-    free(raw);
+    return rc;
+}
+
+/*
+ * A boolean (a Boolean when wrapper) request parameter, given once or several times: one value
+ * binds as admin_spring_boolean. Of several, Spring's ConversionService converts the first alone,
+ * trimmed, an empty one null (which a primitive does not take); when that fails the editor gets them
+ * all comma-joined, which no boolean is. 0 when absent, 1 with *out set, -1 when it does not convert.
+ */
+static int admin_query_boolean_value(const char *path, const char *key, int wrapper, int *out)
+{
+    char *joined = NULL;
+    char *first = NULL;
+    int count = admin_query_values(path, key, &joined, &first);
+    int rc = 0;
+    if (count < 0) {
+        admin_conversion_failed(NULL);
+        rc = -1;
+    } else if (count == 1) {
+        rc = admin_spring_boolean(joined, wrapper, out);
+    } else if (count > 1) {
+        const char *value = first;
+        while (*value != '\0' && (unsigned char)*value <= ' ') ++value;
+        size_t len = strlen(value);
+        while (len > 0U && (unsigned char)value[len - 1U] <= ' ') --len;
+        if (len == 0U && wrapper) {
+            rc = 0;
+        } else if (len > 0U && admin_spring_boolean(first, wrapper, out) == 1) {
+            rc = 1;
+        } else {
+            rc = admin_spring_boolean(joined, wrapper, out) == 1 ? 1 : -1;
+        }
+    }
+    free(joined);
+    free(first);
     return rc;
 }
 
@@ -7657,15 +7745,8 @@ static int build_connection_stats_response(const st_admin_context *context, cons
  */
 static int admin_query_names_no_client(const char *path)
 {
-    char *raw = admin_query_string(path, "clientId");
-    if (raw == NULL) {
-        return 0;
-    }
-    char *end = NULL;
-    long long parsed = strtoll(raw, &end, 10);
-    int none = end != raw && *end == '\0' && parsed <= 0;
-    free(raw);
-    return none;
+    long long client_id = 0;
+    return admin_query_number_param(path, "clientId", LLONG_MIN, LLONG_MAX, &client_id) == 1 && client_id <= 0;
 }
 
 static int build_empty_page_response(const char *path, char *out, size_t out_len)
@@ -10757,6 +10838,17 @@ static int client_download_enum_allowed(const char *value, const char *const *al
     return 0;
 }
 
+/*
+ * Java ClientDownloadLinkService.requireImplementation, requirePlatform and requireArch name the
+ * allowed values by Set.toString of a Set.of, whose order changes from one JVM to the next, so no
+ * text matches it every time; the C, Go and .NET servers list them in declaration order.
+ */
+#define ST_CLIENT_DOWNLOAD_IMPLEMENTATION_REFUSAL \
+    "{\"error\":\"implementation must be one of [java go csharp android]\"}"
+#define ST_CLIENT_DOWNLOAD_PLATFORM_REFUSAL \
+    "{\"error\":\"platform must be one of [windows linux macos android any]\"}"
+#define ST_CLIENT_DOWNLOAD_ARCH_REFUSAL "{\"error\":\"arch must be one of [x64 arm64 any]\"}"
+
 static int normalize_client_download_enum(char *value,
                                           char *out,
                                           size_t out_len,
@@ -10998,9 +11090,10 @@ static int semver_identifiers_valid(const char *text, int prerelease)
 
 /*
  * Java SemanticVersion.parse: trimmed (every character up to and including space, as String.trim
- * does), one optional lowercase "v" removed, at most 32 characters, then strict SemVer 2.0.
+ * does), one optional lowercase "v" removed, at most 32 characters, then strict SemVer 2.0; a
+ * numeric pre-release identifier with a leading zero only when strict is 0.
  */
-static int parse_admin_semver(const char *value, st_admin_semver *out)
+static int parse_admin_semver_rule(const char *value, st_admin_semver *out, int strict)
 {
     if (value == NULL || out == NULL) return -1;
     while (*value != '\0' && (unsigned char)*value <= ' ') ++value;
@@ -11021,7 +11114,9 @@ static int parse_admin_semver(const char *value, st_admin_semver *out)
     memset(out, 0, sizeof(*out));
     if (prerelease != NULL) {
         *prerelease++ = '\0';
-        if (strlen(prerelease) >= sizeof(out->prerelease) || !semver_identifiers_valid(prerelease, 1)) return -1;
+        if (strlen(prerelease) >= sizeof(out->prerelease) || !semver_identifiers_valid(prerelease, strict)) {
+            return -1;
+        }
         snprintf(out->prerelease, sizeof(out->prerelease), "%s", prerelease);
     }
     /* Exactly three parts: strtok_r would skip the empty one in "1..0.0" or ".1.0.0". */
@@ -11036,6 +11131,36 @@ static int parse_admin_semver(const char *value, st_admin_semver *out)
     snprintf(out->minor, sizeof(out->minor), "%s", minor);
     snprintf(out->patch, sizeof(out->patch), "%s", patch);
     return 0;
+}
+
+static int parse_admin_semver(const char *value, st_admin_semver *out)
+{
+    return parse_admin_semver_rule(value, out, 1);
+}
+
+/*
+ * Why Java SemanticVersion.parse(value, field) refuses value, as the words after the field name, or
+ * NULL when it parses: a normalized value longer than 32 UTF-16 units, then one the SemVer 2.0
+ * pattern does not match, then a numeric pre-release identifier with a leading zero.
+ */
+static const char *admin_semver_refusal(const char *value)
+{
+    st_admin_semver parsed;
+    const char *text = value == NULL ? "" : value;
+    if (parse_admin_semver(text, &parsed) == 0) return NULL;
+    const char *start = text;
+    while (*start != '\0' && (unsigned char)*start <= ' ') ++start;
+    if (*start == 'v') ++start;
+    const char *end = start + strlen(start);
+    while (end > start && (unsigned char)end[-1] <= ' ') --end;
+    size_t units = 0U;
+    for (const unsigned char *p = (const unsigned char *)start; p < (const unsigned char *)end; ++p) {
+        if ((*p & 0xC0U) != 0x80U) units += *p >= 0xF0U ? 2U : 1U;
+    }
+    if (units > 32U) return " is too long (max 32)";
+    return parse_admin_semver_rule(text, &parsed, 0) == 0
+        ? " contains a numeric pre-release identifier with a leading zero"
+        : " must be a valid SemVer 2.0 version";
 }
 
 static int compare_semver_numeric(const char *left, const char *right)
@@ -11129,7 +11254,7 @@ static int read_client_download_mutation(const char *body,
                                   out_len,
                                   400,
                                   "Bad Request",
-                                  "{\"error\":\"implementation must be one of [java go csharp android]\"}");
+                                  ST_CLIENT_DOWNLOAD_IMPLEMENTATION_REFUSAL);
         goto done;
     }
     if (normalize_client_download_enum(platform != NULL ? platform
@@ -11142,7 +11267,7 @@ static int read_client_download_mutation(const char *body,
                                   out_len,
                                   400,
                                   "Bad Request",
-                                  "{\"error\":\"platform must be one of [windows linux macos android any]\"}");
+                                  ST_CLIENT_DOWNLOAD_PLATFORM_REFUSAL);
         goto done;
     }
     if (normalize_client_download_enum(arch != NULL ? arch
@@ -11155,7 +11280,7 @@ static int read_client_download_mutation(const char *body,
                                   out_len,
                                   400,
                                   "Bad Request",
-                                  "{\"error\":\"arch must be one of [x64 arm64 any]\"}");
+                                  ST_CLIENT_DOWNLOAD_ARCH_REFUSAL);
         goto done;
     }
     if (copy_trimmed_required(display_name != NULL ? display_name
@@ -11585,22 +11710,32 @@ static int build_client_version_check_response(const char *path, char *out, size
     static const char *const platforms[] = {"windows", "linux", "macos", "android", "any"};
     static const char *const archs[] = {"x64", "arm64", "any"};
     st_admin_semver current;
-    int valid = normalize_client_download_enum(implementation, normalized_implementation,
-            sizeof(normalized_implementation), implementations, 4U) == 0
-        && normalize_client_download_enum(platform, normalized_platform,
-            sizeof(normalized_platform), platforms, 5U) == 0
-        && normalize_client_download_enum(arch, normalized_arch,
-            sizeof(normalized_arch), archs, 3U) == 0
-        && parse_admin_semver(current_text, &current) == 0;
-    free(implementation); free(platform); free(arch); free(current_text);
-    if (!valid) {
-        return write_response(out, out_len, 400, "Bad Request",
-                              "{\"error\":\"invalid client version target\"}");
+    /* Java checkVersion: each coordinate in turn, the pair rules, then the current version. */
+    const char *refusal = NULL;
+    const char *version_refusal = NULL;
+    if (normalize_client_download_enum(implementation, normalized_implementation,
+                                       sizeof(normalized_implementation), implementations, 4U) != 0) {
+        refusal = ST_CLIENT_DOWNLOAD_IMPLEMENTATION_REFUSAL;
+    } else if (normalize_client_download_enum(platform, normalized_platform,
+                                              sizeof(normalized_platform), platforms, 5U) != 0) {
+        refusal = ST_CLIENT_DOWNLOAD_PLATFORM_REFUSAL;
+    } else if (normalize_client_download_enum(arch, normalized_arch, sizeof(normalized_arch), archs, 3U) != 0) {
+        refusal = ST_CLIENT_DOWNLOAD_ARCH_REFUSAL;
+    } else {
+        refusal = client_download_target_error(normalized_implementation, normalized_platform, normalized_arch);
+        version_refusal = refusal == NULL ? admin_semver_refusal(current_text) : NULL;
     }
-    const char *target_error = client_download_target_error(normalized_implementation,
-                                                            normalized_platform, normalized_arch);
-    if (target_error != NULL) {
-        return write_response(out, out_len, 400, "Bad Request", target_error);
+    if (refusal == NULL && version_refusal == NULL) {
+        (void)parse_admin_semver(current_text, &current);
+    }
+    free(implementation); free(platform); free(arch); free(current_text);
+    if (refusal != NULL) {
+        return write_response(out, out_len, 400, "Bad Request", refusal);
+    }
+    if (version_refusal != NULL) {
+        char body[128];
+        snprintf(body, sizeof(body), "{\"error\":\"current%s\"}", version_refusal);
+        return write_response(out, out_len, 400, "Bad Request", body);
     }
     const char *database_path = admin_database_path();
     size_t count = 0U;
@@ -12982,17 +13117,14 @@ static int admin_spring_parameters_list_fail(const char *path, const char *param
         long long number = 0;
         int flag = 0;
         int wrapper = isupper((unsigned char)kind) && kind != 'S';
-        char *raw = NULL;
         char *value = NULL;
         int failed = 0;
         switch (tolower((unsigned char)kind)) {
         case 'l':
         case 'i':
-            raw = admin_query_string(path, name);
-            failed = raw != NULL
-                && admin_spring_number(raw, wrapper, tolower((unsigned char)kind) == 'l' ? LLONG_MIN : INT_MIN,
-                                       tolower((unsigned char)kind) == 'l' ? LLONG_MAX : INT_MAX, &number) < 0;
-            free(raw);
+            failed = admin_query_spring_number(path, name, wrapper,
+                                               tolower((unsigned char)kind) == 'l' ? LLONG_MIN : INT_MIN,
+                                               tolower((unsigned char)kind) == 'l' ? LLONG_MAX : INT_MAX, &number) < 0;
             break;
         case 'b':
             failed = admin_query_boolean_value(path, name, wrapper, &flag) < 0;
@@ -19391,6 +19523,122 @@ static void handle_http_share_client(st_admin_server *server,
     free(admission.relative_path);
 }
 
+/* RFC 9110 tchar: what a method or header name is made of. */
+static int admin_http_tchar(unsigned char c)
+{
+    return isalnum(c) || (c != '\0' && strchr("!#$%&'*+-.^_`|~", c) != NULL);
+}
+
+/*
+ * The status Java answers a request with before any handler or authentication runs, or 0. Tomcat
+ * refuses (400) a request target that is not an absolute path, a byte that is not printable ASCII,
+ * one of "#<>[\]^`| anywhere and '{' or '}' in the path (the query may carry those two), a '%' in
+ * the path that does not start an escape, an escaped NUL, '/' or '\', a path that does not decode as
+ * UTF-8, and a header line
+ * whose name is not a token or whose value carries a control character; TRACE is its 405 and
+ * CONNECT its 501. Spring Security's StrictHttpFirewall then refuses (400) a method other than the
+ * seven it allows, spelled exactly; a path with ';', an escaped '%' or '.', "//", a "." or ".."
+ * segment; and one that decodes to a CR, LF, U+2028 or U+2029.
+ *
+ * A path it lets through is percent-decoded in place, as Tomcat decodes it before Spring maps it
+ * ("/api/admin/cli%65nts" is "/api/admin/clients"), except an escaped '?', which stays escaped so
+ * that the query still starts at the first '?'; decoding never lengthens it.
+ */
+static int admin_request_firewall(const char *method, char *path, const char *request)
+{
+    static const char *const allowed_methods[] = {"DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"};
+    static const char *const refused_escapes[] = {"%25", "%2e", "%2f", "%5c", "%00", "%3b"};
+    if (strcmp(method, "TRACE") == 0) {
+        return 405;
+    }
+    if (strcmp(method, "CONNECT") == 0) {
+        return 501;
+    }
+    if (path[0] != '/') {
+        return 400;
+    }
+    size_t path_len = strcspn(path, "?");
+    for (size_t i = 0U; path[i] != '\0'; ++i) {
+        unsigned char c = (unsigned char)path[i];
+        int refused = c <= ' ' || c >= 0x7fU || strchr(i < path_len ? "\"#<>[\\]^`{|}" : "\"#<>[\\]^`|", c) != NULL;
+        if (refused) {
+            return 400;
+        }
+        if (i < path_len && c == '%'
+            && (i + 2U >= path_len || !isxdigit((unsigned char)path[i + 1U])
+                || !isxdigit((unsigned char)path[i + 2U]))) {
+            return 400;
+        }
+        for (size_t e = 0U; i < path_len && c == '%' && e < sizeof(refused_escapes) / sizeof(refused_escapes[0]); ++e) {
+            if (strncasecmp(path + i, refused_escapes[e], 3U) == 0) {
+                return 400;
+            }
+        }
+    }
+    const char *line = strstr(request, "\r\n");
+    while (line != NULL && line[2] != '\r' && line[2] != '\0') {
+        line += 2;
+        const char *end = strstr(line, "\r\n");
+        size_t line_len = end == NULL ? strlen(line) : (size_t)(end - line);
+        size_t name_len = 0U;
+        while (name_len < line_len && admin_http_tchar((unsigned char)line[name_len])) ++name_len;
+        if (name_len == 0U || name_len >= line_len || line[name_len] != ':') {
+            return 400;
+        }
+        for (size_t i = name_len + 1U; i < line_len; ++i) {
+            unsigned char c = (unsigned char)line[i];
+            if ((c < 0x20U && c != '\t') || c == 0x7fU) {
+                return 400;
+            }
+        }
+        line = end;
+    }
+    int allowed = 0;
+    for (size_t i = 0U; i < sizeof(allowed_methods) / sizeof(allowed_methods[0]); ++i) {
+        allowed = allowed || strcmp(method, allowed_methods[i]) == 0;
+    }
+    if (!allowed || memchr(path, ';', path_len) != NULL) {
+        return 400;
+    }
+    for (size_t i = 0U; i + 1U < path_len; ++i) {
+        if (path[i] == '/' && path[i + 1U] == '/') {
+            return 400;
+        }
+    }
+    for (size_t i = 0U; i < path_len; ++i) {
+        if (path[i] != '/') {
+            continue;
+        }
+        size_t segment = strcspn(path + i + 1U, "/?");
+        if ((segment == 1U && path[i + 1U] == '.') || (segment == 2U && path[i + 1U] == '.' && path[i + 2U] == '.')) {
+            return 400;
+        }
+    }
+    size_t w = 0U;
+    for (size_t r = 0U; r < path_len; ++r) {
+        if (path[r] == '%' && strncasecmp(path + r, "%3f", 3U) != 0) {
+            path[w++] = (char)(admin_hex_digit(path[r + 1U]) * 16 + admin_hex_digit(path[r + 2U]));
+            r += 2U;
+        } else {
+            path[w++] = path[r];
+        }
+    }
+    memmove(path + w, path + path_len, strlen(path + path_len) + 1U);
+    for (size_t offset = 0U; offset < w;) {
+        utf8proc_int32_t point = 0;
+        utf8proc_ssize_t width = utf8proc_iterate((const utf8proc_uint8_t *)path + offset,
+                                                  (utf8proc_ssize_t)(w - offset), &point);
+        if (width <= 0) {
+            return 400;
+        }
+        if (point == '\r' || point == '\n' || point == 0x2028 || point == 0x2029) {
+            return 400;
+        }
+        offset += (size_t)width;
+    }
+    return 0;
+}
+
 static void handle_client(st_admin_server *server, int fd)
 {
     long long started_ms = admin_now_ms();
@@ -19424,6 +19672,17 @@ static void handle_client(st_admin_server *server, int fd)
     if (sscanf(request, "%15s %1023s", method, path) != 2) {
         strcpy(method, "");
         strcpy(path, "");
+    }
+    /* Direct routes and shares carry the requests of the applications behind them, not this API's. */
+    if (strncmp(path, ST_HTTP_SHARE_PATH_ROOT, strlen(ST_HTTP_SHARE_PATH_ROOT)) != 0
+        && strncmp(path, "/http/", 6) != 0) {
+        int refusal = admin_request_firewall(method, path, request);
+        if (refusal != 0) {
+            (void)send_text_http_error(fd, refusal, admin_reason_phrase(refusal));
+            admin_direct_ws_linger(fd);
+            close(fd);
+            return;
+        }
     }
     if (strncmp(path, ST_HTTP_SHARE_PATH_ROOT, strlen(ST_HTTP_SHARE_PATH_ROOT)) == 0) {
         handle_http_share_client(server, fd, method, path, request, (size_t)len);
