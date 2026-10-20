@@ -9878,7 +9878,7 @@ static int write_share_view_response(char *out,
         && admin_sb_append(&builder, suffix) == 0;
     int written = ok ? write_share_response(out, out_len, status, "private, no-store", builder.data, NULL) : -1;
     free(builder.data);
-    return written > 0 ? written : write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+    return written > 0 ? written : write_share_code(out, out_len, 503, ST_HTTP_SHARE_CODE_UNAVAILABLE);
 }
 
 typedef enum {
@@ -10001,11 +10001,11 @@ static int handle_http_share_create(const st_admin_context *context,
 {
     st_http_share_create_fields fields;
     if (st_http_share_parse_create_body(body, body_len, &fields) != 0) {
-        return write_share_code(out, out_len, 400, "SHARE_REQUEST_INVALID");
+        return write_share_code(out, out_len, 400, ST_HTTP_SHARE_CODE_REQUEST_INVALID);
     }
     const char *database_path = admin_share_database();
     if (database_path == NULL) {
-        return write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+        return write_share_code(out, out_len, 503, ST_HTTP_SHARE_CODE_UNAVAILABLE);
     }
     st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
     long long now_ms = st_http_share_now_ms();
@@ -10041,17 +10041,17 @@ static int handle_http_share_create(const st_admin_context *context,
         written = write_share_view_response(out, out_len, 201, "{\"share\":", &share, now_ms, suffix);
         memset(suffix, 0, sizeof(suffix));
     } else if (rc == ST_STORAGE_SHARE_ROUTE_NOT_FOUND) {
-        written = write_share_code(out, out_len, 404, "SHARE_ROUTE_NOT_FOUND");
+        written = write_share_code(out, out_len, 404, ST_HTTP_SHARE_CODE_ROUTE_NOT_FOUND);
     } else if (rc == ST_STORAGE_SHARE_ROUTE_DISABLED) {
-        written = write_share_code(out, out_len, 409, "SHARE_ROUTE_DISABLED");
+        written = write_share_code(out, out_len, 409, ST_HTTP_SHARE_CODE_ROUTE_DISABLED);
     } else if (rc == ST_STORAGE_SHARE_CLIENT_DISABLED) {
-        written = write_share_code(out, out_len, 409, "SHARE_CLIENT_DISABLED");
+        written = write_share_code(out, out_len, 409, ST_HTTP_SHARE_CODE_CLIENT_DISABLED);
     } else if (rc == ST_STORAGE_SHARE_ROUTE_PUBLIC) {
-        written = write_share_code(out, out_len, 409, "SHARE_ROUTE_PUBLIC");
+        written = write_share_code(out, out_len, 409, ST_HTTP_SHARE_CODE_ROUTE_PUBLIC);
     } else if (rc == ST_STORAGE_SHARE_LIMIT_REACHED) {
-        written = write_share_code(out, out_len, 409, "SHARE_LIMIT_REACHED");
+        written = write_share_code(out, out_len, 409, ST_HTTP_SHARE_CODE_LIMIT_REACHED);
     } else {
-        written = write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+        written = write_share_code(out, out_len, 503, ST_HTTP_SHARE_CODE_UNAVAILABLE);
     }
     memset(token, 0, sizeof(token));
     return written;
@@ -10069,11 +10069,11 @@ static int admin_share_check_route(const st_admin_context *context,
     int allowed = 0;
     if (st_storage_http_share_caller_can_manage(database_path, &builtin, context->username, context->tenant_id,
                                                 route_id, &allowed) != 0) {
-        *written = write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+        *written = write_share_code(out, out_len, 503, ST_HTTP_SHARE_CODE_UNAVAILABLE);
         return -1;
     }
     if (!allowed) {
-        *written = write_share_code(out, out_len, 404, "SHARE_ROUTE_NOT_FOUND");
+        *written = write_share_code(out, out_len, 404, ST_HTTP_SHARE_CODE_ROUTE_NOT_FOUND);
         return -1;
     }
     return 0;
@@ -10086,7 +10086,7 @@ static int handle_http_share_list(const st_admin_context *context,
 {
     const char *database_path = admin_share_database();
     if (database_path == NULL) {
-        return write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+        return write_share_code(out, out_len, 503, ST_HTTP_SHARE_CODE_UNAVAILABLE);
     }
     int written = 0;
     if (admin_share_check_route(context, database_path, share_path->route_id, out, out_len, &written) != 0) {
@@ -10094,7 +10094,7 @@ static int handle_http_share_list(const st_admin_context *context,
     }
     int single = share_path->kind == ADMIN_SHARE_PATH_SHARE;
     if (single && !share_path->share_id_valid) {
-        return write_share_code(out, out_len, 404, "SHARE_NOT_FOUND");
+        return write_share_code(out, out_len, 404, ST_HTTP_SHARE_CODE_NOT_FOUND);
     }
     st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
     long long now_ms = st_http_share_now_ms();
@@ -10107,11 +10107,11 @@ static int handle_http_share_list(const st_admin_context *context,
     st_storage_share_ids_free(&revoked);
     if (rc != 0) {
         free(shares);
-        return write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+        return write_share_code(out, out_len, 503, ST_HTTP_SHARE_CODE_UNAVAILABLE);
     }
     if (single) {
         written = count == 0U
-            ? write_share_code(out, out_len, 404, "SHARE_NOT_FOUND")
+            ? write_share_code(out, out_len, 404, ST_HTTP_SHARE_CODE_NOT_FOUND)
             : write_share_view_response(out, out_len, 200, "{\"share\":", &shares[0], now_ms, "}");
         free(shares);
         return written;
@@ -10126,7 +10126,7 @@ static int handle_http_share_list(const st_admin_context *context,
     written = ok ? write_share_response(out, out_len, 200, "private, no-store", builder.data, NULL) : -1;
     free(builder.data);
     free(shares);
-    return written > 0 ? written : write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+    return written > 0 ? written : write_share_code(out, out_len, 503, ST_HTTP_SHARE_CODE_UNAVAILABLE);
 }
 
 /* The revoke body is empty or {} (spec 4.3). */
@@ -10165,18 +10165,18 @@ static int handle_http_share_revoke(const st_admin_context *context,
                                     size_t out_len)
 {
     if (!admin_share_empty_body(body == NULL ? "" : body, body == NULL ? 0U : body_len)) {
-        return write_share_code(out, out_len, 400, "SHARE_REQUEST_INVALID");
+        return write_share_code(out, out_len, 400, ST_HTTP_SHARE_CODE_REQUEST_INVALID);
     }
     const char *database_path = admin_share_database();
     if (database_path == NULL) {
-        return write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+        return write_share_code(out, out_len, 503, ST_HTTP_SHARE_CODE_UNAVAILABLE);
     }
     if (!share_path->share_id_valid) {
         int written = 0;
         if (admin_share_check_route(context, database_path, share_path->route_id, out, out_len, &written) != 0) {
             return written;
         }
-        return write_share_code(out, out_len, 404, "SHARE_NOT_FOUND");
+        return write_share_code(out, out_len, 404, ST_HTTP_SHARE_CODE_NOT_FOUND);
     }
     st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
     long long now_ms = st_http_share_now_ms();
@@ -10185,13 +10185,13 @@ static int handle_http_share_revoke(const st_admin_context *context,
     int rc = st_storage_http_share_revoke(database_path, &builtin, context->username, context->tenant_id,
                                           share_path->route_id, share_path->share_id, now_ms, &share, &changed);
     if (rc == ST_STORAGE_SHARE_ROUTE_NOT_FOUND) {
-        return write_share_code(out, out_len, 404, "SHARE_ROUTE_NOT_FOUND");
+        return write_share_code(out, out_len, 404, ST_HTTP_SHARE_CODE_ROUTE_NOT_FOUND);
     }
     if (rc == ST_STORAGE_SHARE_NOT_FOUND) {
-        return write_share_code(out, out_len, 404, "SHARE_NOT_FOUND");
+        return write_share_code(out, out_len, 404, ST_HTTP_SHARE_CODE_NOT_FOUND);
     }
     if (rc != ST_STORAGE_SHARE_OK) {
-        return write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+        return write_share_code(out, out_len, 503, ST_HTTP_SHARE_CODE_UNAVAILABLE);
     }
     /* Whatever this instance carries of the share stops now (spec 6.6). */
     admin_share_cut_matching(share.share_id, now_ms);
@@ -10227,14 +10227,14 @@ static int build_access_audit_response(const char *database_path,
     int limit_state = admin_share_query_number(path, "limit", &limit);
     int before_state = admin_share_query_number(path, "before", &before);
     if (limit_state < 0 || before_state < 0 || limit < 1 || limit > ST_HTTP_SHARE_AUDIT_MAX_LIMIT) {
-        return write_share_code(out, out_len, 400, "SHARE_REQUEST_INVALID");
+        return write_share_code(out, out_len, 400, ST_HTTP_SHARE_CODE_REQUEST_INVALID);
     }
     st_storage_http_access_audit *entries = NULL;
     size_t count = 0U;
     int more = 0;
     if (st_storage_http_access_audit_list(database_path, tenant_id, route_id, before, (int)limit,
                                           &entries, &count, &more) != 0) {
-        return write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+        return write_share_code(out, out_len, 503, ST_HTTP_SHARE_CODE_UNAVAILABLE);
     }
     st_admin_string_builder builder = {0};
     int ok = admin_sb_append(&builder, "{\"entries\":[") == 0;
@@ -10250,7 +10250,7 @@ static int build_access_audit_response(const char *database_path,
     int written = ok ? write_share_response(out, out_len, 200, "private, no-store", builder.data, NULL) : -1;
     free(builder.data);
     free(entries);
-    return written > 0 ? written : write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+    return written > 0 ? written : write_share_code(out, out_len, 503, ST_HTTP_SHARE_CODE_UNAVAILABLE);
 }
 
 static int handle_http_route_access_audit(const st_admin_context *context,
@@ -10261,7 +10261,7 @@ static int handle_http_route_access_audit(const st_admin_context *context,
 {
     const char *database_path = admin_share_database();
     if (database_path == NULL) {
-        return write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+        return write_share_code(out, out_len, 503, ST_HTTP_SHARE_CODE_UNAVAILABLE);
     }
     int written = 0;
     if (admin_share_check_route(context, database_path, share_path->route_id, out, out_len, &written) != 0) {
@@ -10275,21 +10275,21 @@ static int handle_tenant_access_audit(const st_admin_context *context, const cha
 {
     const char *database_path = admin_share_database();
     if (database_path == NULL) {
-        return write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+        return write_share_code(out, out_len, 503, ST_HTTP_SHARE_CODE_UNAVAILABLE);
     }
     st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
     int admin = 0;
     char tenant_id[128];
     if (st_storage_http_share_caller_is_admin(database_path, &builtin, context->username, context->tenant_id,
                                               &admin, tenant_id) != 0) {
-        return write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+        return write_share_code(out, out_len, 503, ST_HTTP_SHARE_CODE_UNAVAILABLE);
     }
     if (!admin) {
-        return write_share_code(out, out_len, 403, "SHARE_FORBIDDEN");
+        return write_share_code(out, out_len, 403, ST_HTTP_SHARE_CODE_FORBIDDEN);
     }
     long long route_id = 0;
     if (admin_share_query_number(path, "routeId", &route_id) < 0) {
-        return write_share_code(out, out_len, 400, "SHARE_REQUEST_INVALID");
+        return write_share_code(out, out_len, 400, ST_HTTP_SHARE_CODE_REQUEST_INVALID);
     }
     return build_access_audit_response(database_path, tenant_id, route_id, path, out, out_len);
 }
@@ -10335,13 +10335,13 @@ static int handle_http_share_exchange(const char *content_type,
                                       size_t out_len)
 {
     if (!admin_share_media_type_is_json(content_type)) {
-        return write_exchange_code(out, out_len, 415, "SHARE_REQUEST_INVALID", 0);
+        return write_exchange_code(out, out_len, 415, ST_HTTP_SHARE_CODE_REQUEST_INVALID, 0);
     }
     char *token = NULL;
     size_t token_len = 0U;
     if (st_http_share_parse_exchange_body(body == NULL ? "" : body, body == NULL ? 0U : body_len,
                                           &token, &token_len) != 0) {
-        return write_exchange_code(out, out_len, 400, "SHARE_REQUEST_INVALID", 0);
+        return write_exchange_code(out, out_len, 400, ST_HTTP_SHARE_CODE_REQUEST_INVALID, 0);
     }
     /* From here on every attempt is charged to the source address, whatever its outcome. */
     long long now_ms = st_http_share_now_ms();
@@ -10349,12 +10349,12 @@ static int handle_http_share_exchange(const char *content_type,
     long long retry_after = st_http_share_gcra_take(st_http_share_exchange_limiter(), source, now_ms);
     if (retry_after > 0) {
         free(token);
-        return write_exchange_code(out, out_len, 429, "SHARE_RATE_LIMITED", retry_after);
+        return write_exchange_code(out, out_len, 429, ST_HTTP_SHARE_CODE_RATE_LIMITED, retry_after);
     }
     char share_id[ST_HTTP_SHARE_ID_LEN + 1U];
     if (st_http_share_parse_token(token, token_len, share_id) != 0) {
         free(token);
-        return write_exchange_code(out, out_len, 404, "SHARE_NOT_FOUND", 0);
+        return write_exchange_code(out, out_len, 404, ST_HTTP_SHARE_CODE_NOT_FOUND, 0);
     }
     const char *database_path = admin_share_database();
     st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
@@ -10362,20 +10362,20 @@ static int handle_http_share_exchange(const char *content_type,
     if (database_path == NULL
         || st_storage_http_share_resolve(database_path, &builtin, share_id, now_ms, &resolution) != 0) {
         free(token);
-        return write_exchange_code(out, out_len, 503, "SHARE_UNAVAILABLE", 0);
+        return write_exchange_code(out, out_len, 503, ST_HTTP_SHARE_CODE_UNAVAILABLE, 0);
     }
     if (!resolution.found || !st_http_share_hash_matches(token, resolution.share.token_sha256)) {
         free(token);
-        return write_exchange_code(out, out_len, 404, "SHARE_NOT_FOUND", 0);
+        return write_exchange_code(out, out_len, 404, ST_HTTP_SHARE_CODE_NOT_FOUND, 0);
     }
     const st_storage_http_share *share = &resolution.share;
     if (share->revoked) {
         free(token);
-        return write_exchange_code(out, out_len, 410, "SHARE_REVOKED", 0);
+        return write_exchange_code(out, out_len, 410, ST_HTTP_SHARE_CODE_REVOKED, 0);
     }
     if (now_ms >= share->expires_at * 1000LL) {
         free(token);
-        return write_exchange_code(out, out_len, 410, "SHARE_EXPIRED", 0);
+        return write_exchange_code(out, out_len, 410, ST_HTTP_SHARE_CODE_EXPIRED, 0);
     }
     if (resolution.lapse_reason != NULL) {
         /* Revoked in place, so the share cannot come back when its route does. */
@@ -10384,7 +10384,7 @@ static int handle_http_share_exchange(const char *content_type,
                                                   &changed);
         admin_share_cut_matching(share_id, now_ms);
         free(token);
-        return write_exchange_code(out, out_len, 410, "SHARE_REVOKED", 0);
+        return write_exchange_code(out, out_len, 410, ST_HTTP_SHARE_CODE_REVOKED, 0);
     }
     /* The cookie and the share end together. */
     long long max_age = (share->expires_at * 1000LL - now_ms + 999LL) / 1000LL;
@@ -10413,7 +10413,7 @@ static int handle_http_share_exchange(const char *content_type,
     memset(token, 0, token_len);
     free(token);
     free(builder.data);
-    return written > 0 ? written : write_exchange_code(out, out_len, 503, "SHARE_UNAVAILABLE", 0);
+    return written > 0 ? written : write_exchange_code(out, out_len, 503, ST_HTTP_SHARE_CODE_UNAVAILABLE, 0);
 }
 
 /* Dispatches the share endpoints; 0 when the request is not one of them. */
@@ -10439,7 +10439,7 @@ static int handle_http_share_management(const st_admin_context *context,
         return 0;
     }
     if (!share_path.route_valid) {
-        return write_share_code(out, out_len, 404, "SHARE_ROUTE_NOT_FOUND");
+        return write_share_code(out, out_len, 404, ST_HTTP_SHARE_CODE_ROUTE_NOT_FOUND);
     }
     if (share_path.kind == ADMIN_SHARE_PATH_SHARES && strcmp(method, "POST") == 0) {
         return handle_http_share_create(context, share_path.route_id, body, body_len, out, out_len);
@@ -19106,6 +19106,11 @@ static int admin_share_forward_headers(const char *raw_request, char ***headers,
     return rc;
 }
 
+int st_admin_http_share_forward_headers_for_testing(const char *raw_request, char ***headers, size_t *headers_len)
+{
+    return admin_share_forward_headers(raw_request, headers, headers_len);
+}
+
 /*
  * Spec 6.1 steps 1-11 for one request: 1 when it may be forwarded (its stream is then registered
  * and must be unregistered), 0 once the refusal or redirect went out. The share, its route, client
@@ -19125,7 +19130,7 @@ static int admit_http_share_request(int fd,
     const char *slash = memchr(id, '/', (size_t)(path_end - id));
     size_t id_len = (size_t)((slash == NULL ? path_end : slash) - id);
     if (!st_http_share_valid_id(id, id_len)) {
-        send_share_refusal(fd, 404, "SHARE_NOT_FOUND", NULL, NULL, 0);
+        send_share_refusal(fd, 404, ST_HTTP_SHARE_CODE_NOT_FOUND, NULL, NULL, 0);
         return 0;
     }
     memcpy(admission->share_id, id, ST_HTTP_SHARE_ID_LEN);
@@ -19161,7 +19166,7 @@ static int admit_http_share_request(int fd,
     if (admission->relative_path == NULL || database_path == NULL
         || st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0
         || st_storage_http_share_resolve(database_path, &builtin, admission->share_id, now_ms, &resolution) != 0) {
-        send_share_refusal(fd, 503, "SHARE_UNAVAILABLE", NULL, NULL, 0);
+        send_share_refusal(fd, 503, ST_HTTP_SHARE_CODE_UNAVAILABLE, NULL, NULL, 0);
         return 0;
     }
     /* No share, no cookie and a wrong cookie are one answer: the share id alone tells nothing. */
@@ -19171,7 +19176,7 @@ static int admit_http_share_request(int fd,
         size_t cookie_count = 0U;
         char candidates[ST_HTTP_SHARE_MAX_COOKIE_CANDIDATES][ST_HTTP_SHARE_TOKEN_LEN + 1U];
         if (admin_collect_header_values(raw_request, "Cookie", &cookies, &cookie_count) != 0) {
-            send_share_refusal(fd, 503, "SHARE_UNAVAILABLE", NULL, NULL, 0);
+            send_share_refusal(fd, 503, ST_HTTP_SHARE_CODE_UNAVAILABLE, NULL, NULL, 0);
             return 0;
         }
         size_t candidate_count = st_http_share_credential_candidates(cookies, cookie_count, admission->share_id,
@@ -19183,16 +19188,16 @@ static int admit_http_share_request(int fd,
         memset(candidates, 0, sizeof(candidates));
     }
     if (!credential) {
-        send_share_refusal(fd, 404, "SHARE_NOT_FOUND", NULL, NULL, 0);
+        send_share_refusal(fd, 404, ST_HTTP_SHARE_CODE_NOT_FOUND, NULL, NULL, 0);
         return 0;
     }
     const st_storage_http_share *share = &resolution.share;
     if (share->revoked) {
-        send_share_refusal(fd, 410, "SHARE_REVOKED", admission->share_id, NULL, 0);
+        send_share_refusal(fd, 410, ST_HTTP_SHARE_CODE_REVOKED, admission->share_id, NULL, 0);
         return 0;
     }
     if (now_ms >= share->expires_at * 1000LL) {
-        send_share_refusal(fd, 410, "SHARE_EXPIRED", admission->share_id, NULL, 0);
+        send_share_refusal(fd, 410, ST_HTTP_SHARE_CODE_EXPIRED, admission->share_id, NULL, 0);
         return 0;
     }
     if (resolution.lapse_reason != NULL) {
@@ -19201,38 +19206,38 @@ static int admit_http_share_request(int fd,
         (void)st_storage_http_share_revoke_lapsed(database_path, admission->share_id, resolution.lapse_reason,
                                                   now_ms, &changed);
         admin_share_cut_matching(admission->share_id, now_ms);
-        send_share_refusal(fd, 410, "SHARE_REVOKED", admission->share_id, NULL, 0);
+        send_share_refusal(fd, 410, ST_HTTP_SHARE_CODE_REVOKED, admission->share_id, NULL, 0);
         return 0;
     }
     admission->upgrade = admin_header_value_contains_token_ci(raw_request, "Connection", "Upgrade")
         && admin_header_value_equals_ci(raw_request, "Upgrade", "websocket");
     if (strcmp(share->access, "read") == 0) {
         if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0) {
-            send_share_refusal(fd, 405, "SHARE_METHOD_NOT_ALLOWED", NULL, "GET, HEAD", 0);
+            send_share_refusal(fd, 405, ST_HTTP_SHARE_CODE_METHOD_NOT_ALLOWED, NULL, "GET, HEAD", 0);
             return 0;
         }
         if (admission->upgrade) {
             /* A WebSocket can carry data to the target: never read-only. */
-            send_share_refusal(fd, 403, "SHARE_SCOPE_DENIED", NULL, NULL, 0);
+            send_share_refusal(fd, 403, ST_HTTP_SHARE_CODE_SCOPE_DENIED, NULL, NULL, 0);
             return 0;
         }
     }
     if (!st_http_share_path_in_scope(share->path_prefix, admission->relative_path,
                                      strlen(admission->relative_path))) {
-        send_share_refusal(fd, 403, "SHARE_SCOPE_DENIED", NULL, NULL, 0);
+        send_share_refusal(fd, 403, ST_HTTP_SHARE_CODE_SCOPE_DENIED, NULL, NULL, 0);
         return 0;
     }
     /* The budgets are spent only once credential and scope passed. */
     snprintf(admission->stream.share_id, sizeof(admission->stream.share_id), "%s", admission->share_id);
     admission->stream.expires_at = share->expires_at;
     if (admin_share_stream_register(&admission->stream) != 0) {
-        send_share_refusal(fd, 429, "SHARE_BUSY", NULL, NULL, 1);
+        send_share_refusal(fd, 429, ST_HTTP_SHARE_CODE_BUSY, NULL, NULL, 1);
         return 0;
     }
     long long retry_after = st_http_share_gcra_take(st_http_share_request_limiter(), admission->share_id, now_ms);
     if (retry_after > 0) {
         admin_share_stream_unregister(&admission->stream);
-        send_share_refusal(fd, 429, "SHARE_RATE_LIMITED", NULL, NULL, retry_after);
+        send_share_refusal(fd, 429, ST_HTTP_SHARE_CODE_RATE_LIMITED, NULL, NULL, retry_after);
         return 0;
     }
     snprintf(admission->client_name, sizeof(admission->client_name), "%s", resolution.client_name);
