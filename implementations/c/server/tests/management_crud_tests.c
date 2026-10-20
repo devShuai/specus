@@ -1145,6 +1145,179 @@ static int test_user_mutation_binding(void)
     return failed;
 }
 
+/* method path answers status with exactly body. */
+static int expect_exact(const char *method, const char *path, const char *request, const char *token, int status,
+                        const char *body)
+{
+    int answered = call(method, path, request, token);
+    if (answered == status && last_body != NULL && strcmp(last_body, body) == 0) {
+        return 0;
+    }
+    fprintf(stderr, "FAIL %s %s %s: expected %d %s, got %d %s\n", method, path, request == NULL ? "" : request,
+            status, body, answered, last_body == NULL ? "" : last_body);
+    return -1;
+}
+
+/*
+ * The refusals of POST, PUT and DELETE /api/admin/users as Java's ManagementUserService throws them
+ * and GlobalExceptionHandler answers them (400 {"error":"<message>"}), in the service's order:
+ * createUser checks the login name (normalizeUsername: blank, then more than 80 characters), the
+ * built-in administrator's name (String.equalsIgnoreCase), the caller's tenant, then the password
+ * (requirePassword: blank, then more than 120 characters); updateUser and deleteUser check the path
+ * name the same way, the built-in administrator's name, then look it up in the caller's tenant
+ * ("用户不存在: <name>", the name trimmed). Measured against the Java server over HTTP. The C server
+ * used to answer 409 "username already exists", 404 "user not found", 409 "built-in admin cannot be
+ * updated|deleted", "username and password are required" and "username is required".
+ */
+static int test_user_mutation_errors(void)
+{
+    static const char *const blank_username = "{\"error\":\"username cannot be blank\"}";
+    static const char *const long_username = "{\"error\":\"username is too long\"}";
+    static const char *const blank_password = "{\"error\":\"password cannot be blank\"}";
+    static const char *const forbidden = "{\"error\":\"需要 admin 权限\"}";
+    char x81[82];
+    memset(x81, 'x', 81U);
+    x81[81] = '\0';
+    char body[1200];
+    char path[1200];
+    char wide[200];
+    char wide_path[400];
+    char wide_missing[300];
+    wide[0] = '\0';
+    wide_path[0] = '\0';
+    /* 41 "é": 82 bytes, more than C's 80-byte login name, though 41 characters for Java. */
+    for (int i = 0; i < 41; ++i) {
+        strcat(wide, "\xc3\xa9");
+        strcat(wide_path, "%C3%A9");
+    }
+    int failed = expect("POST", "/api/admin/users", "{\"username\":\"alice-e\",\"password\":\"pw-alice\"}",
+                        admin_token, 201, "\"username\":\"alice-e\"") != 0;
+
+    /* createUser: the login name first. */
+    failed = failed
+        || expect_exact("POST", "/api/admin/users", "{\"password\":\"pw\"}", admin_token, 400, blank_username) != 0
+        || expect_exact("POST", "/api/admin/users", "{\"username\":null,\"password\":\"pw\"}", admin_token, 400,
+                        blank_username) != 0
+        || expect_exact("POST", "/api/admin/users", "{\"username\":\"   \",\"password\":\"pw\"}", admin_token, 400,
+                        blank_username) != 0
+        /* StringUtils.hasText takes Character.isWhitespace, which counts U+3000 and U+001C. */
+        || expect_exact("POST", "/api/admin/users", "{\"username\":\"\\u3000\",\"password\":\"pw\"}", admin_token, 400,
+                        blank_username) != 0
+        || expect_exact("POST", "/api/admin/users", "{\"username\":\"\\u001c\",\"password\":\"pw\"}", admin_token, 400,
+                        blank_username) != 0
+        /* A blank name is refused before the password is looked at. */
+        || expect_exact("POST", "/api/admin/users", "{\"username\":\"\",\"password\":\"\"}", admin_token, 400,
+                        blank_username) != 0;
+    snprintf(body, sizeof(body), "{\"username\":\"%s\",\"password\":\"pw\"}", x81);
+    failed = failed || expect_exact("POST", "/api/admin/users", body, admin_token, 400, long_username) != 0;
+    snprintf(body, sizeof(body), "{\"username\":\"%s\"}", x81);
+    failed = failed || expect_exact("POST", "/api/admin/users", body, admin_token, 400, long_username) != 0;
+    /* 80 characters once trimmed are not too long. */
+    snprintf(body, sizeof(body), "{\"username\":\" %.80s \",\"password\":\"pw\"}", x81);
+    failed = failed || expect("POST", "/api/admin/users", body, admin_token, 201, "\"username\":\"xxxxxxxxxx") != 0;
+    /* C's own bound (inventory): 82 bytes Java takes, and a name that trimming empties. */
+    snprintf(body, sizeof(body), "{\"username\":\"%s\",\"password\":\"pw\"}", wide);
+    failed = failed || expect_exact("POST", "/api/admin/users", body, admin_token, 400, long_username) != 0
+        || expect_exact("POST", "/api/admin/users", "{\"username\":\"\\u0001\",\"password\":\"pw\"}", admin_token, 400,
+                        blank_username) != 0;
+
+    /* Then the built-in administrator's name, in any case and before the password. */
+    failed = failed
+        || expect_exact("POST", "/api/admin/users", "{\"username\":\" CRUD-ROOT \",\"password\":\"\"}", admin_token,
+                        400, "{\"error\":\"内置 admin 用户不能重复创建\"}") != 0
+        /* Then the caller's tenant, also before the password. */
+        || expect_exact("POST", "/api/admin/users", "{\"username\":\" ALICE-E \"}", admin_token, 400,
+                        "{\"error\":\"用户名不可用\"}") != 0
+        /* Another tenant's alice-e is no conflict. */
+        || expect("POST", "/api/admin/users", "{\"username\":\"alice-e\",\"password\":\"pw-other\"}", other_token, 201,
+                  "\"tenantId\":\"" OTHER_TENANT "\"") != 0
+        /* Then the password. */
+        || expect_exact("POST", "/api/admin/users", "{\"username\":\"bob-e\"}", admin_token, 400, blank_password) != 0
+        || expect_exact("POST", "/api/admin/users", "{\"username\":\"bob-e\",\"password\":\"  \"}", admin_token, 400,
+                        blank_password) != 0
+        || expect_exact("POST", "/api/admin/users", "{\"username\":\"bob-e\",\"password\":\"\\u3000\"}", admin_token,
+                        400, blank_password) != 0
+        /* Text for hasText, but nothing once trimmed: PasswordService.hash refuses it. */
+        || expect_exact("POST", "/api/admin/users", "{\"username\":\"bob-e\",\"password\":\"\\u0001\"}", admin_token,
+                        400, blank_password) != 0;
+    char p121[122];
+    memset(p121, 'p', 121U);
+    p121[121] = '\0';
+    snprintf(body, sizeof(body), "{\"username\":\"bob-e\",\"password\":\"%s\"}", p121);
+    failed = failed
+        || expect_exact("POST", "/api/admin/users", body, admin_token, 400,
+                        "{\"error\":\"password is too long\"}") != 0;
+    snprintf(body, sizeof(body), "{\"username\":\"bob-e\",\"password\":\" %.120s \"}", p121);
+    failed = failed || expect("POST", "/api/admin/users", body, admin_token, 201, "\"username\":\"bob-e\"") != 0
+        /* What binds meets the administrator check before any of the service's. */
+        || expect_exact("POST", "/api/admin/users", "{\"username\":\"\",\"password\":\"\"}", user_token, 403,
+                        forbidden) != 0;
+
+    /* updateUser: the path name, the built-in administrator's, then the caller's tenant. */
+    snprintf(path, sizeof(path), "/api/admin/users/%s", x81);
+    failed = failed
+        || expect_exact("PUT", "/api/admin/users/%20", "{}", admin_token, 400, blank_username) != 0
+        || expect_exact("PUT", "/api/admin/users/%E3%80%80", "{}", admin_token, 400, blank_username) != 0
+        || expect_exact("PUT", path, "{}", admin_token, 400, long_username) != 0
+        || expect_exact("PUT", "/api/admin/users/%20Crud-Root%20", "{\"role\":\"USER\"}", admin_token, 400,
+                        "{\"error\":\"内置 admin 用户只能通过配置文件修改\"}") != 0
+        || expect_exact("PUT", "/api/admin/users/%20Nobody%20", "{}", admin_token, 400,
+                        "{\"error\":\"用户不存在: Nobody\"}") != 0
+        || expect_exact("PUT", "/api/admin/users/a+b", "{}", admin_token, 400, "{\"error\":\"用户不存在: a+b\"}") != 0
+        /* U+2003 is whitespace for hasText but not trimmed: the name keeps it. */
+        || expect_exact("PUT", "/api/admin/users/%E2%80%83x", "{}", admin_token, 400,
+                        "{\"error\":\"用户不存在: \xe2\x80\x83x\"}") != 0
+        /* Another tenant's account answers as one nobody has. */
+        || expect_exact("PUT", "/api/admin/users/BOB-E", "{\"enabled\":false}", other_token, 400,
+                        "{\"error\":\"用户不存在: BOB-E\"}") != 0
+        || expect_exact("PUT", "/api/admin/users/nobody", "{}", user_token, 403, forbidden) != 0
+        /* Spring has no route for an empty or a two-segment name. */
+        || expect("PUT", "/api/admin/users/", "{}", admin_token, 404, NULL) != 0
+        || expect("PUT", "/api/admin/users/alice-e/x", "{}", admin_token, 404, NULL) != 0
+        /* A password with text replaces the old one, at any length; a blank one changes nothing. */
+        || expect_exact("PUT", "/api/admin/users/ALICE-E", "{\"password\":\"\\u0001\"}", admin_token, 400,
+                        blank_password) != 0
+        || expect("PUT", "/api/admin/users/ALICE-E", "{\"password\":\"  \"}", admin_token, 200,
+                  "\"username\":\"alice-e\"") != 0;
+    snprintf(body, sizeof(body), "{\"password\":\"%s%s\"}", p121, p121);
+    snprintf(path, sizeof(path), "/api/admin/users/%s", wide_path);
+    snprintf(wide_missing, sizeof(wide_missing), "{\"error\":\"用户不存在: %s\"}", wide);
+    failed = failed
+        || expect("PUT", "/api/admin/users/alice-e", body, admin_token, 200, "\"username\":\"alice-e\"") != 0
+        /* A name longer than C keeps is looked up like any other, and found by no one. */
+        || expect_exact("PUT", path, "{}", admin_token, 400, wide_missing) != 0
+        || expect_exact("DELETE", path, NULL, admin_token, 400, wide_missing) != 0;
+
+    /* deleteUser: the same checks in the same order. */
+    snprintf(path, sizeof(path), "/api/admin/users/%s", x81);
+    failed = failed
+        || expect_exact("DELETE", "/api/admin/users/%20", NULL, admin_token, 400, blank_username) != 0
+        || expect_exact("DELETE", "/api/admin/users/%E2%80%83", NULL, admin_token, 400, blank_username) != 0
+        || expect_exact("DELETE", path, NULL, admin_token, 400, long_username) != 0
+        || expect_exact("DELETE", "/api/admin/users/CRUD-ROOT", NULL, admin_token, 400,
+                        "{\"error\":\"内置 admin 用户不能删除\"}") != 0
+        || expect_exact("DELETE", "/api/admin/users/nobody", NULL, admin_token, 400,
+                        "{\"error\":\"用户不存在: nobody\"}") != 0
+        || expect_exact("DELETE", "/api/admin/users/alice-e", NULL, other_token, 204, "") != 0
+        || expect_exact("DELETE", "/api/admin/users/nobody", NULL, user_token, 403, forbidden) != 0
+        || expect("DELETE", "/api/admin/users/", NULL, admin_token, 404, NULL) != 0
+        || expect("DELETE", "/api/admin/users/alice-e/x", NULL, admin_token, 404, NULL) != 0
+        || expect("GET", "/api/admin/users", NULL, admin_token, 200, "\"username\":\"alice-e\"") != 0;
+
+    /* String.equalsIgnoreCase folds beyond ASCII: a dotless or dotted I is the built-in "admin". */
+    setenv("SPECUS_AUTH_USERNAME", "admin", 1);
+    failed = failed
+        || expect_exact("POST", "/api/admin/users", "{\"username\":\"adm\\u0131n\",\"password\":\"pw\"}", admin_token,
+                        400, "{\"error\":\"内置 admin 用户不能重复创建\"}") != 0
+        || expect_exact("PUT", "/api/admin/users/adm%C4%B1n", "{}", admin_token, 400,
+                        "{\"error\":\"内置 admin 用户只能通过配置文件修改\"}") != 0
+        || expect_exact("DELETE", "/api/admin/users/ADM%C4%B0N", NULL, admin_token, 400,
+                        "{\"error\":\"内置 admin 用户不能删除\"}") != 0;
+    setenv("SPECUS_AUTH_USERNAME", BUILT_IN, 1);
+    printf("%s management user refusals answer as Java's ManagementUserService\n", failed ? "FAIL" : "ok  ");
+    return failed;
+}
+
 /* ---- client name availability ------------------------------------------------------------- */
 
 static int test_name_availability(void)
@@ -1427,6 +1600,7 @@ int main(void)
         failed = test_peer_import_targets() != 0 || failed;
         failed = test_path_variables() != 0 || failed;
         failed = test_user_mutation_binding() != 0 || failed;
+        failed = test_user_mutation_errors() != 0 || failed;
         failed = test_query_parameters() != 0 || failed;
         failed = test_repeated_query_parameters() != 0 || failed;
         failed = test_request_firewall() != 0 || failed;

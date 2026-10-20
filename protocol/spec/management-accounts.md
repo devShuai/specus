@@ -129,10 +129,18 @@ OIDC 直连 Bearer（非本地 token）按已绑定的 issuer/subject 找账号�
 | --- | --- |
 | `GET /api/admin/me` | `username` 为登录名，`tenantId` 为账号的租户 |
 | `GET /api/admin/users` | 只列调用者租户的账号，按登录名排序，`username` 字段是登录名。内置管理员只属于默认租户：**只有调用者租户是默认租户时**列出它的一行（`builtIn: true`，`tenantId` 为默认租户），排在最前；其他租户的列表里没有这一行 |
-| `POST /api/admin/users` | 只在调用者租户检查规范登录名冲突。**其他租户已有同名账号不算冲突**，照常创建，账号键为新的 UUID。本租户冲突的状态码沿用各端现状（Java、Go、.NET `400`，C `409`），错误信息不含其他租户的任何信息。与内置管理员同名一律拒绝 |
-| `PUT/DELETE /api/admin/users/{username}` | 路径参数是登录名，只在调用者租户按规范登录名查找；其他租户的账号与不存在的账号答复相同 |
+| `POST /api/admin/users` | 只在调用者租户检查规范登录名冲突。**其他租户已有同名账号不算冲突**，照常创建，账号键为新的 UUID。本租户冲突答复 `400`，Java 与 C 的文案为 `用户名不可用`（Go、.NET 为 `用户名已存在: <登录名>`，见第 11 节），错误信息不含其他租户的任何信息。与内置管理员同名（Java `String.equalsIgnoreCase`）一律拒绝 |
+| `PUT/DELETE /api/admin/users/{username}` | 路径参数是登录名，只在调用者租户按规范登录名查找；其他租户的账号与不存在的账号答复相同：`400` `{"error":"用户不存在: <登录名>"}`，登录名为路径参数去掉首尾空白后的原样（Go 为 `404`，见第 11 节） |
 
 创建冲突与跨租户目标都不能透露其他租户里是否存在该名字。
+
+这三个接口的拒绝都按 Java `ManagementUserService` 的检查顺序与文案答复，由 `GlobalExceptionHandler` 把 `IllegalArgumentException` 答成 `400` `{"error":"<文案>"}`；C 与 Java 逐项一致，只有第 11 节所列的两处登录名存储限制不同。Spring 绑定请求体失败的 `400` `{"error":"Bad Request"}` 在这些检查之前，非管理员的 `403` `{"error":"需要 admin 权限"}` 在绑定之后、这些检查之前：
+
+| 接口 | 依次检查 | 文案 |
+| --- | --- | --- |
+| `POST` | 用户名为空（`StringUtils.hasText`，Unicode 空白也算空）；去掉首尾空白（`String.trim`）后超过 80 个字符（UTF-16 单元）；与内置管理员同名；本租户已有；口令为空；去掉首尾空白后超过 120 个字符 | `username cannot be blank`、`username is too long`、`内置 admin 用户不能重复创建`、`用户名不可用`、`password cannot be blank`、`password is too long` |
+| `PUT` | 路径参数为空；超过 80 个字符；与内置管理员同名；本租户没有；口令有内容但去掉首尾空白后为空（口令为空白时不改，不限长度） | `username cannot be blank`、`username is too long`、`内置 admin 用户只能通过配置文件修改`、`用户不存在: <登录名>`、`password cannot be blank` |
+| `DELETE` | 路径参数为空；超过 80 个字符；与内置管理员同名；本租户没有；仍拥有客户端或接入凭证（`409`，7.1 节） | `username cannot be blank`、`username is too long`、`内置 admin 用户不能删除`、`用户不存在: <登录名>` |
 
 列表里的内置管理员一行是配置的写照，不是账号：其他租户的管理员看不到它，也不能创建、修改或删除与它同名的账号（这三项照旧拒绝，不论调用者在哪个租户）。
 
@@ -148,7 +156,7 @@ OIDC 直连 Bearer（非本地 token）按已绑定的 issuer/subject 找账号�
    {"error": "该账号仍拥有 2 个客户端、1 个接入凭证，需先转移或删除", "clients": 2, "credentials": 1}
    ```
 
-   两个计数都给出，为零的也给；`error` 的措辞各端可以不同（C 为英文）。客户端带着在用的隧道，凭证会在客户端登录时派生新的客户端，这些不能被一次账号删除顺带删掉或交给别人，由管理员先删除，或把归属转给其他账号。目前没有修改 `owner_username` 的接口，转移只能直接改数据；转移客户端时它的 Peer Mesh 设备行要一起改（设备行的归属跟随客户端，客户端每次登录也会刷新）。
+   两个计数都给出，为零的也给；`error` 的措辞各端可以不同（C 与 Java 相同）。客户端带着在用的隧道，凭证会在客户端登录时派生新的客户端，这些不能被一次账号删除顺带删掉或交给别人，由管理员先删除，或把归属转给其他账号。目前没有修改 `owner_username` 的接口，转移只能直接改数据；转移客户端时它的 Peer Mesh 设备行要一起改（设备行的归属跟随客户端，客户端每次登录也会刷新）。
 2. **个人数据随账号删除**，与账号行、邮箱记录同一事务：
 
    | 数据 | 处理 |
@@ -242,9 +250,9 @@ OIDC 直连 Bearer（非本地 token）按已绑定的 issuer/subject 找账号�
 | 实现 | 差异 |
 | --- | --- |
 | Java | 参考实现 |
-| Go | 规范登录名用 `strings.ToLower`（Unicode 简单大小写映射），与 Java 的 `Locale.ROOT` 在少数字符上可能不同 |
-| .NET | 规范登录名用 `ToLowerInvariant()`，同上 |
-| C | 只用 SQLite。规范登录名只折叠 ASCII 字母（与既有的 SQLite `lower()` 一致），非 ASCII 字母区分大小写；token 的租户声明最长 63 字节；限流键的分隔符是 `\x1f` 而不是 `\0`（C 字符串不能含 `\0`），效果相同。管理 WebSocket 的 ticket 在进程内存里；提交后删除本地 ticket 并关闭连接，启用公共互传集群时发布及接收 STCE kind 4/5，远端收到撤销后同样删除本地 ticket、关闭两类连接。仍只用 SQLite，事件协调不提供数据库 HA（[c-server-api-inventory.md](../../docs/cross-language/alignment/c-server-api-inventory.md) 第 8 节） |
+| Go | 规范登录名用 `strings.ToLower`（Unicode 简单大小写映射），与 Java 的 `Locale.ROOT` 在少数字符上可能不同；`PUT`/`DELETE /api/admin/users/{username}` 的目标在本租户不存在时答复 `404`（Java、.NET、C 为 `400` `用户不存在: <登录名>`）；本租户同名创建的文案是 `用户名已存在: <登录名>`（Java、C 为 `用户名不可用`） |
+| .NET | 规范登录名用 `ToLowerInvariant()`，同上；本租户同名创建的文案是 `用户名已存在: <登录名>`（Java、C 为 `用户名不可用`） |
+| C | 只用 SQLite。规范登录名只折叠 ASCII 字母（与既有的 SQLite `lower()` 一致），非 ASCII 字母区分大小写；token 的租户声明最长 63 字节；限流键的分隔符是 `\x1f` 而不是 `\0`（C 字符串不能含 `\0`），效果相同。登录名存成 80 字节：`POST /api/admin/users` 对超过 80 字节、但不超过 80 个字符的非 ASCII 用户名答复 `username is too long`（Java 接受），对去掉首尾空白后为空的用户名（只有控制字符，`hasText` 不算空）答复 `username cannot be blank`（Java 会建出没有登录名的账号）；管理用户三个接口的其余拒绝自 `fix/c-server-user-errors-as-java` 起与 Java 一致（第 7 节）。管理 WebSocket 的 ticket 在进程内存里；提交后删除本地 ticket 并关闭连接，启用公共互传集群时发布及接收 STCE kind 4/5，远端收到撤销后同样删除本地 ticket、关闭两类连接。仍只用 SQLite，事件协调不提供数据库 HA（[c-server-api-inventory.md](../../docs/cross-language/alignment/c-server-api-inventory.md) 第 8 节） |
 
 MySQL 上（Java、Go、.NET）：库的默认排序规则（如 `utf8mb4_0900_ai_ci`）不区分大小写和重音，`tenant_id = ?` 与唯一索引在这种库上也就不区分，`Tenant-A` 与 `tenant-a`、`élise` 与 `elise` 会被当成同一个。这与第 1 节「租户区分大小写」不符，属于已知差异；需要严格语义的部署应为这两列使用二进制或区分大小写的排序规则。
 
