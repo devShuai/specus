@@ -9322,6 +9322,10 @@ static int handle_specus_update(const st_admin_context *context, long long id, c
                                              detail_capture_enabled,
                                              &mapping);
     free(target_address);
+    if (rc == -2) {
+        /* Another request took the port in between: Java's unique constraint, as on create. */
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"客户端名称已存在或数据不符合约束\"}");
+    }
     if (rc != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"specus update failed\"}");
     }
