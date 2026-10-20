@@ -891,6 +891,10 @@ int st_storage_get_mapping_by_client_port(const char *path,
                                           st_storage_mapping *mapping);
 /* The mapping of any client on listen_port (the oldest if several): 0 found, 1 none, -1 on error. */
 int st_storage_find_mapping_by_listen_port(const char *path, int listen_port, st_storage_mapping *mapping);
+/*
+ * Inserts client_name's mapping on listen_port or replaces its target. -1 when another client's
+ * mapping holds the port (uk_specus_mapping_listen_port) or on a storage error.
+ */
 int st_storage_upsert_mapping(const char *path,
                               const char *client_name,
                               int listen_port,
@@ -905,6 +909,7 @@ int st_storage_create_mapping_for_client(const char *path,
                                          int enabled,
                                          int detail_capture_enabled,
                                          st_storage_mapping *out_mapping);
+/* -2 when another mapping holds listen_port (uk_specus_mapping_listen_port), -1 on any other failure. */
 int st_storage_update_mapping_by_id(const char *path,
                                     long long id,
                                     int listen_port,

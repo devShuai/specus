@@ -1,13 +1,16 @@
+#define _POSIX_C_SOURCE 200809L
 #include "storage.h"
 
 #include "client_auth_nonce.h"
 #include "crypto.h"
+#include "object_storage.h"
 #include "peer_egress.h"
 
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int test_peer_mesh_acl_direction_migration(void)
@@ -740,6 +743,21 @@ static int test_client_auth_nonce_store(void)
     return failures;
 }
 
+/* specus_client_session as releases before peer service discovery and peer egress created it. */
+#define LEGACY_CLIENT_SESSION_TABLE                                                                         \
+    "CREATE TABLE specus_client_session ("                                                                  \
+    "id INTEGER PRIMARY KEY AUTOINCREMENT,tenant_id TEXT NOT NULL DEFAULT 'default',"                       \
+    "credential_id INTEGER NOT NULL,identity_id INTEGER NOT NULL,client_id INTEGER NOT NULL,"               \
+    "client_name TEXT NOT NULL,token_hash TEXT NOT NULL,status TEXT NOT NULL,"                              \
+    "machine_fingerprint TEXT NOT NULL,os_user TEXT NOT NULL,hostname TEXT,os_name TEXT,"                   \
+    "os_version TEXT,os_arch TEXT,client_version TEXT,java_version TEXT,local_addresses TEXT,"              \
+    "message_send_capable INTEGER NOT NULL DEFAULT 0,message_receive_capable INTEGER NOT NULL DEFAULT 0,"   \
+    "message_attachments_capable INTEGER NOT NULL DEFAULT 0,"                                               \
+    "message_media_preview_capable INTEGER NOT NULL DEFAULT 0,"                                             \
+    "message_max_attachment_bytes INTEGER NOT NULL DEFAULT 0,"                                              \
+    "http_login_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,netty_connected_at TEXT,"                        \
+    "disconnected_at TEXT,expires_at TEXT NOT NULL,channel_id TEXT,remote_address TEXT);"
+
 /*
  * Java PeerServiceDiscoverySchemaMigratorTests, createsTablesDisabledByDefaultAndAddsSessionCapabilityColumns.
  * A session table from before peer service discovery and peer egress gains the four capability
@@ -753,18 +771,7 @@ static int test_peer_service_discovery_migration(void)
     char path[256];
     scratch_db_path(path, sizeof(path), "peer-service-migration");
     const char *legacy_schema =
-        "CREATE TABLE specus_client_session ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT,tenant_id TEXT NOT NULL DEFAULT 'default',"
-        "credential_id INTEGER NOT NULL,identity_id INTEGER NOT NULL,client_id INTEGER NOT NULL,"
-        "client_name TEXT NOT NULL,token_hash TEXT NOT NULL,status TEXT NOT NULL,"
-        "machine_fingerprint TEXT NOT NULL,os_user TEXT NOT NULL,hostname TEXT,os_name TEXT,"
-        "os_version TEXT,os_arch TEXT,client_version TEXT,java_version TEXT,local_addresses TEXT,"
-        "message_send_capable INTEGER NOT NULL DEFAULT 0,message_receive_capable INTEGER NOT NULL DEFAULT 0,"
-        "message_attachments_capable INTEGER NOT NULL DEFAULT 0,"
-        "message_media_preview_capable INTEGER NOT NULL DEFAULT 0,"
-        "message_max_attachment_bytes INTEGER NOT NULL DEFAULT 0,"
-        "http_login_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,netty_connected_at TEXT,"
-        "disconnected_at TEXT,expires_at TEXT NOT NULL,channel_id TEXT,remote_address TEXT);"
+        LEGACY_CLIENT_SESSION_TABLE
         "INSERT INTO specus_client_session(id,credential_id,identity_id,client_id,client_name,token_hash,"
         "status,machine_fingerprint,os_user,expires_at) VALUES(2,1,1,7,'legacy','legacy-token',"
         "'DISCONNECTED','machine','user','2026-06-25T08:00:00Z');"
@@ -1328,6 +1335,643 @@ static int test_login_names_are_unique_per_tenant(void)
     return failed ? 1 : 0;
 }
 
+/*
+ * Whether table has a unique index on exactly these comma-separated columns, in any order and under
+ * any name, as a table constraint or CREATE UNIQUE INDEX makes one: 1 a full one, 2 only a partial
+ * one, 0 none, -1 on error. With name set, only the index of that name counts.
+ */
+static int unique_index_on(const char *path, const char *table, const char *columns, const char *name)
+{
+    char wanted[8][64];
+    size_t wanted_count = 0U;
+    for (const char *cursor = columns; *cursor != '\0' && wanted_count < 8U;) {
+        size_t len = strcspn(cursor, ",");
+        snprintf(wanted[wanted_count++], sizeof(wanted[0]), "%.*s", (int)len, cursor);
+        cursor += len;
+        if (*cursor == ',') {
+            ++cursor;
+        }
+    }
+    sqlite3 *db = NULL;
+    sqlite3_stmt *indexes = NULL;
+    int result = -1;
+    if (sqlite3_open(path, &db) == SQLITE_OK
+        && sqlite3_prepare_v2(db, "SELECT name, \"unique\", partial FROM pragma_index_list(?1)", -1, &indexes,
+                              NULL) == SQLITE_OK) {
+        sqlite3_bind_text(indexes, 1, table, -1, SQLITE_STATIC);
+        result = 0;
+        while (result >= 0 && result != 1 && sqlite3_step(indexes) == SQLITE_ROW) {
+            const char *index = (const char *)sqlite3_column_text(indexes, 0);
+            if (index == NULL || sqlite3_column_int(indexes, 1) == 0 || (name != NULL && strcmp(index, name) != 0)) {
+                continue;
+            }
+            sqlite3_stmt *info = NULL;
+            size_t total = 0U;
+            size_t matched = 0U;
+            if (sqlite3_prepare_v2(db, "SELECT name FROM pragma_index_info(?1)", -1, &info, NULL) != SQLITE_OK) {
+                result = -1;
+            } else {
+                sqlite3_bind_text(info, 1, index, -1, SQLITE_TRANSIENT);
+                while (sqlite3_step(info) == SQLITE_ROW) {
+                    const char *column = (const char *)sqlite3_column_text(info, 0);
+                    ++total;
+                    for (size_t i = 0U; column != NULL && i < wanted_count; ++i) {
+                        if (strcmp(column, wanted[i]) == 0) {
+                            ++matched;
+                            break;
+                        }
+                    }
+                }
+            }
+            sqlite3_finalize(info);
+            if (result >= 0 && total == wanted_count && matched == wanted_count) {
+                result = sqlite3_column_int(indexes, 2) == 0 ? 1 : 2;
+            }
+        }
+    }
+    sqlite3_finalize(indexes);
+    sqlite3_close(db);
+    return result;
+}
+
+/* Every table, index and trigger with its SQL, as one string the caller frees; NULL on error. */
+static char *schema_snapshot(const char *path)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    char *snapshot = NULL;
+    if (sqlite3_open(path, &db) == SQLITE_OK
+        && sqlite3_prepare_v2(db,
+               "SELECT group_concat(type || ' ' || name || ' ' || tbl_name || ' ' || COALESCE(sql, ''), char(10)) "
+               "FROM (SELECT * FROM sqlite_master ORDER BY type, name)",
+               -1, &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_text(stmt, 0) != NULL) {
+        snapshot = strdup((const char *)sqlite3_column_text(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return snapshot;
+}
+
+/* Runs sql on its own connection: the SQLite result code, with the error message in message. */
+static int exec_status(const char *path, const char *sql, char *message, size_t message_len)
+{
+    sqlite3 *db = NULL;
+    char *error = NULL;
+    int rc = sqlite3_open(path, &db);
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_exec(db, sql, NULL, NULL, &error);
+    }
+    snprintf(message, message_len, "%s", error == NULL ? "" : error);
+    sqlite3_free(error);
+    sqlite3_close(db);
+    return rc;
+}
+
+/*
+ * A new database as the server leaves it: st_storage_init, then the attachment tables, which
+ * object_storage.c creates when attachments are first used (here through the expiry sweep, which
+ * opens SPECUS_DATABASE_PATH with object storage switched off).
+ */
+static int init_full_schema(const char *path)
+{
+    if (st_storage_init(path, 0) != 0 || setenv("SPECUS_DATABASE_PATH", path, 1) != 0
+        || unsetenv("SPECUS_OBJECT_STORAGE_PROVIDER") != 0) {
+        return -1;
+    }
+    int rc = st_object_storage_cleanup_expired();
+    unsetenv("SPECUS_DATABASE_PATH");
+    return rc;
+}
+
+/*
+ * Java SqliteUniqueIndexStartupTests.startupEnforcesEveryUniqueKeyOfTheMapping over the 22
+ * table-level unique keys that SqliteUniqueIndexMigratorTests.listsEveryTableLevelUniqueKeyOfTheMapping
+ * counts (SqliteUniqueIndexMigrator.UNIQUE_KEYS): on a new database each is enforced by a full unique
+ * index or table constraint on the C table and columns listed here. Where C's table or key columns
+ * differ from Java's, the comment says why the key is the same. The two keys C used to lack carry
+ * Java's index names, as the migrator creates them.
+ */
+static int test_schema_enforces_java_unique_keys(void)
+{
+    static const struct {
+        const char *java_key;
+        const char *table;
+        const char *columns;
+        const char *index_name; /* when the index must carry Java's name */
+    } keys[] = {
+        {"uk_client_credential_api_key", "specus_client_credential", "api_key", NULL},
+        {"uk_client_identity_machine_user", "specus_client_identity", "credential_id,machine_fingerprint,os_user",
+         NULL},
+        {"uq_management_user_tenant_login_name", "specus_management_user", "tenant_id,login_name_normalized",
+         "uq_management_user_tenant_login_name"},
+        /* Both declared COLLATE NOCASE in C, so the key also refuses a value differing only in ASCII case. */
+        {"uq_registration_challenge_username", "specus_management_registration_challenge", "username", NULL},
+        {"uq_registration_challenge_email", "specus_management_registration_challenge", "email", NULL},
+        {"uk_specus_mapping_listen_port", "specus_mapping", "listen_port", "uk_specus_mapping_listen_port"},
+        /*
+         * Java (client_id, route). C's routes, like its traffic counters below, name their client
+         * instead of numbering it: client_account.client_name is unique across all tenants and a
+         * rename rewrites it in these tables, so one name is one client of one tenant.
+         */
+        {"uk_http_route_client_route", "http_route_mapping", "client_name,route", NULL},
+        {"uk_peer_mesh_acl_pair", "peer_mesh_acl", "tenant_id,source_client_id,target_client_id", NULL},
+        {"uk_peer_mesh_device_client", "peer_mesh_device", "tenant_id,client_id", NULL},
+        {"uk_peer_mesh_device_ip", "peer_mesh_device", "tenant_id,virtual_ip", "uk_peer_mesh_device_ip"},
+        {"uk_peer_egress_policy_client", "peer_mesh_egress_policy", "tenant_id,egress_client_id", NULL},
+        {"uk_peer_egress_activity_client", "peer_mesh_egress_activity", "tenant_id,egress_client_id", NULL},
+        {"uk_peer_shared_service_id", "peer_mesh_shared_service", "tenant_id,client_id,service_id", NULL},
+        {"uk_public_transfer_room_key", "public_transfer_room", "room_name,owner_token_hash", NULL},
+        {"uk_public_transfer_access_token", "public_transfer_room_access", "token_hash", NULL},
+        {"uk_public_transfer_pairing_code_hash", "public_transfer_room_pairing_code", "code_hash", NULL},
+        {"uk_attachment_download_grant_token", "transfer_attachment_download_grant", "token_hash", NULL},
+        /* Java specus_traffic_usage (client_id, usage_date): C's traffic_usage, by client name. */
+        {"uk_specus_traffic_client_date", "traffic_usage", "client_name,usage_date", NULL},
+        /* Java (tenant_id, client_id, ...): the client's name fixes its tenant as well. */
+        {"uk_resource_traffic_resource_date", "resource_traffic_usage",
+         "client_name,resource_type,resource_key,usage_date", NULL},
+        /*
+         * Java specus_connection_stat (tenant_id, client_name, stat_month): C's connection_stat keeps
+         * the same "yyyy-MM" month in stat_date (st_storage_archive_connections), and the name fixes
+         * the tenant.
+         */
+        {"uk_specus_connection_stat", "connection_stat", "client_name,stat_date", NULL},
+        {"uk_http_media_deduplication", "specus_http_media_capture", "deduplication_key", NULL},
+    };
+    const size_t key_count = sizeof(keys) / sizeof(keys[0]);
+    char path[256];
+    scratch_db_path(path, sizeof(path), "unique-keys");
+    if (init_full_schema(path) != 0) {
+        fprintf(stderr, "unique keys: schema setup failed\n");
+        unlink(path);
+        return 1;
+    }
+    int failures = 0;
+    /* The keys above and the OIDC identity key below. */
+    if (key_count + 1U != 22U) {
+        fprintf(stderr, "unique keys: %zu keys listed, Java's mapping has 22\n", key_count + 1U);
+        ++failures;
+    }
+    for (size_t i = 0U; i < key_count; ++i) {
+        int state = unique_index_on(path, keys[i].table, keys[i].columns, keys[i].index_name);
+        if (state != 1) {
+            fprintf(stderr, "unique keys: %s is not enforced on %s (%s)%s%s, state %d\n", keys[i].java_key,
+                    keys[i].table, keys[i].columns, keys[i].index_name == NULL ? "" : " by an index named ",
+                    keys[i].index_name == NULL ? "" : keys[i].index_name, state);
+            ++failures;
+        }
+    }
+    /*
+     * Java uq_management_user_oidc_identity_key is a full unique index on oidc_identity_key. C's is
+     * partial, WHERE oidc_identity_key IS NOT NULL AND oidc_identity_key <> ''. NULLs never collide in
+     * either, so the two differ only for '': accounts without an OIDC identity store NULL, and an
+     * identity key is never empty, so no row C writes is treated differently.
+     */
+    if (unique_index_on(path, "specus_management_user", "oidc_identity_key", "uq_management_user_oidc_identity_key")
+            != 2
+        || unique_index_on(path, "specus_management_user", "oidc_identity_key", NULL) != 2) {
+        fprintf(stderr, "unique keys: the OIDC identity key is not C's partial unique index\n");
+        ++failures;
+    }
+    unlink(path);
+    return failures == 0 ? 0 : 1;
+}
+
+/*
+ * Java SqliteIdentityKeySchemaTests.everyIdentityIdAliasesTheRowid: every table keyed by an id the
+ * database numbers has that id as its only key column, declared INTEGER, so it is the rowid and
+ * holds what sqlite3_last_insert_rowid() reports. Java checks its IDENTITY entities, among them the
+ * three tables its SqliteIdentityKeyMigrator repairs; C checks every table whose key is id.
+ * specus_client_auth_nonce is the exception, as in Java: its id is computed (a SHA-256 in hex,
+ * Java's String id without @GeneratedValue), not numbered.
+ */
+static int test_every_identity_id_aliases_the_rowid(void)
+{
+    char path[256];
+    scratch_db_path(path, sizeof(path), "identity-ids");
+    sqlite3 *db = NULL;
+    sqlite3_stmt *tables = NULL;
+    if (init_full_schema(path) != 0 || sqlite3_open(path, &db) != SQLITE_OK
+        || sqlite3_prepare_v2(db,
+               "SELECT m.name, (SELECT COUNT(*) FROM pragma_table_info(m.name) WHERE pk > 0), "
+               "(SELECT upper(type) FROM pragma_table_info(m.name) WHERE name = 'id' AND pk > 0) "
+               "FROM sqlite_master m WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' "
+               "AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) WHERE name = 'id' AND pk > 0) "
+               "ORDER BY m.name",
+               -1, &tables, NULL) != SQLITE_OK) {
+        fprintf(stderr, "identity ids: schema setup failed\n");
+        sqlite3_finalize(tables);
+        sqlite3_close(db);
+        unlink(path);
+        return 1;
+    }
+    int failures = 0;
+    int checked = 0;
+    int repaired_by_java = 0;
+    while (sqlite3_step(tables) == SQLITE_ROW) {
+        const char *table = (const char *)sqlite3_column_text(tables, 0);
+        const char *type = (const char *)sqlite3_column_text(tables, 2);
+        const char *expected = strcmp(table, "specus_client_auth_nonce") == 0 ? "VARCHAR(64)" : "INTEGER";
+        ++checked;
+        if (strcmp(table, "specus_http_media_capture") == 0 || strcmp(table, "specus_http_traffic_exchange") == 0
+            || strcmp(table, "specus_tcp_traffic_frame") == 0) {
+            ++repaired_by_java;
+        }
+        if (sqlite3_column_int(tables, 1) != 1 || type == NULL || strcmp(type, expected) != 0) {
+            fprintf(stderr, "identity ids: %s has %d key column(s), id typed %s, expected id alone as %s\n", table,
+                    sqlite3_column_int(tables, 1), type == NULL ? "(none)" : type, expected);
+            ++failures;
+        }
+    }
+    sqlite3_finalize(tables);
+    sqlite3_close(db);
+    if (checked <= 3 || repaired_by_java != 3) {
+        fprintf(stderr, "identity ids: %d tables checked, %d of Java's three repaired ones\n", checked,
+                repaired_by_java);
+        ++failures;
+    }
+    unlink(path);
+    return failures == 0 ? 0 : 1;
+}
+
+/*
+ * Java SqliteSchemaUpdateRestartTests.serverRestartsOnAnExistingSqliteDatabase and
+ * SqliteIdentityKeySchemaTests.theRepairLeavesACreatedSchemaAlone: later starts on a database
+ * the server created leave every table, index and constraint as the first start made them.
+ */
+static int test_restart_keeps_the_schema(void)
+{
+    char path[256];
+    scratch_db_path(path, sizeof(path), "restart-schema");
+    char *first = init_full_schema(path) == 0 ? schema_snapshot(path) : NULL;
+    char *second = first != NULL && init_full_schema(path) == 0 && st_storage_init(path, 1) == 0
+        ? schema_snapshot(path) : NULL;
+    int failed = first == NULL || second == NULL || strcmp(first, second) != 0;
+    if (failed) {
+        fprintf(stderr, "restart changed the schema\n--- first\n%s\n--- second\n%s\n", first == NULL ? "" : first,
+                second == NULL ? "" : second);
+    }
+    free(first);
+    free(second);
+    unlink(path);
+    return failed ? 1 : 0;
+}
+
+/*
+ * Java PostgresSchemaMigrationTests.managementUserMigrationAcceptsTheIndexHibernateCreated on
+ * SQLite: the login-name columns and a correct uq_management_user_tenant_login_name are already
+ * there, the row's login names are not. Startup backfills them and keeps the index as it was.
+ */
+static int test_login_name_migration_accepts_an_existing_index(void)
+{
+    char path[256];
+    char text[512];
+    char index_before[512];
+    snprintf(path, sizeof(path), "/tmp/specus-c-login-name-existing-index-%ld.db", (long)getpid());
+    if (legacy_login_name_database(path,
+            "ALTER TABLE specus_management_user ADD COLUMN login_name TEXT;"
+            "ALTER TABLE specus_management_user ADD COLUMN login_name_normalized TEXT;"
+            "CREATE UNIQUE INDEX uq_management_user_tenant_login_name "
+            "ON specus_management_user (tenant_id, login_name_normalized);"
+            "INSERT INTO specus_management_user(username, tenant_id) VALUES('Alice', 'tenant-a');") != 0) {
+        return 1;
+    }
+    query_text(path, "SELECT sql FROM sqlite_master WHERE name = 'uq_management_user_tenant_login_name'",
+               index_before, sizeof(index_before));
+    int failed = st_storage_init(path, 0) != 0 || st_storage_init(path, 0) != 0;
+    if (failed) fprintf(stderr, "login-name migration refused its own index\n");
+    if (!failed) {
+        failed = login_name_query_text(path, "SELECT login_name || '/' || login_name_normalized "
+                                             "FROM specus_management_user WHERE username = 'Alice'",
+                                       text, sizeof(text)) != 0
+            || strcmp(text, "Alice/alice") != 0;
+        if (failed) fprintf(stderr, "login names under an existing index: %s, expected Alice/alice\n", text);
+    }
+    if (!failed) {
+        query_text(path, "SELECT sql FROM sqlite_master WHERE name = 'uq_management_user_tenant_login_name'",
+                   text, sizeof(text));
+        failed = strcmp(text, index_before) != 0
+            || unique_index_on(path, "specus_management_user", "tenant_id,login_name_normalized",
+                               "uq_management_user_tenant_login_name") != 1;
+        if (failed) fprintf(stderr, "the existing login-name index changed: %s\n", text);
+    }
+    unlink(path);
+    return failed ? 1 : 0;
+}
+
+/*
+ * Java PostgresSchemaMigrationTests.peerServiceMigrationAddsColumnsToALegacySessionTable on SQLite:
+ * a database from before peer service discovery, with a session row and no shared-service table,
+ * gains the session capability columns (0 on the old row) and the shared-service table with its
+ * unique key on (tenant_id, client_id, service_id), Java's uk_peer_shared_service_id (a table
+ * constraint in C), and idx_peer_shared_service_tenant_client. Startup runs twice.
+ */
+static int test_peer_service_migration_creates_the_shared_service_keys(void)
+{
+    char path[256];
+    scratch_db_path(path, sizeof(path), "peer-service-keys");
+    if (exec_script(path,
+            LEGACY_CLIENT_SESSION_TABLE
+            "INSERT INTO specus_client_session(id,credential_id,identity_id,client_id,client_name,token_hash,"
+            "status,machine_fingerprint,os_user,expires_at) VALUES(1,1,1,7,'legacy','legacy-token',"
+            "'DISCONNECTED','machine','user','2026-06-25T08:00:00Z');") != 0
+        || query_int(path, "SELECT COUNT(*) FROM sqlite_master WHERE tbl_name = 'peer_mesh_shared_service'") != 0
+        || st_storage_init(path, 0) != 0 || st_storage_init(path, 0) != 0) {
+        fprintf(stderr, "peer service migration of a database without shared services failed\n");
+        unlink(path);
+        return 1;
+    }
+    int failures = 0;
+    if (query_int(path, "SELECT peer_service_discovery_version + client_egress_version * 10 "
+                        "+ client_egress_domain_targets * 100 FROM specus_client_session WHERE id = 1") != 0) {
+        fprintf(stderr, "the legacy session announces peer services or egress after the migration\n");
+        ++failures;
+    }
+    if (unique_index_on(path, "peer_mesh_shared_service", "tenant_id,client_id,service_id", NULL) != 1) {
+        fprintf(stderr, "peer_mesh_shared_service lacks its unique (tenant_id, client_id, service_id)\n");
+        ++failures;
+    }
+    char columns[128];
+    query_text(path, "SELECT group_concat(name, ',') FROM (SELECT name FROM "
+                     "pragma_index_info('idx_peer_shared_service_tenant_client') ORDER BY seqno)",
+               columns, sizeof(columns));
+    if (query_int(path, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' "
+                        "AND name = 'idx_peer_shared_service_tenant_client' "
+                        "AND tbl_name = 'peer_mesh_shared_service'") != 1
+        || strcmp(columns, "tenant_id,client_id") != 0) {
+        fprintf(stderr, "idx_peer_shared_service_tenant_client missing or on (%s)\n", columns);
+        ++failures;
+    }
+    unlink(path);
+    return failures == 0 ? 0 : 1;
+}
+
+/* Lets every child pass the gate at once and waits for them: 0 when each exited 0. */
+static int run_gated_children(int gate[2], const pid_t *children, size_t started, size_t wanted)
+{
+    close(gate[0]);
+    close(gate[1]);
+    int failed = started != wanted;
+    for (size_t i = 0U; i < started; ++i) {
+        int status = 0;
+        if (waitpid(children[i], &status, 0) != children[i] || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            failed = 1;
+        }
+    }
+    return failed ? -1 : 0;
+}
+
+/* Enrols each client from a process of its own, all released together. */
+static int race_peer_mesh_enrolments(const char *path, const st_storage_client *clients, size_t count)
+{
+    int gate[2];
+    pid_t children[8];
+    if (count > 8U || pipe(gate) != 0) {
+        return -1;
+    }
+    fflush(NULL);
+    size_t started = 0U;
+    for (; started < count; ++started) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            break;
+        }
+        if (pid == 0) {
+            close(gate[1]);
+            char byte;
+            /* Returns at end of file, when the parent closes its end of the gate. */
+            ssize_t got = read(gate[0], &byte, 1U);
+            st_storage_peer_mesh_device device;
+            int rc = got >= 0 ? st_storage_ensure_peer_mesh_device(path, &clients[started], &device) : -1;
+            _exit(rc == 0 ? 0 : 1);
+        }
+        children[started] = pid;
+    }
+    return run_gated_children(gate, children, started, count);
+}
+
+/*
+ * Java uk_peer_mesh_device_ip: one device per virtual address in a tenant. A second row on an
+ * address is refused, the same address in another tenant and devices without one are not. Clients
+ * enrolling at the same time each get an address of their own (PeerMeshService.allocateVirtualIp
+ * under Java's transaction and unique key): a /29 has six, and six enrolments race for them.
+ */
+static int test_peer_mesh_device_ip_is_unique(void)
+{
+    char path[256];
+    char message[256];
+    scratch_db_path(path, sizeof(path), "peer-device-ip");
+    if (st_storage_init(path, 0) != 0) {
+        unlink(path);
+        return 1;
+    }
+    int failures = 0;
+    if (exec_status(path, "INSERT INTO peer_mesh_device(tenant_id, client_id, client_name, virtual_ip) "
+                          "VALUES('t-ip', 1001, 'ip-a', '100.96.0.5')", message, sizeof(message)) != SQLITE_OK
+        || exec_status(path, "INSERT INTO peer_mesh_device(tenant_id, client_id, client_name, virtual_ip) "
+                             "VALUES('t-ip', 1002, 'ip-b', '100.96.0.5')", message, sizeof(message))
+               != SQLITE_CONSTRAINT
+        || strstr(message, "UNIQUE constraint failed: peer_mesh_device.tenant_id, peer_mesh_device.virtual_ip")
+               == NULL) {
+        fprintf(stderr, "a second device on one virtual address was not refused: %s\n", message);
+        ++failures;
+    }
+    if (exec_status(path, "INSERT INTO peer_mesh_device(tenant_id, client_id, client_name, virtual_ip) "
+                          "VALUES('t-other', 1002, 'ip-b', '100.96.0.5');"
+                          "INSERT INTO peer_mesh_device(tenant_id, client_id, client_name) "
+                          "VALUES('t-ip', 1003, 'ip-c'), ('t-ip', 1004, 'ip-d');",
+                    message, sizeof(message)) != SQLITE_OK) {
+        fprintf(stderr, "another tenant's address or devices without one were refused: %s\n", message);
+        ++failures;
+    }
+
+    if (setenv("SPECUS_PEER_MESH_CIDR", "10.200.0.0/29", 1) != 0) {
+        unlink(path);
+        return 1;
+    }
+    st_storage_client clients[7];
+    for (int i = 0; i < 7; ++i) {
+        char name[32];
+        snprintf(name, sizeof(name), "race-client-%d", i);
+        if (st_storage_upsert_client(path, 0, "t-race", name, "admin", 1, 30, &clients[i]) != 0) {
+            fprintf(stderr, "race client %d could not be created\n", i);
+            ++failures;
+        }
+    }
+    for (int round = 0; failures == 0 && round < 5; ++round) {
+        if (exec_script(path, "DELETE FROM peer_mesh_device WHERE tenant_id = 't-race'") != 0
+            || race_peer_mesh_enrolments(path, clients, 6U) != 0) {
+            fprintf(stderr, "round %d: a racing enrolment failed\n", round);
+            ++failures;
+        } else if (query_int(path, "SELECT COUNT(*) FROM peer_mesh_device WHERE tenant_id = 't-race'") != 6
+                   || query_int(path, "SELECT COUNT(DISTINCT virtual_ip) FROM peer_mesh_device "
+                                      "WHERE tenant_id = 't-race' AND virtual_ip LIKE '10.200.0.%'") != 6) {
+            fprintf(stderr, "round %d: racing enrolments shared a virtual address\n", round);
+            ++failures;
+        }
+    }
+    st_storage_peer_mesh_device device;
+    if (failures == 0
+        && (st_storage_ensure_peer_mesh_device(path, &clients[6], &device) == 0
+            || query_int(path, "SELECT COUNT(*) FROM peer_mesh_device WHERE tenant_id = 't-race'") != 6)) {
+        fprintf(stderr, "a seventh device was enrolled in a pool of six addresses\n");
+        ++failures;
+    }
+    unsetenv("SPECUS_PEER_MESH_CIDR");
+    unlink(path);
+    return failures == 0 ? 0 : 1;
+}
+
+/*
+ * Java SqliteUniqueIndexMigratorTests.leavesConflictingRowsAloneAndCreatesTheIndexOnceTheyAreResolved
+ * and rowsWithANullKeyColumnDoNotCollide, for the two keys C databases ran without: rows that
+ * already share a key keep the index out and are left exactly as they are, at every start, until
+ * they are resolved; rows whose key column is NULL never collide. An index of that name on other
+ * columns is left alone as well.
+ */
+static int test_reported_unique_keys_wait_for_their_rows(void)
+{
+    static const char mapping_rows[] =
+        "SELECT group_concat(id || '|' || client_name || '|' || listen_port || '|' || target_port, ';') "
+        "FROM (SELECT * FROM specus_mapping ORDER BY id)";
+    static const char device_rows[] =
+        "SELECT group_concat(id || '|' || client_id || '|' || COALESCE(virtual_ip, 'NULL'), ';') "
+        "FROM (SELECT * FROM peer_mesh_device ORDER BY id)";
+    static const char mapping_index[] =
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'uk_specus_mapping_listen_port'";
+    static const char device_index[] =
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'uk_peer_mesh_device_ip'";
+    char path[256];
+    char text[256];
+    scratch_db_path(path, sizeof(path), "reported-unique-keys");
+    if (st_storage_init(path, 0) != 0
+        || exec_script(path,
+               "DROP INDEX uk_specus_mapping_listen_port;"
+               "DROP INDEX uk_peer_mesh_device_ip;"
+               "INSERT INTO specus_mapping(id, client_name, listen_port, target_address, target_port) "
+               "VALUES(1, 'legacy-a', 2222, '127.0.0.1', 22), (2, 'legacy-b', 2222, '127.0.0.1', 2022);"
+               "INSERT INTO peer_mesh_device(id, tenant_id, client_id, client_name, virtual_ip) "
+               "VALUES(1, 'default', 11, 'legacy-a', '100.96.0.7'), (2, 'default', 12, 'legacy-b', '100.96.0.7'),"
+               "(3, 'default', 13, 'legacy-c', NULL), (4, 'default', 14, 'legacy-d', NULL);") != 0) {
+        fprintf(stderr, "reported unique keys: legacy rows setup failed\n");
+        unlink(path);
+        return 1;
+    }
+    int failures = 0;
+    for (int start = 0; start < 2; ++start) {
+        if (st_storage_init(path, 0) != 0) {
+            fprintf(stderr, "reported unique keys: start %d failed on conflicting rows\n", start);
+            ++failures;
+        }
+        if (query_int(path, mapping_index) != 0 || query_int(path, device_index) != 0
+            || unique_index_on(path, "specus_mapping", "listen_port", NULL) != 0
+            || unique_index_on(path, "peer_mesh_device", "tenant_id,virtual_ip", NULL) != 0) {
+            fprintf(stderr, "reported unique keys: start %d created an index over conflicting rows\n", start);
+            ++failures;
+        }
+        query_text(path, mapping_rows, text, sizeof(text));
+        if (strcmp(text, "1|legacy-a|2222|22;2|legacy-b|2222|2022") != 0) {
+            fprintf(stderr, "reported unique keys: start %d changed the mappings: %s\n", start, text);
+            ++failures;
+        }
+        query_text(path, device_rows, text, sizeof(text));
+        if (strcmp(text, "1|11|100.96.0.7;2|12|100.96.0.7;3|13|NULL;4|14|NULL") != 0) {
+            fprintf(stderr, "reported unique keys: start %d changed the devices: %s\n", start, text);
+            ++failures;
+        }
+    }
+    if (exec_script(path, "UPDATE specus_mapping SET listen_port = 2223 WHERE id = 2") != 0
+        || st_storage_init(path, 0) != 0
+        || unique_index_on(path, "specus_mapping", "listen_port", "uk_specus_mapping_listen_port") != 1
+        || query_int(path, device_index) != 0) {
+        fprintf(stderr, "reported unique keys: the mapping index did not follow its resolved rows alone\n");
+        ++failures;
+    }
+    /* The two devices without an address stay: NULLs never collide. */
+    if (exec_script(path, "UPDATE peer_mesh_device SET virtual_ip = '100.96.0.8' WHERE id = 2") != 0
+        || st_storage_init(path, 0) != 0
+        || unique_index_on(path, "peer_mesh_device", "tenant_id,virtual_ip", "uk_peer_mesh_device_ip") != 1
+        || query_int(path, "SELECT COUNT(*) FROM peer_mesh_device") != 4) {
+        fprintf(stderr, "reported unique keys: the device index did not follow its resolved rows\n");
+        ++failures;
+    }
+    if (exec_script(path, "DROP INDEX uk_specus_mapping_listen_port;"
+                          "CREATE INDEX uk_specus_mapping_listen_port ON specus_mapping(target_port);") != 0
+        || st_storage_init(path, 0) != 0
+        || unique_index_on(path, "specus_mapping", "listen_port", NULL) != 0
+        || query_int(path, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'uk_specus_mapping_listen_port' "
+                           "AND sql LIKE '%(target_port)'") != 1) {
+        fprintf(stderr, "reported unique keys: an index of that name on other columns was replaced\n");
+        ++failures;
+    }
+    unlink(path);
+    return failures == 0 ? 0 : 1;
+}
+
+/*
+ * Java uk_specus_mapping_listen_port: a public port belongs to one mapping of any client. The
+ * management API refuses a taken port before writing (management_crud_tests); here every storage
+ * write path meets the key itself. The upsert still replaces the target of the client's own mapping
+ * on the port and refuses another client's; a create or a move onto a taken port fails, the move
+ * telling the caller so (-2) apart from a mapping that is gone (-1).
+ */
+static int test_mapping_listen_port_is_unique(void)
+{
+    char path[256];
+    char message[256];
+    scratch_db_path(path, sizeof(path), "mapping-port");
+    st_storage_client a;
+    st_storage_client b;
+    st_storage_mapping mapping_a;
+    st_storage_mapping mapping_b;
+    st_storage_mapping refused;
+    if (st_storage_init(path, 0) != 0
+        || st_storage_upsert_client(path, 0, "default", "map-a", "admin", 1, 30, &a) != 0
+        || st_storage_upsert_client(path, 0, "default", "map-b", "admin", 1, 30, &b) != 0
+        || st_storage_create_mapping_for_client(path, a.id, 18080, "127.0.0.1", 8080, 1, 0, &mapping_a) != 0) {
+        fprintf(stderr, "mapping port: setup failed\n");
+        unlink(path);
+        return 1;
+    }
+    int failures = 0;
+    if (st_storage_upsert_mapping(path, "map-b", 18080, "127.0.0.1", 9, 1) != -1
+        || query_int(path, "SELECT COUNT(*) FROM specus_mapping WHERE listen_port = 18080") != 1) {
+        fprintf(stderr, "mapping port: the upsert gave another client's port a second mapping\n");
+        ++failures;
+    }
+    char sql[160];
+    char text[128];
+    snprintf(sql, sizeof(sql), "SELECT target_address || ':' || target_port || ':' || enabled "
+                               "FROM specus_mapping WHERE id = %lld", mapping_a.id);
+    int upserted = st_storage_upsert_mapping(path, "map-a", 18080, "10.0.0.1", 9090, 0);
+    query_text(path, sql, text, sizeof(text));
+    if (upserted != 0 || strcmp(text, "10.0.0.1:9090:0") != 0
+        || query_int(path, "SELECT COUNT(*) FROM specus_mapping") != 1) {
+        fprintf(stderr, "mapping port: the upsert no longer replaces the client's own mapping (%s)\n", text);
+        ++failures;
+    }
+    if (st_storage_create_mapping_for_client(path, b.id, 18080, "127.0.0.1", 9, 1, 0, &refused) != -1
+        || st_storage_create_mapping_for_client(path, b.id, 18081, "127.0.0.1", 9, 1, 0, &mapping_b) != 0) {
+        fprintf(stderr, "mapping port: create on a taken or a free port answered wrongly\n");
+        ++failures;
+    }
+    snprintf(sql, sizeof(sql), "SELECT listen_port FROM specus_mapping WHERE id = %lld", mapping_b.id);
+    if (st_storage_update_mapping_by_id(path, mapping_b.id, 18080, "127.0.0.1", 9, 1, 0, &refused) != -2
+        || query_int(path, sql) != 18081
+        || st_storage_update_mapping_by_id(path, mapping_b.id + 1000, 18082, "127.0.0.1", 9, 1, 0, &refused) != -1) {
+        fprintf(stderr, "mapping port: a move onto a taken port or of a missing mapping answered wrongly\n");
+        ++failures;
+    }
+    if (exec_status(path, "INSERT INTO specus_mapping(client_name, listen_port, target_address, target_port) "
+                          "VALUES('map-c', 18081, '127.0.0.1', 9)", message, sizeof(message)) != SQLITE_CONSTRAINT
+        || strcmp(message, "UNIQUE constraint failed: specus_mapping.listen_port") != 0) {
+        fprintf(stderr, "mapping port: a raw second mapping on a port was not refused: %s\n", message);
+        ++failures;
+    }
+    unlink(path);
+    return failures == 0 ? 0 : 1;
+}
+
 int main(void)
 {
     if (test_client_account_id_migration() != 0) {
@@ -1373,6 +2017,19 @@ int main(void)
         return 1;
     }
     if (test_peer_egress_known_codes() != 0) {
+        return 1;
+    }
+    /* Run all of them: each names what it found, and the schema checks are independent. */
+    int schema_failures = test_schema_enforces_java_unique_keys()
+        + test_every_identity_id_aliases_the_rowid()
+        + test_restart_keeps_the_schema()
+        + test_login_name_migration_accepts_an_existing_index()
+        + test_peer_service_migration_creates_the_shared_service_keys()
+        + test_peer_mesh_device_ip_is_unique()
+        + test_reported_unique_keys_wait_for_their_rows()
+        + test_mapping_listen_port_is_unique();
+    if (schema_failures != 0) {
+        fprintf(stderr, "%d schema test(s) failed\n", schema_failures);
         return 1;
     }
     char path[256];
