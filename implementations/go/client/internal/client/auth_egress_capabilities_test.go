@@ -55,12 +55,12 @@ func TestLoginEnvironmentAnnouncesEgressCapabilities(t *testing.T) {
 	if caps.IPv6TargetCapable == nil || !*caps.IPv6TargetCapable {
 		t.Error("ipv6TargetCapable must be present and true: the egress dials AAAA-only names")
 	}
-	// The egress side of the IPv6 data plane is here; the consumer side is not, and announcing the
-	// packet capability must not have switched it on.
+	// The packet capability is the egress side of the IPv6 data plane. Whether this device also
+	// carries IPv6 as a consumer is a separate answer, which no route takeover means no.
 	if caps.IPv6PacketCapable == nil || !*caps.IPv6PacketCapable {
 		t.Error("ipv6PacketCapable must be present and true: the egress accepts IPv6 packets in SPEG1")
 	}
-	if egressConsumerCarriesIPv6 {
-		t.Error("the consumer carries IPv6, but only the egress side of the data plane exists")
+	if egressPlatformCarriesIPv6 && !egressRouteTakeoverSupported {
+		t.Error("the consumer carries IPv6 on a platform with no route takeover")
 	}
 }

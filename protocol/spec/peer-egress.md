@@ -14,7 +14,7 @@
 | 不支持 | 行为 |
 | --- | --- |
 | 域名与域名后缀规则 | 配置校验阶段拒绝，返回 `EGRESS_RULE_DOMAIN_UNSUPPORTED`。不得忽略，更不得在启动时解析成静态 IP |
-| IPv6 单地址与 CIDR 规则 | 按下文「IPv6 写法」读取与校验，写错的报 `EGRESS_RULE_MALFORMED`；写法正确的，在消费端没有 IPv6 数据面时以 `EGRESS_RULE_IPV6_UNSUPPORTED` 不生效。匹配语义已定，见「规则语义」；数据面见「IPv6 数据面」（规范已定，三个客户端尚未实现） |
+| IPv6 单地址与 CIDR 规则 | 按下文「IPv6 写法」读取与校验，写错的报 `EGRESS_RULE_MALFORMED`；写法正确的，在消费端没有 IPv6 数据面时以 `EGRESS_RULE_IPV6_UNSUPPORTED` 不生效。匹配语义已定，见「规则语义」；数据面见「IPv6 数据面」：Go 客户端已实现消费端数据面（Linux、Windows、macOS；Windows 的路由与地址安装、macOS 全部尚未在真机上验证），Java 与 .NET 客户端尚未实现 |
 | IPv6 数据面 | 见「IPv6 数据面」：`SPEG1` 原样承载 IPv6 packet，只发给声明了 `ipv6PacketCapable` 的出口；没有声明的出口收到 IPv6 packet 拒绝，返回 `EGRESS_IPV6_UNSUPPORTED` |
 | DNS 接管 | 不实现。一期不修改任何用户系统 DNS 配置 |
 | ICMP | 出口不代发。代 ping 需要 raw socket 权限，与「出口零特权」前提冲突。消费端对命中 `egress` 规则的 ICMP 包**丢弃**并计入 `unsupported-protocol`，不改走本机：规则说了这个目标不许从本地出去，ping 不通好过从本机地址 ping 通 |
@@ -101,7 +101,7 @@
 
 `match` 是规则的主体：先判断它是什么、是否合法、作为前缀是否被策略拒绝，最后才轮到 `action` 与它需要的字段。冒号是无歧义的信号，所以 IPv6 排在域名之前：带冒号的就按 IPv6 读，读不出即写错（`*.example.com:443` 报 `EGRESS_RULE_MALFORMED`），不会被猜成域名。
 
-`EGRESS_RULE_IPV6_UNSUPPORTED` 排在最后，因为它说的不是规则写错了，而是这台设备承载不了：IPv6 规则要生效，消费端得能从 TUN 读 IPv6 包、往 TUN 装 IPv6 路由、把 IPv6 包交给出口，三个客户端目前都没有这条数据面。规则先被完整校验，写错的报写错，写对的才报这个码；数据面交付时只需打开这一道门，读法与匹配语义不变（向量的 `ipv6` 节以「承载 IPv6」钉住，三端在测试里照此运行）。在此之前，合法的 IPv6 规则与一期一样不生效、不装路由、在状态里以 `inForce: false` 列出——**不生效而不是静默直连**：报告一条没装路由的规则在生效，等于把它的目标送去本地。
+`EGRESS_RULE_IPV6_UNSUPPORTED` 排在最后，因为它说的不是规则写错了，而是这台设备承载不了：IPv6 规则要生效，消费端得能从 TUN 读 IPv6 包、往 TUN 装 IPv6 路由、把 IPv6 包交给出口（「IPv6 数据面」；Go 客户端已有，Java 与 .NET 还没有，地址没配上的设备也没有）。规则先被完整校验，写错的报写错，写对的才报这个码；数据面交付时只需打开这一道门，读法与匹配语义不变（向量的 `ipv6` 节以「承载 IPv6」钉住，三端在测试里照此运行）。在此之前，合法的 IPv6 规则与一期一样不生效、不装路由、在状态里以 `inForce: false` 列出——**不生效而不是静默直连**：报告一条没装路由的规则在生效，等于把它的目标送去本地。
 
 ### IPv6 写法
 
@@ -130,7 +130,7 @@ IPv6 规则不与 fake-IP 池比较重叠（池是 IPv4）。有 IPv6 数据面�
 
 ## IPv6 数据面
 
-> 规范已定、实现待交付（#245）。三个客户端交付之前，上文「一期边界」里 IPv6 规则不生效、`SPEG1` 拒绝 IPv6 的行为照旧；
+> Go 客户端已交付消费端与出口两侧（#245）；Java 与 .NET 客户端交付之前，它们照旧按上文「一期边界」：IPv6 规则不生效、`SPEG1` 拒绝 IPv6；
 > 四个服务端已保存并转发 `ipv6PacketCapable`（向量 `peer-egress-ipv6-packet-announcement-v1.json`）；客户端上报它之前，目录里所有出口都是 `false`。
 
 消费端把命中规则的 IPv6 流量也引进 TUN，交给出口，与 IPv4 走同一套规则匹配、路由接管、出口授权与明确失败。三处选择：
@@ -153,7 +153,7 @@ IPv6 规则不与 fake-IP 池比较重叠（池是 IPv4）。有 IPv6 数据面�
 
 ### 消费端
 
-**TUN。** 网卡加上本机的推出地址，前缀长度 `/128`，不产生任何 on-link 路由；MTU 为 1280。`peerMeshMtu` 低于 1280 的设备没有 IPv6 数据面，IPv6 规则照旧报 `EGRESS_RULE_IPV6_UNSUPPORTED`。平台命令：
+**TUN。** 网卡加上本机的推出地址，前缀长度 `/128`，不产生任何 on-link 路由；MTU 为 1280。`peerMeshMtu` 低于 1280 的设备没有 IPv6 数据面，IPv6 规则照旧报 `EGRESS_RULE_IPV6_UNSUPPORTED`。推出地址没能配到 TUN 上（例如主机禁用了 IPv6）、或 TUN 没起来或是 `noop` 时，设备同样没有 IPv6 数据面：IPv6 规则报 `EGRESS_RULE_IPV6_UNSUPPORTED`、不计划任何 IPv6 路由与旁路，IPv4 的计划与安装不受影响（装不上的 IPv6 路由不得连带回滚 IPv4 路由），原因只记一次日志；TUN 重建后地址配上了，下一次重算即启用。平台命令：
 
 | 平台 | 地址 | 规则路由 | 读表 |
 | --- | --- | --- | --- |
@@ -768,7 +768,7 @@ RST 被计为 `return-no-flow` 丢弃，应用对着同一拒绝重传 SYN 直�
 | `EGRESS_PORT_DENIED` | 地址与协议命中但端口未授权 |
 | `EGRESS_LIMIT_EXCEEDED` | 并发、新建流速率或配额上限 |
 | `EGRESS_RULE_DOMAIN_UNSUPPORTED` | 配置校验：一期不支持域名规则 |
-| `EGRESS_RULE_IPV6_UNSUPPORTED` | 配置校验：写法正确的 IPv6 规则，而本消费端没有 IPv6 数据面（三个客户端目前都没有；`peerMeshMtu` 低于 1280 的设备也没有） |
+| `EGRESS_RULE_IPV6_UNSUPPORTED` | 配置校验：写法正确的 IPv6 规则，而本消费端没有 IPv6 数据面（Java 与 .NET 客户端目前没有；`peerMeshMtu` 低于 1280、或推出地址没配上 TUN 的设备也没有） |
 | `EGRESS_RULE_EGRESS_NO_IPV6` | 配置校验：IPv6 规则指向的出口在线，却没有声明 `ipv6PacketCapable` |
 | `EGRESS_RULE_MALFORMED` | 配置校验：前缀非法、主机位非零，或 IPv6 规则落在 IPv4 映射段内 |
 | `EGRESS_RULE_MISSING_TARGET` | 配置校验：`action=egress` 缺少 `egressClientId` |
@@ -931,7 +931,7 @@ RST 被计为 `return-no-flow` 丢弃，应用对着同一拒绝重传 SYN 直�
 - 出口使用普通 socket 连接目标，因此不保留原始源地址；目标看到的是出口所在网络的出口地址。
 - 出口与消费端角色可以同时启用，但不构成出口链：hop 标记保证一跳即止。
 - 校验只拒绝 `/0`。运维手写 `0.0.0.0/1` 与 `128.0.0.0/1` 两条规则仍然可以覆盖全部地址，其中下半区目前只是因为覆盖 Peer Mesh 网段才被拒。堵住它需要定一个最小前缀长度，属于策略决定。IPv6 的 `::/1` 加 `8000::/1` 同理，且没有 mesh 网段挡住其中任何一半。
-- **IPv6 交付了规则的读法与匹配语义、出口侧的授权与按 AAAA 拨号；消费端数据面的规范已定（「IPv6 数据面」，向量 `peer-egress-ipv6-v1.json`），实现还没有。** 出口：IPv6 目的地址按自己的强制拒绝清单与 `LAN` 段判定，名字没有 A 记录时拨 AAAA 地址，`ipv6TargetCapable` 为 `true`；服务端接受并保存 IPv6 目的规则。所以「域名规则 → 只有 IPv6 的站点」今天就能经出口访问：消费端那一段仍是 IPv4 fake-IP。消费端：TUN 不读 IPv6 包、不装 IPv6 路由、SPEG1 不承载 IPv6（`EGRESS_IPV6_UNSUPPORTED`），所以合法的 IPv6 规则以 `EGRESS_RULE_IPV6_UNSUPPORTED` 不生效，应用直接访问 IPv6 地址的流量不受规则约束、照常走本机；fake-IP 的 DNS 应答对 AAAA 仍回 NODATA，名字规则命中的名字只给应用 IPv4 fake-IP。`egress test` 只接受 IPv4 地址与名字，输入 IPv6 地址报 `ADDRESS must be an IPv4 address.`。源地址、帧、平台命令与出站 socket 的 IPv6 绑定已在「IPv6 数据面」定下；平台路由与 socket 选择的向量随实现补齐。目录的 `ipv6TargetCapable` 已作为独立的出口声明保存并转发；这不代表消费端 IPv6 数据面已经交付。
+- **IPv6 消费端数据面（「IPv6 数据面」，向量 `peer-egress-ipv6-v1.json`）只有 Go 客户端实现了，Linux、Windows、macOS 三个平台都有；Java 与 .NET 客户端还没有，下面说的消费端现状是它们的。** Go 的 Linux 实现在网络命名空间里用真实的 `ip -6` 路由与 TUN 测过；Windows 的路由安装、撤销与 TUN 地址配置，以及 macOS 的全部 IPv6 路由与地址操作，尚未在真机上验证，只有命令构造与解析的测试（macOS 的真机用例在 `peer-egress-macos.yml` 里首次运行）。Go 客户端的 `egress test` 也接受 IPv6 地址。规则的读法与匹配语义、出口侧的授权与按 AAAA 拨号三端都已交付。 出口：IPv6 目的地址按自己的强制拒绝清单与 `LAN` 段判定，名字没有 A 记录时拨 AAAA 地址，`ipv6TargetCapable` 为 `true`；服务端接受并保存 IPv6 目的规则。所以「域名规则 → 只有 IPv6 的站点」今天就能经出口访问：消费端那一段仍是 IPv4 fake-IP。消费端：TUN 不读 IPv6 包、不装 IPv6 路由、SPEG1 不承载 IPv6（`EGRESS_IPV6_UNSUPPORTED`），所以合法的 IPv6 规则以 `EGRESS_RULE_IPV6_UNSUPPORTED` 不生效，应用直接访问 IPv6 地址的流量不受规则约束、照常走本机；fake-IP 的 DNS 应答对 AAAA 仍回 NODATA，名字规则命中的名字只给应用 IPv4 fake-IP。`egress test` 只接受 IPv4 地址与名字，输入 IPv6 地址报 `ADDRESS must be an IPv4 address.`。源地址、帧、平台命令与出站 socket 的 IPv6 绑定已在「IPv6 数据面」定下；平台路由与 socket 选择的向量随实现补齐。目录的 `ipv6TargetCapable` 已作为独立的出口声明保存并转发；这不代表消费端 IPv6 数据面已经交付。
 - **出口的 IPv6 拨号没有在真机上验收过。** 授权、候选地址的选择与 IPv6 socket 的建立由三端单元测试与共享向量覆盖；真实 AAAA 解析与经 IPv6 出网归 #50 的实机验收。
 - **macOS 的安装路径在 CI 的真机上跑，但指向的是 lo0 而不是 TUN。** GitHub 的 macos runner 给免密 sudo，所以 `peer-egress-macos.yml` 里有一条用例真的装一条文档保留前缀、在整表里查到它、再撤销并确认它不在了。指向的接口是 lo0：真正的 utun 必须先配上 IPv4 地址（见上），而在 CI 里造一个带地址的 utun 要另外一个进程把它持住。argv 形态、输出分类、读表与撤销都是真的，「装进 TUN」这一步与真机的差别只有接口名。
 - **macOS 的旁路下一跳同样是逐条解析的，没有批量。** 与 Windows 同一个原因：批量需要改三端共享的安装器接口。这边代价更小，一次 `route -n get` 是 26 ms。

@@ -1,7 +1,5 @@
 package client
 
-import "strings"
-
 // Finding the consumer's own routes gone or moved after the machine changed networks.
 //
 // A route installed into a routing table is not installed for good. An interface that goes down
@@ -83,7 +81,7 @@ func egressRouteDrifts(owned []egressRoute, table []egressBindRoute, tunnel stri
 			}
 			continue
 		}
-		address := strings.TrimSuffix(route.CIDR, "/32")
+		address := egressBypassRouteAddress(route.CIDR)
 		hop, hasHop := selectEgressBypassHop(table, tunnel, prefixes, address)
 		var present []egressBindRoute
 		for _, row := range rows {

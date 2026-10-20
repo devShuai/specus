@@ -181,6 +181,12 @@ type peerMeshClient struct {
 	// egressCommander overrides the platform's routing table. Nil means the real one; tests set
 	// it so applying rules never runs a route command on the machine they run on.
 	egressCommander egressRouteCommander
+	// egressIPv6 overrides what the platform and peerMeshMtu say about the IPv6 data plane
+	// (egressConsumerCarriesIPv6); the device must still carry IPv6 (egressIPv6State). Nil means the
+	// real answer; tests set it so the IPv6 paths run on every platform the suite runs on.
+	egressIPv6 *bool
+	// egressIPv6Logged is the last reason logged for IPv6 rules being out of force. Under egressPlanMu.
+	egressIPv6Logged string
 	// egressCatalog is what the server's egress-catalog said about which egresses it lists, the
 	// version each announced, and which resolve names. Kept across control sessions: a new session
 	// resets only its revision floor and whether this session has accepted one. Guarded by mu.

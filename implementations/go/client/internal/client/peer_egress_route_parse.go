@@ -76,6 +76,22 @@ func parseIPRouteShowExact(output string) (bool, string) {
 // linuxShowMainTableArgs reads the main table, for a bypass hop `ip route get` could not give.
 func linuxShowMainTableArgs() []string { return []string{"ip", "-4", "route", "show", "table", "main"} }
 
+// linuxShowMainTableArgs6 reads the IPv6 main table (protocol/spec/peer-egress.md, IPv6 数据面).
+func linuxShowMainTableArgs6() []string {
+	return []string{"ip", "-6", "route", "show", "table", "main"}
+}
+
+// linuxRouteArgs builds an `ip route` command for a prefix or address of either family: `ip route
+// ...` for IPv4, exactly as it always was, and `ip -6 route ...` for IPv6. Argv entries, so nothing
+// here is ever seen by a shell.
+func linuxRouteArgs(target string, args ...string) []string {
+	command := []string{"ip", "route"}
+	if strings.Contains(target, ":") {
+		command = []string{"ip", "-6", "route"}
+	}
+	return append(command, args...)
+}
+
 // linuxRouteLeadsNowhere are the route types that drop or refuse a packet. They stay candidates,
 // with no interface, so the address they cover is not reached some other way.
 var linuxRouteLeadsNowhere = map[string]bool{"blackhole": true, "unreachable": true, "prohibit": true, "throw": true}
@@ -93,6 +109,29 @@ var linuxRouteNotForwarding = map[string]bool{"local": true, "broadcast": true, 
 //
 // Shared vector: protocol/test-vectors/peer-egress-socket-binding-v1.json, linux.
 func parseIPRouteTable(output string) []egressBindRoute {
+	return parseIPRouteTableFamily(output, false)
+}
+
+// parseIPRouteTable6 reads `ip -6 route show table main` the same way: the layout is the same, the
+// destinations and gateways are IPv6. A gateway is usually link-local; it is kept as written, since
+// `ip -6 route add ... via fe80::1 dev eth0` names the interface that scopes it.
+func parseIPRouteTable6(output string) []egressBindRoute {
+	return parseIPRouteTableFamily(output, true)
+}
+
+func parseIPRouteTableFamily(output string, ipv6 bool) []egressBindRoute {
+	gatewayOK := func(text string) bool {
+		if ipv6 {
+			address, err := netip.ParseAddr(text)
+			return err == nil && address.Is6() && !address.Is4In6() && address.Zone() == ""
+		}
+		_, ok := parseEgressAddress(text)
+		return ok
+	}
+	prefixOf := linuxRoutePrefix
+	if ipv6 {
+		prefixOf = linuxRoutePrefix6
+	}
 	routes := make([]egressBindRoute, 0, 8)
 	pending := -1
 	var deviceless []int
@@ -106,7 +145,7 @@ func parseIPRouteTable(output string) []egressBindRoute {
 				for index := 1; index+1 < len(fields); index++ {
 					switch fields[index] {
 					case "via":
-						if _, ok := parseEgressAddress(fields[index+1]); ok {
+						if gatewayOK(fields[index+1]) {
 							routes[pending].Gateway = fields[index+1]
 						}
 					case "dev":
@@ -127,7 +166,7 @@ func parseIPRouteTable(output string) []egressBindRoute {
 				continue
 			}
 		}
-		prefix, ok := linuxRoutePrefix(fields[0])
+		prefix, ok := prefixOf(fields[0])
 		if !ok {
 			continue
 		}
@@ -141,7 +180,7 @@ func parseIPRouteTable(output string) []egressBindRoute {
 			}
 			switch fields[index] {
 			case "via":
-				if _, ok := parseEgressAddress(fields[index+1]); ok {
+				if gatewayOK(fields[index+1]) {
 					route.Gateway = fields[index+1]
 				}
 			case "dev":
@@ -180,6 +219,23 @@ func linuxRoutePrefix(text string) (string, bool) {
 		return "", false
 	}
 	return prefix.Masked().String(), true
+}
+
+// linuxRoutePrefix6 reads an IPv6 destination of `ip -6 route`: "default" is ::/0, a bare address a
+// /128, and the prefix is written the way this feature writes its own, so a row for a route it
+// installed compares equal to the journal's entry.
+func linuxRoutePrefix6(text string) (string, bool) {
+	if text == "default" {
+		return "::/0", true
+	}
+	if !strings.Contains(text, "/") {
+		text += "/128"
+	}
+	prefix, err := netip.ParsePrefix(text)
+	if err != nil || !prefix.Addr().Is6() || prefix.Addr().Zone() != "" {
+		return "", false
+	}
+	return formatEgressCIDR6(egressCIDR6{network: prefix.Masked().Addr().As16(), prefixLen: prefix.Bits()}), true
 }
 
 func egressRouteHopIsDevice(hop egressRouteHop, device string) bool {

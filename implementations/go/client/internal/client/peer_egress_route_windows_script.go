@@ -197,3 +197,98 @@ func splitWindowsScriptLines(output string) []string {
 	}
 	return lines
 }
+
+// The IPv6 counterparts (protocol/spec/peer-egress.md, IPv6 数据面). Separate builders rather than a
+// family argument on the IPv4 ones, so those stay exactly what the shared vector pins -- including
+// refusing an IPv6 address -- and an IPv6 value can only reach a script written for IPv6.
+
+// validWindowsPrefix6 accepts an IPv6 prefix in the form this feature writes it and nothing else:
+// RFC 5952 hex groups and colons, a slash, and a decimal length. The same whitelist argument as for
+// IPv4 -- no quote can be in it -- and the canonical form is required so the text checked is the text
+// sent, never a second spelling of it.
+func validWindowsPrefix6(value string) bool {
+	cidr, hadLength, ok := parseEgressCIDR6(value)
+	return ok && hadLength && formatEgressCIDR6(cidr) == value
+}
+
+// validWindowsAddress6 accepts an IPv6 address of hex groups and colons: what a next hop or a bypass
+// address is. No zone, no brackets, no dotted tail -- parseEgressAddress6 refuses each of them -- so
+// nothing but [0-9A-Fa-f:] can reach the script.
+func validWindowsAddress6(value string) bool {
+	_, ok := parseEgressAddress6(value)
+	return ok
+}
+
+// windowsFindRoutesScript6 resolves IPv6 bypass addresses in one process, in the same shape as the
+// IPv4 query.
+func windowsFindRoutesScript6(addresses []string) (string, error) {
+	quoted := make([]string, 0, len(addresses))
+	for _, address := range addresses {
+		if !validWindowsAddress6(address) {
+			return "", errEgressRouteArgument
+		}
+		quoted = append(quoted, quoteWindowsArgument(address))
+	}
+	return "foreach($a in @(" + strings.Join(quoted, ",") + ")){ConvertTo-Json -Compress " +
+		"-InputObject @(Find-NetRoute -RemoteIPAddress $a " +
+		"-ErrorAction SilentlyContinue|Select-Object " +
+		"InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)}\nexit 0", nil
+}
+
+// windowsInstallRouteScript6 adds one IPv6 route to ActiveStore, for the same reason as IPv4. An
+// empty gateway is on-link, written as -NextHop '::'.
+func windowsInstallRouteScript6(cidr string, interfaceIndex int, gateway string) (string, error) {
+	if !validWindowsPrefix6(cidr) || interfaceIndex <= 0 {
+		return "", errEgressRouteArgument
+	}
+	if gateway == "" {
+		// Named explicitly, as the spec's command does: "::" is how Windows writes on-link in IPv6.
+		gateway = windowsOnLinkNextHop6
+	}
+	if !validWindowsAddress6(gateway) {
+		return "", errEgressRouteArgument
+	}
+	return "try{New-NetRoute -AddressFamily IPv6 -DestinationPrefix " + quoteWindowsArgument(cidr) +
+		" -NextHop " + quoteWindowsArgument(gateway) +
+		" -InterfaceIndex " + strconv.Itoa(interfaceIndex) +
+		" -PolicyStore ActiveStore -ErrorAction Stop|Out-Null}catch{ConvertTo-Json -Compress " +
+		"-InputObject @{errorId=$_.FullyQualifiedErrorId};exit 1}", nil
+}
+
+// windowsRemoveRouteScript6 withdraws one IPv6 route, with -Confirm:$false as for IPv4.
+func windowsRemoveRouteScript6(cidr string) (string, error) {
+	if !validWindowsPrefix6(cidr) {
+		return "", errEgressRouteArgument
+	}
+	return "try{Remove-NetRoute -AddressFamily IPv6 -DestinationPrefix " + quoteWindowsArgument(cidr) +
+		" -Confirm:$false -PolicyStore ActiveStore -ErrorAction Stop|Out-Null}catch{" +
+		"ConvertTo-Json -Compress -InputObject @{errorId=$_.FullyQualifiedErrorId};exit 1}", nil
+}
+
+// windowsShowAllRoutesScript6 reads the whole IPv6 table in one query, for the IPv6 conflict check.
+func windowsShowAllRoutesScript6() string {
+	return "ConvertTo-Json -Compress -InputObject @(Get-NetRoute -AddressFamily IPv6 " +
+		"-ErrorAction SilentlyContinue|Select-Object " +
+		"InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)"
+}
+
+// windowsAssignAddress6Script gives the TUN the device's derived IPv6 address, a /128 with no
+// on-link route, and sets the interface's IPv6 MTU, which on Windows is separate from the IPv4 one
+// netsh sets. Both go to ActiveStore: nothing here outlives a reboot.
+//
+// An address that is already there -- the adapter was reopened rather than created -- is not a
+// failure: the outcome asked for holds. Anything else is written as {errorId} on stdout, as the
+// route scripts write theirs. Only the index and the address go in, and nothing comes back but
+// that JSON.
+func windowsAssignAddress6Script(interfaceIndex int, address string, mtu int) (string, error) {
+	if interfaceIndex <= 0 || mtu <= 0 || !validWindowsAddress6(address) {
+		return "", errEgressRouteArgument
+	}
+	index, quoted := strconv.Itoa(interfaceIndex), quoteWindowsArgument(address)
+	return "try{if(-not(Get-NetIPAddress -AddressFamily IPv6 -InterfaceIndex " + index + " -IPAddress " + quoted +
+		" -PolicyStore ActiveStore -ErrorAction SilentlyContinue)){New-NetIPAddress -AddressFamily IPv6 -IPAddress " +
+		quoted + " -PrefixLength 128 -InterfaceIndex " + index +
+		" -PolicyStore ActiveStore -ErrorAction Stop|Out-Null};Set-NetIPInterface -AddressFamily IPv6 -InterfaceIndex " +
+		index + " -NlMtuBytes " + strconv.Itoa(mtu) + " -PolicyStore ActiveStore -ErrorAction Stop}catch{" +
+		"ConvertTo-Json -Compress -InputObject @{errorId=$_.FullyQualifiedErrorId};exit 1}", nil
+}

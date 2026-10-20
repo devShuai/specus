@@ -25,8 +25,10 @@ const egressBypassResolveTTL = 60 * time.Second
 
 type egressBypassLookup struct {
 	addresses []string
-	failed    bool
-	at        time.Time
+	// addresses6 are the IPv6 answers, in RFC 5952 form, for a consumer with the IPv6 data plane.
+	addresses6 []string
+	failed     bool
+	at         time.Time
 }
 
 // egressBypassResolver resolves hosts to IPv4 literals with a short cache.
@@ -77,6 +79,57 @@ func (r *egressBypassResolver) resolve(entries []string, now time.Time) (address
 	return addresses, failed
 }
 
+// resolve6 returns the IPv6 addresses behind each entry, in input order without duplicates and in
+// RFC 5952 form, for a consumer with the IPv6 data plane: an IPv6 rule can cover an endpoint the
+// tunnel's transport uses as surely as an IPv4 one can. Failures are left to resolve, which asks the
+// same lookups and says so once.
+func (r *egressBypassResolver) resolve6(entries []string, now time.Time) []string {
+	seen := make(map[string]struct{}, len(entries))
+	var addresses []string
+	for _, entry := range entries {
+		var resolved []string
+		if literal, ok := egressBypassLiteral6(entry); ok {
+			resolved = []string{literal}
+		} else if host := egressBypassHost(entry); host != "" {
+			if _, literal := parseEgressAddress(host); literal {
+				continue
+			}
+			resolved = r.lookupCached(host, now).addresses6
+		}
+		for _, address := range resolved {
+			if _, duplicate := seen[address]; duplicate {
+				continue
+			}
+			seen[address] = struct{}{}
+			addresses = append(addresses, address)
+		}
+	}
+	return addresses
+}
+
+// egressBypassLiteral6 reads an IPv6 literal out of a URL, a bracketed host with a port, or a bare
+// address, in RFC 5952 form. A zone is not an address a route can name, and neither is an
+// IPv4-mapped one, which the IPv4 side covers.
+func egressBypassLiteral6(entry string) (string, bool) {
+	entry = strings.TrimSpace(entry)
+	if strings.Contains(entry, "://") {
+		parsed, err := url.Parse(entry)
+		if err != nil {
+			return "", false
+		}
+		entry = parsed.Host
+	}
+	if host, _, err := net.SplitHostPort(entry); err == nil {
+		entry = host
+	}
+	entry = strings.TrimSuffix(strings.TrimPrefix(entry, "["), "]")
+	address, ok := parseEgressAddress6(entry)
+	if !ok || (egressCIDR6{network: address, prefixLen: egressMaxPrefix6}).mapped() {
+		return "", false
+	}
+	return formatEgressAddress6(address), true
+}
+
 func (r *egressBypassResolver) lookupCached(host string, now time.Time) egressBypassLookup {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -93,6 +146,9 @@ func (r *egressBypassResolver) lookupCached(host string, now time.Time) egressBy
 		// has nothing to be routed around.
 		if v4 := ip.To4(); v4 != nil {
 			answer.addresses = append(answer.addresses, v4.String())
+		} else if v6 := ip.To16(); v6 != nil {
+			// Kept apart, for resolve6: the IPv4 answer is what resolve has always returned.
+			answer.addresses6 = append(answer.addresses6, formatEgressAddress6([16]byte(v6)))
 		}
 	}
 	// A failure is cached too. Retrying a name that does not resolve on every tick would be the

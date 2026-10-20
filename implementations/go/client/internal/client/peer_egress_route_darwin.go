@@ -44,6 +44,10 @@ type macosEgressRouteCommander struct {
 // Declared next to the commander it describes, so the two cannot disagree about the platform.
 const egressRouteTakeoverSupported = true
 
+// egressPlatformCarriesIPv6 is whether this build reads IPv6 from its TUN, gives the TUN the
+// device's derived IPv6 address and routes IPv6 into it (protocol/spec/peer-egress.md, IPv6 数据面).
+const egressPlatformCarriesIPv6 = true
+
 func newEgressRouteCommanderForPlatform(tun string) egressRouteCommander {
 	return &macosEgressRouteCommander{tun: tun, hops: map[string]egressRouteHop{}}
 }
@@ -60,6 +64,13 @@ func newEgressRouteCommanderForPlatform(tun string) egressRouteCommander {
 // `route -n get` does a longest-prefix lookup, so on any machine with a default route it answers
 // "yes, reachable" for every prefix that nobody owns.
 func (c *macosEgressRouteCommander) Conflict(route egressRoute) (bool, string) {
+	if egressRouteIsIPv6(route) {
+		stdout, _, err := c.run(macosShowTableArgs6())
+		if err != nil {
+			return false, ""
+		}
+		return macosConflictFromTable6(stdout, route.CIDR)
+	}
 	stdout, _, err := c.run(macosShowTableArgs())
 	if err != nil {
 		// Unable to ask. Reporting no conflict lets the add proceed, and `route add` refuses an
@@ -74,7 +85,8 @@ func (c *macosEgressRouteCommander) Install(route egressRoute) error {
 	// prefix of 203.0.113.0/33 is accepted by `route`, which prints a success line naming
 	// 203.0.113.0, exits 0, and installs 128.0/1 -- half the IPv4 address space pointed at the
 	// gateway. Nothing in the output says so, so nothing downstream could catch it.
-	if !validMacosPrefix(route.CIDR) {
+	ipv6 := egressRouteIsIPv6(route)
+	if (!ipv6 && !validMacosPrefix(route.CIDR)) || (ipv6 && !validMacosPrefix6(route.CIDR)) {
 		return fmt.Errorf("install %s: %w", route.CIDR, errEgressRouteArgument)
 	}
 	if route.Kind == egressRouteBypass {
@@ -83,7 +95,13 @@ func (c *macosEgressRouteCommander) Install(route egressRoute) error {
 	if strings.TrimSpace(c.tun) == "" {
 		return errors.New("no TUN interface to route into")
 	}
-	args, err := macosInstallInterfaceArgs(route.CIDR, c.tun)
+	install := macosInstallInterfaceArgs
+	if ipv6 {
+		// The utun needs its derived IPv6 address before a route can point at it, as it needs its
+		// IPv4 one; the device configures both before any plan is applied.
+		install = macosInstallInterfaceArgs6
+	}
+	args, err := install(route.CIDR, c.tun)
 	if err != nil {
 		return fmt.Errorf("install %s into %s: %w", route.CIDR, c.tun, err)
 	}
@@ -99,10 +117,15 @@ func (c *macosEgressRouteCommander) Install(route egressRoute) error {
 // applying a plan -- but it is why an install can fail in a way that is neither a conflict nor a
 // permissions problem.
 func (c *macosEgressRouteCommander) installBypass(route egressRoute) error {
-	address := strings.TrimSuffix(route.CIDR, "/32")
+	ipv6 := egressRouteIsIPv6(route)
+	address := egressBypassRouteAddress(route.CIDR)
 	hop, cached := c.hops[address]
 	if !cached {
-		args, err := macosFindRouteArgs(address)
+		find, parse, read := macosFindRouteArgs, parseMacosRouteGet, c.readTable
+		if ipv6 {
+			find, parse, read = macosFindRouteArgs6, parseMacosRouteGet6, c.readTable6
+		}
+		args, err := find(address)
 		if err != nil {
 			return fmt.Errorf("resolve bypass hop for %s: %w", address, err)
 		}
@@ -110,7 +133,7 @@ func (c *macosEgressRouteCommander) installBypass(route egressRoute) error {
 		if err != nil && strings.TrimSpace(stdout) == "" {
 			return fmt.Errorf("resolve bypass hop for %s: %w", address, err)
 		}
-		resolved, ok := parseMacosRouteGet(stdout, stderr)
+		resolved, ok := parse(stdout, stderr)
 		if !ok {
 			return fmt.Errorf("no route to %s to bypass through", address)
 		}
@@ -118,7 +141,7 @@ func (c *macosEgressRouteCommander) installBypass(route egressRoute) error {
 			// A rule's route covers the address, so the query can only see the tunnel. Pinning
 			// the bypass there would send the transport through the thing it carries; the
 			// table, read with the tunnel left out, says where it went before.
-			fallback, err := egressBypassHopFromTable(address, c.tun, c.readTable)
+			fallback, err := egressBypassHopFromTable(address, c.tun, read)
 			if err != nil {
 				return err
 			}
@@ -127,7 +150,7 @@ func (c *macosEgressRouteCommander) installBypass(route egressRoute) error {
 		c.hops[address] = resolved
 		hop = resolved
 	}
-	args, err := c.bypassArgs(route.CIDR, hop)
+	args, err := c.bypassArgs(route.CIDR, hop, ipv6)
 	if err != nil {
 		return fmt.Errorf("install bypass %s: %w", route.CIDR, err)
 	}
@@ -143,8 +166,23 @@ func (c *macosEgressRouteCommander) readTable() ([]egressBindRoute, error) {
 	return macosBindRoutes(stdout), nil
 }
 
+// readTable6 reads the IPv6 table for a bypass hop, gateways kept.
+func (c *macosEgressRouteCommander) readTable6() ([]egressBindRoute, error) {
+	stdout, stderr, err := c.run(macosShowTableArgs6())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr))
+	}
+	return macosBypassRoutes6(stdout), nil
+}
+
 // bypassArgs picks the form of the add, which depends on whether the address is on-link.
-func (c *macosEgressRouteCommander) bypassArgs(cidr string, hop egressRouteHop) ([]string, error) {
+func (c *macosEgressRouteCommander) bypassArgs(cidr string, hop egressRouteHop, ipv6 bool) ([]string, error) {
+	if ipv6 {
+		if hop.Gateway == "" {
+			return macosInstallInterfaceArgs6(cidr, hop.Device)
+		}
+		return macosInstallGatewayArgs6(cidr, hop.Gateway)
+	}
 	if hop.Gateway == "" {
 		return macosInstallInterfaceArgs(cidr, hop.Device)
 	}
@@ -152,8 +190,12 @@ func (c *macosEgressRouteCommander) bypassArgs(cidr string, hop egressRouteHop) 
 }
 
 func (c *macosEgressRouteCommander) Remove(route egressRoute) error {
-	delete(c.hops, strings.TrimSuffix(route.CIDR, "/32"))
-	args, err := macosRemoveArgs(route.CIDR)
+	delete(c.hops, egressBypassRouteAddress(route.CIDR))
+	remove := macosRemoveArgs
+	if egressRouteIsIPv6(route) {
+		remove = macosRemoveArgs6
+	}
+	args, err := remove(route.CIDR)
 	if err != nil {
 		return fmt.Errorf("remove %s: %w", route.CIDR, err)
 	}
@@ -162,6 +204,11 @@ func (c *macosEgressRouteCommander) Remove(route egressRoute) error {
 
 func (c *macosEgressRouteCommander) Table() ([]egressBindRoute, string, error) {
 	routes, err := c.readTable()
+	return routes, c.tun, err
+}
+
+func (c *macosEgressRouteCommander) Table6() ([]egressBindRoute, string, error) {
+	routes, err := c.readTable6()
 	return routes, c.tun, err
 }
 

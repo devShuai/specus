@@ -138,7 +138,7 @@ jobs:
           sudo -n env SPECUS_ROUTE_MUTATION_TEST=1 "$RUNNER_TEMP/client.test" \
             -test.run 'TestMacosCommander' -test.v | tee "$RUNNER_TEMP/mutation.log"
           for name in InstallsAndWithdrawsARealRoute InstallsABypassThroughTheRealNextHop \
-              InstallsABypassUnderItsOwnTunnelRoute RepairsARouteTheTableLost; do
+              InstallsABypassUnderItsOwnTunnelRoute RepairsARouteTheTableLost InstallsAndWithdrawsARealIPv6Route; do
             if ! grep -q "^--- PASS: TestMacosCommander$name" "$RUNNER_TEMP/mutation.log"; then
               echo "TestMacosCommander$name did not run against the real routing table"
               exit 1
@@ -154,5 +154,10 @@ jobs:
           netstat -rn -f inet
           if netstat -rn -f inet | grep -E '^(203\.0\.113|198\.51\.100)'; then
             echo "a test route was left in the table"
+            exit 1
+          fi
+          netstat -rn -f inet6
+          if netstat -rn -f inet6 | grep -E '^2001:db8:5ec5'; then
+            echo "a test IPv6 route was left in the table"
             exit 1
           fi

@@ -2,6 +2,7 @@ package client
 
 import (
 	"encoding/json"
+	"net/netip"
 	"strconv"
 	"strings"
 )
@@ -118,6 +119,33 @@ func windowsConflictFromTable(table string, prefix string) (bool, string) {
 		}
 	}
 	return describeWindowsRoutes(matching)
+}
+
+// windowsConflictFromTable6 is windowsConflictFromTable for the IPv6 table. The prefixes are compared
+// by value, each side written the way this feature writes its own: Windows writes them lower case and
+// compressed, but a comparison of text would turn any other spelling into "no conflict, install it".
+func windowsConflictFromTable6(table string, prefix string) (bool, string) {
+	wanted, _, ok := parseEgressCIDR6(strings.TrimSpace(prefix))
+	if !ok {
+		return false, ""
+	}
+	var matching []windowsNetRoute
+	for _, route := range windowsRoutesWithPrefix(table) {
+		if have, ok := parseWindowsPrefix6(windowsRoutePrefix(route)); ok && have == wanted {
+			matching = append(matching, route)
+		}
+	}
+	return describeWindowsRoutes(matching)
+}
+
+// parseWindowsPrefix6 reads an IPv6 DestinationPrefix, masking any host bits rather than refusing
+// them: the question is which prefix the row routes, not whether it was written tidily.
+func parseWindowsPrefix6(text string) (egressCIDR6, bool) {
+	prefix, err := netip.ParsePrefix(strings.TrimSpace(text))
+	if err != nil || !prefix.Addr().Is6() || prefix.Addr().Zone() != "" {
+		return egressCIDR6{}, false
+	}
+	return egressCIDR6{network: prefix.Masked().Addr().As16(), prefixLen: prefix.Bits()}, true
 }
 
 // windowsRoutesWithPrefix keeps every entry that actually carries a prefix.
@@ -239,7 +267,8 @@ func windowsRouteGateway(route windowsNetRoute) string {
 		return ""
 	}
 	gateway := strings.TrimSpace(*route.NextHop)
-	if gateway == windowsOnLinkNextHop {
+	// "::" is the IPv6 spelling of on-link, as Get-NetRoute -AddressFamily IPv6 writes it.
+	if gateway == windowsOnLinkNextHop || gateway == windowsOnLinkNextHop6 {
 		return ""
 	}
 	return gateway

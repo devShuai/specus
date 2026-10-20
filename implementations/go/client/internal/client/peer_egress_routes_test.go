@@ -32,6 +32,10 @@ type fakeRouteCommander struct {
 	physical []egressBindRoute
 	hops     map[string]egressBindRoute
 	tableErr error
+	// physical6 and table6Err are the same for the IPv6 table, and table6Reads counts its reads.
+	physical6   []egressBindRoute
+	table6Err   error
+	table6Reads int
 }
 
 func newFakeRouteCommander() *fakeRouteCommander {
@@ -43,6 +47,9 @@ func newFakeRouteCommander() *fakeRouteCommander {
 		tunnel:     "specus0",
 		physical: []egressBindRoute{
 			{Prefix: "0.0.0.0/0", Interface: "eth0", Gateway: "192.0.2.1", Metric: 100, Usable: true},
+		},
+		physical6: []egressBindRoute{
+			{Prefix: "::/0", Interface: "eth0", Gateway: "fe80::1", Metric: 100, Usable: true},
 		},
 		hops: map[string]egressBindRoute{},
 	}
@@ -60,7 +67,11 @@ func (c *fakeRouteCommander) Install(route egressRoute) error {
 	}
 	if route.Kind == egressRouteBypass {
 		// Resolved the way the real commanders resolve it: from the physical routes, now.
-		hop, ok := selectEgressBypassHop(c.physical, c.tunnel, nil, strings.TrimSuffix(route.CIDR, "/32"))
+		physical := c.physical
+		if egressRouteIsIPv6(route) {
+			physical = c.physical6
+		}
+		hop, ok := selectEgressBypassHop(physical, c.tunnel, nil, egressBypassRouteAddress(route.CIDR))
 		if !ok {
 			return errEgressNoPhysicalRoute
 		}
@@ -85,10 +96,25 @@ func (c *fakeRouteCommander) Table() ([]egressBindRoute, string, error) {
 	if c.tableErr != nil {
 		return nil, "", c.tableErr
 	}
-	rows := append([]egressBindRoute(nil), c.physical...)
+	return c.tableOf(c.physical, false), c.tunnel, nil
+}
+
+func (c *fakeRouteCommander) Table6() ([]egressBindRoute, string, error) {
+	c.table6Reads++
+	if c.table6Err != nil {
+		return nil, "", c.table6Err
+	}
+	return c.tableOf(c.physical6, true), c.tunnel, nil
+}
+
+// tableOf is one family's table: its physical routes, then the installed routes of that family.
+func (c *fakeRouteCommander) tableOf(physical []egressBindRoute, ipv6 bool) []egressBindRoute {
+	rows := append([]egressBindRoute(nil), physical...)
 	cidrs := make([]string, 0, len(c.table))
 	for cidr := range c.table {
-		cidrs = append(cidrs, cidr)
+		if strings.Contains(cidr, ":") == ipv6 {
+			cidrs = append(cidrs, cidr)
+		}
 	}
 	sort.Strings(cidrs)
 	for _, cidr := range cidrs {
@@ -99,7 +125,7 @@ func (c *fakeRouteCommander) Table() ([]egressBindRoute, string, error) {
 		}
 		rows = append(rows, egressBindRoute{Prefix: cidr, Interface: c.tunnel, Usable: true})
 	}
-	return rows, c.tunnel, nil
+	return rows
 }
 
 // lose drops a route from the table behind the journal's back, the way an interface going down does.

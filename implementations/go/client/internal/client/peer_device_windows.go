@@ -30,6 +30,11 @@ type windowsWintunDevice struct {
 	cidr    string
 	mtu     int
 	logger  *log.Logger
+	// address6 is the derived IPv6 address the device is given, "" when it is given none
+	// (peerDeviceAddress6).
+	address6 string
+	// ipv6 says whether the address was assigned, under mu: what IPv6Ready answers.
+	ipv6 peerDeviceIPv6State
 
 	mu      sync.Mutex
 	dll     *syscall.LazyDLL
@@ -60,7 +65,9 @@ func newPlatformPeerVirtualDevice(config Config, runtime PeerMeshConfig, logger 
 	if mode != "auto" && mode != "windows-wintun" && mode != "wintun" {
 		return newUnsupportedPeerVirtualDevice(config, fmt.Sprintf("unsupported peerMeshDevice on Windows: %s", config.PeerMeshDevice))
 	}
+	address6, _ := peerDeviceAddress6(config, runtime.VirtualIP)
 	return &windowsWintunDevice{
+		address6:         address6,
 		name:             firstNonEmpty(config.PeerMeshTunName, DefaultPeerMeshTunName),
 		virtual:          runtime.VirtualIP,
 		cidr:             runtime.CIDR,
@@ -186,6 +193,7 @@ func (device *windowsWintunDevice) WritePacket(packet []byte) error {
 
 func (device *windowsWintunDevice) Close() error {
 	device.SyncPeerRoutes(nil)
+	device.setIPv6(false, "the adapter is closed")
 	device.mu.Lock()
 	api := device.api
 	session := device.session
@@ -260,7 +268,52 @@ func (device *windowsWintunDevice) configure() error {
 	if strings.TrimSpace(device.cidr) != "" {
 		device.runCommandQuiet("netsh", "interface", "ipv4", "delete", "route", device.cidr, device.name, "store=active")
 	}
+	device.configureIPv6()
 	return nil
+}
+
+// configureIPv6 gives the adapter its derived IPv6 address and its IPv6 MTU, which Windows keeps
+// apart from the IPv4 one netsh set. Through PowerShell, by interface index, as the route commander
+// does: the adapter's name goes in, only its index comes back. A failure is logged and the device
+// stays up, for the reason the Linux device gives.
+func (device *windowsWintunDevice) configureIPv6() {
+	if device.address6 == "" {
+		device.setIPv6(false, peerDeviceIPv6NotAsked)
+		return
+	}
+	err := func() error {
+		output, err := runWindowsPowerShell(windowsInterfaceIndexScript(device.name))
+		if err != nil {
+			return fmt.Errorf("resolve interface index for %s: %w", device.name, err)
+		}
+		index, ok := parseWindowsInterfaceIndex(output)
+		if !ok {
+			return fmt.Errorf("no adapter named %s", device.name)
+		}
+		script, err := windowsAssignAddress6Script(index, device.address6, device.mtu)
+		if err != nil {
+			return err
+		}
+		output, runErr := runWindowsPowerShell(script)
+		switch parseWindowsCommandFailure(output) {
+		case windowsRouteFailureDenied:
+			return errors.New("assigning the address needs administrator rights")
+		case windowsRouteFailureOther:
+			return fmt.Errorf("assigning the address failed: %s", strings.TrimSpace(output))
+		}
+		if runErr != nil && strings.TrimSpace(output) == "" {
+			return runErr
+		}
+		return nil
+	}()
+	if err != nil {
+		device.setIPv6(false, "the adapter's IPv6 address could not be assigned: "+err.Error())
+		if device.logger != nil {
+			device.logger.Printf("Peer Mesh Wintun IPv6 address not assigned; IPv6 rules are not in force: %v", err)
+		}
+		return
+	}
+	device.setIPv6(true, "")
 }
 
 func (device *windowsWintunDevice) setStatus(status, errText string) {
@@ -394,4 +447,18 @@ func runWindowsCommand(args ...string) error {
 		return fmt.Errorf("%s failed: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+// IPv6Ready reports whether the device carries IPv6: up with its derived address assigned. A device
+// whose address could not be assigned has no IPv6 data plane, and its IPv4 one is unaffected.
+func (device *windowsWintunDevice) IPv6Ready() (bool, string) {
+	device.mu.Lock()
+	defer device.mu.Unlock()
+	return device.ipv6.ready, device.ipv6.reason
+}
+
+func (device *windowsWintunDevice) setIPv6(ready bool, reason string) {
+	device.mu.Lock()
+	device.ipv6 = peerDeviceIPv6State{ready: ready, reason: reason}
+	device.mu.Unlock()
 }

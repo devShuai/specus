@@ -138,3 +138,60 @@ func macosRemoveArgs(prefix string) ([]string, error) {
 func isMacosLetter(character byte) bool {
 	return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z')
 }
+
+// The IPv6 commands (protocol/spec/peer-egress.md, IPv6 数据面): `route -n ... -inet6`, read back from
+// `netstat -rn -f inet6`. Separate builders, so the IPv4 ones stay what the shared vector pins.
+
+// validMacosPrefix6 accepts an IPv6 prefix in the form this feature writes it: RFC 5952 address,
+// slash, decimal length. Requiring the canonical form keeps the text checked the text sent: `route`
+// has its own reading of an address, and one spelling leaves it nothing to read differently.
+func validMacosPrefix6(value string) bool {
+	cidr, hadLength, ok := parseEgressCIDR6(value)
+	return ok && hadLength && formatEgressCIDR6(cidr) == value
+}
+
+// validMacosAddress6 accepts an IPv6 address, optionally with a zone naming an interface -- a
+// link-local next hop means nothing without one -- and nothing else: no brackets, no dotted tail,
+// and a zone that passes the same whitelist as an interface name.
+func validMacosAddress6(value string) bool {
+	address, zone, zoned := strings.Cut(value, "%")
+	if zoned && !validMacosInterfaceName(zone) {
+		return false
+	}
+	_, ok := parseEgressAddress6(address)
+	return ok
+}
+
+// macosFindRouteArgs6 asks where an IPv6 address would go right now.
+func macosFindRouteArgs6(address string) ([]string, error) {
+	if !validMacosAddress6(address) || strings.Contains(address, "%") {
+		return nil, errEgressRouteArgument
+	}
+	return []string{"route", "-n", "get", "-inet6", address}, nil
+}
+
+// macosInstallInterfaceArgs6 sends an IPv6 prefix out of an interface: a rule's route into the TUN,
+// or an on-link bypass.
+func macosInstallInterfaceArgs6(prefix string, name string) ([]string, error) {
+	if !validMacosPrefix6(prefix) || !validMacosInterfaceName(name) {
+		return nil, errEgressRouteArgument
+	}
+	return []string{"route", "-n", "add", "-inet6", "-net", prefix, "-interface", name}, nil
+}
+
+// macosInstallGatewayArgs6 sends an IPv6 prefix to a next hop, which for IPv6 is usually link-local
+// and so carries its zone.
+func macosInstallGatewayArgs6(prefix string, gateway string) ([]string, error) {
+	if !validMacosPrefix6(prefix) || !validMacosAddress6(gateway) {
+		return nil, errEgressRouteArgument
+	}
+	return []string{"route", "-n", "add", "-inet6", "-net", prefix, gateway}, nil
+}
+
+// macosRemoveArgs6 withdraws an IPv6 prefix, unscoped like the install.
+func macosRemoveArgs6(prefix string) ([]string, error) {
+	if !validMacosPrefix6(prefix) {
+		return nil, errEgressRouteArgument
+	}
+	return []string{"route", "-n", "delete", "-inet6", "-net", prefix}, nil
+}

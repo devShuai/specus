@@ -143,7 +143,14 @@ func TestEgressTargetReadsAnAddressOrAName(t *testing.T) {
 		{"-bad.example", "", "", egressNameUnusableText},
 		{"10.0.0.0/8", "", "", egressNotAnAddressText},
 		{"256.1.1.1", "", "", egressNotAnAddressText},
-		{"2001:db8::1", "", "", egressNotAnAddressText},
+		// An IPv6 address is previewed as an address, written as a rule's match is; a zone, brackets,
+		// a dotted tail or a prefix are not one.
+		{"2001:db8::1", "address", "2001:db8::1", ""},
+		{"2001:DB8:0::1", "address", "2001:DB8:0::1", ""},
+		{"fe80::1%eth0", "", "", egressNotAnAddressText},
+		{"[2001:db8::1]", "", "", egressNotAnAddressText},
+		{"::ffff:192.0.2.1", "", "", egressNotAnAddressText},
+		{"2001:db8::/32", "", "", egressNotAnAddressText},
 		{"example.com:443", "", "", egressNotAnAddressText},
 	}
 	for _, c := range cases {
@@ -290,7 +297,33 @@ func TestEgressAddressPreviewSaysItIsAnAddress(t *testing.T) {
 	}
 }
 
-const egressNameTestConfig = "{\r\n  \"serverBaseUrl\": \"http://127.0.0.1:1\",\r\n  \"apiKey\": \"k\",\r\n  \"secret\": \"s\",\r\n" +
+// An IPv6 address previews by the IPv6 rules, where this client carries IPv6, in the same lines; at a
+// peerMeshMtu below 1280 no IPv6 rule is in force and the address stays local.
+func TestEgressAddressPreviewReadsAnIPv6Address(t *testing.T) {
+	rules := []client.EgressRule{
+		{Match: "203.0.113.0/24", Action: "egress", EgressClientID: 7},
+		{Match: "2001:db8::/32", Action: "egress", EgressClientID: 42},
+	}
+	config := client.Config{PeerEgressEnabled: true, PeerEgressRules: rules, PeerMeshMTU: 1280}
+	data, lines := egressPreview("c.jsonc", config, egressTargetAddress, "2001:DB8::9")
+	want := []string{"Preview for 2001:DB8::9 from the configuration (no connection is made; --connect PORT tests one)",
+		"  takeover: on", "  rule: [1] 2001:db8::/32 egress 42", "  result: through egress 42"}
+	if client.EgressRuleCode(config, rules[1]) != "" {
+		// A platform without the IPv6 data plane: the rule is not in force.
+		want = []string{want[0], "  takeover: on", "  rule: none", "  result: not covered by any rule; stays local (direct)"}
+	}
+	if !reflect.DeepEqual(lines, want) || data["kind"] != "address" {
+		t.Errorf("lines %q data %v", lines, data)
+	}
+
+	config.PeerMeshMTU = 1200
+	_, lines = egressPreview("c.jsonc", config, egressTargetAddress, "2001:db8::9")
+	if lines[2] != "  rule: none" {
+		t.Errorf("below 1280 an IPv6 rule steered the preview: %q", lines)
+	}
+}
+
+const egressNameTestConfig ="{\r\n  \"serverBaseUrl\": \"http://127.0.0.1:1\",\r\n  \"apiKey\": \"k\",\r\n  \"secret\": \"s\",\r\n" +
 	"  \"peerEgressDnsTakeover\": true,\r\n" +
 	"  \"peerEgressRules\": [{\"match\": \"example.com\", \"action\": \"egress\", \"egressClientId\": 42}]\r\n}\r\n"
 

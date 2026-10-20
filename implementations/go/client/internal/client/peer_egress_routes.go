@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -105,7 +106,19 @@ const egressRouteOriginFakeIPPool = "fake-ip-pool"
 // and "" while it does not. A domain rule installs nothing of its own; the pool's one route carries
 // every name, and it is recorded, refused on conflict and rolled back like any rule's route.
 func planEgressRoutesIn(rules []egressRule, bypass []string, meshCIDR, fakeIPPool string) ([]egressRoute, []egressRuleSetError) {
-	refused := validateEgressRuleSetIn(rules, meshCIDR, fakeIPPool)
+	return planEgressRoutesFor(rules, bypass, meshCIDR, fakeIPPool, false)
+}
+
+// planEgressRoutesFor is planEgressRoutesIn with the consumer's IPv6 data plane stated.
+//
+// The two families are planned apart and by the same rules (protocol/spec/peer-egress.md, IPv6 数据面,
+// 消费端): exact IPv6 prefixes, nothing invented -- no ::/0 and no ::/1 plus 8000::/1 -- nothing
+// for a direct rule, a route for a block rule, and a /128 bypass for each IPv6 endpoint an IPv6
+// rule's prefix covers. A prefix of one family never covers an address of the other, so neither
+// family's plan changes the other's. Without the data plane no IPv6 rule is in force, and the plan
+// is exactly what it was before IPv6 existed.
+func planEgressRoutesFor(rules []egressRule, bypass []string, meshCIDR, fakeIPPool string, carriesIPv6 bool) ([]egressRoute, []egressRuleSetError) {
+	refused := validateEgressRuleSetFor(rules, meshCIDR, fakeIPPool, carriesIPv6)
 	skip := make(map[int]struct{}, len(refused))
 	for _, entry := range refused {
 		skip[entry.Index] = struct{}{}
@@ -122,13 +135,32 @@ func planEgressRoutesIn(rules []egressRule, bypass []string, meshCIDR, fakeIPPoo
 		cidr   egressCIDR
 		origin string
 	}
+	type captured6 struct {
+		cidr   egressCIDR6
+		origin string
+	}
 	seen := make(map[string]struct{})
 	capturing := make([]captured, 0, len(rules)+1)
+	var capturing6 []captured6
 	for index, rule := range rules {
 		if _, refusedRule := skip[index]; refusedRule {
 			continue
 		}
 		if rule.Action != egressActionEgress && rule.Action != egressActionBlock {
+			continue
+		}
+		if egressRuleIsIPv6(rule.Match) {
+			// In force only with the data plane, so validation has already let it through or not.
+			cidr6, _, ok := parseEgressCIDR6(strings.TrimSpace(rule.Match))
+			if !ok {
+				continue
+			}
+			normalised := formatEgressCIDR6(cidr6)
+			if _, duplicate := seen[normalised]; duplicate {
+				continue
+			}
+			seen[normalised] = struct{}{}
+			capturing6 = append(capturing6, captured6{cidr: cidr6, origin: "rule:" + rule.Match})
 			continue
 		}
 		cidr, ok := parseEgressRuleMatch(strings.TrimSpace(rule.Match))
@@ -164,6 +196,27 @@ func planEgressRoutesIn(rules []egressRule, bypass []string, meshCIDR, fakeIPPoo
 	for _, endpoint := range bypass {
 		address, ok := parseEgressAddress(strings.TrimSpace(endpoint))
 		if !ok {
+			// An IPv6 endpoint gets its /128 the same way, when an IPv6 rule covers it.
+			address6, ok6 := parseEgressAddress6(strings.TrimSpace(endpoint))
+			if !ok6 {
+				continue
+			}
+			covered := false
+			for _, entry := range capturing6 {
+				if entry.cidr.contains(address6) {
+					covered = true
+					break
+				}
+			}
+			if !covered {
+				continue
+			}
+			cidr := formatEgressAddress6(address6) + "/128"
+			if _, duplicate := seen[cidr]; duplicate {
+				continue
+			}
+			seen[cidr] = struct{}{}
+			routes = append(routes, egressRoute{CIDR: cidr, Kind: egressRouteBypass, Origin: "bypass"})
 			continue
 		}
 		covered := false
@@ -193,6 +246,14 @@ func planEgressRoutesIn(rules []egressRule, bypass []string, meshCIDR, fakeIPPoo
 		routes = append(routes, egressRoute{
 			CIDR: normalised, Kind: egressRouteToTun, Origin: entry.origin,
 		})
+	}
+	for _, entry := range capturing6 {
+		normalised := formatEgressCIDR6(entry.cidr)
+		if _, duplicate := seen[normalised]; duplicate {
+			continue
+		}
+		seen[normalised] = struct{}{}
+		routes = append(routes, egressRoute{CIDR: normalised, Kind: egressRouteToTun, Origin: entry.origin})
 	}
 
 	sortEgressRoutes(routes)
@@ -256,15 +317,28 @@ func formatEgressCIDR(cidr egressCIDR) string {
 	return formatEgressAddress(cidr.network) + "/" + strconv.Itoa(cidr.prefixLen)
 }
 
-// sortEgressRoutes orders bypass entries first, then by prefix.
+// sortEgressRoutes orders bypass entries first, then IPv4 before IPv6, then by prefix.
 //
 // Bypass first because installation happens in this order: the addresses that keep the tunnel's own
 // transport working are in place before anything is pointed into the tunnel. Deterministic order
-// also means the journal and every log line read the same way run to run.
+// also means the journal and every log line read the same way run to run. The family comes before
+// the prefix so the order stays one order when both are present: compared as text across families
+// and as numbers within one, three prefixes could each sort before the next.
 func sortEgressRoutes(routes []egressRoute) {
 	sort.Slice(routes, func(i, j int) bool {
 		if routes[i].Kind != routes[j].Kind {
 			return routes[i].Kind == egressRouteBypass
+		}
+		left6, leftIs6 := parseEgressRouteCIDR6(routes[i].CIDR)
+		right6, rightIs6 := parseEgressRouteCIDR6(routes[j].CIDR)
+		if leftIs6 != rightIs6 {
+			return rightIs6
+		}
+		if leftIs6 {
+			if left6.network != right6.network {
+				return bytes.Compare(left6.network[:], right6.network[:]) < 0
+			}
+			return left6.prefixLen < right6.prefixLen
 		}
 		left, leftOK := parseEgressCIDR(routes[i].CIDR)
 		right, rightOK := parseEgressCIDR(routes[j].CIDR)
@@ -276,6 +350,28 @@ func sortEgressRoutes(routes []egressRoute) {
 		}
 		return left.prefixLen < right.prefixLen
 	})
+}
+
+// parseEgressRouteCIDR6 reads a route's CIDR as an IPv6 prefix, reporting false for anything else.
+func parseEgressRouteCIDR6(text string) (egressCIDR6, bool) {
+	if !strings.Contains(text, ":") {
+		return egressCIDR6{}, false
+	}
+	cidr, _, ok := parseEgressCIDR6(text)
+	return cidr, ok
+}
+
+// egressRouteIsIPv6 reports whether a route's prefix is IPv6.
+func egressRouteIsIPv6(route egressRoute) bool {
+	return strings.Contains(route.CIDR, ":")
+}
+
+// egressBypassRouteAddress is the address a bypass route pins: its CIDR without the /32 or /128.
+func egressBypassRouteAddress(cidr string) string {
+	if strings.Contains(cidr, ":") {
+		return strings.TrimSuffix(cidr, "/128")
+	}
+	return strings.TrimSuffix(cidr, "/32")
 }
 
 // diffEgressRoutes reports what to add and what to withdraw to get from one set to another.

@@ -29,6 +29,11 @@ type linuxTunDevice struct {
 	cidr    string
 	mtu     int
 	logger  *log.Logger
+	// address6 is the derived IPv6 address the device is given, "" when it is given none
+	// (peerDeviceAddress6).
+	address6 string
+	// ipv6 says whether the address was assigned, under mu: what IPv6Ready answers.
+	ipv6 peerDeviceIPv6State
 
 	mu     sync.Mutex
 	file   *os.File
@@ -40,7 +45,9 @@ type linuxTunDevice struct {
 }
 
 func newPlatformPeerVirtualDevice(config Config, runtime PeerMeshConfig, logger *log.Logger) peerVirtualDevice {
+	address6, _ := peerDeviceAddress6(config, runtime.VirtualIP)
 	return &linuxTunDevice{
+		address6:         address6,
 		name:             firstNonEmpty(config.PeerMeshTunName, DefaultPeerMeshTunName),
 		virtual:          runtime.VirtualIP,
 		cidr:             runtime.CIDR,
@@ -169,6 +176,7 @@ func (device *linuxTunDevice) WritePacket(packet []byte) error {
 
 func (device *linuxTunDevice) Close() error {
 	device.SyncPeerRoutes(nil)
+	device.setIPv6(false, "the TUN is closed")
 	device.mu.Lock()
 	file := device.file
 	device.file = nil
@@ -235,7 +243,29 @@ func (device *linuxTunDevice) configure() error {
 	if strings.TrimSpace(device.cidr) != "" {
 		device.runCommandQuiet("ip", "route", "del", device.cidr, "dev", device.name)
 	}
+	device.configureIPv6()
 	return nil
+}
+
+// configureIPv6 gives the device its derived IPv6 address. The link is up with its MTU already,
+// which applies to both families.
+//
+// A failure is logged and the device stays up: the IPv4 mesh does not depend on it. The device then
+// reports no IPv6 data plane (IPv6Ready), so IPv6 rules are refused with EGRESS_RULE_IPV6_UNSUPPORTED
+// and no IPv6 route is planned -- an IPv6 install that would fail must not roll the IPv4 routes back.
+func (device *linuxTunDevice) configureIPv6() {
+	if device.address6 == "" {
+		device.setIPv6(false, peerDeviceIPv6NotAsked)
+		return
+	}
+	if err := runCommand(linuxAssignAddress6Args(device.name, device.address6)...); err != nil {
+		device.setIPv6(false, "the TUN's IPv6 address could not be assigned: "+err.Error())
+		if device.logger != nil {
+			device.logger.Printf("Peer Mesh Linux TUN IPv6 address not assigned; IPv6 rules are not in force: %v", err)
+		}
+		return
+	}
+	device.setIPv6(true, "")
 }
 
 func (device *linuxTunDevice) setStatus(status, errText string) {
@@ -255,4 +285,18 @@ func runCommand(args ...string) error {
 		return fmt.Errorf("%s failed: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+// IPv6Ready reports whether the device carries IPv6: up with its derived address assigned. A device
+// whose address could not be assigned has no IPv6 data plane, and its IPv4 one is unaffected.
+func (device *linuxTunDevice) IPv6Ready() (bool, string) {
+	device.mu.Lock()
+	defer device.mu.Unlock()
+	return device.ipv6.ready, device.ipv6.reason
+}
+
+func (device *linuxTunDevice) setIPv6(ready bool, reason string) {
+	device.mu.Lock()
+	device.ipv6 = peerDeviceIPv6State{ready: ready, reason: reason}
+	device.mu.Unlock()
 }

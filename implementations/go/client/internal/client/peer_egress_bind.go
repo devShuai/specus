@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"time"
 )
 
@@ -124,7 +125,11 @@ func egressBypassHopFromTable(address string, tunnel string, read func() ([]egre
 	// The bypass's own /32 is left out too. When one is being put back after a network change,
 	// the stale row is still in the table naming the old gateway, and it would win the lookup for
 	// its own address.
-	hop, ok := selectEgressBypassHop(routes, tunnel, []string{address + "/32"}, address)
+	own := address + "/32"
+	if strings.Contains(address, ":") {
+		own = address + "/128"
+	}
+	hop, ok := selectEgressBypassHop(routes, tunnel, []string{own}, address)
 	if !ok {
 		return egressBindRoute{}, fmt.Errorf("resolve bypass hop for %s: %w", address, errEgressNoPhysicalRoute)
 	}

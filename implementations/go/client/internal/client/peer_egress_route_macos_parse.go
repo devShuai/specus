@@ -302,3 +302,64 @@ func macosDecimalValue(digits string, limit int) (int, bool) {
 	}
 	return value, true
 }
+
+// parseMacosRouteGet6 reads `route -n get -inet6 <address>`. The same shape as IPv4; the gateway is
+// an IPv6 address, link-local ones with their zone -- `gateway: fe80::1%en0` -- and anything that is
+// not one (a link#N, a MAC) is read as on-link, as for IPv4.
+func parseMacosRouteGet6(stdout string, stderr string) (egressRouteHop, bool) {
+	if strings.TrimSpace(stderr) != "" {
+		return egressRouteHop{}, false
+	}
+	var hop egressRouteHop
+	for _, line := range strings.Split(stdout, "\n") {
+		key, value, found := strings.Cut(line, ":")
+		if !found {
+			continue
+		}
+		switch strings.TrimSpace(key) {
+		case "gateway":
+			hop.Gateway = strings.TrimSpace(value)
+		case "interface":
+			hop.Device = strings.TrimSpace(value)
+		}
+	}
+	if hop.Device == "" {
+		return egressRouteHop{}, false
+	}
+	if hop.Gateway != "" && !validMacosAddress6(hop.Gateway) {
+		hop.Gateway = ""
+	}
+	return hop, true
+}
+
+// macosConflictFromTable6 answers whether anything already owns this exact IPv6 prefix, from the
+// Internet6 section, with the same exclusion of kernel-generated rows as IPv4: neighbour entries are
+// host routes the kernel makes for every address it has talked to.
+func macosConflictFromTable6(table string, prefix string) (bool, string) {
+	wanted := normaliseMacosPrefix6(prefix)
+	if wanted == "" {
+		return false, ""
+	}
+	var matching []macosRoute
+	for _, route := range parseMacosRouteTable6(table) {
+		if route.Prefix != wanted || strings.Contains(route.Flags, macosKernelGeneratedFlag) {
+			continue
+		}
+		matching = append(matching, route)
+	}
+	return describeMacosRoutes(matching)
+}
+
+// macosBypassRoutes6 reads the IPv6 table for a bypass hop: macosBindRoutes6's candidates, with the
+// gateway kept where the flags say the column is one, zone and all, since a link-local next hop is
+// meaningless without it.
+func macosBypassRoutes6(table string) []egressBindRoute {
+	rows := parseMacosRouteTable6(table)
+	routes := macosBindRoutes6(table)
+	for index, row := range rows {
+		if strings.Contains(row.Flags, macosGatewayFlag) && validMacosAddress6(row.Gateway) {
+			routes[index].Gateway = row.Gateway
+		}
+	}
+	return routes
+}

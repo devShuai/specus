@@ -15,8 +15,12 @@ const DefaultEgressMeshCIDR = egressDefaultMeshCIDR
 // EgressRuleCode reports why a rule is not in force under a configuration, or "" when it would be.
 // The master switch is not part of it; see EgressRuleStatusCode. The configuration decides whether
 // a domain rule is judged as a name (peerEgressDnsTakeover on with a usable pool) or refused.
+//
+// An IPv6 rule is judged with this device's IPv6 data plane, which its platform and peerMeshMtu
+// decide. Whether its egress takes IPv6 packets is only known once connected and is not judged here.
 func EgressRuleCode(config Config, rule EgressRule) string {
-	return validateEgressRuleIn(rule, egressDefaultMeshCIDR, offlineEgressFakeIPPool(config))
+	return validateEgressRuleFor(rule, egressDefaultMeshCIDR, offlineEgressFakeIPPool(config),
+		egressConsumerCarriesIPv6(config.PeerMeshMTU))
 }
 
 // EgressRuleStatusCode is the code a rule reports in status: the master switch off names itself
@@ -49,10 +53,12 @@ type EgressPreview struct {
 	EgressClientID   int64
 }
 
-// PreviewEgressDestination runs the rules as configured against one destination, ignoring the
-// master switch: the caller says what the switch changes.
-func PreviewEgressDestination(rules []EgressRule, destination string) EgressPreview {
-	decision := matchEgressRules(rules, destination, egressDefaultMeshCIDR)
+// PreviewEgressDestination runs the rules as configured against one destination, IPv4 or IPv6,
+// ignoring the master switch: the caller says what the switch changes. IPv6 rules take part only when
+// this device has the IPv6 data plane, so an IPv6 destination is previewed the way it would go.
+func PreviewEgressDestination(config Config, destination string) EgressPreview {
+	decision := matchEgressRulesFor(config.PeerEgressRules, destination, egressDefaultMeshCIDR, "",
+		egressConsumerCarriesIPv6(config.PeerMeshMTU))
 	return EgressPreview{
 		Action:           decision.Action,
 		MatchedRuleIndex: decision.MatchedRuleIndex,
@@ -110,7 +116,11 @@ func EgressCodeExplanation(code string) string {
 	case egressCodeRuleDomainUnsupported:
 		return "domain rules are not supported yet; use an IPv4 address or CIDR range"
 	case egressCodeRuleIPv6Unsupported:
+		// Worded as the Java and .NET clients word it. With the data plane it is what a platform without
+		// IPv6 support, or a peerMeshMtu below 1280, still reports.
 		return "IPv6 rules are not in force yet: this client cannot carry IPv6 traffic"
+	case egressCodeRuleEgressNoIPv6:
+		return "the egress device is online but does not take IPv6 traffic; upgrade its client"
 	case egressCodeRuleMalformed:
 		return "not an IPv4 or IPv6 address or CIDR range with zero host bits (IPv4-mapped IPv6 is written as IPv4), or an unknown action"
 	case egressCodeRuleDefaultRoute:
@@ -132,10 +142,14 @@ func EgressCodeExplanation(code string) string {
 }
 
 // ValidEgressAddress reports whether a destination is one the address rules can decide: a plain IPv4
-// address. Something that reads as a name is told apart, for EgressPreviewName to judge.
+// address, or an IPv6 one written as a rule's match is (no zone, no brackets, no dotted tail).
+// Something that reads as a name is told apart, for EgressPreviewName to judge.
 func ValidEgressAddress(destination string) (ok bool, domain bool) {
 	value := strings.TrimSpace(destination)
 	if _, parsed := parseEgressRuleMatch(value); parsed && !strings.Contains(value, "/") {
+		return true, false
+	}
+	if _, parsed := parseEgressAddress6(value); parsed {
 		return true, false
 	}
 	return false, looksLikeEgressDomainRule(value) && !strings.Contains(value, ":")
