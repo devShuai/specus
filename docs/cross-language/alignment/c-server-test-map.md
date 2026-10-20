@@ -121,6 +121,7 @@ Peer 信令断言接受公开格式的 0/3/6/9 位小数，并用正反例继续
 | `management/controller/WorkbenchConcurrentWriteTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `management/controller/WorkbenchResourceTests` | 7 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `management/controller/WorkbenchVectorTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `management/service/ClientDownloadLinkValidationVectorTests`（2026-10-20 新增，不在锚定快照内） | 3 | 覆盖（候选） | 三个方法都读共享向量 `protocol/test-vectors/client-download-link-validation-v1.json`：`uriCases` 由 ctest `java_uri_tests` 对 `java.net.URI` 的移植 `src/java_uri.c` 逐例比较消息与 scheme、user info、host、authority、path、query、fragment；`createCases` 与 `updateCases` 由 `client_package_tests:test_download_link_vector` 经真实处理入口逐例比较 400 文案（`errorPrefix` 只比前缀）或成功视图的 14 个字段，修改用例先建 `seed` 行并按 `seedHosted` 标为托管。 |
 | `management/service/HttpMediaCaptureSqliteRaceTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `management/service/HttpMediaCaptureSqliteTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `management/service/HttpShareServiceRouteLockTests` | 6 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
