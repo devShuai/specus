@@ -11,6 +11,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <openssl/rand.h>
 #include <poll.h>
@@ -258,6 +259,30 @@ static int env_int_alias(const char *name, const char *legacy_name, int default_
     return value != NULL && *value != '\0'
         ? env_int_value(name, default_value)
         : env_int_value(legacy_name, default_value);
+}
+
+static int env_signed_int_alias(const char *name, const char *legacy_name, int default_value)
+{
+    const char *value = getenv(name);
+    return value != NULL && *value != '\0'
+        ? env_signed_int_value(name, default_value)
+        : env_signed_int_value(legacy_name, default_value);
+}
+
+/* Java InetAddress.getLocalHost: this host's name resolved (IPv4, as every socket here is). */
+static void local_host_address(struct in_addr *out)
+{
+    char name[256];
+    struct addrinfo hints;
+    struct addrinfo *found = NULL;
+    out->s_addr = htonl(INADDR_LOOPBACK);
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    if (gethostname(name, sizeof(name)) != 0) return;
+    name[sizeof(name) - 1U] = '\0';
+    if (getaddrinfo(name, NULL, &hints, &found) != 0 || found == NULL) return;
+    *out = ((const struct sockaddr_in *)found->ai_addr)->sin_addr;
+    freeaddrinfo(found);
 }
 
 static int sockaddr_equal(const struct sockaddr_storage *left,
@@ -616,12 +641,14 @@ static int add_stun_endpoint(st_stun_turn_server *server,
     struct sockaddr_in *advertised = (struct sockaddr_in *)&endpoint->advertised;
     advertised->sin_family = AF_INET;
     advertised->sin_port = htons((uint16_t)actual_port);
+    /* Java resolvePrimaryAdvertisedAddress: the public address, else the bind address unless it is
+     * the wildcard, else this host's address. */
     const char *selected = advertised_address;
     if (selected == NULL || inet_pton(AF_INET, selected, &advertised->sin_addr) != 1) {
         selected = bind_address;
         if (selected == NULL || inet_pton(AF_INET, selected, &advertised->sin_addr) != 1
             || advertised->sin_addr.s_addr == htonl(INADDR_ANY)) {
-            advertised->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            local_host_address(&advertised->sin_addr);
         }
     }
     endpoint->advertised_len = sizeof(*advertised);
@@ -1165,10 +1192,11 @@ static turn_allocation *create_allocation(st_stun_turn_server *server,
     struct sockaddr_in *relay = (struct sockaddr_in *)&slot->relay;
     relay->sin_family = AF_INET;
     relay->sin_port = htons((uint16_t)relay_port);
+    /* SPECUS_PEER_MESH_RELAY_ADDRESS is C's own override; otherwise, as Java's
+     * turnAdvertisedAddress, the main listener's advertised address. */
     const char *advertised = getenv("SPECUS_PEER_MESH_RELAY_ADDRESS");
-    if (advertised == NULL || *advertised == '\0') advertised = getenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS");
     if (advertised == NULL || inet_pton(AF_INET, advertised, &relay->sin_addr) != 1) {
-        relay->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        relay->sin_addr = ((const struct sockaddr_in *)&server->endpoints[0].advertised)->sin_addr;
     }
     slot->relay_len = sizeof(*relay);
     /* Java createAllocation logs every allocation at info. */
@@ -1882,23 +1910,26 @@ int st_stun_turn_server_start(st_stun_turn_server **out_server)
                                            "SPECUS_PEER_MESH_TURN_ALLOCATION_TTL_SECONDS", 300);
     server->permission_ttl = env_int_value("SPECUS_PEER_MESH_TURN_PERMISSION_TTL_SECONDS", 300);
     server->channel_ttl = env_int_value("SPECUS_PEER_MESH_TURN_CHANNEL_TTL_SECONDS", 600);
-    server->relay_min_port = env_int_alias("SPECUS_PEER_MESH_RELAY_MIN_PORT",
-                                          "SPECUS_PEER_MESH_TURN_RELAY_MIN_PORT", 49152);
-    server->relay_max_port = env_int_alias("SPECUS_PEER_MESH_RELAY_MAX_PORT",
-                                          "SPECUS_PEER_MESH_TURN_RELAY_MAX_PORT", 65535);
-    server->general_relay_max_allocations = env_int_value(
+    /* Java bindRelaySocket: each end clamped to 1..65535, a reversed range put in order. */
+    int relay_min_port = env_signed_int_alias("SPECUS_PEER_MESH_RELAY_MIN_PORT",
+                                              "SPECUS_PEER_MESH_TURN_RELAY_MIN_PORT", 49152);
+    int relay_max_port = env_signed_int_alias("SPECUS_PEER_MESH_RELAY_MAX_PORT",
+                                              "SPECUS_PEER_MESH_TURN_RELAY_MAX_PORT", 65535);
+    relay_min_port = relay_min_port < 1 ? 1 : (relay_min_port > 65535 ? 65535 : relay_min_port);
+    relay_max_port = relay_max_port < 1 ? 1 : (relay_max_port > 65535 ? 65535 : relay_max_port);
+    server->relay_min_port = relay_min_port <= relay_max_port ? relay_min_port : relay_max_port;
+    server->relay_max_port = relay_min_port <= relay_max_port ? relay_max_port : relay_min_port;
+    /* Java int properties: a total <= 0 switches the general relay off, a per-address limit <= 0
+     * lifts that limit. */
+    server->general_relay_max_allocations = env_signed_int_value(
         "SPECUS_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS", 256);
-    server->general_relay_max_allocations_per_address = env_int_value(
+    server->general_relay_max_allocations_per_address = env_signed_int_value(
         "SPECUS_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS_PER_ADDRESS", 4);
     server->general_relay_max_bytes = env_i64_value(
         "SPECUS_PEER_MESH_GENERAL_RELAY_MAX_BYTES", 512LL * 1024LL * 1024LL);
     server->udp_receive_buffer = env_signed_int_value("SPECUS_PEER_MESH_UDP_RECEIVE_BUFFER_BYTES", 4 * 1024 * 1024);
     server->udp_send_buffer = env_signed_int_value("SPECUS_PEER_MESH_UDP_SEND_BUFFER_BYTES", 4 * 1024 * 1024);
     server->udp_traffic_class = env_signed_int_value("SPECUS_PEER_MESH_UDP_TRAFFIC_CLASS", 0x10);
-    if (server->relay_min_port <= 0 || server->relay_max_port < server->relay_min_port) {
-        discard_server(server);
-        return -1;
-    }
     const char *primary_bind = getenv("SPECUS_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS");
     int primary_explicit = primary_bind != NULL && *primary_bind != '\0';
     if (!primary_explicit) primary_bind = getenv("SPECUS_PEER_MESH_BIND_ADDRESS");

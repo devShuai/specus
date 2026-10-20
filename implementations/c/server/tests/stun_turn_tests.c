@@ -6,6 +6,7 @@
 #include "turn_auth.h"
 
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sqlite3.h>
 #include <stdint.h>
@@ -1151,6 +1152,129 @@ static int test_turn_wire_details(void)
     if (second >= 0) close(second);
     if (peer >= 0) close(peer);
     if (other >= 0) close(other);
+    if (fixture.server != NULL) st_stun_turn_server_stop(fixture.server);
+    return failed ? -1 : 0;
+}
+
+/* XOR-RELAYED-ADDRESS (or another XOR address attribute) of an answer, as text. */
+static int xor_address_text(const unsigned char *packet, int len, unsigned type, char *out, size_t out_len)
+{
+    size_t value_len = 0U;
+    const unsigned char *value = len >= 20 ? find_attr(packet, (size_t)len, type, &value_len) : NULL;
+    if (value == NULL || value_len != 8U) return -1;
+    struct in_addr address;
+    address.s_addr = htonl(r32(value + 4U) ^ COOKIE);
+    return inet_ntop(AF_INET, &address, out, (socklen_t)out_len) != NULL ? 0 : -1;
+}
+
+/* Java InetAddress.getLocalHost: this host's name resolved, IPv4 here; loopback when it fails. */
+static void local_host_address(char *out, size_t out_len)
+{
+    char name[256];
+    struct addrinfo hints;
+    struct addrinfo *found = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    snprintf(out, out_len, "127.0.0.1");
+    if (gethostname(name, sizeof(name)) != 0 || getaddrinfo(name, NULL, &hints, &found) != 0 || found == NULL) return;
+    (void)inet_ntop(AF_INET, &((struct sockaddr_in *)found->ai_addr)->sin_addr, out, (socklen_t)out_len);
+    freeaddrinfo(found);
+}
+
+/*
+ * Without a public address the relayed address and the listener's advertised address follow Java
+ * resolvePrimaryAdvertisedAddress: the bind address unless it is the wildcard, then this host's
+ * address. C advertised 127.0.0.1 for the relay whatever it was bound to, and for a wildcard
+ * listener, which no remote client can reach.
+ */
+static int test_advertised_address_fallback(void)
+{
+    turn_fixture fixture;
+    turn_credential credential;
+    if (turn_fixture_start(&fixture, 1, "55250", "55299", NULL) != 0
+        || issue_credential("public-transfer-advertised", &credential) != 0) return -1;
+    char host[INET_ADDRSTRLEN];
+    local_host_address(host, sizeof(host));
+    static const char *const binds[] = {"127.0.0.2", "0.0.0.0"};
+    int failed = 0;
+    for (size_t round = 0; round < 2U && !failed; ++round) {
+        const char *expected = round == 0U ? binds[0] : host;
+        unsetenv("SPECUS_PEER_MESH_RELAY_ADDRESS");
+        setenv("SPECUS_PEER_MESH_BIND_ADDRESS", binds[round], 1);
+        failed = turn_fixture_restart(&fixture) != 0;
+        if (round == 0U) inet_pton(AF_INET, "127.0.0.2", &fixture.address.sin_addr);
+        struct sockaddr_in client_address;
+        int client = failed ? -1 : udp_socket(&client_address);
+        unsigned char response[2048];
+        char relayed[INET_ADDRSTRLEN] = "", origin[INET_ADDRSTRLEN] = "";
+        int received = client < 0 ? -1 : allocate_answer(client, &fixture, &credential, 1900U + (unsigned)round,
+                                                         response, sizeof(response));
+        if (!failed && (xor_address_text(response, received, 0x0016U, relayed, sizeof(relayed)) != 0
+                        || strcmp(relayed, expected) != 0)) {
+            fprintf(stderr, "bound to %s, the relayed address is %s, want %s\n", binds[round], relayed, expected);
+            failed = 1;
+        }
+        packet_builder request;
+        start(&request, 0x0001U, 1910U + (unsigned)round);
+        received = failed ? -1 : exchange(client, &fixture.address, &request, response, sizeof(response));
+        if (!failed && (xor_address_text(response, received, 0x802bU, origin, sizeof(origin)) != 0
+                        || strcmp(origin, expected) != 0)) {
+            fprintf(stderr, "bound to %s, RESPONSE-ORIGIN is %s, want %s\n", binds[round], origin, expected);
+            failed = 1;
+        }
+        if (client >= 0) close(client);
+        fixture.address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    }
+    setenv("SPECUS_PEER_MESH_BIND_ADDRESS", "127.0.0.1", 1);
+    setenv("SPECUS_PEER_MESH_RELAY_ADDRESS", "127.0.0.1", 1);
+    if (fixture.server != NULL) st_stun_turn_server_stop(fixture.server);
+    return failed ? -1 : 0;
+}
+
+/*
+ * The relay settings read as Java's int properties: a general relay total <= 0 switches the
+ * general relay off, a per-address limit <= 0 lifts it, and a reversed or out-of-range relay port
+ * range is clamped and put in order. C took negative values for the defaults (256 and 4) and did
+ * not start the STUN/TURN server at all for a reversed range.
+ */
+static int test_relay_settings_parsing(void)
+{
+    turn_fixture fixture;
+    turn_credential credential;
+    if (turn_fixture_start(&fixture, 1, "55250", "55299", NULL) != 0
+        || issue_credential("public-transfer-settings", &credential) != 0) return -1;
+    unsigned char response[2048];
+    struct sockaddr_in client_address, relay;
+    int clients[6] = {-1, -1, -1, -1, -1, -1};
+    setenv("SPECUS_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS", "-1", 1);
+    int failed = turn_fixture_restart(&fixture) != 0 || (clients[0] = udp_socket(&client_address)) < 0;
+    int received = failed ? -1 : allocate_answer(clients[0], &fixture, &credential, 2000U, response, sizeof(response));
+    failed = failed || expect_reason(response, received, 0x0113U, 486, "general-relay-disabled",
+                                     "general relay total -1") != 0;
+    close(clients[0]);
+    clients[0] = -1;
+    setenv("SPECUS_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS", "16", 1);
+    setenv("SPECUS_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS_PER_ADDRESS", "-1", 1);
+    failed = failed || turn_fixture_restart(&fixture) != 0;
+    for (int i = 0; !failed && i < 6; ++i) {
+        failed = (clients[i] = udp_socket(&client_address)) < 0
+            || allocate(clients[i], &fixture, &credential, 2010U + (unsigned)i, &relay) != 0;
+        if (failed) fprintf(stderr, "general relay allocation %d from one address with no per-address limit\n", i + 1);
+    }
+    for (int i = 0; i < 6; ++i) {
+        if (clients[i] >= 0) close(clients[i]);
+        clients[i] = -1;
+    }
+    setenv("SPECUS_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS_PER_ADDRESS", "16", 1);
+    setenv("SPECUS_PEER_MESH_TURN_RELAY_MIN_PORT", "55299", 1);
+    setenv("SPECUS_PEER_MESH_TURN_RELAY_MAX_PORT", "55250", 1);
+    failed = failed || turn_fixture_restart(&fixture) != 0 || (clients[0] = udp_socket(&client_address)) < 0
+        || allocate(clients[0], &fixture, &credential, 2020U, &relay) != 0;
+    if (!failed && (ntohs(relay.sin_port) < 55250U || ntohs(relay.sin_port) > 55299U)) {
+        fprintf(stderr, "relay port %u outside the reversed range 55299-55250\n", ntohs(relay.sin_port));
+        failed = 1;
+    }
+    if (clients[0] >= 0) close(clients[0]);
     if (fixture.server != NULL) st_stun_turn_server_stop(fixture.server);
     return failed ? -1 : 0;
 }
@@ -2587,6 +2711,8 @@ int main(void)
         || test_stale_nonce() != 0
         || test_allocation_audit_log() != 0
         || test_turn_wire_details() != 0
+        || test_advertised_address_fallback() != 0
+        || test_relay_settings_parsing() != 0
         || test_default_private_peer_refusal() != 0
         || test_private_peers_allowed_by_switch() != 0
         || test_expiry() != 0
