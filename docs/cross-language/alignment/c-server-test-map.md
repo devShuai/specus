@@ -80,7 +80,7 @@ Peer 信令断言接受公开格式的 0/3/6/9 位小数，并用正反例继续
 
 以 JDK 21 的 `JavacTask.parse` 解析上述提交的全部 `src/test/java` 源文件（不解析依赖、不执行测试）：main 有 136 个 Java 源文件，其中 128 个类包含 591 个测试注解方法（565 个 `@Test`、14 个 `@ParameterizedTest`、12 个 `@TestFactory`）。另外 8 个源文件是无上述测试注解的辅助源码。注册分支同样为 128 类，仅 `RegistrationServiceTests` 由 2 个增加到 8 个，总注解方法为 597 个。这里是静态方法声明数，**不是运行次数、参数化/动态用例数、通过数或 C 覆盖数**。
 
-旧表的79类仍保留历史证据；本轮未重新核验它们当前增加或变更后的全部断言，因此不能把历史“覆盖73类”直接当作当前类的完整覆盖。当前main另有下列50类不在旧表中（49类加2026-10-20新增的 `ClientDownloadLinkValidationVectorTests`）：前批说明4类框架/平台差异；连通性4类20方法、控制写入/会话/离线通知/指标4类8方法、HTTP流重置1类2方法、路由生命周期/失败关闭/NAT推送3类5方法、显式空快照/NAT大小与管理变更3类5方法先后补证；本节新增SQLite二进制列/真实约束2类8方法的候选对照，并逐方法说明Spring/JDBC异常转换1类4方法的平台差异，见相应新节。2026-10-20 余下24类逐方法核验完毕（#317 临时分享3类、#318 服务工作台5类、#319 产品指标/媒体采集/管理账号/注册8类、#320 数据库8类，另 #316 新增1类），核验中补测并修正了若干 C 行为（工作台身份索引、注册 `expiresAt` 精度、映射端口与 Peer 设备 IP 的唯一键）。当前50=9类平台差异+38类候选覆盖（132个注解方法）+2类按方法拆分（`PostgresSchemaMigrationTests` 5方法覆盖、5方法平台差异；`SqliteSchemaUpdateRestartTests` 1方法覆盖、1方法平台差异；均无未对应方法）+1类部分（`SortableTimestampOrderingTests` 7个注解方法，不能计为全部通过）+0类待核验；这仍不包括部分排序类的连接限流缺口及旧79类的当前断言复核。候选类内仍有明确列出的框架API差异，132不是132个独立C运行场景。表中增量是待合并C分支的候选对照状态，不是main完成率；最终提交CI须另行核验。待核验不等于C没有相应能力，同名功能也不等于覆盖已成立。
+旧表的79类已于2026-10-20按当前 main 的 Java 源码逐方法复核（见下方“79 个 Java 测试类”一段），不再沿用2026-10-08的历史计数。当前main另有下列50类不在旧表中（49类加2026-10-20新增的 `ClientDownloadLinkValidationVectorTests`）：前批说明4类框架/平台差异；连通性4类20方法、控制写入/会话/离线通知/指标4类8方法、HTTP流重置1类2方法、路由生命周期/失败关闭/NAT推送3类5方法、显式空快照/NAT大小与管理变更3类5方法先后补证；本节新增SQLite二进制列/真实约束2类8方法的候选对照，并逐方法说明Spring/JDBC异常转换1类4方法的平台差异，见相应新节。2026-10-20 余下24类逐方法核验完毕（#317 临时分享3类、#318 服务工作台5类、#319 产品指标/媒体采集/管理账号/注册8类、#320 数据库8类，另 #316 新增1类），核验中补测并修正了若干 C 行为（工作台身份索引、注册 `expiresAt` 精度、映射端口与 Peer 设备 IP 的唯一键）。当前50=9类平台差异+38类候选覆盖（132个注解方法）+2类按方法拆分（`PostgresSchemaMigrationTests` 5方法覆盖、5方法平台差异；`SqliteSchemaUpdateRestartTests` 1方法覆盖、1方法平台差异；均无未对应方法）+1类部分（`SortableTimestampOrderingTests` 7个注解方法，不能计为全部通过）+0类待核验；这仍不包括部分排序类的连接限流缺口及旧79类的当前断言复核。候选类内仍有明确列出的框架API差异，132不是132个独立C运行场景。表中增量是待合并C分支的候选对照状态，不是main完成率；最终提交CI须另行核验。待核验不等于C没有相应能力，同名功能也不等于覆盖已成立。
 
 新增“无（平台差异）”只限定到说明的框架断言。不得将其扩展为存储完整性、唯一约束、并发/回滚或 HTTP 契约的豁免；尤其不能把所有 SQLite/MySQL/MariaDB 测试一律排除。关闭 #35 前仍须为当前全部参考断言补齐 C 证据或逐项的书面差异说明，并完成该 issue 的其他运行时及真实环境验收。
 
@@ -424,7 +424,7 @@ Rate批次结束时，四类连通性中Vector、Resource、Rate三类为候选�
 
 ## 历史基线汇总（非当前全部测试覆盖）
 
-79 个 Java 测试类中，**覆盖 73 个，部分 0 个，无 6 个**（2026-10-08 按逐行状态重算：`fix/c-server-parity-peer` 与 `fix/c-server-parity-transfer` 之后，`fix/c-server-parity-rest` 把 WebSocket 路由、登录 nonce、流量明细两类、连接事件、STUN/TURN 指标与 HTTP 流共 7 个类改为覆盖，`PeerMeshServiceTests` 由两个分支合起来补齐；`feat/tenant-scoped-login-names`（#183）实现了按租户唯一的登录名，把 `ManagementUserServiceTests`、`ManagementUserServiceIntegrationTests`（原为部分）与 `ManagementUserSchemaMigratorTests`（原为无）改为覆盖）。 2026-10-13 #261 补齐两个 Redis 相关类的管理事件缺口；计数仍只含这 79 个基线类，不代表后续全部新增类或 #35 完成。
+79 个 Java 测试类中，**覆盖 75 个，部分 0 个，无（平台差异）4 个**，共 421 个注解方法（2026-10-20 按当前 main 的 Java 源码逐方法复核后重算）。复核分五组读取每个类的全部注解方法，对照 C 测试的具体断言：自 2026-10-08 以来新增方法的类（`ClientAuthNonceServiceTests` 1→2、`ClientAuthServiceEgressLoginTests` 4→8、`HttpRouteAuthenticationServiceTests` 4→6、`PeerEgressServiceTests` 20→23、`PeerMeshServiceTests` 22→23、`PublicTransferCoordinationRedisIT` 2→3、`PublicTransferClusterFrameTests` 4→5）与断言有变的类都已补证。缺口由 #322（单元级检查，基线口令与 JWT 拒绝文案改为 Java 原文）、#323（Peer Mesh/出口/服务发现，登录回放按每个发布会话补发空目录）、#324（客户端下载 `catalog_key`/`latest_slot` 唯一键与迁移、附件保留期与大小上限的默认值）、#325（HTTP route 与客户端找不到回 400 带 id、route 认证文案、受保护 route 哈希损坏回 503、出口活动 `rejectedFlows` 解码）补齐，并各自修正了复核中发现的 C 行为差异。原记为“无”的 `GlobalExceptionHandlerTests` 与 `ClientDownloadSchemaMigratorTests` 现为覆盖；余下 4 类为平台差异：Spring 上下文启动（`SpecusServerApplicationTests`）、按数据库方言选择 SQL（`ClientAuthNonceRepositoryCustomImplTests`）、真实数据库上的 JPA 查询（`JpaHttpTrafficExchangeStoreIntegrationTests`，其可观察部分由 SQLite 摘要查询的断言覆盖）、Java 写入的库中演示凭据的清理（`LegacyDemoCredentialSanitizerIntegrationTests`，C 从不打开 Java 建的库）。各行的“说明”列逐方法写明 C 证据与仍保留的限定差异；“覆盖”不表示各方法没有任何限定差异。历史记录：2026-10-08 计为覆盖 73、部分 0、无 6；2026-10-13 #261 补齐两个 Redis 相关类的管理事件缺口。这一计数只含原基线 79 类，旧表外的 50 类见上方范围盘点；二者都不代表 #35 的背压/HA 与真实跨 NAT 验收完成。
 
 原审计点名的类在历史记录中的状态如下（不是本轮对当前全部断言的复核结论）：
 
@@ -441,7 +441,7 @@ Rate批次结束时，四类连通性中Vector、Resource、Rate三类为候选�
 | `StunTurnServerMetricsTests` | 覆盖 | 目的地址策略的全部用例（含 IPv6、IPv4-mapped 与 CGNAT 的两半）由 `stun_turn_tests` 对 CreatePermission 与 ChannelBind 验证；relay 工作队列的丢弃数与高水位是平台差异：C 在一个 select 线程里同步转发，没有可丢弃的工作队列，也没有指标注册表 |
 | `ConnectionEventsWebSocketHandlerTests` | 覆盖 | #132 的本地 socket 证据加 #261 的真实 Redis 双 C、C↔Java 原生事件扇出、过滤与故障本地回退，详见第 6 节；“多实例只看本机事件”已不是现状，但这不构成数据库 HA 或 Pub/Sub 漏收保证 |
 
-历史标为“无”的6类：`SpecusServerApplicationTests`、`GlobalExceptionHandlerTests`、`ClientDownloadSchemaMigratorTests`、`LegacyDemoCredentialSanitizerIntegrationTests`、`ClientAuthNonceRepositoryCustomImplTests`、`JpaHttpTrafficExchangeStoreIntegrationTests`。各行分别限定框架差异及仍欠缺的行为证据，不是六类全部断言的平台豁免；例如ClientDownloadSchemaMigratorTests的唯一约束、去重迁移与补列路径仍须补证。
+历史标为“无”的6类中，`GlobalExceptionHandlerTests` 与 `ClientDownloadSchemaMigratorTests` 已于 2026-10-20 补证为覆盖（后者对应 #324 补上的唯一键与去重迁移）；`SpecusServerApplicationTests`、`LegacyDemoCredentialSanitizerIntegrationTests`、`ClientAuthNonceRepositoryCustomImplTests`、`JpaHttpTrafficExchangeStoreIntegrationTests` 为平台差异，各行写明限定范围，不是这些类全部断言的豁免。
 
 ## 1. 启动、认证与安全规则
 
