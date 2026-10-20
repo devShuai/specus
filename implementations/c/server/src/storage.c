@@ -811,6 +811,136 @@ static int seed_demo_client_on_db(sqlite3 *db, const char *tenant_id, const char
     return result;
 }
 
+/* First column of the first row of sql as an integer; -1 when it cannot be read. */
+static long long schema_count(sqlite3 *db, const char *sql)
+{
+    sqlite3_stmt *stmt = NULL;
+    long long value = -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
+        value = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return value;
+}
+
+/*
+ * A table-level unique key of the Java mapping that the C schema did not always enforce, so a
+ * database written before the index existed can hold rows it would reject. `reported` keeps the
+ * warning about such rows to one per process: st_storage_init runs before many requests.
+ */
+typedef struct {
+    const char *name;
+    const char *table;
+    const char *columns;        /* as the index lists them: "tenant_id, virtual_ip" */
+    const char *quoted_columns; /* the same names as SQL literals: "'tenant_id','virtual_ip'" */
+    const char *not_null;       /* every key column IS NOT NULL */
+    size_t column_count;
+    atomic_int *reported;
+} reported_unique_key;
+
+static atomic_int peer_mesh_device_ip_reported;
+static atomic_int specus_mapping_listen_port_reported;
+
+static const reported_unique_key REPORTED_UNIQUE_KEYS[] = {
+    {"uk_peer_mesh_device_ip", "peer_mesh_device", "tenant_id, virtual_ip", "'tenant_id','virtual_ip'",
+     "tenant_id IS NOT NULL AND virtual_ip IS NOT NULL", 2U, &peer_mesh_device_ip_reported},
+    {"uk_specus_mapping_listen_port", "specus_mapping", "listen_port", "'listen_port'",
+     "listen_port IS NOT NULL", 1U, &specus_mapping_listen_port_reported},
+};
+
+/*
+ * Java SqliteUniqueIndexMigrator for a key whose conflicting rows only an operator can resolve
+ * (Duplicates.REPORT): nothing happens when a full unique index on exactly these columns exists
+ * under any name; otherwise the index is created, unless rows already share a key (NULLs never
+ * collide) or an index of that name is on something else. Then nothing is changed, a warning names
+ * the rows and the query that lists them, and every later st_storage_init tries again, so the
+ * index appears once they are resolved. Returns 0 whether the index is in place or left out, and
+ * -1 only when the schema cannot be read.
+ */
+static int ensure_reported_unique_index(sqlite3 *db, const reported_unique_key *key, int announce)
+{
+    char sql[768];
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM pragma_table_info('%s')", key->table);
+    long long columns = schema_count(db, sql);
+    if (columns <= 0) {
+        return columns < 0 ? -1 : 0;
+    }
+    /* A partial index enforces nothing outside its WHERE clause; an expression column has no name. */
+    snprintf(sql, sizeof(sql),
+             "SELECT il.name, il.\"unique\" AND NOT il.partial, "
+             "(SELECT COUNT(*) FROM pragma_index_info(il.name)), "
+             "(SELECT COUNT(*) FROM pragma_index_info(il.name) WHERE lower(name) IN (%s)) "
+             "FROM pragma_index_list('%s') il",
+             key->quoted_columns, key->table);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    int enforced = 0;
+    int name_taken = 0;
+    int step;
+    while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(stmt, 0);
+        long long total = sqlite3_column_int64(stmt, 2);
+        if (sqlite3_column_int(stmt, 1) != 0 && total == (long long)key->column_count
+            && sqlite3_column_int64(stmt, 3) == total) {
+            enforced = 1;
+        } else if (name != NULL && sqlite3_stricmp(name, key->name) == 0) {
+            name_taken = 1;
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (step != SQLITE_DONE) {
+        return -1;
+    }
+    if (enforced) {
+        return 0;
+    }
+    if (name_taken) {
+        if (atomic_exchange(key->reported, 1) == 0) {
+            fprintf(stderr, "[schema] unique index %s not created: an index of that name on %s is not unique "
+                            "on (%s)\n", key->name, key->table, key->columns);
+        }
+        return 0;
+    }
+    snprintf(sql, sizeof(sql),
+             "SELECT COUNT(*), COALESCE(SUM(n), 0), group_concat(ids, ', ') FROM ("
+             "SELECT COUNT(*) AS n, group_concat(rowid, ', ') AS ids FROM %s WHERE %s "
+             "GROUP BY %s HAVING COUNT(*) > 1)",
+             key->table, key->not_null, key->columns);
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK || sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    long long groups = sqlite3_column_int64(stmt, 0);
+    if (groups > 0) {
+        if (atomic_exchange(key->reported, 1) == 0) {
+            const char *ids = (const char *)sqlite3_column_text(stmt, 2);
+            fprintf(stderr, "[schema] unique index %s not created: %s holds %lld group(s) of rows sharing (%s), "
+                            "%lld row(s) in all, rowid [%.160s%s]. Nothing was changed; resolve them and restart. "
+                            "List them with: select %s, count(*) from %s group by %s having count(*) > 1\n",
+                    key->name, key->table, groups, key->columns, sqlite3_column_int64(stmt, 1),
+                    ids == NULL ? "" : ids, ids != NULL && strlen(ids) > 160U ? " ..." : "",
+                    key->columns, key->table, key->columns);
+        }
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+    sqlite3_finalize(stmt);
+    snprintf(sql, sizeof(sql), "CREATE UNIQUE INDEX IF NOT EXISTS %s ON %s(%s)", key->name, key->table, key->columns);
+    if (exec_sql(db, sql) != 0) {
+        /* The rows are as they were; the server runs on as before the index existed and retries later. */
+        fprintf(stderr, "[schema] unique index %s on %s (%s) not created\n", key->name, key->table, key->columns);
+        return 0;
+    }
+    atomic_store(key->reported, 0);
+    if (announce) {
+        fprintf(stderr, "[schema] created SQLite unique index %s on %s (%s)\n", key->name, key->table, key->columns);
+    }
+    return 0;
+}
+
 int st_storage_init(const char *path, int seed_demo_client)
 {
     sqlite3 *db = NULL;
@@ -1590,6 +1720,14 @@ int st_storage_init(const char *path, int seed_demo_client)
             "CREATE INDEX IF NOT EXISTS idx_peer_mesh_session_source ON peer_mesh_session(tenant_id, source_client_id);"
             "CREATE INDEX IF NOT EXISTS idx_peer_mesh_session_target ON peer_mesh_session(tenant_id, target_client_id);"
             "CREATE INDEX IF NOT EXISTS idx_peer_mesh_session_status ON peer_mesh_session(status);");
+    }
+    /*
+     * Java uk_peer_mesh_device_ip and uk_specus_mapping_listen_port: one device per virtual
+     * address in a tenant, one mapping per public port across clients. Older C databases ran
+     * without them and may hold rows that share a key; those are reported and left as they are.
+     */
+    for (size_t i = 0U; rc == 0 && i < sizeof(REPORTED_UNIQUE_KEYS) / sizeof(REPORTED_UNIQUE_KEYS[0]); ++i) {
+        rc = ensure_reported_unique_index(db, &REPORTED_UNIQUE_KEYS[i], !fresh);
     }
     if (rc == 0) {
         /*
@@ -5648,14 +5786,15 @@ int st_storage_update_mapping_by_id(const char *path,
         sqlite3_bind_int(stmt, 4, enabled ? 1 : 0);
         sqlite3_bind_int(stmt, 5, detail_capture_enabled ? 1 : 0);
         sqlite3_bind_int64(stmt, 6, id);
-        rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
+        int step = sqlite3_step(stmt);
+        rc = step == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : ((step & 0xff) == SQLITE_CONSTRAINT ? -2 : -1);
     } else {
         rc = -1;
     }
     sqlite3_finalize(stmt);
     sqlite3_close(db);
     if (rc != 0) {
-        return -1;
+        return rc;
     }
     return out_mapping == NULL ? 0 : load_mapping_by_id(path, id, out_mapping);
 }
@@ -7453,12 +7592,21 @@ int st_storage_ensure_peer_mesh_device(const char *path,
     }
     const char *cidr = getenv("SPECUS_PEER_MESH_CIDR");
     if (cidr == NULL || *cidr == '\0') cidr = "100.96.0.0/11";
+    /*
+     * The free address is looked up and taken in one write transaction, so two enrolments of the
+     * tenant cannot both pick it; uk_peer_mesh_device_ip refuses a second holder as well.
+     */
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
+        sqlite3_close(db);
+        return -1;
+    }
     char virtual_ip[64];
     st_storage_peer_mesh_device existing;
     if (read_peer_mesh_device(db, client->tenant_id, client->id, &existing) == 0
         && existing.virtual_ip[0] != '\0') {
         snprintf(virtual_ip, sizeof(virtual_ip), "%s", existing.virtual_ip);
     } else if (peer_mesh_allocate_virtual_ip(db, client, cidr, virtual_ip) != 0) {
+        (void)exec_sql(db, "ROLLBACK");
         sqlite3_close(db);
         return -1;
     }
@@ -7498,6 +7646,12 @@ int st_storage_ensure_peer_mesh_device(const char *path,
             out_device->message_media_preview_capable = client->message_media_preview_capable;
             out_device->message_max_attachment_bytes = client->message_max_attachment_bytes;
         }
+    }
+    if (rc == 0) {
+        rc = exec_sql(db, "COMMIT");
+    }
+    if (rc != 0) {
+        (void)exec_sql(db, "ROLLBACK");
     }
     sqlite3_close(db);
     return rc == 0 ? 0 : -1;

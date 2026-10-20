@@ -1205,8 +1205,32 @@ static int test_peer_import_targets(void)
 
 /* ---- database/initialize ------------------------------------------------------------------ */
 
+/* Every table, index and trigger of the database with its SQL, as one string the caller frees. */
+static char *schema_snapshot(void)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    char *snapshot = NULL;
+    if (sqlite3_open(db_path, &db) == SQLITE_OK
+        && sqlite3_prepare_v2(db,
+               "SELECT group_concat(type || ' ' || name || ' ' || tbl_name || ' ' || COALESCE(sql, ''), char(10)) "
+               "FROM (SELECT * FROM sqlite_master ORDER BY type, name)",
+               -1, &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_text(stmt, 0) != NULL) {
+        snapshot = strdup((const char *)sqlite3_column_text(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return snapshot;
+}
+
 static int test_database_initialize(void)
 {
+    /*
+     * Java PostgresSchemaMigrationTests.serverStartsRestartsAndReinitializesOnPostgres: initialize
+     * on a database the server already set up leaves every table, index and constraint as it was.
+     */
+    char *schema_before = schema_snapshot();
     /* Seeding off: nothing is created, the answer counts the tenant's clients. */
     setenv("SPECUS_DB_SEED_DEMO_CLIENT", "false", 1);
     int failed = expect("POST", "/api/admin/database/initialize", NULL, user_token, 403,
@@ -1223,6 +1247,13 @@ static int test_database_initialize(void)
         || strcmp(demo.tenant_id, "default") != 0 || strcmp(demo.owner_username, BUILT_IN) != 0
         || expect("POST", "/api/admin/database/initialize", NULL, admin_token, 400,
                   "\"error\":\"客户端名称已存在或数据不符合约束\"") != 0;
+    char *schema_after = schema_snapshot();
+    if (schema_before == NULL || schema_after == NULL || strcmp(schema_before, schema_after) != 0) {
+        fprintf(stderr, "database/initialize changed sqlite_master\n");
+        failed = 1;
+    }
+    free(schema_before);
+    free(schema_after);
     /* Without one anywhere, the caller's tenant gets it. */
     failed = failed || st_storage_delete_client(db_path, demo.id) != 0;
     setenv("SPECUS_AUTH_TENANT_ID", OTHER_TENANT, 1);
