@@ -466,7 +466,10 @@ static int test_package_download_contract(void)
     snprintf(path, sizeof(path), "/api/admin/client-downloads/%lld", id);
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
         char body[256];
-        snprintf(body, sizeof(body), "{\"displayName\":\"%s\"}", names[i].display_name);
+        /* Java's update binds the whole mutation: the coordinates and name again, the URL kept for a hosted row. */
+        snprintf(body, sizeof(body),
+                 "{\"implementation\":\"android\",\"platform\":\"android\",\"arch\":\"any\",\"displayName\":\"%s\"}",
+                 names[i].display_name);
         CHECK(admin_call("PUT", path, body) == 200, "rename: %s", response);
         CHECK(download("GET", id, NULL, &reply) == 0 && reply.status == 200
                   && strcmp(header_value(&reply, "Content-Disposition", value, sizeof(value)),
@@ -474,9 +477,11 @@ static int test_package_download_contract(void)
               "Content-Disposition for %s: %s", names[i].display_name, value);
     }
 
-    CHECK(admin_call("PUT", path, "{\"enabled\":false}") == 200, "disable: %s", response);
+    CHECK(admin_call("PUT", path, "{\"implementation\":\"android\",\"platform\":\"android\",\"arch\":\"any\","
+                     "\"displayName\":\"Specus\",\"enabled\":false}") == 200, "disable: %s", response);
     CHECK(download("GET", id, NULL, &reply) == 0 && reply.status == 404, "disabled package status %d", reply.status);
-    CHECK(admin_call("PUT", path, "{\"enabled\":true}") == 200, "enable: %s", response);
+    CHECK(admin_call("PUT", path, "{\"implementation\":\"android\",\"platform\":\"android\",\"arch\":\"any\","
+                     "\"displayName\":\"Specus\",\"enabled\":true}") == 200, "enable: %s", response);
 
     /* Bytes that no longer match the catalogue: Java's IllegalStateException, 409. */
     char file_path[512];
@@ -975,7 +980,8 @@ static int test_catalogue_mutations(void)
         {"https://github.com/devShuai/specus/releases/download/v1.2.3/client.zip", NULL, "sha256"},
         {"https://github.com/devShuai/specus/releases/download/v1.2.3/client.zip?raw=1", SHA_A, "HTTPS"},
         {"https://github.com/devShuai/specus/releases/download/v1.2.3/client.zip#part", SHA_A, "HTTPS"},
-        {"https://user@github.com/devShuai/specus/releases/download/v1.2.3/client.zip", SHA_A, "HTTPS"},
+        /* requireDownloadUrl refuses the user information before the latest checks run. */
+        {"https://user@github.com/devShuai/specus/releases/download/v1.2.3/client.zip", SHA_A, "user information"},
         {"http://github.com/devShuai/specus/releases/download/v1.2.3/client.zip", SHA_A, "HTTPS"},
     };
     for (size_t i = 0; i < sizeof(unsafe) / sizeof(unsafe[0]); ++i) {
@@ -1030,6 +1036,132 @@ static int test_catalogue_mutations(void)
 
 /* ------------------------------------------------------------------------------------------- */
 
+/* ------------------------------------------------------------------------------------------- */
+/* Shared vector: client-download-link-validation-v1.json                                        */
+
+/* Expected and actual agree, NULL standing for JSON null. */
+static int same_text(const char *expected, const char *actual)
+{
+    return expected == NULL ? actual == NULL : actual != NULL && strcmp(expected, actual) == 0;
+}
+
+/*
+ * The answer in response to a case: its "error" text, an "errorPrefix" the error starts with, or the
+ * "stored" members of the link view.
+ */
+static int answer_matches(const char *item, int status, int success_status, char *why, size_t why_len)
+{
+    char *error = st_json_get_top_level_string(item, "error");
+    char *prefix = st_json_get_top_level_string(item, "errorPrefix");
+    char *actual_error = st_json_get_top_level_string(response_body(), "error");
+    int ok = 1;
+    if (error != NULL || prefix != NULL) {
+        ok = status == 400 && actual_error != NULL
+            && (error != NULL ? strcmp(error, actual_error) == 0 : strncmp(actual_error, prefix, strlen(prefix)) == 0);
+        if (!ok) snprintf(why, why_len, "expected 400 %s, got %d %.300s", error != NULL ? error : prefix, status,
+                          response_body());
+    } else {
+        static const char *const texts[] = {"implementation", "platform", "arch", "displayName", "downloadUrl",
+                                            "description", "version", "sha256", "changelogUrl", "minSupportedVersion"};
+        static const char *const scalars[] = {"displayOrder", "enabled", "fileSize", "isLatest"};
+        char *stored = st_json_get_top_level_raw(item, "stored");
+        ok = stored != NULL && status == success_status;
+        if (!ok) snprintf(why, why_len, "expected %d, got %d %.300s", success_status, status, response_body());
+        for (size_t i = 0; ok && i < sizeof(texts) / sizeof(texts[0]); ++i) {
+            char *expected = st_json_get_top_level_string(stored, texts[i]);
+            char *actual = st_json_get_top_level_string(response_body(), texts[i]);
+            ok = same_text(expected, actual);
+            if (!ok) snprintf(why, why_len, "%s expected %.200s, got %.200s", texts[i],
+                              expected == NULL ? "null" : expected, actual == NULL ? "null" : actual);
+            free(expected);
+            free(actual);
+        }
+        for (size_t i = 0; ok && i < sizeof(scalars) / sizeof(scalars[0]); ++i) {
+            char *expected = st_json_get_top_level_raw(stored, scalars[i]);
+            char *actual = st_json_get_top_level_raw(response_body(), scalars[i]);
+            ok = same_text(expected, actual);
+            if (!ok) snprintf(why, why_len, "%s expected %s, got %s", scalars[i], expected == NULL ? "null" : expected,
+                              actual == NULL ? "null" : actual);
+            free(expected);
+            free(actual);
+        }
+        free(stored);
+    }
+    free(error);
+    free(prefix);
+    free(actual_error);
+    return ok;
+}
+
+/*
+ * Every create and update case of the shared vector, which Java's
+ * ClientDownloadLinkValidationVectorTests proves is what ClientDownloadLinkService answers: the
+ * check order and messages, the normalized values, the members an update keeps or clears and the
+ * checks a hosted package skips. An update case first creates the vector's seed row, and marks it
+ * hosted when the case says so.
+ */
+static int test_download_link_vector(void)
+{
+    CHECK(fresh_database("vector") == 0, "database setup failed");
+    use_release_fallback(NULL);
+    FILE *file = fopen(ST_DOWNLOAD_LINK_VECTOR_FILE, "rb");
+    CHECK(file != NULL, "cannot open %s", ST_DOWNLOAD_LINK_VECTOR_FILE);
+    static char vector[1U << 20];
+    size_t bytes = fread(vector, 1U, sizeof(vector) - 1U, file);
+    int read_failed = ferror(file) || bytes == sizeof(vector) - 1U;
+    fclose(file);
+    CHECK(!read_failed, "cannot read %s", ST_DOWNLOAD_LINK_VECTOR_FILE);
+    vector[bytes] = '\0';
+    char *seed = st_json_get_top_level_raw(vector, "seed");
+    char **creates = NULL;
+    char **updates = NULL;
+    size_t create_count = 0U;
+    size_t update_count = 0U;
+    CHECK(seed != NULL && st_json_get_raw_array(vector, "createCases", &creates, &create_count) == 0
+              && st_json_get_raw_array(vector, "updateCases", &updates, &update_count) == 0 && create_count > 0U
+              && update_count > 0U,
+          "the vector has no cases");
+    int failures = 0;
+    char why[600];
+    for (size_t i = 0; i < create_count; ++i) {
+        char *name = st_json_get_top_level_string(creates[i], "name");
+        char *body = st_json_get_top_level_raw(creates[i], "body");
+        int status = body == NULL ? -1 : admin_call("POST", "/api/admin/client-downloads", body);
+        if (!answer_matches(creates[i], status, 201, why, sizeof(why))) {
+            fprintf(stderr, "FAIL create %s: %s\n", name == NULL ? "?" : name, why);
+            ++failures;
+        }
+        free(name);
+        free(body);
+    }
+    for (size_t i = 0; i < update_count; ++i) {
+        char *name = st_json_get_top_level_string(updates[i], "name");
+        char *body = st_json_get_top_level_raw(updates[i], "body");
+        int hosted = 0;
+        long long id = create_link(seed);
+        char statement[160];
+        snprintf(statement, sizeof(statement), "UPDATE client_download_link SET hosted = 1 WHERE id = %lld", id);
+        char path[96];
+        snprintf(path, sizeof(path), "/api/admin/client-downloads/%lld", id);
+        int status = id <= 0 || body == NULL || st_json_get_bool(updates[i], "seedHosted", &hosted) != 0
+                || (hosted && sql_exec(statement) != 0)
+            ? -1
+            : admin_call("PUT", path, body);
+        if (!answer_matches(updates[i], status, 200, why, sizeof(why))) {
+            fprintf(stderr, "FAIL update %s: %s\n", name == NULL ? "?" : name, why);
+            ++failures;
+        }
+        free(name);
+        free(body);
+    }
+    st_json_free_string_array(creates, create_count);
+    st_json_free_string_array(updates, update_count);
+    free(seed);
+    CHECK(failures == 0, "%d of %zu client download link vector cases failed", failures, create_count + update_count);
+    printf("ok   client download link vector: %zu create and %zu update cases\n", create_count, update_count);
+    return 0;
+}
+
 int main(void)
 {
     /* The in-process admin server can still be writing to a socket the test has closed. */
@@ -1065,11 +1197,12 @@ int main(void)
         || test_public_list_legacy_targets()
         || test_version_check_rules()
         || test_public_list_release_fallback()
-        || test_catalogue_mutations();
+        || test_catalogue_mutations()
+        || test_download_link_vector();
 
     static const char *const databases[] = {
         "download", "rate", "storage", "lifecycle", "legacy-targets", "version-specificity", "version-unmarked",
-        "version-no-latest", "version-release", "list-release", "list-all-configured", "mutations"
+        "version-no-latest", "version-release", "list-release", "list-all-configured", "mutations", "vector"
     };
     for (size_t i = 0; i < sizeof(databases) / sizeof(databases[0]); ++i) {
         char path[400];

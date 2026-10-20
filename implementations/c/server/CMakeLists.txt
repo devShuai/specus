@@ -28,6 +28,7 @@ add_library(specus_c_core
     src/http_share.c
     src/instant.c
     src/instant_storage.c
+    src/java_uri.c
     src/json.c
     src/login_rate_limiter.c
     src/media_capture.c
@@ -65,6 +66,13 @@ target_link_libraries(specus_c_unicode_java21_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_unicode_java21_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME unicode_java21_tests COMMAND specus_c_unicode_java21_tests
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/java21-root-case-v1.json")
+
+# The java.net.URI port behind the client download link URL checks.
+add_executable(specus_c_java_uri_tests tests/java_uri_tests.c)
+target_link_libraries(specus_c_java_uri_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_java_uri_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME java_uri_tests COMMAND specus_c_java_uri_tests
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/client-download-link-validation-v1.json")
 
 # libbrotlidec is optional: with it, Content-Encoding br is decoded as Java's org.brotli:dec does
 # (traffic detail previews and display, media manifests); without it a br body stays as stored.
@@ -125,6 +133,8 @@ add_test(NAME github_release_tests COMMAND specus_c_github_release_tests)
 add_executable(specus_c_client_package_tests tests/client_package_tests.c)
 target_link_libraries(specus_c_client_package_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_client_package_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_client_package_tests PRIVATE
+    ST_DOWNLOAD_LINK_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/client-download-link-validation-v1.json")
 add_test(NAME client_package_tests COMMAND specus_c_client_package_tests)
 
 add_executable(specus_c_client_address_tests tests/client_address_tests.c)

@@ -11,6 +11,7 @@
 #include "github_release.h"
 #include "http_client.h"
 #include "http_share.h"
+#include "java_uri.h"
 #include "json.h"
 #include "peer_egress.h"
 #include "login_rate_limiter.h"
@@ -10815,16 +10816,16 @@ typedef struct {
     char implementation[33];
     char platform[33];
     char arch[33];
-    char display_name[121];
-    char download_url[1025];
-    char description[513];
+    char display_name[361];
+    char download_url[3073];
+    char description[1537];
     int display_order;
     int enabled;
     char version[81];
     char sha256[65];
     long long file_size;
     int is_latest;
-    char changelog_url[1025];
+    char changelog_url[3073];
     char min_supported_version[81];
 } st_admin_client_download_mutation;
 
@@ -10870,70 +10871,6 @@ static int normalize_client_download_enum(char *value,
     return client_download_enum_allowed(out, allowed, allowed_count) ? 0 : -1;
 }
 
-static int copy_trimmed_required(char *value, char *out, size_t out_len)
-{
-    if (value == NULL || out_len == 0) {
-        return -1;
-    }
-    char *trimmed = admin_trim(value);
-    size_t len = strlen(trimmed);
-    if (len == 0 || len >= out_len) {
-        return -1;
-    }
-    memcpy(out, trimmed, len + 1U);
-    return 0;
-}
-
-static void copy_trimmed_optional_truncated(char *value, char *out, size_t out_len)
-{
-    if (out_len == 0) {
-        return;
-    }
-    out[0] = '\0';
-    if (value == NULL) {
-        return;
-    }
-    char *trimmed = admin_trim(value);
-    size_t len = strlen(trimmed);
-    if (len >= out_len) {
-        len = out_len - 1U;
-    }
-    memcpy(out, trimmed, len);
-    out[len] = '\0';
-}
-
-static int valid_client_download_url(const char *url)
-{
-    const char *authority = NULL;
-    if (admin_ascii_ncasecmp(url, "http://", 7U) == 0) {
-        authority = url + 7U;
-    } else if (admin_ascii_ncasecmp(url, "https://", 8U) == 0) {
-        authority = url + 8U;
-    } else {
-        return 0;
-    }
-    if (*authority == '\0' || *authority == '/') {
-        return 0;
-    }
-    const char *cursor = authority;
-    while (*cursor != '\0' && *cursor != '/') {
-        if (isspace((unsigned char)*cursor)) {
-            return 0;
-        }
-        ++cursor;
-    }
-    return cursor > authority;
-}
-
-static int valid_sha256_text(const char *value)
-{
-    if (value == NULL || strlen(value) != 64U) return 0;
-    for (const unsigned char *cursor = (const unsigned char *)value; *cursor != '\0'; ++cursor) {
-        if (!isxdigit(*cursor)) return 0;
-    }
-    return 1;
-}
-
 /* Java's "[0-9a-f]{64}": the digest form a publishable row must carry. */
 static int canonical_sha256_text(const char *value)
 {
@@ -10944,51 +10881,166 @@ static int canonical_sha256_text(const char *value)
     return 1;
 }
 
+/* A message formatted into a new string; NULL when memory runs out. */
+static char *admin_format_message(const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    va_list copy;
+    va_copy(copy, args);
+    int length = vsnprintf(NULL, 0U, format, copy);
+    va_end(copy);
+    char *message = length < 0 ? NULL : (char *)malloc((size_t)length + 1U);
+    if (message != NULL) {
+        (void)vsnprintf(message, (size_t)length + 1U, format, args);
+    }
+    va_end(args);
+    return message;
+}
+
 /*
- * Java ClientDownloadLinkService.isSafeExternalPackageUrl over java.net.URI: an absolute https URL
- * with a server-based host, no user information, no query and no fragment. Characters URI refuses
- * (whitespace, controls, "<>\^`{|} and the double quote) make it unsafe, and so does a host of
- * anything but letters, digits, '-' and '.' or a port that is not a number: URI reads such an
- * authority as registry-based, and getHost() is then null.
+ * A String member of a client download link body as Jackson binds it (admin_jackson_string), with
+ * *nul set when the decoded text holds a NUL, which C strings cannot carry.
+ */
+static int client_download_member(const char *body, const char *key, char **out, int *nul)
+{
+    *out = NULL;
+    *nul = 0;
+    char *raw = admin_json_member_raw(body, key);
+    if (raw == NULL) {
+        return 0;
+    }
+    if (raw[0] == '{' || raw[0] == '[') {
+        free(raw);
+        return -2;
+    }
+    if (raw[0] != '"') {
+        *out = raw;
+        return 1;
+    }
+    size_t decoded_len = 0U;
+    *out = st_json_decode_string(raw, &decoded_len);
+    free(raw);
+    if (*out == NULL) {
+        return -2;
+    }
+    *nul = strlen(*out) != decoded_len;
+    return 1;
+}
+
+/* Spring StringUtils.hasText: a character Character.isWhitespace does not match. */
+static int client_download_has_text(const char *value)
+{
+    return value != NULL && st_unicode_java21_has_text(value, strlen(value)) > 0;
+}
+
+/* Character.isISOControl over every code point: U+0000-U+001F and U+007F-U+009F. */
+static int client_download_has_control(const char *value)
+{
+    size_t length = strlen(value);
+    for (size_t offset = 0U; offset < length;) {
+        utf8proc_int32_t point = 0;
+        utf8proc_ssize_t width = utf8proc_iterate((const utf8proc_uint8_t *)value + offset,
+                                                  (utf8proc_ssize_t)(length - offset), &point);
+        if (width <= 0) return 1;
+        if (point <= 0x1F || (point >= 0x7F && point <= 0x9F)) return 1;
+        offset += (size_t)width;
+    }
+    return 0;
+}
+
+/* A new string holding text cut after at most units UTF-16 units, as String.substring(0, units). */
+static void client_download_truncate_utf16(char *text, size_t units)
+{
+    size_t count = 0U;
+    for (unsigned char *cursor = (unsigned char *)text; *cursor != '\0'; ++cursor) {
+        if ((*cursor & 0xC0U) == 0x80U) continue;
+        size_t width = *cursor >= 0xF0U ? 2U : 1U;
+        if (count + width > units) {
+            *cursor = '\0';
+            return;
+        }
+        count += width;
+    }
+}
+
+/* Copies text into out (out_len bytes); the validators bound every stored member below its column. */
+static void client_download_copy(char *out, size_t out_len, const char *text)
+{
+    snprintf(out, out_len, "%s", text == NULL ? "" : text);
+}
+
+/*
+ * Java requireHttpUrl(value, fieldName, allowRelative): NULL when value is a URL the catalogue
+ * accepts, its trimmed text copied to out; else the message, which the caller frees. A
+ * root-relative path is accepted only with allow_relative (a hosted package's own download path).
+ */
+static char *client_download_url_refusal(const char *value, int nul, const char *field, int allow_relative,
+                                         char *out, size_t out_len)
+{
+    char *message = NULL;
+    if (!client_download_has_text(value)) {
+        return admin_format_message("%s cannot be blank", field);
+    }
+    char *trimmed = admin_java_trim(strdup(value));
+    if (trimmed == NULL) {
+        return admin_format_message("%s cannot be blank", field);
+    }
+    if (nul || admin_utf16_length(trimmed) > 1024U || strchr(trimmed, '\\') != NULL
+        || client_download_has_control(trimmed)) {
+        free(trimmed);
+        return admin_format_message("%s is too long (max 1024)", field);
+    }
+    st_java_uri uri;
+    if (st_java_uri_parse(trimmed, &uri) != 0) {
+        message = admin_format_message("%s is not a valid URI: %s", field, uri.error == NULL ? "" : uri.error);
+    } else if (allow_relative && uri.scheme == NULL) {
+        int unsafe = trimmed[0] != '/' || trimmed[1] == '/' || uri.raw_authority != NULL || uri.raw_path == NULL;
+        for (const char *segment = uri.raw_path; !unsafe && segment != NULL;) {
+            const char *end = strchr(segment, '/');
+            size_t length = end == NULL ? strlen(segment) : (size_t)(end - segment);
+            unsafe = length == 2U && segment[0] == '.' && segment[1] == '.';
+            segment = end == NULL ? NULL : end + 1;
+        }
+        for (const char *at = uri.raw_path; !unsafe && at != NULL && *at != '\0'; ++at) {
+            unsafe = at[0] == '%' && at[1] == '2' && (at[2] == 'e' || at[2] == 'E');
+        }
+        if (unsafe) {
+            message = admin_format_message("%s must be a safe root-relative path", field);
+        }
+    } else if (uri.scheme == NULL
+               || (admin_ascii_casecmp(uri.scheme, "http") != 0 && admin_ascii_casecmp(uri.scheme, "https") != 0)) {
+        message = admin_format_message("%s must be an absolute http(s) URL", field);
+    } else if (!client_download_has_text(uri.host)) {
+        message = admin_format_message("%s must contain a host", field);
+    } else if (uri.user_info != NULL) {
+        message = admin_format_message("%s cannot contain user information", field);
+    }
+    st_java_uri_free(&uri);
+    if (message == NULL) {
+        client_download_copy(out, out_len, trimmed);
+    }
+    free(trimmed);
+    return message;
+}
+
+/*
+ * Java ClientDownloadLinkService.isSafeExternalPackageUrl: the trimmed text parses as java.net.URI
+ * (st_java_uri_parse) into an https URL with a server-based host, no user information, no query and
+ * no fragment.
  */
 static int client_download_safe_external_url(const char *value)
 {
-    if (value == NULL) return 0;
-    while (*value != '\0' && (unsigned char)*value <= ' ') ++value;
-    const char *end = value + strlen(value);
-    while (end > value && (unsigned char)end[-1] <= ' ') --end;
-    if ((size_t)(end - value) < 9U || admin_ascii_ncasecmp(value, "https://", 8U) != 0) return 0;
-    for (const char *p = value; p < end; ++p) {
-        unsigned char c = (unsigned char)*p;
-        if (c <= ' ' || c == 0x7fU || strchr("\"<>\\^`{|}?#", (int)c) != NULL) return 0;
-    }
-    const char *authority = value + 8U;
-    const char *authority_end = authority;
-    while (authority_end < end && *authority_end != '/') ++authority_end;
-    if (authority_end == authority || memchr(authority, '@', (size_t)(authority_end - authority)) != NULL) {
-        return 0;
-    }
-    const char *host_end = authority_end;
-    if (*authority == '[') {
-        const char *close = memchr(authority, ']', (size_t)(authority_end - authority));
-        if (close == NULL || close == authority + 1) return 0;
-        host_end = close + 1;
-    } else {
-        const char *colon = memchr(authority, ':', (size_t)(authority_end - authority));
-        if (colon != NULL) host_end = colon;
-        if (host_end == authority || *authority == '.' || *authority == '-'
-            || host_end[-1] == '-') return 0;
-        for (const char *p = authority; p < host_end; ++p) {
-            if (!isalnum((unsigned char)*p) && *p != '-' && *p != '.') return 0;
-        }
-    }
-    if (host_end < authority_end) {
-        if (*host_end != ':') return 0;
-        for (const char *p = host_end + 1; p < authority_end; ++p) {
-            if (!isdigit((unsigned char)*p)) return 0;
-        }
-    }
-    return 1;
+    if (!client_download_has_text(value)) return 0;
+    char *trimmed = admin_java_trim(strdup(value));
+    if (trimmed == NULL) return 0;
+    st_java_uri uri;
+    int safe = st_java_uri_parse(trimmed, &uri) == 0 && uri.scheme != NULL
+        && admin_ascii_casecmp(uri.scheme, "https") == 0 && client_download_has_text(uri.host)
+        && uri.user_info == NULL && uri.raw_query == NULL && uri.raw_fragment == NULL;
+    st_java_uri_free(&uri);
+    free(trimmed);
+    return safe;
 }
 
 /*
@@ -11214,6 +11266,53 @@ int st_admin_semver_compare_for_testing(const char *left, const char *right, int
     return 0;
 }
 
+/*
+ * Java normalizeOptionalVersion, which version and minSupportedVersion share, so both report
+ * themselves as minSupportedVersion: no text is null; otherwise SemanticVersion.normalize (trimmed,
+ * one leading "v" dropped) at most 32 UTF-16 units, which SemanticVersion.parse then normalizes
+ * once more before it matches it. The once-normalized text is what is stored.
+ */
+static char *client_download_version_refusal(const char *value, int nul, char *out, size_t out_len)
+{
+    out[0] = '\0';
+    if (!client_download_has_text(value)) {
+        return NULL;
+    }
+    const char *start = value;
+    while (*start != '\0' && (unsigned char)*start <= ' ') ++start;
+    if (*start == 'v') ++start;
+    size_t length = strlen(start);
+    while (length > 0U && (unsigned char)start[length - 1U] <= ' ') --length;
+    char *normalized = (char *)malloc(length + 1U);
+    if (normalized == NULL) {
+        return admin_format_message("minSupportedVersion must be a valid SemVer 2.0 version");
+    }
+    memcpy(normalized, start, length);
+    normalized[length] = '\0';
+    char *message = NULL;
+    const char *refusal = NULL;
+    if (admin_utf16_length(normalized) > 32U) {
+        message = admin_format_message("minSupportedVersion is too long (max 32)");
+    } else if (nul) {
+        message = admin_format_message("minSupportedVersion must be a valid SemVer 2.0 version");
+    } else if ((refusal = admin_semver_refusal(normalized)) != NULL) {
+        message = admin_format_message("minSupportedVersion%s", refusal);
+    } else {
+        client_download_copy(out, out_len, normalized);
+    }
+    free(normalized);
+    return message;
+}
+
+/*
+ * Java ClientDownloadLinkService.apply for a create (existing NULL) or an update of existing, in
+ * its order: the three coordinates and their pairing, displayName, downloadUrl (kept for a hosted
+ * package), description (always replaced, so an update without one clears it), version, sha256 and
+ * fileSize (kept for a hosted package, and on an update whenever the member is absent or null),
+ * changelogUrl, minSupportedVersion, the minimum against the version, displayOrder and enabled
+ * (kept when absent or null on an update), then the latest flag's requirements. 0 with mutation
+ * filled, else the 400 written to out.
+ */
 static int read_client_download_mutation(const char *body,
                                          const st_storage_client_download_link *existing,
                                          st_admin_client_download_mutation *mutation,
@@ -11228,163 +11327,184 @@ static int read_client_download_mutation(const char *body,
     static const char *const implementations[] = {"java", "go", "csharp", "android"};
     static const char *const platforms[] = {"windows", "linux", "macos", "android", "any"};
     static const char *const archs[] = {"x64", "arm64", "any"};
-    char *implementation = st_json_get_string(body, "implementation");
-    char *platform = st_json_get_string(body, "platform");
-    char *arch = st_json_get_string(body, "arch");
-    char *display_name = st_json_get_string(body, "displayName");
-    char *download_url = st_json_get_string(body, "downloadUrl");
-    char *description = st_json_get_string(body, "description");
-    char *version = st_json_get_string(body, "version");
-    char *sha256 = st_json_get_string(body, "sha256");
-    char *changelog_url = st_json_get_string(body, "changelogUrl");
-    char *min_supported_version = st_json_get_string(body, "minSupportedVersion");
+    enum { IMPLEMENTATION, PLATFORM, ARCH, DISPLAY_NAME, DOWNLOAD_URL, DESCRIPTION, VERSION, SHA256,
+           CHANGELOG_URL, MINIMUM, MEMBER_COUNT };
+    static const char *const names[MEMBER_COUNT] = {"implementation", "platform", "arch", "displayName",
+                                                    "downloadUrl", "description", "version", "sha256",
+                                                    "changelogUrl", "minSupportedVersion"};
+    char *values[MEMBER_COUNT] = {NULL};
+    int given[MEMBER_COUNT] = {0};
+    int nul[MEMBER_COUNT] = {0};
     int response = 0;
+    for (int i = 0; i < MEMBER_COUNT && response == 0; ++i) {
+        int bound = client_download_member(body, names[i], &values[i], &nul[i]);
+        if (bound == -2) {
+            response = write_spring_bad_request(out, out_len);
+        }
+        given[i] = bound == 1;
+    }
+    int creating = existing == NULL;
+    int hosted = existing != NULL && existing->hosted;
+    const char *fixed = NULL;
+    char *message = NULL;
     memset(mutation, 0, sizeof(*mutation));
-    mutation->display_order = existing == NULL ? 0 : existing->display_order;
-    mutation->enabled = existing == NULL ? 1 : existing->enabled;
-    mutation->file_size = existing == NULL ? 0 : existing->file_size;
-    mutation->is_latest = existing == NULL ? 0 : existing->is_latest;
-    if (normalize_client_download_enum(implementation != NULL ? implementation
-                                                              : (char *)(existing == NULL ? NULL : existing->implementation),
-                                       mutation->implementation,
-                                       sizeof(mutation->implementation),
-                                       implementations,
-                                       sizeof(implementations) / sizeof(implementations[0])) != 0) {
-        response = write_response(out,
-                                  out_len,
-                                  400,
-                                  "Bad Request",
-                                  ST_CLIENT_DOWNLOAD_IMPLEMENTATION_REFUSAL);
+    if (existing != NULL) {
+        client_download_copy(mutation->download_url, sizeof(mutation->download_url), existing->download_url);
+        client_download_copy(mutation->version, sizeof(mutation->version), existing->version);
+        client_download_copy(mutation->sha256, sizeof(mutation->sha256), existing->sha256);
+        client_download_copy(mutation->changelog_url, sizeof(mutation->changelog_url), existing->changelog_url);
+        client_download_copy(mutation->min_supported_version, sizeof(mutation->min_supported_version),
+                             existing->min_supported_version);
+        mutation->file_size = existing->file_size;
+        mutation->display_order = existing->display_order;
+        mutation->enabled = existing->enabled;
+        mutation->is_latest = existing->is_latest;
+    }
+    if (response != 0) {
         goto done;
     }
-    if (normalize_client_download_enum(platform != NULL ? platform
-                                                        : (char *)(existing == NULL ? NULL : existing->platform),
-                                       mutation->platform,
-                                       sizeof(mutation->platform),
-                                       platforms,
-                                       sizeof(platforms) / sizeof(platforms[0])) != 0) {
-        response = write_response(out,
-                                  out_len,
-                                  400,
-                                  "Bad Request",
-                                  ST_CLIENT_DOWNLOAD_PLATFORM_REFUSAL);
+    if (normalize_client_download_enum(values[IMPLEMENTATION], mutation->implementation,
+                                       sizeof(mutation->implementation), implementations, 4U) != 0) {
+        fixed = ST_CLIENT_DOWNLOAD_IMPLEMENTATION_REFUSAL;
+    } else if (normalize_client_download_enum(values[PLATFORM], mutation->platform, sizeof(mutation->platform),
+                                              platforms, 5U) != 0) {
+        fixed = ST_CLIENT_DOWNLOAD_PLATFORM_REFUSAL;
+    } else if (normalize_client_download_enum(values[ARCH], mutation->arch, sizeof(mutation->arch), archs, 3U) != 0) {
+        fixed = ST_CLIENT_DOWNLOAD_ARCH_REFUSAL;
+    } else {
+        fixed = client_download_target_error(mutation->implementation, mutation->platform, mutation->arch);
+    }
+    if (fixed != NULL) {
         goto done;
     }
-    if (normalize_client_download_enum(arch != NULL ? arch
-                                                    : (char *)(existing == NULL ? NULL : existing->arch),
-                                       mutation->arch,
-                                       sizeof(mutation->arch),
-                                       archs,
-                                       sizeof(archs) / sizeof(archs[0])) != 0) {
-        response = write_response(out,
-                                  out_len,
-                                  400,
-                                  "Bad Request",
-                                  ST_CLIENT_DOWNLOAD_ARCH_REFUSAL);
+    /* requireDisplayName */
+    if (!client_download_has_text(values[DISPLAY_NAME])) {
+        message = admin_format_message("displayName cannot be blank");
         goto done;
     }
-    if (copy_trimmed_required(display_name != NULL ? display_name
-                                                   : (char *)(existing == NULL ? NULL : existing->display_name),
-                              mutation->display_name, sizeof(mutation->display_name)) != 0) {
-        response = write_response(out,
-                                  out_len,
-                                  400,
-                                  "Bad Request",
-                                  "{\"error\":\"displayName cannot be blank or longer than 120\"}");
+    (void)admin_java_trim(values[DISPLAY_NAME]);
+    if (admin_utf16_length(values[DISPLAY_NAME]) > 120U) {
+        message = admin_format_message("displayName is too long (max 120)");
         goto done;
     }
-    if (copy_trimmed_required(download_url != NULL ? download_url
-                                                   : (char *)(existing == NULL ? NULL : existing->download_url),
-                              mutation->download_url, sizeof(mutation->download_url)) != 0
-        || (!valid_client_download_url(mutation->download_url)
-            && !(existing != NULL && existing->hosted
-                 && strncmp(mutation->download_url, "/api/public/client-packages/", 28U) == 0))) {
-        response = write_response(out,
-                                  out_len,
-                                  400,
-                                  "Bad Request",
-                                  "{\"error\":\"downloadUrl must be an absolute http(s) URL\"}");
+    if (nul[DISPLAY_NAME] || client_download_has_control(values[DISPLAY_NAME])) {
+        message = admin_format_message("displayName cannot contain control characters");
         goto done;
     }
-    copy_trimmed_optional_truncated(description != NULL ? description
-        : (char *)(existing == NULL ? NULL : existing->description),
-        mutation->description, sizeof(mutation->description));
-    copy_trimmed_optional_truncated(version != NULL ? version
-        : (char *)(existing == NULL ? NULL : existing->version),
-        mutation->version, sizeof(mutation->version));
-    copy_trimmed_optional_truncated(sha256 != NULL ? sha256
-        : (char *)(existing == NULL ? NULL : existing->sha256),
-        mutation->sha256, sizeof(mutation->sha256));
-    for (char *cursor = mutation->sha256; *cursor != '\0'; ++cursor) {
-        *cursor = (char)tolower((unsigned char)*cursor);
+    client_download_copy(mutation->display_name, sizeof(mutation->display_name), values[DISPLAY_NAME]);
+    if (creating || !hosted) {
+        message = client_download_url_refusal(values[DOWNLOAD_URL], nul[DOWNLOAD_URL], "downloadUrl", 1,
+                                              mutation->download_url, sizeof(mutation->download_url));
+        if (message != NULL) goto done;
     }
-    copy_trimmed_optional_truncated(changelog_url != NULL ? changelog_url
-        : (char *)(existing == NULL ? NULL : existing->changelog_url),
-        mutation->changelog_url, sizeof(mutation->changelog_url));
-    copy_trimmed_optional_truncated(min_supported_version != NULL ? min_supported_version
-        : (char *)(existing == NULL ? NULL : existing->min_supported_version),
-        mutation->min_supported_version, sizeof(mutation->min_supported_version));
-    if (mutation->version[0] == 'v') memmove(mutation->version, mutation->version + 1,
-                                             strlen(mutation->version));
-    if (mutation->min_supported_version[0] == 'v') {
-        memmove(mutation->min_supported_version, mutation->min_supported_version + 1,
-                strlen(mutation->min_supported_version));
+    /* normalizeDescription: no text is null, else trimmed and cut to 512 UTF-16 units. */
+    mutation->description[0] = '\0';
+    if (client_download_has_text(values[DESCRIPTION])) {
+        (void)admin_java_trim(values[DESCRIPTION]);
+        client_download_truncate_utf16(values[DESCRIPTION], 512U);
+        client_download_copy(mutation->description, sizeof(mutation->description), values[DESCRIPTION]);
     }
-    (void)admin_jackson_int(body, "displayOrder", &mutation->display_order);
-    (void)admin_jackson_boolean(body, "enabled", &mutation->enabled);
-    (void)admin_jackson_long(body, "fileSize", LLONG_MIN, LLONG_MAX, &mutation->file_size);
-    (void)admin_jackson_boolean(body, "isLatest", &mutation->is_latest);
-    const char *target_error = client_download_target_error(mutation->implementation,
-                                                            mutation->platform, mutation->arch);
-    if (target_error != NULL) {
-        response = write_response(out, out_len, 400, "Bad Request", target_error);
-        goto done;
+    if (creating || given[VERSION]) {
+        message = client_download_version_refusal(values[VERSION], nul[VERSION], mutation->version,
+                                                  sizeof(mutation->version));
+        if (message != NULL) goto done;
     }
-    st_admin_semver release_version;
-    st_admin_semver minimum_version;
-    if ((mutation->version[0] != '\0' && parse_admin_semver(mutation->version, &release_version) != 0)
-        || (mutation->min_supported_version[0] != '\0'
-            && parse_admin_semver(mutation->min_supported_version, &minimum_version) != 0)
-        || (mutation->min_supported_version[0] != '\0' && mutation->version[0] == '\0')
-        || (mutation->min_supported_version[0] != '\0'
-            && compare_admin_semver(&minimum_version, &release_version) > 0)) {
-        response = write_response(out, out_len, 400, "Bad Request",
-                                  "{\"error\":\"invalid version or minSupportedVersion\"}");
-        goto done;
+    /* normalizeSha256: no text is null, else trimmed, lowercased and exactly 64 hex digits. */
+    if (creating || (!hosted && given[SHA256])) {
+        mutation->sha256[0] = '\0';
+        if (client_download_has_text(values[SHA256])) {
+            (void)admin_java_trim(values[SHA256]);
+            for (char *cursor = values[SHA256]; *cursor != '\0'; ++cursor) {
+                *cursor = (char)admin_ascii_lower((unsigned char)*cursor);
+            }
+            if (nul[SHA256] || !canonical_sha256_text(values[SHA256])) {
+                message = admin_format_message("sha256 must be 64 lowercase hex characters");
+                goto done;
+            }
+            client_download_copy(mutation->sha256, sizeof(mutation->sha256), values[SHA256]);
+        }
     }
-    if (mutation->file_size < 0 || (mutation->sha256[0] != '\0' && !valid_sha256_text(mutation->sha256))) {
-        response = write_response(out, out_len, 400, "Bad Request",
-                                  "{\"error\":\"invalid fileSize or sha256\"}");
-        goto done;
+    long long file_size = 0;
+    int size_given = admin_jackson_long(body, "fileSize", LLONG_MIN, LLONG_MAX, &file_size) == 1;
+    if (creating || (!hosted && size_given)) {
+        if (size_given && file_size < 0) {
+            message = admin_format_message("fileSize cannot be negative");
+            goto done;
+        }
+        mutation->file_size = size_given ? file_size : 0;
     }
-    if (mutation->is_latest && mutation->version[0] == '\0') {
-        response = write_response(out, out_len, 400, "Bad Request",
-                                  "{\"error\":\"isLatest requires a versioned catalogue entry\"}");
-        goto done;
+    if (creating || given[CHANGELOG_URL]) {
+        mutation->changelog_url[0] = '\0';
+        if (client_download_has_text(values[CHANGELOG_URL])) {
+            message = client_download_url_refusal(values[CHANGELOG_URL], nul[CHANGELOG_URL], "changelogUrl", 0,
+                                                  mutation->changelog_url, sizeof(mutation->changelog_url));
+            if (message != NULL) goto done;
+        }
     }
-    if (mutation->is_latest && !mutation->enabled) {
-        response = write_response(out, out_len, 400, "Bad Request",
-                                  "{\"error\":\"a disabled client download cannot be latest\"}");
-        goto done;
+    if (creating || given[MINIMUM]) {
+        message = client_download_version_refusal(values[MINIMUM], nul[MINIMUM], mutation->min_supported_version,
+                                                  sizeof(mutation->min_supported_version));
+        if (message != NULL) goto done;
     }
-    if (mutation->is_latest && (existing == NULL || !existing->hosted)
-        && !client_download_has_authoritative_metadata(0, 0, mutation->download_url,
-                                                       mutation->sha256, mutation->file_size)) {
-        response = write_response(out, out_len, 400, "Bad Request",
-            "{\"error\":\"an external latest download requires HTTPS, sha256 and a positive fileSize\"}");
-        goto done;
+    /* validateMinSupportedVersion over what the row now holds. */
+    if (client_download_has_text(mutation->min_supported_version)) {
+        const char *refusal = NULL;
+        st_admin_semver minimum;
+        st_admin_semver release;
+        if (!client_download_has_text(mutation->version)) {
+            message = admin_format_message("minSupportedVersion requires version");
+        } else if ((refusal = admin_semver_refusal(mutation->min_supported_version)) != NULL) {
+            message = admin_format_message("minSupportedVersion%s", refusal);
+        } else if ((refusal = admin_semver_refusal(mutation->version)) != NULL) {
+            message = admin_format_message("version%s", refusal);
+        } else if (parse_admin_semver(mutation->min_supported_version, &minimum) == 0
+                   && parse_admin_semver(mutation->version, &release) == 0
+                   && compare_admin_semver(&minimum, &release) > 0) {
+            message = admin_format_message("minSupportedVersion cannot be newer than version");
+        }
+        if (message != NULL) goto done;
+    }
+    int display_order = 0;
+    if (admin_jackson_int(body, "displayOrder", &display_order) == 1) {
+        mutation->display_order = display_order;
+    } else if (creating) {
+        mutation->display_order = 0;
+    }
+    int enabled = 1;
+    if (admin_jackson_boolean(body, "enabled", &enabled) == 1) {
+        mutation->enabled = enabled;
+    } else if (creating) {
+        mutation->enabled = 1;
+    }
+    int latest = 0;
+    if (admin_jackson_boolean(body, "isLatest", &latest) == 1) {
+        mutation->is_latest = latest;
+    }
+    if (mutation->is_latest && !client_download_has_text(mutation->version)) {
+        message = admin_format_message("isLatest requires a versioned catalogue entry");
+    } else if (mutation->is_latest && !mutation->enabled) {
+        message = admin_format_message("a disabled client download cannot be latest");
+    } else if (mutation->is_latest && !hosted
+               && !client_download_has_authoritative_metadata(0, 0, mutation->download_url, mutation->sha256,
+                                                              mutation->file_size)) {
+        message = admin_format_message("an external latest download requires HTTPS, sha256 and a positive fileSize");
     }
 done:
-    free(implementation);
-    free(platform);
-    free(arch);
-    free(display_name);
-    free(download_url);
-    free(description);
-    free(version);
-    free(sha256);
-    free(changelog_url);
-    free(min_supported_version);
+    if (response == 0 && fixed != NULL) {
+        response = write_response(out, out_len, 400, "Bad Request", fixed);
+    } else if (response == 0 && message != NULL) {
+        char *escaped = st_json_escape(message);
+        char *refusal = escaped == NULL ? NULL : admin_format_message("{\"error\":\"%s\"}", escaped);
+        response = refusal == NULL
+            ? write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client download check failed\"}")
+            : write_response(out, out_len, 400, "Bad Request", refusal);
+        free(refusal);
+        free(escaped);
+    }
+    free(message);
+    for (int i = 0; i < MEMBER_COUNT; ++i) {
+        free(values[i]);
+    }
     return response;
 }
 
@@ -11644,31 +11764,41 @@ static int handle_client_download_mark_latest(const st_admin_context *context,
         return write_client_download_not_found(id, out, out_len);
     }
     /*
-     * Java markLatest: a version is required and must be SemVer, a minimum must not be newer, the
-     * row must be enabled and an external one must carry verified HTTPS metadata. The stored
-     * version and minimum are rewritten in canonical form (one leading "v" removed).
+     * Java markLatest: a version is required (requireVersion: normalized at most 32 UTF-16 units,
+     * then SemVer, reported as version), the minimum as a create or update reads it
+     * (normalizeOptionalVersion) and not newer, the row enabled, and an external one with verified
+     * HTTPS metadata. The stored version and minimum are rewritten in their normalized form.
      */
     char version[sizeof(existing.version)];
     char minimum[sizeof(existing.min_supported_version)];
     admin_normalize_semver_text(existing.version, version, sizeof(version));
-    admin_normalize_semver_text(existing.min_supported_version, minimum, sizeof(minimum));
+    char *refusal = NULL;
+    const char *semver_refusal = NULL;
     st_admin_semver parsed_version;
     st_admin_semver parsed_minimum;
-    if (version[0] == '\0') {
-        return write_response(out, out_len, 400, "Bad Request",
-                              "{\"error\":\"client download link has no version\"}");
+    if (!client_download_has_text(existing.version)) {
+        refusal = admin_format_message("client download link has no version: %lld", id);
+    } else if (admin_utf16_length(version) > 32U) {
+        refusal = admin_format_message("version is too long (max 32)");
+    } else if ((semver_refusal = admin_semver_refusal(version)) != NULL) {
+        refusal = admin_format_message("version%s", semver_refusal);
+    } else if ((refusal = client_download_version_refusal(existing.min_supported_version, 0, minimum,
+                                                          sizeof(minimum))) == NULL
+               && minimum[0] != '\0' && parse_admin_semver(minimum, &parsed_minimum) == 0
+               && parse_admin_semver(version, &parsed_version) == 0
+               && compare_admin_semver(&parsed_minimum, &parsed_version) > 0) {
+        refusal = admin_format_message("minSupportedVersion cannot be newer than version");
     }
-    if (parse_admin_semver(version, &parsed_version) != 0) {
-        return write_response(out, out_len, 400, "Bad Request",
-                              "{\"error\":\"version must be a valid SemVer 2.0 version\"}");
-    }
-    if (minimum[0] != '\0' && parse_admin_semver(minimum, &parsed_minimum) != 0) {
-        return write_response(out, out_len, 400, "Bad Request",
-                              "{\"error\":\"minSupportedVersion must be a valid SemVer 2.0 version\"}");
-    }
-    if (minimum[0] != '\0' && compare_admin_semver(&parsed_minimum, &parsed_version) > 0) {
-        return write_response(out, out_len, 400, "Bad Request",
-                              "{\"error\":\"minSupportedVersion cannot be newer than version\"}");
+    if (refusal != NULL) {
+        char *escaped = st_json_escape(refusal);
+        char *answer = escaped == NULL ? NULL : admin_format_message("{\"error\":\"%s\"}", escaped);
+        int written = answer == NULL
+            ? write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client download check failed\"}")
+            : write_response(out, out_len, 400, "Bad Request", answer);
+        free(answer);
+        free(escaped);
+        free(refusal);
+        return written;
     }
     if (!existing.enabled) {
         return write_response(out, out_len, 400, "Bad Request",
