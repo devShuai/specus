@@ -2387,6 +2387,19 @@ static int test_relay_traffic_batches(void)
         || !frame_relayed(pair.source_fd, &turn.address, &pair.target_relay, pair.target_fd, third.id, 1, 1310U)
         || !frame_relayed(pair.target_fd, &turn.address, &pair.source_relay, pair.source_fd, third.id, 2, 1311U)
         || session_is(fixture.path, "tenant-batches", third.id, "ACTIVE", "RELAY", -1, "before the stop") != 0;
+    /* A batch that cannot be written is kept for the next one (Java restoreRelayTrafficBatch):
+     * here the database is away, so the flush opens an empty one beside it and fails. */
+    char away[80];
+    snprintf(away, sizeof(away), "%s.away", fixture.path);
+    if (!failed && rename(fixture.path, away) == 0) {
+        st_stun_turn_server_flush_relay_traffic(turn.server);
+        unlink(fixture.path);
+        failed = rename(away, fixture.path) != 0
+            || wait_for_relay_bytes(fixture.path, "tenant-batches", third.id, 0, 0L) != 0;
+        if (failed) fprintf(stderr, "a failed relay batch was not kept back\n");
+    } else if (!failed) {
+        failed = 1;
+    }
     relay_pair_close(&pair);
     if (started) st_stun_turn_server_stop(turn.server);
     if (!failed && wait_for_relay_bytes(fixture.path, "tenant-batches", third.id, 104, 0L) != 0) {
