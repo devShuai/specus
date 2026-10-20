@@ -2,6 +2,8 @@ package client
 
 import (
 	"encoding/binary"
+	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -18,6 +20,10 @@ const macosScopedFlag = "I"
 
 // macosIPBoundIf is IP_BOUND_IF, at level IPPROTO_IP.
 const macosIPBoundIf = 25
+
+// macosIPv6BoundIf is IPV6_BOUND_IF, at level IPPROTO_IPV6. Its value is the index in host order,
+// like IP_BOUND_IF's.
+const macosIPv6BoundIf = 125
 
 // macosBindTableLifetime is how long one read of the table answers for.
 //
@@ -49,6 +55,93 @@ func macosBindRoutes(table string) []egressBindRoute {
 		routes = append(routes, route)
 	}
 	return routes
+}
+
+// macosShowTableArgs6 reads the IPv6 table, for a socket to an IPv6 target.
+func macosShowTableArgs6() []string {
+	return []string{"netstat", "-rn", "-f", "inet6"}
+}
+
+// macosBindRoutes6 reads the candidate routes of `netstat -rn -f inet6`, with the same rule as IPv4:
+// a route scoped to its interface is not one an unbound socket would follow.
+//
+// No gateway is kept. Bypass routes, the only reader of it, are IPv4 for now, and an IPv6 gateway
+// is usually link-local, meaningful only with the zone this reading drops.
+func macosBindRoutes6(table string) []egressBindRoute {
+	rows := parseMacosRouteTable6(table)
+	routes := make([]egressBindRoute, 0, len(rows))
+	for _, row := range rows {
+		routes = append(routes, egressBindRoute{
+			Prefix:    row.Prefix,
+			Interface: row.Netif,
+			Usable:    !strings.Contains(row.Flags, macosScopedFlag),
+		})
+	}
+	return routes
+}
+
+// parseMacosRouteTable6 reads the rows under the "Internet6:" heading of `netstat -rn`, the IPv6
+// counterpart of parseMacosRouteTable. Rows whose destination does not read as IPv6 are skipped.
+func parseMacosRouteTable6(stdout string) []macosRoute {
+	var routes []macosRoute
+	inside := false
+	for _, line := range strings.Split(stdout, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasSuffix(trimmed, ":") && !strings.Contains(trimmed, " ") {
+			inside = trimmed == "Internet6:"
+			continue
+		}
+		if !inside || strings.HasPrefix(trimmed, "Destination") {
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) < 4 {
+			continue
+		}
+		prefix := normaliseMacosPrefix6(fields[0])
+		if prefix == "" {
+			continue
+		}
+		routes = append(routes, macosRoute{
+			Prefix:      prefix,
+			Destination: fields[0],
+			Gateway:     fields[1],
+			Flags:       fields[2],
+			Netif:       fields[3],
+		})
+	}
+	return routes
+}
+
+// normaliseMacosPrefix6 turns a destination of the IPv6 table into a canonical prefix, or "" when it
+// is not one. netstat writes "default" for ::/0, a host route without a length, and a link-local
+// destination with its zone: fe80::%lo0/64, fe80::1%lo0. The zone goes; the interface is in the
+// Netif column anyway.
+func normaliseMacosPrefix6(text string) string {
+	value := strings.TrimSpace(text)
+	if value == "default" {
+		return "::/0"
+	}
+	address, length, hasLength := strings.Cut(value, "/")
+	if zone := strings.IndexByte(address, '%'); zone >= 0 {
+		address = address[:zone]
+	}
+	parsed, err := netip.ParseAddr(address)
+	if err != nil || !parsed.Is6() {
+		return ""
+	}
+	bits := 128
+	if hasLength {
+		number, err := strconv.Atoi(length)
+		if err != nil || number < 0 || number > 128 || strconv.Itoa(number) != length {
+			return ""
+		}
+		bits = number
+	}
+	return netip.PrefixFrom(parsed, bits).Masked().String()
 }
 
 // macosBoundInterfaceOption is the IP_BOUND_IF value: the index as a host-order int.

@@ -186,23 +186,34 @@ func (r *egressRuntime) shutdown(now time.Time) {
 	r.releaseAll(egressRevocationsFor(r.flows.drain(), egressCodeDisabled), now)
 }
 
-// handleFrame is the SPEG1 entry point: one decrypted payload from one consumer.
+// handleFrame is handleFrameFrom for a consumer whose mesh address is not known, which carries IPv4
+// only: an IPv6 packet's source has nothing to be checked against, so every one is dropped.
+func (r *egressRuntime) handleFrame(consumer int64, payload []byte, now time.Time) bool {
+	return r.handleFrameFrom(consumer, "", payload, now)
+}
+
+// handleFrameFrom is the SPEG1 entry point: one decrypted payload from one consumer, whose mesh
+// IPv4 address, as the authenticated session has it, is consumerMeshIP.
 //
 // It returns false when the payload is not an egress frame at all, so the mesh dispatch can go on
 // to its other cases. A payload that carries the magic but nothing valid returns true, because it
 // was addressed here and has already been refused with its own code.
-func (r *egressRuntime) handleFrame(consumer int64, payload []byte, now time.Time) bool {
+func (r *egressRuntime) handleFrameFrom(consumer int64, consumerMeshIP string, payload []byte, now time.Time) bool {
 	if !looksLikePeerEgressFrame(payload) {
 		return false
 	}
-	frame, code := parsePeerEgressFrame(payload)
+	frame, code := parsePeerEgressFrameFor(payload, egressIPv6PacketCapable)
 	if code != "" {
 		r.refuse(consumer, egressFlowKey{}, code, now)
 		return true
 	}
 	switch frame.Type {
 	case peerEgressTypeIPPacket:
-		r.handleInnerPacket(consumer, frame, now)
+		if frame.Inner.IPv6 {
+			r.handleInnerPacket6(consumer, consumerMeshIP, frame, now)
+		} else {
+			r.handleInnerPacket(consumer, frame, now)
+		}
 	case peerEgressTypeControl:
 		r.handleControl(consumer, frame, now)
 	}
@@ -232,6 +243,46 @@ func (r *egressRuntime) handleInnerPacket(consumer int64, frame peerEgressFrame,
 		return
 	}
 	r.refuse(consumer, egressFlowKey{protocol: frame.Inner.Protocol}, egressCodeFrameTruncated, now)
+}
+
+// handleInnerPacket6 is handleInnerPacket for an IPv6 body (protocol/spec/peer-egress.md, IPv6 数据面,
+// 出口). The protocol goes first, as for IPv4: anything but TCP and UDP -- ICMPv6, and any packet that
+// starts with an extension or fragment header -- is refused with EGRESS_PROTOCOL_DENIED.
+//
+// Then the source. It has to be the address derived from the session peer's mesh IPv4, or a consumer
+// could speak for another device the policy allows. IPv4 has no counterpart to this in this client:
+// the session alone identifies the consumer there. The spec names no code for a forged source, so the
+// packet is dropped without one; nothing is owed to an address the sender does not hold.
+//
+// The destination is judged when the flow opens, as for IPv4: the derived prefix stands in the
+// forced-deny list the way the mesh network does (egressForcedDenyFor).
+func (r *egressRuntime) handleInnerPacket6(consumer int64, consumerMeshIP string, frame peerEgressFrame, now time.Time) {
+	protocol := frame.Inner.Protocol
+	if protocol != ipv4ProtocolTCP && protocol != ipv4ProtocolUDP {
+		r.refuse(consumer, egressFlowKey{
+			protocol:   protocol,
+			remotePort: uint16(frame.Inner.DestinationPort),
+			ipv6:       true,
+		}, egressCodeProtocolDenied, now)
+		return
+	}
+	expected, known := egressDeviceAddress6(consumerMeshIP)
+	if !known || [16]byte(frame.Body[8:24]) != expected {
+		return
+	}
+	switch protocol {
+	case ipv4ProtocolTCP:
+		if segment, ok := parseTCPSegment6(frame.Body); ok {
+			r.handleSegment(consumer, segment, now)
+			return
+		}
+	case ipv4ProtocolUDP:
+		if datagram, ok := parseUDPDatagram6(frame.Body); ok {
+			r.handleDatagram(consumer, datagram, now)
+			return
+		}
+	}
+	r.refuse(consumer, egressFlowKey{protocol: protocol, ipv6: true}, egressCodeFrameTruncated, now)
 }
 
 func (r *egressRuntime) handleControl(consumer int64, frame peerEgressFrame, now time.Time) {
@@ -287,13 +338,7 @@ func (r *egressRuntime) handleControl(consumer int64, frame peerEgressFrame, now
 
 // handleSegment drives one TCP segment from a consumer.
 func (r *egressRuntime) handleSegment(consumer int64, segment tcpSegment, now time.Time) {
-	key := egressFlowKey{
-		protocol:     ipv4ProtocolTCP,
-		consumerIP:   segment.SourceIP,
-		consumerPort: segment.SourcePort,
-		remoteIP:     segment.DestinationIP,
-		remotePort:   segment.DestinationPort,
-	}
+	key := segment.flowKey()
 
 	r.mu.Lock()
 	flow, known := r.flows.lookup(key)
@@ -503,13 +548,7 @@ func (r *egressRuntime) applyTCPOutput(consumer int64, flow *egressFlow, handle 
 // handleDatagram drives one UDP datagram from a consumer. UDP has no handshake, so the first
 // datagram of a four-tuple is the authorization point and every later one rides that decision.
 func (r *egressRuntime) handleDatagram(consumer int64, datagram udpDatagram, now time.Time) {
-	key := egressFlowKey{
-		protocol:     ipv4ProtocolUDP,
-		consumerIP:   datagram.SourceIP,
-		consumerPort: datagram.SourcePort,
-		remoteIP:     datagram.DestinationIP,
-		remotePort:   datagram.DestinationPort,
-	}
+	key := datagram.flowKey()
 
 	r.mu.Lock()
 	flow, known := r.flows.lookup(key)
@@ -593,7 +632,11 @@ func (r *egressRuntime) handleDatagram(consumer int64, datagram udpDatagram, now
 // startUDPReader returns the socket's replies to the consumer. Called with the lock held.
 func (r *egressRuntime) startUDPReader(consumer int64, flow *egressFlow, handle *egressUDPFlow) {
 	go func() {
-		buffer := make([]byte, udpMaxPayload)
+		size := udpMaxPayload
+		if flow.Key.ipv6 {
+			size = udpMaxPayload6
+		}
+		buffer := make([]byte, size)
 		for {
 			read, err := handle.socket.Read(buffer)
 			if err != nil {
@@ -615,6 +658,9 @@ func (r *egressRuntime) startUDPReader(consumer int64, flow *egressFlow, handle 
 			r.emitSegment(consumer, buildUDPDatagram(udpDatagram{
 				SourceIP:        flow.Key.remoteIP,
 				DestinationIP:   flow.Key.consumerIP,
+				IPv6:            flow.Key.ipv6,
+				SourceIP6:       flow.Key.remoteIP6,
+				DestinationIP6:  flow.Key.consumerIP6,
 				SourcePort:      flow.Key.remotePort,
 				DestinationPort: flow.Key.consumerPort,
 				Payload:         append([]byte(nil), buffer[:read]...),
@@ -682,7 +728,7 @@ func (r *egressRuntime) flowSnapshot() []*egressFlow {
 // same four-tuple arriving while the first is still connecting finds the reservation already there,
 // and must not dial again.
 func (r *egressRuntime) reserve(consumer int64, key egressFlowKey, now time.Time) (*egressFlow, string, bool) {
-	return r.reserveTo(consumer, key, egressNetAddr(key.remoteIP), "", now)
+	return r.reserveTo(consumer, key, key.remoteAddr(), "", now)
 }
 
 // reserveTo is reserve for a flow whose socket goes to destination, which differs from the key's
@@ -745,11 +791,15 @@ func (r *egressRuntime) authorizeTo(consumer int64, key egressFlowKey, destinati
 // a second packet of a flow whose name is still resolving: the first one is opening it. A non-empty
 // code refuses the flow.
 func (r *egressRuntime) resolveDestination(consumer int64, key egressFlowKey) (destination netip.Addr, name string, code string, proceed bool) {
+	if key.ipv6 {
+		// Names are bound to IPv4 fake addresses only.
+		return key.remoteAddr(), "", "", true
+	}
 	r.mu.Lock()
 	name, bound := r.names.lookup(consumer, key.remoteIP)
 	if !bound {
 		r.mu.Unlock()
-		return egressNetAddr(key.remoteIP), "", "", true
+		return key.remoteAddr(), "", "", true
 	}
 	if _, busy := r.resolving[key]; busy {
 		r.mu.Unlock()
@@ -785,6 +835,9 @@ func (r *egressRuntime) resolveDestination(consumer int64, key egressFlowKey) (d
 // name the flow was resolved for. Checked under the same lock as the reservation, so a name-bind
 // either closes the flow it makes stale or is in place before the flow opens, never in between.
 func (r *egressRuntime) bindingMovedLocked(consumer int64, key egressFlowKey, name string) bool {
+	if key.ipv6 {
+		return false
+	}
 	current, _ := r.names.lookup(consumer, key.remoteIP)
 	return current != name
 }
@@ -812,9 +865,9 @@ func (r *egressRuntime) refuse(consumer int64, key egressFlowKey, code string, n
 	body, err := encodePeerEgressControl(peerEgressControl{
 		Type:            peerEgressControlFlowReject,
 		Protocol:        key.protocolName(),
-		SourceIP:        formatEgressAddress(key.consumerIP),
+		SourceIP:        formatEgressNetAddr(key.consumerAddr()),
 		SourcePort:      int(key.consumerPort),
-		DestinationIP:   formatEgressAddress(key.remoteIP),
+		DestinationIP:   formatEgressNetAddr(key.remoteAddr()),
 		DestinationPort: int(key.remotePort),
 		Code:            code,
 	})
@@ -908,9 +961,9 @@ func (r *egressRuntime) releaseAll(revoked []egressRevocation, now time.Time) {
 		if body, err := encodePeerEgressControl(peerEgressControl{
 			Type:            peerEgressControlFlowReject,
 			Protocol:        flow.Key.protocolName(),
-			SourceIP:        formatEgressAddress(flow.Key.consumerIP),
+			SourceIP:        formatEgressNetAddr(flow.Key.consumerAddr()),
 			SourcePort:      int(flow.Key.consumerPort),
-			DestinationIP:   formatEgressAddress(flow.Key.remoteIP),
+			DestinationIP:   formatEgressNetAddr(flow.Key.remoteAddr()),
 			DestinationPort: int(flow.Key.remotePort),
 			Code:            entry.Code,
 		}); err == nil {

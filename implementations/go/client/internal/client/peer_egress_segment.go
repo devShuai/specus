@@ -24,10 +24,14 @@ const (
 	tcpDefaultMSS = 536
 )
 
-// tcpSegment is one parsed TCP segment together with the IPv4 addresses that carried it.
+// tcpSegment is one parsed TCP segment together with the addresses that carried it: the IPv4 ones,
+// or, when IPv6 is set, the IPv6 ones with the IPv4 fields left zero.
 type tcpSegment struct {
 	SourceIP        uint32
 	DestinationIP   uint32
+	IPv6            bool
+	SourceIP6       [16]byte
+	DestinationIP6  [16]byte
 	SourcePort      uint16
 	DestinationPort uint16
 	Seq             uint32
@@ -112,7 +116,8 @@ func parseTCPOptionMSS(options []byte) int {
 	return 0
 }
 
-// buildTCPSegment renders a segment as a complete IPv4 packet, checksums included.
+// buildTCPSegment renders a segment as a complete IPv4 packet, or IPv6 packet when the segment is
+// IPv6, checksums included.
 //
 // mss > 0 emits an MSS option, which is only meaningful on a SYN.
 func buildTCPSegment(segment tcpSegment) []byte {
@@ -125,16 +130,24 @@ func buildTCPSegment(segment tcpSegment) []byte {
 		options = append(options, 0)
 	}
 	tcpLen := tcpMinHeaderLen + len(options) + len(segment.Payload)
-	packet := make([]byte, ipv4MinHeaderLen+tcpLen)
+	headerLen := ipv4MinHeaderLen
+	if segment.IPv6 {
+		headerLen = ipv6HeaderLen
+	}
+	packet := make([]byte, headerLen+tcpLen)
 
-	packet[0] = 0x45
-	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
-	packet[8] = 64
-	packet[9] = ipv4ProtocolTCP
-	binary.BigEndian.PutUint32(packet[12:16], segment.SourceIP)
-	binary.BigEndian.PutUint32(packet[16:20], segment.DestinationIP)
+	if segment.IPv6 {
+		writeIPv6Header(packet, ipv4ProtocolTCP, tcpLen, segment.SourceIP6, segment.DestinationIP6)
+	} else {
+		packet[0] = 0x45
+		binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
+		packet[8] = 64
+		packet[9] = ipv4ProtocolTCP
+		binary.BigEndian.PutUint32(packet[12:16], segment.SourceIP)
+		binary.BigEndian.PutUint32(packet[16:20], segment.DestinationIP)
+	}
 
-	tcp := packet[ipv4MinHeaderLen:]
+	tcp := packet[headerLen:]
 	binary.BigEndian.PutUint16(tcp[0:2], segment.SourcePort)
 	binary.BigEndian.PutUint16(tcp[2:4], segment.DestinationPort)
 	binary.BigEndian.PutUint32(tcp[4:8], segment.Seq)
@@ -145,9 +158,28 @@ func buildTCPSegment(segment tcpSegment) []byte {
 	copy(tcp[tcpMinHeaderLen:], options)
 	copy(tcp[tcpMinHeaderLen+len(options):], segment.Payload)
 
+	if segment.IPv6 {
+		binary.BigEndian.PutUint16(tcp[16:18],
+			egressChecksum6(segment.SourceIP6, segment.DestinationIP6, ipv4ProtocolTCP, tcp))
+		return packet
+	}
 	binary.BigEndian.PutUint16(packet[10:12], peerPacketChecksum(packet[:ipv4MinHeaderLen]))
 	binary.BigEndian.PutUint16(tcp[16:18], peerPacketTCPChecksum(packet, ipv4MinHeaderLen, tcpLen))
 	return packet
+}
+
+// flowKey is the egress flow key of a segment arriving from a consumer.
+func (s tcpSegment) flowKey() egressFlowKey {
+	return egressFlowKey{
+		protocol:     ipv4ProtocolTCP,
+		consumerIP:   s.SourceIP,
+		consumerPort: s.SourcePort,
+		remoteIP:     s.DestinationIP,
+		remotePort:   s.DestinationPort,
+		ipv6:         s.IPv6,
+		consumerIP6:  s.SourceIP6,
+		remoteIP6:    s.DestinationIP6,
+	}
 }
 
 // buildTCPReset answers an unwanted segment with an RST the peer's stack will accept.
@@ -159,6 +191,9 @@ func buildTCPReset(segment tcpSegment) []byte {
 	reset := tcpSegment{
 		SourceIP:        segment.DestinationIP,
 		DestinationIP:   segment.SourceIP,
+		IPv6:            segment.IPv6,
+		SourceIP6:       segment.DestinationIP6,
+		DestinationIP6:  segment.SourceIP6,
 		SourcePort:      segment.DestinationPort,
 		DestinationPort: segment.SourcePort,
 		Flags:           tcpFlagRST,

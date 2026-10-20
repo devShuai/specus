@@ -19,10 +19,14 @@ const (
 	udpMaxPayload = 65535 - ipv4MinHeaderLen - udpHeaderLen
 )
 
-// udpDatagram is one parsed UDP datagram together with the IPv4 addresses that carried it.
+// udpDatagram is one parsed UDP datagram together with the addresses that carried it: the IPv4
+// ones, or, when IPv6 is set, the IPv6 ones with the IPv4 fields left zero.
 type udpDatagram struct {
 	SourceIP        uint32
 	DestinationIP   uint32
+	IPv6            bool
+	SourceIP6       [16]byte
+	DestinationIP6  [16]byte
 	SourcePort      uint16
 	DestinationPort uint16
 	Payload         []byte
@@ -64,9 +68,40 @@ func parseUDPDatagram(packet []byte) (udpDatagram, bool) {
 	}, true
 }
 
-// buildUDPDatagram renders a datagram as a complete IPv4 packet, checksums included.
+// flowKey is the egress flow key of a datagram arriving from a consumer.
+func (d udpDatagram) flowKey() egressFlowKey {
+	return egressFlowKey{
+		protocol:     ipv4ProtocolUDP,
+		consumerIP:   d.SourceIP,
+		consumerPort: d.SourcePort,
+		remoteIP:     d.DestinationIP,
+		remotePort:   d.DestinationPort,
+		ipv6:         d.IPv6,
+		consumerIP6:  d.SourceIP6,
+		remoteIP6:    d.DestinationIP6,
+	}
+}
+
+// buildUDPDatagram renders a datagram as a complete IPv4 packet, or IPv6 packet when the datagram
+// is IPv6, checksums included.
 func buildUDPDatagram(datagram udpDatagram) []byte {
 	length := udpHeaderLen + len(datagram.Payload)
+	if datagram.IPv6 {
+		packet := make([]byte, ipv6HeaderLen+length)
+		writeIPv6Header(packet, ipv4ProtocolUDP, length, datagram.SourceIP6, datagram.DestinationIP6)
+		udp := packet[ipv6HeaderLen:]
+		binary.BigEndian.PutUint16(udp[0:2], datagram.SourcePort)
+		binary.BigEndian.PutUint16(udp[2:4], datagram.DestinationPort)
+		binary.BigEndian.PutUint16(udp[4:6], uint16(length))
+		copy(udp[udpHeaderLen:], datagram.Payload)
+		checksum := egressChecksum6(datagram.SourceIP6, datagram.DestinationIP6, ipv4ProtocolUDP, udp)
+		// Zero would read as "no checksum", which IPv6 does not allow; its complement is the same sum.
+		if checksum == 0 {
+			checksum = 0xffff
+		}
+		binary.BigEndian.PutUint16(udp[6:8], checksum)
+		return packet
+	}
 	packet := make([]byte, ipv4MinHeaderLen+length)
 
 	packet[0] = 0x45

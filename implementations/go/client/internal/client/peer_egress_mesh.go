@@ -184,7 +184,9 @@ func (mesh *peerMeshClient) handlePeerEgressFrame(frame *peerDataFrame, session 
 	if session.PathMTU != nil {
 		runtime.setPathMTU(session.PathMTU.effectiveMTU(mesh.config.PeerMeshMTU) - peerEgressFrameHeaderLen)
 	}
-	return runtime.handleFrame(session.PeerID, frame.Payload, time.Now())
+	// The session's peer address is what an IPv6 packet's source is checked against: the consumer's
+	// derived address, not whatever the packet claims.
+	return runtime.handleFrameFrom(session.PeerID, session.PeerVirtualIP, frame.Payload, time.Now())
 }
 
 // ensureEgressConsumer lazily builds the consumer side. Called with no mesh lock held.

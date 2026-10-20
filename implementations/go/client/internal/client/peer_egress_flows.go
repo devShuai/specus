@@ -1,8 +1,10 @@
 package client
 
 import (
+	"bytes"
 	"net/netip"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -29,9 +31,30 @@ type egressFlowKey struct {
 	consumerPort uint16
 	remoteIP     uint32
 	remotePort   uint16
+	// An IPv6 flow (protocol/spec/peer-egress.md, IPv6 数据面) holds its addresses here and leaves
+	// the two above zero. ipv6 keeps it apart from an IPv4 flow whose addresses are zero.
+	ipv6        bool
+	consumerIP6 [16]byte
+	remoteIP6   [16]byte
 }
 
 func (k egressFlowKey) protocolName() string { return egressProtocolName(k.protocol) }
+
+// remoteAddr is the key's remote address, of either family.
+func (k egressFlowKey) remoteAddr() netip.Addr {
+	if k.ipv6 {
+		return netip.AddrFrom16(k.remoteIP6)
+	}
+	return egressNetAddr(k.remoteIP)
+}
+
+// consumerAddr is the key's consumer address, of either family.
+func (k egressFlowKey) consumerAddr() netip.Addr {
+	if k.ipv6 {
+		return netip.AddrFrom16(k.consumerIP6)
+	}
+	return egressNetAddr(k.consumerIP)
+}
 
 // egressFlow is one live flow's accounting. The data plane owns the socket; this owns the fact that
 // the socket is allowed to exist.
@@ -71,7 +94,7 @@ func (f *egressFlow) dialled() netip.Addr {
 	if f.Destination.IsValid() {
 		return f.Destination
 	}
-	return egressNetAddr(f.Key.remoteIP)
+	return f.Key.remoteAddr()
 }
 
 // egressNetAddr is an IPv4 address as the flow keys hold it, in the form a dialled address takes.
@@ -203,7 +226,8 @@ func (t *egressFlowTable) revokeConsumer(consumer int64) []*egressFlow {
 	return t.reap(func(flow *egressFlow) bool { return flow.Consumer == consumer })
 }
 
-// purgeDestinations closes every flow whose remote address falls inside one of the given prefixes.
+// purgeDestinations closes every flow whose remote address falls inside one of the given prefixes,
+// IPv4 or IPv6; a prefix only ever matches flows of its own family.
 // This serves the flow-purge control message, which a consumer sends when its own routing rules
 // change and it wants the matching flows torn down rather than left to time out.
 //
@@ -218,17 +242,32 @@ func (t *egressFlowTable) purgeDestinations(destinations []string) []*egressFlow
 // let any peer tear down every other peer's traffic with one message. A zero consumer means no
 // restriction, which is for local teardown rather than for anything that arrives on the wire.
 func (t *egressFlowTable) purgeConsumerDestinations(consumer int64, destinations []string) []*egressFlow {
-	prefixes := make([]egressCIDR, 0, len(destinations))
+	var prefixes []egressCIDR
+	var prefixes6 []egressCIDR6
 	for _, text := range destinations {
+		if strings.Contains(text, ":") {
+			if cidr, _, ok := parseEgressCIDR6(strings.TrimSpace(text)); ok {
+				prefixes6 = append(prefixes6, cidr)
+			}
+			continue
+		}
 		if cidr, ok := parseEgressCIDR(text); ok {
 			prefixes = append(prefixes, cidr)
 		}
 	}
-	if len(prefixes) == 0 {
+	if len(prefixes) == 0 && len(prefixes6) == 0 {
 		return nil
 	}
 	return t.reap(func(flow *egressFlow) bool {
 		if consumer != 0 && flow.Consumer != consumer {
+			return false
+		}
+		if flow.Key.ipv6 {
+			for _, prefix := range prefixes6 {
+				if prefix.contains(flow.Key.remoteIP6) {
+					return true
+				}
+			}
 			return false
 		}
 		for _, prefix := range prefixes {
@@ -246,10 +285,11 @@ func (t *egressFlowTable) purgeConsumerDestinations(consumer int64, destinations
 // itself and will never work, and the consumer's next SYN or datagram would be taken as part of it;
 // closed, that next packet opens the flow by name. A flow opened for another name is closed as well,
 // since the address now stands for a different destination. Which of them the consumer is told
-// about is the caller's decision: each flow still carries the name it was opened for.
+// about is the caller's decision: each flow still carries the name it was opened for. Names are bound
+// to IPv4 fake addresses only, so no IPv6 flow is ever one of them.
 func (t *egressFlowTable) closeNotNamed(consumer int64, address uint32, name string) []*egressFlow {
 	return t.reap(func(flow *egressFlow) bool {
-		return flow.Consumer == consumer && flow.Key.remoteIP == address && flow.Name != name
+		return flow.Consumer == consumer && !flow.Key.ipv6 && flow.Key.remoteIP == address && flow.Name != name
 	})
 }
 
@@ -357,12 +397,18 @@ func sortEgressFlows(flows []*egressFlow) {
 		switch {
 		case left.protocol != right.protocol:
 			return left.protocol < right.protocol
+		case left.ipv6 != right.ipv6:
+			return !left.ipv6
 		case left.consumerIP != right.consumerIP:
 			return left.consumerIP < right.consumerIP
+		case left.consumerIP6 != right.consumerIP6:
+			return bytes.Compare(left.consumerIP6[:], right.consumerIP6[:]) < 0
 		case left.consumerPort != right.consumerPort:
 			return left.consumerPort < right.consumerPort
 		case left.remoteIP != right.remoteIP:
 			return left.remoteIP < right.remoteIP
+		case left.remoteIP6 != right.remoteIP6:
+			return bytes.Compare(left.remoteIP6[:], right.remoteIP6[:]) < 0
 		default:
 			return left.remotePort < right.remotePort
 		}

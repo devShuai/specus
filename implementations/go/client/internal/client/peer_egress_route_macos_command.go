@@ -84,7 +84,7 @@ func validMacosInterfaceName(value string) bool {
 // macosShowTableArgs reads the whole table.
 //
 // IPv4 only: the IPv6 section has a different column layout and this feature does not route IPv6
-// yet.
+// yet. The egress socket binder reads the IPv6 table with macosShowTableArgs6.
 func macosShowTableArgs() []string {
 	return []string{"netstat", "-rn", "-f", "inet"}
 }

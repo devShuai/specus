@@ -133,13 +133,13 @@ func TestEgressRuntimeRefusesANameThatResolvesToIPv6Loopback(t *testing.T) {
 	}
 }
 
-// Only an IPv6 target is dialled unbound; an IPv4-mapped one goes through the IPv4 choice.
-func TestEgressSocketsToIPv6TargetsAreLeftUnbound(t *testing.T) {
+// Only an IPv6 target is bound from the IPv6 table; an IPv4-mapped one goes through the IPv4 choice.
+func TestEgressSocketsToIPv6TargetsUseTheIPv6Table(t *testing.T) {
 	for address, want := range map[string]bool{
 		"[2001:db8::10]:443": true, "203.0.113.10:443": false, "[::ffff:203.0.113.10]:443": false, "nonsense": false,
 	} {
-		if got := egressLeftUnbound(address); got != want {
-			t.Errorf("%s: unbound = %v, want %v", address, got, want)
+		if got := egressTargetIs6(address); got != want {
+			t.Errorf("%s: IPv6 = %v, want %v", address, got, want)
 		}
 	}
 }

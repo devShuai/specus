@@ -40,13 +40,15 @@ type peerEgressFrame struct {
 	Inner peerEgressInner
 }
 
-// peerEgressInner is the parsed IPv4 tuple of a type=1 body, filled only for that type.
+// peerEgressInner is the parsed tuple of a type=1 body, filled only for that type. For an IPv6 body
+// the addresses are in RFC 5952 form and Protocol is the next header.
 type peerEgressInner struct {
 	SourceIP        string
 	DestinationIP   string
 	Protocol        int
 	SourcePort      int
 	DestinationPort int
+	IPv6            bool
 }
 
 type peerEgressControl struct {
@@ -73,11 +75,19 @@ func looksLikePeerEgressFrame(payload []byte) bool {
 		string(payload[:len(peerEgressMagic)]) == string(peerEgressMagic[:])
 }
 
-// parsePeerEgressFrame decodes one SPEG1 frame, returning the failing result code on rejection.
+// parsePeerEgressFrame decodes one SPEG1 frame as a receiver without the IPv6 data plane does,
+// refusing an IPv6 body with EGRESS_IPV6_UNSUPPORTED. The consumer reads frames this way: it does not
+// carry IPv6 (egressConsumerCarriesIPv6).
+func parsePeerEgressFrame(payload []byte) (peerEgressFrame, string) {
+	return parsePeerEgressFrameFor(payload, false)
+}
+
+// parsePeerEgressFrameFor decodes one SPEG1 frame, returning the failing result code on rejection.
+// ipv6 says whether this receiver accepts an IPv6 body: an egress that announces ipv6PacketCapable.
 //
 // The checks run in a fixed order so every implementation reports the same code for a frame that
 // violates more than one constraint.
-func parsePeerEgressFrame(payload []byte) (peerEgressFrame, string) {
+func parsePeerEgressFrameFor(payload []byte, ipv6 bool) (peerEgressFrame, string) {
 	if len(payload) < peerEgressFrameHeaderLen {
 		return peerEgressFrame{}, egressCodeFrameTruncated
 	}
@@ -104,7 +114,7 @@ func parsePeerEgressFrame(payload []byte) (peerEgressFrame, string) {
 		}
 		return frame, ""
 	}
-	inner, code := parsePeerEgressInnerPacket(frame.Body)
+	inner, code := parsePeerEgressInnerPacket(frame.Body, ipv6)
 	if code != "" {
 		return peerEgressFrame{}, code
 	}
@@ -112,9 +122,16 @@ func parsePeerEgressFrame(payload []byte) (peerEgressFrame, string) {
 	return frame, ""
 }
 
-func parsePeerEgressInnerPacket(body []byte) (peerEgressInner, string) {
+// parsePeerEgressInnerPacket reads a type=1 body. A body shorter than the smallest IPv4 header is
+// truncated whatever its version, as it was before IPv6 bodies were read: no IPv6 header fits in it
+// either. Then the version decides: 4 reads as IPv4, 6 as IPv6 when ipv6 is set, and anything else is
+// EGRESS_IPV6_UNSUPPORTED.
+func parsePeerEgressInnerPacket(body []byte, ipv6 bool) (peerEgressInner, string) {
 	if len(body) < 20 {
 		return peerEgressInner{}, egressCodeFrameTruncated
+	}
+	if ipv6 && body[0]>>4 == 6 {
+		return parsePeerEgressInnerPacket6(body)
 	}
 	if body[0]>>4 != 4 {
 		return peerEgressInner{}, egressCodeIPv6Unsupported
@@ -140,6 +157,36 @@ func parsePeerEgressInnerPacket(body []byte) (peerEgressInner, string) {
 	if (inner.Protocol == ipv4ProtocolTCP || inner.Protocol == ipv4ProtocolUDP) && len(body) >= ihl+4 {
 		inner.SourcePort = int(binary.BigEndian.Uint16(body[ihl : ihl+2]))
 		inner.DestinationPort = int(binary.BigEndian.Uint16(body[ihl+2 : ihl+4]))
+	}
+	return inner, ""
+}
+
+// parsePeerEgressInnerPacket6 reads an IPv6 body (protocol/spec/peer-egress.md, IPv6 数据面, 出口).
+//
+// Only the fixed header is read: the next header is the protocol, and ports are taken when it is TCP
+// or UDP. An extension header is not walked; a packet that starts with one is refused later by
+// protocol, the way ICMP over IPv4 is. There are no jumbograms, so a payload length of zero with
+// bytes behind the header is trailing bytes like any other mismatch.
+func parsePeerEgressInnerPacket6(body []byte) (peerEgressInner, string) {
+	if len(body) < ipv6HeaderLen {
+		return peerEgressInner{}, egressCodeFrameTruncated
+	}
+	total := ipv6HeaderLen + int(binary.BigEndian.Uint16(body[4:6]))
+	if total > len(body) {
+		return peerEgressInner{}, egressCodeFrameTruncated
+	}
+	if total < len(body) {
+		return peerEgressInner{}, egressCodeFrameTrailingBytes
+	}
+	inner := peerEgressInner{
+		SourceIP:      formatEgressAddress6([16]byte(body[8:24])),
+		DestinationIP: formatEgressAddress6([16]byte(body[24:40])),
+		Protocol:      int(body[6]),
+		IPv6:          true,
+	}
+	if (inner.Protocol == ipv4ProtocolTCP || inner.Protocol == ipv4ProtocolUDP) && len(body) >= ipv6HeaderLen+4 {
+		inner.SourcePort = int(binary.BigEndian.Uint16(body[ipv6HeaderLen : ipv6HeaderLen+2]))
+		inner.DestinationPort = int(binary.BigEndian.Uint16(body[ipv6HeaderLen+2 : ipv6HeaderLen+4]))
 	}
 	return inner, ""
 }

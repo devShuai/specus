@@ -341,7 +341,7 @@ func authorizeEgressFlow(request egressRequest, policy egressPolicy, peerACLAllo
 func egressForcedDenyFor(context egressContext, request egressRequest) []string {
 	denied := make([]string, 0, len(egressForcedDenyCIDRs)+len(egressCloudMetadataCIDRs)+
 		len(egressForcedDenyCIDRs6)+len(egressCloudMetadataCIDRs6)+
-		len(context.DeploymentDenyCIDRs)+len(request.LocalInterfaceCIDRs)+1)
+		len(context.DeploymentDenyCIDRs)+len(request.LocalInterfaceCIDRs)+2)
 	denied = append(denied, egressForcedDenyCIDRs...)
 	denied = append(denied, egressCloudMetadataCIDRs...)
 	denied = append(denied, egressForcedDenyCIDRs6...)
@@ -350,7 +350,10 @@ func egressForcedDenyFor(context egressContext, request egressRequest) []string 
 	if mesh == "" {
 		mesh = egressDefaultMeshCIDR
 	}
-	denied = append(denied, mesh)
+	// The prefix devices' IPv6 addresses are derived in is the mesh network's IPv6 counterpart, and is
+	// refused for the same reason: forwarding into it would let a consumer reach another peer
+	// through this egress, past the mesh ACL.
+	denied = append(denied, mesh, egressMeshPrefix6)
 	denied = append(denied, context.DeploymentDenyCIDRs...)
 	denied = append(denied, request.LocalInterfaceCIDRs...)
 	return denied
