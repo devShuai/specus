@@ -1,9 +1,9 @@
 #define _POSIX_C_SOURCE 200809L
 
 /*
- * STUN/TURN capacity: socket numbers past FD_SETSIZE and more allocations than the old fixed
- * table held. Java gives every socket its own (virtual) thread and keeps allocations in an
- * unbounded map, so neither is a limit there.
+ * STUN/TURN capacity: socket numbers past FD_SETSIZE, more allocations than the old fixed table
+ * held, and unpredictable relay ports. Java gives every socket its own (virtual) thread and keeps
+ * allocations in an unbounded map, so none of these is a limit there.
  */
 
 #include "crypto.h"
@@ -385,7 +385,53 @@ static int test_allocations_beyond_256(void)
     return failed ? -1 : 0;
 }
 
-/* With an argument, only the named case runs: fd-setsize or allocations. */
+/*
+ * Java bindRelaySocket starts at a random port of the range, so the next relay port cannot be
+ * predicted from the last one; consecutive allocations used to take consecutive ports.
+ */
+#define PORT_SAMPLES 12
+
+static int test_relay_ports_not_sequential(void)
+{
+    st_stun_turn_server *server = NULL;
+    struct sockaddr_in server_address;
+    struct sockaddr_in client_address;
+    struct sockaddr_in relay;
+    turn_credential general;
+    int clients[PORT_SAMPLES];
+    unsigned ports[PORT_SAMPLES];
+    size_t count = 0U;
+    int failed = start_server(&server, &server_address, "57100", "58099") != 0
+        || issue("public-transfer-ports", &general) != 0;
+    for (int i = 0; !failed && i < PORT_SAMPLES; ++i) {
+        int fd = udp_socket(&client_address);
+        if (fd < 0 || allocate(fd, &server_address, &general, 8000U + (unsigned)i, &relay) != 0) {
+            if (fd >= 0) close(fd);
+            failed = 1;
+            break;
+        }
+        clients[count] = fd;
+        ports[count++] = ntohs(relay.sin_port);
+        if (ports[count - 1U] < 57100U || ports[count - 1U] > 58099U) {
+            fprintf(stderr, "relay port %u outside the configured range\n", ports[count - 1U]);
+            failed = 1;
+        }
+    }
+    int sequential = !failed;
+    for (size_t i = 1; sequential && i < count; ++i) {
+        sequential = ports[i] == (ports[i - 1U] == 58099U ? 57100U : ports[i - 1U] + 1U);
+    }
+    if (sequential) {
+        fprintf(stderr, "%d consecutive allocations took consecutive relay ports starting at %u\n",
+                PORT_SAMPLES, count > 0U ? ports[0] : 0U);
+        failed = 1;
+    }
+    for (size_t i = 0; i < count; ++i) close(clients[i]);
+    if (server != NULL) st_stun_turn_server_stop(server);
+    return failed ? -1 : 0;
+}
+
+/* With an argument, only the named case runs: fd-setsize, allocations or ports. */
 static int selected(int argc, char **argv, const char *name)
 {
     return argc < 2 || strcmp(argv[1], name) == 0;
@@ -405,7 +451,8 @@ int main(int argc, char **argv)
     unsetenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS");
     unsetenv("SPECUS_DATABASE_PATH");
     if ((selected(argc, argv, "fd-setsize") && test_sockets_past_fd_setsize() != 0)
-        || (selected(argc, argv, "allocations") && test_allocations_beyond_256() != 0)) {
+        || (selected(argc, argv, "allocations") && test_allocations_beyond_256() != 0)
+        || (selected(argc, argv, "ports") && test_relay_ports_not_sequential() != 0)) {
         fprintf(stderr, "STUN/TURN scale tests failed\n");
         return 1;
     }

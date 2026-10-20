@@ -114,7 +114,6 @@ struct st_stun_turn_server {
     int channel_ttl;
     int relay_min_port;
     int relay_max_port;
-    int next_relay_port;
     int general_relay_max_allocations;
     int general_relay_max_allocations_per_address;
     long long general_relay_max_bytes;
@@ -456,7 +455,12 @@ static int builder_error(stun_builder *builder,
     return 0;
 }
 
-static int create_udp_socket(const char *bind_address, int port, int *actual_port)
+/*
+ * reuse_address is for the listening endpoints only. A relay socket must fail to bind a port
+ * another relay holds: on Linux SO_REUSEADDR lets two UDP sockets share one, and the second
+ * allocation would then take the first one's datagrams (Java's DatagramSocket does not set it).
+ */
+static int create_udp_socket(const char *bind_address, int port, int reuse_address, int *actual_port)
 {
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
@@ -465,7 +469,8 @@ static int create_udp_socket(const char *bind_address, int port, int *actual_por
     if (inet_pton(AF_INET, bind_address, &address.sin_addr) != 1) return -1;
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     int reuse = 1;
-    if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0
+    if (fd < 0
+        || (reuse_address && setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0)
         || bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
         if (fd >= 0) close(fd);
         return -1;
@@ -507,7 +512,7 @@ static int add_stun_endpoint(st_stun_turn_server *server,
 {
     if (server->endpoint_count >= STUN_MAX_ENDPOINTS) return -1;
     int actual_port = 0;
-    int fd = create_udp_socket(bind_address, port, &actual_port);
+    int fd = create_udp_socket(bind_address, port, 1, &actual_port);
     if (fd < 0) return -1;
     stun_server_endpoint *endpoint = &server->endpoints[server->endpoint_count];
     memset(endpoint, 0, sizeof(*endpoint));
@@ -826,15 +831,16 @@ static turn_allocation *create_allocation(st_stun_turn_server *server,
     if (bind_address == NULL || *bind_address == '\0') bind_address = "0.0.0.0";
     int relay_fd = -1;
     int relay_port = 0;
+    /* Java bindRelaySocket: the first port is random, so the next relay port cannot be predicted,
+     * and at most clamp(range, 16, 128) ports are tried, so a crowded range cannot hold this thread
+     * in thousands of bind calls. */
     int range = server->relay_max_port - server->relay_min_port + 1;
-    for (int i = 0; i < range; ++i) {
-        int port = server->relay_min_port
-            + ((server->next_relay_port - server->relay_min_port + i) % range);
-        relay_fd = create_udp_socket(bind_address, port, &relay_port);
-        if (relay_fd >= 0) {
-            server->next_relay_port = port == server->relay_max_port ? server->relay_min_port : port + 1;
-            break;
-        }
+    int attempts = range < 16 ? 16 : (range > 128 ? 128 : range);
+    unsigned int random = 0U;
+    if (RAND_bytes((unsigned char *)&random, (int)sizeof(random)) != 1) random = (unsigned int)time(NULL);
+    int first = (int)(random % (unsigned int)range);
+    for (int i = 0; i < attempts && relay_fd < 0; ++i) {
+        relay_fd = create_udp_socket(bind_address, server->relay_min_port + (first + i) % range, 0, &relay_port);
     }
     if (relay_fd < 0) return NULL;
     turn_allocation *slot = (turn_allocation *)calloc(1, sizeof(*slot));
@@ -1438,7 +1444,6 @@ int st_stun_turn_server_start(st_stun_turn_server **out_server)
         free(server);
         return -1;
     }
-    server->next_relay_port = server->relay_min_port;
     const char *primary_bind = getenv("SPECUS_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS");
     int primary_explicit = primary_bind != NULL && *primary_bind != '\0';
     if (!primary_explicit) primary_bind = getenv("SPECUS_PEER_MESH_BIND_ADDRESS");
