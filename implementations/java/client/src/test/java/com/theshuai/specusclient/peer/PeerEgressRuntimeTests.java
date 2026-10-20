@@ -393,6 +393,47 @@ class PeerEgressRuntimeTests {
     }
 
     /**
+     * The #256 signature: a new connection's SYN on a four-tuple the egress still holds is answered
+     * with a reset without ACK, which the consumer's socket ignores. The egress logs what it was
+     * holding, so the next occurrence in the lab says where the flow came from, and leaves the tuple
+     * out of the log.
+     */
+    @Test
+    void logsANewSynMeetingAHeldFlow() {
+        ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger)
+                org.slf4j.LoggerFactory.getLogger(PeerEgressRuntime.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+                new ch.qos.logback.core.read.ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            Harness harness = new Harness();
+            PeerEgressSegment.Segment opening = syn("100.96.0.1", 40000, "203.0.113.10", 443);
+            harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(opening)), EPOCH);
+            harness.completeHandshake(7, opening);
+
+            PeerEgressSegment.Segment again = new PeerEgressSegment.Segment(
+                    opening.sourceIp(), opening.destinationIp(), opening.sourcePort(), opening.destinationPort(),
+                    opening.seq() + 100000, 0, PeerEgressSegment.FLAG_SYN, 65535, 0, new byte[0]);
+            int before = harness.segments().size();
+            harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(again)), EPOCH + 2000);
+
+            List<PeerEgressSegment.Segment> answers = harness.segments().subList(before, harness.segments().size());
+            assertEquals(1, answers.size(), "one answer to the SYN");
+            assertEquals(PeerEgressSegment.FLAG_RST, answers.get(0).flags(), "a reset without ACK");
+            assertEquals(1, harness.dialCount(), "the held flow is not dialled again");
+            String text = appender.list.stream().map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage)
+                    .filter(message -> message.contains("new SYN met an existing flow"))
+                    .findFirst().orElse("");
+            assertTrue(text.contains("consumer=7 state=ESTABLISHED lingering=false age=2000ms"),
+                    "log does not describe the held flow: " + text);
+            assertFalse(text.contains("203.0.113.10") || text.contains("40000"), "log carries the tuple: " + text);
+        } finally {
+            logger.detachAppender(appender);
+        }
+    }
+
+    /**
      * A refused flow must never reach a socket. Dialing first and checking after would leak a
      * connection to a destination the policy forbids, which is the whole failure this layer exists
      * to prevent.

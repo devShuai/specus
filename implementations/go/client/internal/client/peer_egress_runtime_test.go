@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -303,6 +304,52 @@ func TestEgressRuntimeOpensAndForwardsATCPFlow(t *testing.T) {
 		t.Errorf("socket received %q", got)
 	}
 }
+
+// The #256 signature: a new connection's SYN on a four-tuple the egress still holds is answered with
+// a reset without ACK, which the consumer's socket ignores. The egress logs what it was holding, so
+// the next occurrence in the lab says where the flow came from, and leaves the tuple out of the log.
+func TestEgressRuntimeLogsANewSynMeetingAHeldFlow(t *testing.T) {
+	harness := newEgressHarness(t)
+	var logged strings.Builder
+	var logMu sync.Mutex
+	harness.runtime.logger = log.New(writerFunc(func(p []byte) (int, error) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		return logged.Write(p)
+	}), "", 0)
+	syn := egressSyn(t, "100.96.0.1", 40000, "203.0.113.10", 443)
+	harness.runtime.handleFrame(7, egressFrameFor(buildTCPSegment(syn)), flowEpoch)
+	handshake := harness.segments()[0]
+	ack := tcpSegment{
+		SourceIP: syn.SourceIP, DestinationIP: syn.DestinationIP,
+		SourcePort: syn.SourcePort, DestinationPort: syn.DestinationPort,
+		Seq: syn.Seq + 1, Ack: handshake.Seq + 1, Flags: tcpFlagACK, Window: 65535,
+	}
+	harness.runtime.handleFrame(7, egressFrameFor(buildTCPSegment(ack)), flowEpoch)
+
+	again := syn
+	again.Seq = syn.Seq + 100000
+	before := len(harness.segments())
+	harness.runtime.handleFrame(7, egressFrameFor(buildTCPSegment(again)), flowEpoch.Add(2*time.Second))
+
+	answers := harness.segments()[before:]
+	if len(answers) != 1 || answers[0].Flags != tcpFlagRST || harness.dialCount() != 1 {
+		t.Fatalf("a SYN on a held four-tuple: answers %+v, dialed %d times", answers, harness.dialCount())
+	}
+	logMu.Lock()
+	text := logged.String()
+	logMu.Unlock()
+	if !strings.Contains(text, "new SYN met an existing flow consumer=7 state=ESTABLISHED lingering=false age=2s") {
+		t.Fatalf("log does not describe the held flow: %q", text)
+	}
+	if strings.Contains(text, "203.0.113.10") || strings.Contains(text, "40000") {
+		t.Fatalf("log carries the tuple: %q", text)
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
 func TestEgressRuntimeBackpressuresReaderAndResumesOnAck(t *testing.T) {
 	h := newEgressHarness(t)
