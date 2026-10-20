@@ -1412,11 +1412,15 @@ static int pm_replay_catalogs(const st_peer_mesh_runtime *runtime,
     for (size_t i = 0; i < count; ++i) {
         st_storage_client publisher;
         int allowed = 0;
+        /*
+         * As Java catalogsForRecipient: every live publisher session is replayed, and one the
+         * recipient may not peer with goes out with no services, so the recipient replaces whatever
+         * it still holds for that session rather than keeping it.
+         */
         if (st_storage_get_client_by_name(runtime->database_path,
                                           snapshots[i].publisher_client_name, &publisher) != 0
-            || st_storage_can_peer(runtime->database_path, &publisher, recipient, &allowed) != 0
-            || !allowed) continue;
-        char *message = pm_build_catalog_message(runtime, &snapshots[i], &publisher, recipient, 1);
+            || st_storage_can_peer(runtime->database_path, &publisher, recipient, &allowed) != 0) continue;
+        char *message = pm_build_catalog_message(runtime, &snapshots[i], &publisher, recipient, allowed);
         if (message == NULL
             || runtime->send(runtime->ctx, recipient->client_name, "server", message) != 0) rc = -1;
         free(message);
