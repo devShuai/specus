@@ -503,7 +503,7 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 
 没有 TUN 的节点（虚拟网卡为 `noop`）没有路由要去掉，按同样的规则选出来的就是系统自己的选择。TUN 名在系统里找不到对应接口时同样视为没有路由要去掉：不存在的接口上不会有路由。
 
-**IPv6 目标的 socket 目前不绑定接口**（Linux 照常打标记）。绑定防的是 socket 跟着本机隧道的路由走，而今天没有客户端往隧道装 IPv6 路由：IPv6 规则在消费端不生效（`EGRESS_RULE_IPV6_UNSUPPORTED`）。`IP_UNICAST_IF` 与 `IP_BOUND_IF` 本来也只作用于 IPv4 socket。消费端 IPv6 数据面会往隧道装 IPv6 路由，选项与选择规则见「IPv6 数据面」的出口部分，随数据面一起交付。IPv4 映射地址不算 IPv6 目标，照旧走 IPv4 的选择（它本来就被强制拒绝清单挡住）。
+**IPv6 目标的 socket 与 IPv4 一样绑定**（Linux 照常打标记），从 IPv6 路由表选接口；选项与读表见「IPv6 数据面」的出口部分。此前它们不绑定：那时没有客户端往隧道装 IPv6 路由，socket 也就不会跟着隧道走；数据面让消费端装 IPv6 路由之后，同时是消费端的出口必须绑定。没有候选时同样拒绝建流。IPv4 映射地址不算 IPv6 目标，照旧走 IPv4 的选择（它本来就被强制拒绝清单挡住）。
 
 **读表。** Windows 每次 connect 用 `GetIpForwardTable2` 与 `GetIpInterfaceTable` 原生读取，不经 PowerShell：一次 `Get-NetRoute` 要 419 ms，这两个调用是微秒级，不需要缓存，切网之后下一次 connect 就能看到。macOS 读 `netstat -rn -f inet`，与路由接管同一套读取与归一，25 ms 一次，结果保留 2 秒：隧道自己的路由本来就不参与选择，缓存能错过的只有物理网络的变化，而错过的后果是 connect 失败，不是泄漏。
 
