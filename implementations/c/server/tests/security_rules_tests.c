@@ -11,7 +11,11 @@
  *     /http/ answers carry none of the portal's headers;
  *   - the cloud diagram API needs a session, and an account manages its own diagram with it;
  *   - a protected route challenges without credentials and lets valid ones through to the offline
- *     client's 502 "客户端不在线".
+ *     client's 502 "客户端不在线";
+ *   - without a session the public presign, the route API, the connectivity check and the package
+ *     upload are 401, and a USER account is refused the download catalog (403);
+ *   - the client detail shows a route's authentication state (authEnabled, authUsername,
+ *     authPasswordConfigured) and never its password or hash.
  *
  * Usage: specus_c_security_rules_tests <path-to-specus-server-c>
  */
@@ -244,12 +248,119 @@ static int check_protected_route_entry(test_server *server)
     return 0;
 }
 
+/*
+ * publicTransferObjectStorageRequiresAuthentication, httpRouteApiRequiresAuthentication and
+ * clientPackageAdministrationRequiresAuthentication...: without a session the presign, the route
+ * API, the connectivity check and the package upload are all 401 before anything else is read.
+ */
+static int check_anonymous_rules(test_server *server)
+{
+    static const char presign_body[] =
+        "{\"fileName\":\"note.txt\",\"mimeType\":\"text/plain\",\"sizeBytes\":4,"
+        "\"roomId\":\"security-test\",\"roomToken\":\"security-test-token\"}";
+    char request[1024];
+    raw_answer answer;
+    snprintf(request, sizeof(request),
+             "POST /api/public/transfer/attachments/presign-upload HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+             "Content-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
+             strlen(presign_body), presign_body);
+    CHECK(raw_request(server, request, &answer) == 0, "anonymous presign request");
+    CHECK(expect_status(&answer, 401, NULL, "an anonymous public presign") == 0, "anonymous presign");
+    CHECK(raw_request(server, "GET /api/admin/http-routes HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                      &answer) == 0, "anonymous route list request");
+    CHECK(expect_status(&answer, 401, NULL, "the route API without a session") == 0, "anonymous route list");
+    CHECK(raw_request(server, "POST /api/admin/http-routes/1/connectivity-check HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                              "Content-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                      &answer) == 0, "anonymous connectivity check request");
+    CHECK(expect_status(&answer, 401, NULL, "a connectivity check without a session") == 0,
+          "anonymous connectivity check");
+    CHECK(raw_request(server, "POST /api/admin/client-packages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                              "Content-Type: multipart/form-data; boundary=specus-test\r\nContent-Length: 17\r\n"
+                              "Connection: close\r\n\r\n--specus-test--\r\n", &answer) == 0,
+          "anonymous package upload request");
+    CHECK(expect_status(&answer, 401, NULL, "a package upload without a session") == 0, "anonymous upload");
+    return 0;
+}
+
+/* clientPackageAdministrationRequiresAdminRole: a USER account is refused the download catalog. */
+static int check_user_role_rules(test_server *server)
+{
+    char token[1024];
+    CHECK(admin_token(server, token, sizeof(token)) == 0, "management login");
+    int status = 0;
+    char *body = NULL;
+    CHECK(http_request(server->admin_port, "POST", "/api/admin/users",
+                       "{\"username\":\"package-user\",\"password\":\"Package-user-password-42\","
+                       "\"role\":\"USER\",\"enabled\":true}", token, &status, &body) == 0 && status == 201,
+          "user create: %d %s", status, body == NULL ? "" : body);
+    free(body);
+    body = NULL;
+    CHECK(http_request(server->admin_port, "POST", "/auth/login",
+                       "{\"username\":\"package-user\",\"password\":\"Package-user-password-42\"}", NULL, &status,
+                       &body) == 0 && status == 200, "user login: %d", status);
+    char *user_token = st_json_get_top_level_string(body, "accessToken");
+    free(body);
+    CHECK(user_token != NULL, "user token");
+    body = NULL;
+    int requested = http_request(server->admin_port, "GET", "/api/admin/client-downloads", NULL, user_token, &status,
+                                 &body);
+    free(user_token);
+    CHECK(requested == 0 && status == 403, "a USER read the download catalog: %d %s", status,
+          body == NULL ? "" : body);
+    free(body);
+    return 0;
+}
+
+/* clientDetailExposesRouteAuthenticationStateWithoutPasswordOrHash, the management half. */
+static int check_client_detail_route_auth(test_server *server)
+{
+    char token[1024];
+    CHECK(admin_token(server, token, sizeof(token)) == 0, "management login");
+    int status = 0;
+    char *body = NULL;
+    CHECK(http_request(server->admin_port, "POST", "/api/admin/clients",
+                       "{\"clientName\":\"route-auth-api\",\"enabled\":true}", token, &status, &body) == 0
+              && status == 201, "client create: %d %s", status, body == NULL ? "" : body);
+    char *client = body == NULL ? NULL : st_json_get_top_level_raw(body, "client");
+    long long client_id = 0;
+    int parsed = client != NULL && st_json_get_i64(client, "id", &client_id) == 0 && client_id > 0;
+    free(client);
+    free(body);
+    CHECK(parsed, "client id");
+    char path[128];
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld/http-routes", client_id);
+    body = NULL;
+    CHECK(http_request(server->admin_port, "POST", path,
+                       "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+                       "\"authEnabled\":true,\"authUsername\":\"viewer\",\"authPassword\":\"s3cret-value\"}",
+                       token, &status, &body) == 0 && status == 201,
+          "route create: %d %s", status, body == NULL ? "" : body);
+    free(body);
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld", client_id);
+    body = NULL;
+    CHECK(http_request(server->admin_port, "GET", path, NULL, token, &status, &body) == 0 && status == 200
+              && body != NULL, "client detail: %d", status);
+    char *routes = st_json_get_top_level_raw(body, "httpRoutes");
+    int exposed = routes != NULL && strstr(routes, "\"authEnabled\":true") != NULL
+        && strstr(routes, "\"authUsername\":\"viewer\"") != NULL
+        && strstr(routes, "\"authPasswordConfigured\":true") != NULL
+        && strstr(routes, "\"authPassword\":") == NULL && strstr(routes, "\"authPasswordHash\"") == NULL
+        && strstr(body, "s3cret-value") == NULL;
+    free(routes);
+    CHECK(exposed, "the client detail must show the route's authentication state only:\n%s", body);
+    free(body);
+    return 0;
+}
+
 static int scenario_security_rules(test_server *server)
 {
     return check_public_transfer_rules(server)
         || check_public_entry_rules(server)
         || check_cloud_diagram_rules(server)
-        || check_protected_route_entry(server);
+        || check_protected_route_entry(server)
+        || check_anonymous_rules(server)
+        || check_user_role_rules(server)
+        || check_client_detail_route_auth(server);
 }
 
 /* With aliyun-oss configured the portal policy lets the browser reach the bucket directly. */

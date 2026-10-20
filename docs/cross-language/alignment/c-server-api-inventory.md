@@ -78,9 +78,9 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | 方法 | 路径 | 鉴权 | 请求 / 响应要点 | C 状态 | C 证据 / 说明 |
 | --- | --- | --- | --- | --- | --- |
 | GET | `/api/admin/http-routes` | Bearer | 可见 HTTP 路由 | 一致 | `HttpRouteServiceTests` 覆盖；**本分支**去掉全库 64 条上限。`fix/c-server-parity-peer-api`：`clientId` 不是数字 400，时间为 ISO-8601（`peer_mesh_api_tests`） |
-| POST | `/api/admin/clients/{id}/http-routes` | Bearer | 创建路由 | 有差异 | 不限条数（#191）；会让 `NAT_CONTROL` 超过 1 MiB 的新增或启用以 400 拒绝，Java 不检查（#197） |
-| PUT | `/api/admin/http-routes/{routeId}` | Bearer | 更新路由 | 一致 | `HttpRouteServiceTests` 覆盖；中央向量 `http-route-lifecycle-v1.json`（ctest `http_route_lifecycle_tests`） |
-| DELETE | `/api/admin/http-routes/{routeId}` | Bearer | 删除路由 | 一致 | 同上 |
+| POST | `/api/admin/clients/{id}/http-routes` | Bearer | 创建路由 | 有差异 | 不限条数（#191）；会让 `NAT_CONTROL` 超过 1 MiB 的新增或启用以 400 拒绝，Java 不检查（#197）。`test/c-server-baseline-admin`：未知、其他租户或非本人的客户端由 `404 client not found` 改为 Java 的 `400 {"error":"client not found: <id>"}`；认证字段的 400 改为 Java `HttpRouteService` 的原文（`HttpRouteServiceTests`） |
+| PUT | `/api/admin/http-routes/{routeId}` | Bearer | 更新路由 | 一致 | `HttpRouteServiceTests` 覆盖；中央向量 `http-route-lifecycle-v1.json`（ctest `http_route_lifecycle_tests`）。`test/c-server-baseline-admin`：不存在或不可见的 route 由 `404 http route not found` 改为 Java 的 `400 {"error":"http route not found: <id>"}`，认证字段的 400 为 Java 原文 |
+| DELETE | `/api/admin/http-routes/{routeId}` | Bearer | 删除路由 | 一致 | 同上；不存在或不可见的 route 为 `400 {"error":"http route not found: <id>"}`（原为 `404`） |
 | POST | `/api/admin/http-routes/{routeId}/shares` | Bearer | 创建临时分享 | 一致 | 中央向量 `temporary-http-share-v1.json`（ctest `http_share_tests`）；Java `HttpShareHttpTests`/`HttpShareVectorTests` 消费同一向量 |
 | GET | `/api/admin/http-routes/{routeId}/shares` | Bearer | 分享列表 | 一致 | 同上 |
 | GET | `/api/admin/http-routes/{routeId}/shares/{shareId}` | Bearer | 单个分享 | 一致 | 同上 |
