@@ -404,19 +404,16 @@ static int registration_random_code(char out[7])
     return 0;
 }
 
-static int registration_format_time(time_t value, char out[64])
+/* Java Instant.getEpochSecond of a normalized (sortable, 28-character) instant: its whole seconds. */
+static long long registration_epoch_second(const char normalized[ST_INSTANT_CAPACITY])
 {
-    struct tm utc;
-    if (gmtime_r(&value, &utc) == NULL) return -1;
-    return strftime(out, 64U, "%Y-%m-%dT%H:%M:%SZ", &utc) > 0U ? 0 : -1;
-}
-
-static time_t registration_parse_time(const char *value)
-{
+    char seconds[20];
     struct tm utc;
     memset(&utc, 0, sizeof(utc));
-    char *end = strptime(value, "%Y-%m-%dT%H:%M:%SZ", &utc);
-    return end != NULL && *end == '\0' ? timegm(&utc) : (time_t)-1;
+    memcpy(seconds, normalized, 19U);
+    seconds[19] = '\0';
+    char *end = strptime(seconds, "%Y-%m-%dT%H:%M:%S", &utc);
+    return end != NULL && *end == '\0' ? (long long)timegm(&utc) : 0;
 }
 
 /* Spring StringUtils.hasText over ASCII: a character that Character.isWhitespace does not match. */
@@ -601,10 +598,9 @@ int st_registration_request(const char *database_path,
         registration_error(error, error_len, email_exists > 0 ? "该邮箱已注册" : "注册数据库不可用");
         goto fail;
     }
-    time_t now = time(NULL);
-    char now_text[64];
-    if (now == (time_t)-1 || registration_format_time(now, now_text) != 0
-        || st_storage_delete_expired_registration_challenges(database_path, now_text) != 0) {
+    /* Java takes Instant.now() unrounded: stored instants keep 100ns, answers use Instant.toString. */
+    char now[ST_INSTANT_CAPACITY];
+    if (st_instant_now(now) != 0 || st_storage_delete_expired_registration_challenges(database_path, now) != 0) {
         if (http_status != NULL) *http_status = 500;
         registration_error(error, error_len, "注册验证创建失败");
         goto fail;
@@ -615,10 +611,10 @@ int st_registration_request(const char *database_path,
             registration_error(error, error_len, "用户名或邮箱正在等待验证");
             goto fail;
         }
-        time_t resend_at = registration_parse_time(existing.resend_available_at);
-        if (resend_at > now) {
+        char resend_at[ST_INSTANT_CAPACITY];
+        if (st_instant_normalize(existing.resend_available_at, resend_at) == 0 && strcmp(resend_at, now) > 0) {
             if (http_status != NULL) *http_status = 429;
-            long long wait = (long long)(resend_at - now);
+            long long wait = registration_epoch_second(resend_at) - registration_epoch_second(now);
             char message[128];
             snprintf(message, sizeof(message), "请在 %lld 秒后重新发送验证码", wait < 1 ? 1 : wait);
             registration_error(error, error_len, message);
@@ -635,12 +631,20 @@ int st_registration_request(const char *database_path,
     st_storage_registration_challenge challenge;
     memset(&challenge, 0, sizeof(challenge));
     char code[7];
+    char expires_at[ST_INSTANT_CAPACITY], resend_available_at[ST_INSTANT_CAPACITY];
+    /*
+     * As Java: created_at and resend_available_at hold Instant.toString text; expires_at is stored
+     * sortable (the storage layer normalizes it) and answered as Instant.toString.
+     */
     if (registration_random_id(challenge.registration_id) != 0 || registration_random_code(code) != 0
         || st_password_hash(password_value, challenge.password_hash) != 0
         || st_security_registration_code_hash(challenge.registration_id, code, challenge.code_hash) != 0
-        || registration_format_time(now, challenge.created_at) != 0
-        || registration_format_time(now + (time_t)ttl, challenge.expires_at) != 0
-        || registration_format_time(now + (time_t)cooldown, challenge.resend_available_at) != 0) {
+        || st_instant_add_seconds(now, ttl, expires_at) != 0
+        || st_instant_add_seconds(now, cooldown, resend_available_at) != 0
+        || st_instant_public(now, challenge.created_at, sizeof(challenge.created_at)) != 0
+        || st_instant_public(expires_at, challenge.expires_at, sizeof(challenge.expires_at)) != 0
+        || st_instant_public(resend_available_at, challenge.resend_available_at,
+                             sizeof(challenge.resend_available_at)) != 0) {
         if (http_status != NULL) *http_status = 500;
         registration_error(error, error_len, "注册验证创建失败");
         goto fail;

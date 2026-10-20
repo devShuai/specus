@@ -1007,6 +1007,8 @@ static int replay_ingest_validation(const jv *vector)
         ++replayed;
     }
     EXPECT(replayed == cases->count, "replayed %zu of %zu validation cases", replayed, cases->count);
+    /* ProductMetricsVectorTests pins the vector's 44 validation bodies. */
+    EXPECT(cases->count == 44U, "the vector has %zu validation cases, Java pins 44", cases->count);
     printf("%s vector ingestValidation: %zu/%zu cases\n", bad ? "FAIL" : "ok  ", replayed, cases->count);
     return bad || replayed != cases->count ? -1 : 0;
 }
@@ -1124,6 +1126,9 @@ static int replay_scenarios(const jv *vector)
         bad |= replay_scenario(scenarios->items[i], &replayed) != 0;
     }
     EXPECT(replayed == want, "replayed %zu of %zu scenario ops", replayed, want);
+    /* ProductMetricsVectorTests pins five scenarios of 128 ops in all. */
+    EXPECT(scenarios->count == 5U && want == 128U, "the vector has %zu scenarios of %zu ops, Java pins 5 and 128",
+           scenarios->count, want);
     printf("%s vector scenarios: %zu scenarios, %zu/%zu ops\n", bad || replayed != want ? "FAIL" : "ok  ",
            scenarios->count, replayed, want);
     return bad || replayed != want ? -1 : 0;
@@ -1222,6 +1227,11 @@ static int closed_schema_checks(void)
         {"schemaVersion null", "{\"schemaVersion\":null,\"events\":[" SAMPLE_EVENT "]}", 400, 0},
         {"trailing garbage", "{\"schemaVersion\":1,\"events\":[" SAMPLE_EVENT "]}x", 400, 0},
         {"trailing second document", "{\"schemaVersion\":1,\"events\":[" SAMPLE_EVENT "]}{}", 400, 0},
+        /* ProductMetricsModelTests.ingestRefusesWhatTheClosedSchemaDoesNotAllow, its exact inputs. */
+        {"trailing spaced second document", "{\"schemaVersion\":1,\"events\":[" SAMPLE_EVENT "]} {}", 400, 0},
+        {"truncated after an event", "{\"schemaVersion\":1,\"events\":[" SAMPLE_EVENT, 400, 0},
+        {"invalid UTF-8 in an unknown member", "{\"a\":\"\xff\"}", 400, 0},
+        {"leading and trailing whitespace", " \n{\"events\":[" SAMPLE_EVENT "],\"schemaVersion\":1}\n", 200, 1},
         {"trailing comma", "{\"schemaVersion\":1,\"events\":[" SAMPLE_EVENT ",]}", 400, 0},
         {"unterminated", "{\"schemaVersion\":1,\"events\":[" SAMPLE_EVENT "]", 400, 0},
         {"empty body", "", 400, 0},
@@ -1269,6 +1279,28 @@ static int closed_schema_checks(void)
                ST_PRODUCT_METRICS_CODE_INVALID);
     expect_put("put large integer version", root_auth, "{\"enabled\":true,\"disclosureVersion\":100000000000000000000}",
                400, ST_PRODUCT_METRICS_CODE_DISCLOSURE_REQUIRED);
+    /*
+     * ProductMetricsModelTests.settingsBodyIsClosed, its exact bodies: each refused one answers 400
+     * INVALID. Of the two it parses, version 2 then fails the disclosure check (400
+     * DISCLOSURE_REQUIRED, not INVALID) and {"enabled":false} is applied.
+     */
+    static const char *const closed_settings[] = {
+        "{\"disclosureVersion\":1}", "{\"enabled\":\"true\"}", "{\"enabled\":true,\"disclosureVersion\":true}",
+        "{\"enabled\":true,\"disclosureVersion\":1.5}", "{\"enabled\":false,\"tenantId\":\"t2\"}",
+        "{\"enabled\":false,\"enabled\":true}", "[true]", "{\"enabled\":false}x",
+        "{\"enabled\":true,\"disclosureVersion\":null}", "{}", "{\"enabled\":true,\"disclosureVersion\":\"1\"}"
+    };
+    for (size_t i = 0; i < sizeof(closed_settings) / sizeof(closed_settings[0]); ++i) {
+        expect_put(closed_settings[i], root_auth, closed_settings[i], 400, ST_PRODUCT_METRICS_CODE_INVALID);
+    }
+    expect_put("put version 2 parses", root_auth, "{\"disclosureVersion\":2,\"enabled\":true}", 400,
+               ST_PRODUCT_METRICS_CODE_DISCLOSURE_REQUIRED);
+    EXPECT(sql_scalar("SELECT enabled FROM product_metrics_switch WHERE tenant_id = 't1'") == 1,
+           "refused settings bodies changed the switch");
+    expect_put("put disable parses", root_auth, "{\"enabled\":false}", 200, NULL);
+    EXPECT(sql_scalar("SELECT enabled FROM product_metrics_switch WHERE tenant_id = 't1'") == 0,
+           "{\"enabled\":false} did not switch off");
+    expect_put("re-enable", root_auth, "{\"enabled\":true,\"disclosureVersion\":1}", 200, NULL);
     expect_put("put USER refused before the body", user_auth, "not json", 403, NULL);
 
     /* Summary ranges: malformed days answer like out-of-range ones. */
@@ -1437,9 +1469,12 @@ static int sweep_rechecks_the_switch(void)
     EXPECT(sql_scalar("SELECT COUNT(*) FROM product_metrics_onboarding_progress WHERE username = 'sw-bob'") == 1
                && sql_scalar("SELECT COUNT(*) FROM product_metrics_onboarding_progress") == 1,
            "the started account must keep its progress row");
-    EXPECT(sql_scalar("SELECT COALESCE(SUM(users), 0) FROM product_metrics_onboarding_daily") == 1,
+    /* Java: exactly one onboarding row of one user and one transfer row of count 1. */
+    EXPECT(sql_scalar("SELECT COUNT(*) FROM product_metrics_onboarding_daily") == 1
+               && sql_scalar("SELECT COALESCE(SUM(users), 0) FROM product_metrics_onboarding_daily") == 1,
            "the completed account must stay counted");
-    EXPECT(transfer_total() == 1, "the transfer must stay counted, got %lld", transfer_total());
+    EXPECT(sql_scalar("SELECT COUNT(*) FROM product_metrics_transfer_daily") == 1 && transfer_total() == 1,
+           "the transfer must stay counted, got %lld", transfer_total());
 
     /* When the deployment does not allow metrics no tenant collects: step 1 drops the row anyway. */
     setenv("SPECUS_PRODUCT_METRICS_ALLOWED", "false", 1);
@@ -1673,6 +1708,173 @@ static int wiring_checks(void)
     return failures == before ? 0 : -1;
 }
 
+/*
+ * ProductMetricsWritePathTests.writePathsRecordTheOnboardingMilestones, step by step: a database
+ * ADMIN opts in, then pm-alice is created, signs in, creates a credential, comes online and
+ * publishes an HTTP route 20 minutes after she was created; bob is created and deleted; alice's
+ * transfer outcome is counted and only the ADMIN reads the summary; switching off drops progress.
+ */
+static int write_paths_record_the_milestones(void)
+{
+    int before = failures;
+    if (fresh_database() != 0) {
+        return -1;
+    }
+    actor_count = 0U;
+    test_now_ms = instant_ms("2026-09-01T08:00:00Z");
+    char admin_auth[2200];
+    st_storage_management_user user;
+    if (st_storage_create_management_user(db_path, "pm-admin", "default", actor_password_hash, "ADMIN", 1, &user) != 0
+        || bearer_for("pm-admin", "default", admin_auth, sizeof(admin_auth)) != 0) {
+        return -1;
+    }
+    pm_response response;
+    EXPECT(create_user(admin_auth, "pm-early") == 0, "pm-early create failed");
+    EXPECT(progress_column("pm-early", "started_at") == -1, "an account created before opt-in got a row");
+
+    if (call_text("PUT", "/api/admin/product-metrics/settings", admin_auth,
+                  "{\"enabled\":true,\"disclosureVersion\":1}", &response) == 0) {
+        jv *body = jv_parse(response.body);
+        const char *updated_by = jv_text(body, "updatedBy");
+        EXPECT(response.status == 200 && updated_by != NULL && strcmp(updated_by, "pm-admin") == 0,
+               "enable: %d %s, want updatedBy pm-admin", response.status, response.body);
+        jv_free(body);
+    }
+
+    EXPECT(create_user(admin_auth, "pm-alice") == 0, "pm-alice create failed");
+    EXPECT(progress_column("pm-alice", "started_at") == test_now_ms
+               && progress_column("pm-alice", "signed_in_at") == -2,
+           "pm-alice right after creation: started_at %lld, signed_in_at %lld (want null)",
+           progress_column("pm-alice", "started_at"), progress_column("pm-alice", "signed_in_at"));
+
+    test_now_ms = instant_ms("2026-09-01T08:01:00Z");
+    char alice_auth[2200] = "";
+    if (call_text("POST", "/auth/login", NULL, "{\"username\":\"pm-alice\",\"password\":\"pm-alice-password-2026\"}",
+                  &response) == 0) {
+        jv *body = jv_parse(response.body);
+        const char *token = jv_text(body, "accessToken");
+        EXPECT(response.status == 200 && token != NULL, "pm-alice login: %d %s", response.status, response.body);
+        snprintf(alice_auth, sizeof(alice_auth), "Bearer %s", token == NULL ? "" : token);
+        jv_free(body);
+    }
+    EXPECT(progress_column("pm-alice", "signed_in_at") == test_now_ms, "signed_in not recorded");
+
+    EXPECT(call_text("POST", "/api/admin/client-credentials", alice_auth, "{}", &response) == 0
+               && response.status == 201,
+           "credential create: %d %s", response.status, response.body);
+    EXPECT(progress_column("pm-alice", "credential_created_at") == test_now_ms, "credential_created not recorded");
+
+    /* Java stores the client row directly; here alice creates it, which records no milestone. */
+    long long client = create_client(alice_auth, "pm-client");
+    EXPECT(client > 0, "pm-client create failed");
+    test_now_ms = instant_ms("2026-09-01T08:05:00Z");
+    EXPECT(strcmp(st_product_metrics_milestone(db_path, "default", "pm-alice", ST_PRODUCT_METRICS_STEP_CLIENT_ONLINE),
+                  "recorded") == 0,
+           "client_online must be recorded");
+
+    test_now_ms = instant_ms("2026-09-01T08:20:00Z");
+    char path[128];
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld/http-routes", client);
+    EXPECT(call_text("POST", path, alice_auth,
+                     "{\"route\":\"metrics\",\"targetBaseUrl\":\"http://127.0.0.1:18080\",\"enabled\":true}",
+                     &response) == 0 && response.status == 201,
+           "route create: %d %s", response.status, response.body);
+    EXPECT(progress_column("pm-alice", "started_at") == -1, "completion did not close the row");
+    EXPECT(sql_scalar("SELECT COUNT(*) FROM product_metrics_onboarding_daily") == 1
+               && sql_scalar("SELECT users FROM product_metrics_onboarding_daily WHERE tenant_id = 'default' "
+                             "AND cohort_day = '2026-09-01' AND reached_step = 'service_published' "
+                             "AND duration_bucket = '10m-30m'") == 1,
+           "the onboarding counts must be exactly (default, 2026-09-01, service_published, 10m-30m, 1)");
+
+    EXPECT(create_user(admin_auth, "pm-bob") == 0, "pm-bob create failed");
+    EXPECT(progress_column("pm-bob", "started_at") > 0, "pm-bob has no progress row");
+    EXPECT(call_text("DELETE", "/api/admin/users/pm-bob", admin_auth, NULL, &response) == 0 && response.status == 204,
+           "pm-bob delete: %d %s", response.status, response.body);
+    EXPECT(progress_column("pm-bob", "started_at") == -1, "a deleted account kept its progress");
+
+    static const char batch[] = "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"turn\","
+                                "\"sizeBucket\":\"1m-16m\",\"attempt\":\"retry_after_failure\","
+                                "\"outcome\":\"success\"}]}";
+    expect_ingest("alice ingest", alice_auth, batch, sizeof(batch) - 1U, 200, NULL, 1);
+    if (call_text("GET", "/api/admin/product-metrics/settings", alice_auth, NULL, &response) == 0) {
+        EXPECT(response.status == 200 && strstr(response.body, "updatedBy") == NULL,
+               "a member must never see updatedBy: %s", response.body);
+    }
+    expect_summary("member summary", alice_auth, "", 403, NULL);
+    if (call_text("GET", "/api/admin/product-metrics/summary", admin_auth, NULL, &response) == 0) {
+        jv *body = jv_parse(response.body);
+        const jv *onboarding = jv_get(body, "onboarding");
+        const jv *by_attempt = jv_get(jv_get(body, "transfers"), "byAttempt");
+        const char *median = jv_text(onboarding, "medianDurationBucket");
+        EXPECT(response.status == 200 && jv_int(onboarding, "completed", -1) == 1 && median != NULL
+                   && strcmp(median, "10m-30m") == 0 && by_attempt != NULL && by_attempt->kind == JV_ARRAY
+                   && by_attempt->count > 1U && jv_int(by_attempt->items[1], "successRateBp", -1) == 10000,
+               "admin summary: %d %s", response.status, response.body);
+        jv_free(body);
+    }
+
+    EXPECT(create_user(admin_auth, "pm-carol") == 0, "pm-carol create failed");
+    expect_put("disable", admin_auth, "{\"enabled\":false}", 200, NULL);
+    EXPECT(sql_scalar("SELECT COUNT(*) FROM product_metrics_onboarding_progress WHERE tenant_id = 'default'") == 0,
+           "switching off must drop progress");
+    if (call_text("POST", "/api/admin/product-metrics/transfer-outcomes", alice_auth, batch, &response) == 0) {
+        jv *body = jv_parse(response.body);
+        const jv *collecting = jv_get(body, "collecting");
+        EXPECT(collecting != NULL && collecting->kind == JV_BOOL && !collecting->boolean,
+               "ingest after switching off: %s", response.body);
+        jv_free(body);
+    }
+    printf("%s write paths record the onboarding milestones (Java writePathsRecordTheOnboardingMilestones)\n",
+           failures == before ? "ok  " : "FAIL");
+    return failures == before ? 0 : -1;
+}
+
+/*
+ * ProductMetricsWritePathTests.theDeploymentSwitchKeepsEveryTenantOff: on a fresh database whose
+ * deployment does not allow metrics, enabling answers 409 NOT_ALLOWED and stores no switch row,
+ * settings read off, and 4097 bytes are still refused as too large.
+ */
+static int the_deployment_switch_keeps_every_tenant_off(void)
+{
+    int before = failures;
+    if (fresh_database() != 0) {
+        return -1;
+    }
+    actor_count = 0U;
+    test_now_ms = instant_ms("2026-09-01T08:00:00Z");
+    setenv("SPECUS_PRODUCT_METRICS_ALLOWED", "false", 1);
+    char admin_auth[2200];
+    st_storage_management_user user;
+    int ready = st_storage_create_management_user(db_path, "pm-admin", "default", actor_password_hash, "ADMIN", 1,
+                                                  &user) == 0
+        && bearer_for("pm-admin", "default", admin_auth, sizeof(admin_auth)) == 0;
+    EXPECT(ready, "pm-admin setup failed");
+    if (ready) {
+        expect_put("not allowed: enable", admin_auth, "{\"enabled\":true,\"disclosureVersion\":1}", 409,
+                   ST_PRODUCT_METRICS_CODE_NOT_ALLOWED);
+        pm_response response;
+        if (call_text("GET", "/api/admin/product-metrics/settings", admin_auth, NULL, &response) == 0) {
+            jv *body = jv_parse(response.body);
+            const jv *enabled = jv_get(body, "enabled");
+            EXPECT(response.status == 200 && enabled != NULL && enabled->kind == JV_BOOL && !enabled->boolean,
+                   "not allowed: settings %d %s", response.status, response.body);
+            jv_free(body);
+        }
+        static char spaces[4097];
+        memset(spaces, ' ', sizeof(spaces));
+        if (call("POST", "/api/admin/product-metrics/transfer-outcomes", admin_auth, spaces, sizeof(spaces),
+                 &response) == 0) {
+            expect_answer("not allowed: 4097 spaces", &response, 413, ST_PRODUCT_METRICS_CODE_TOO_LARGE);
+        }
+        EXPECT(sql_scalar("SELECT COUNT(*) FROM product_metrics_switch") == 0,
+               "a refused enable stored a switch row");
+    }
+    unsetenv("SPECUS_PRODUCT_METRICS_ALLOWED");
+    printf("%s the deployment switch keeps every tenant off (Java theDeploymentSwitchKeepsEveryTenantOff)\n",
+           failures == before ? "ok  " : "FAIL");
+    return failures == before ? 0 : -1;
+}
+
 /* ---- A real specus-server-c process ----------------------------------------------------------- */
 
 typedef struct {
@@ -1903,6 +2105,8 @@ int main(int argc, char **argv)
     bad |= closed_schema_checks() != 0;
     bad |= sweep_rechecks_the_switch() != 0;
     bad |= wiring_checks() != 0;
+    bad |= write_paths_record_the_milestones() != 0;
+    bad |= the_deployment_switch_keeps_every_tenant_off() != 0;
     jv_free(vector);
     free(text);
     drop_database();

@@ -182,6 +182,16 @@ static int scenario_revocation_edges(test_server *server)
                 "X-Auth-Reason: invalid or consumed ticket", NULL, 0U);
             CHECK(fd >= 0, "one-time ticket consumed even when identity rejected");
             close(fd); free(ticket);
+            if (change == 2) {
+                /* ManagementAccountsHttpTests: a token naming the recreated account's key opens it. */
+                char replacement[2048];
+                CHECK(st_security_issue_local_token_for_account("stale-user", "default", "USER", "replacement-key",
+                    ADMIN_JWT_SECRET, 600, replacement, sizeof(replacement)) == 0, "replacement token");
+                fd = ws_open_endpoint(server->admin_port, replacement, endpoints[i], i == 1U ? hello : NULL,
+                                      sizeof(hello));
+                CHECK(fd >= 0 && ws_ping_answered(fd), "recreated account opens %s", endpoints[i]);
+                close(fd);
+            }
         }
     }
     char actor[2048], token[2048];
