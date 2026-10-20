@@ -24,6 +24,7 @@ func TestLoginEnvironmentAnnouncesEgressCapabilities(t *testing.T) {
 			EgressCapable       *bool `json:"egressCapable"`
 			DomainTargetCapable *bool `json:"domainTargetCapable"`
 			IPv6TargetCapable   *bool `json:"ipv6TargetCapable"`
+			IPv6PacketCapable   *bool `json:"ipv6PacketCapable"`
 		} `json:"clientEgressCapabilities"`
 	}
 	if err := json.Unmarshal(encoded, &wire); err != nil {
@@ -53,5 +54,13 @@ func TestLoginEnvironmentAnnouncesEgressCapabilities(t *testing.T) {
 	}
 	if caps.IPv6TargetCapable == nil || !*caps.IPv6TargetCapable {
 		t.Error("ipv6TargetCapable must be present and true: the egress dials AAAA-only names")
+	}
+	// The egress side of the IPv6 data plane is here; the consumer side is not, and announcing the
+	// packet capability must not have switched it on.
+	if caps.IPv6PacketCapable == nil || !*caps.IPv6PacketCapable {
+		t.Error("ipv6PacketCapable must be present and true: the egress accepts IPv6 packets in SPEG1")
+	}
+	if egressConsumerCarriesIPv6 {
+		t.Error("the consumer carries IPv6, but only the egress side of the data plane exists")
 	}
 }

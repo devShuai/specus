@@ -75,6 +75,9 @@ type clientEgressCapabilities struct {
 	// coexist. A domain-capable egress honours name-bind (protocol/spec/peer-egress-dns.md).
 	DomainTargetCapable bool `json:"domainTargetCapable"`
 	IPv6TargetCapable   bool `json:"ipv6TargetCapable"`
+	// The egress accepts IPv6 packets in SPEG1 frames (protocol/spec/peer-egress.md, IPv6 数据面).
+	// Only consumers read it; it says nothing about whether this device sends IPv6 as a consumer.
+	IPv6PacketCapable bool `json:"ipv6PacketCapable"`
 }
 
 // clientHTTPRouteCapabilities is what this build does for HTTP route streams.
@@ -104,6 +107,7 @@ func currentEgressCapabilities() clientEgressCapabilities {
 		// records (peer_egress_names.go).
 		DomainTargetCapable: true,
 		IPv6TargetCapable:   egressIPv6TargetCapable,
+		IPv6PacketCapable:   egressIPv6PacketCapable,
 	}
 }
 
