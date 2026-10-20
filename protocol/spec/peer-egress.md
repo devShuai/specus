@@ -192,8 +192,8 @@ IPv6 包的协议按它的 next header 判断：TCP、UDP 之外（含任何扩�
 - 版本 4：按「接收方校验」的 IPv4 规则；版本 6：按本节；其他版本沿用一期的 `EGRESS_IPV6_UNSUPPORTED`；
 - body 短于 40 字节，或 `40 + payloadLength` 大于 body：`EGRESS_FRAME_TRUNCATED`；小于 body：`EGRESS_FRAME_TRAILING_BYTES`（不承载 jumbogram，`payloadLength` 为 0 的包也按此判）；
 - 解析只取 next header 与（TCP、UDP 时）端口；按协议处理时 TCP、UDP 以外以 `EGRESS_PROTOCOL_DENIED` 拒绝，与 IPv4 的 ICMP 相同；
-- **源地址等于该已认证 session 对端的 mesh IPv4 推出的地址**；
-- 目的地址不在推出前缀内，并通过完整的出口授权判定：IPv6 目的地址的强制拒绝清单与 `LAN` 段见「强制拒绝清单」，与按 AAAA 拨号的目标同一份；
+- **源地址等于该已认证 session 对端的 mesh IPv4 推出的地址**；不等的包丢弃，不回应、不计数——不欠一个发送者并不持有的地址任何答复；
+- 目的地址不在推出前缀内：推出前缀与 IPv4 的 Peer Mesh 网段一样列在强制拒绝清单里，命中报 `EGRESS_FORBIDDEN_DESTINATION`（按 AAAA 拨号的目标同样被挡）；并通过完整的出口授权判定：IPv6 目的地址的强制拒绝清单与 `LAN` 段见「强制拒绝清单」，与按 AAAA 拨号的目标同一份；
 - 用户态栈对 IPv6 的 TCP、UDP 与 IPv4 同一套状态机与上限，校验和按 RFC 8200 的伪首部；回程包源是目标地址、目的是消费端推出地址，hop limit 64。
 
 出口 → 消费端时，目的必须是该消费端的推出地址；源必须对应本机为它建的存活出口流，且不在推出前缀内。
