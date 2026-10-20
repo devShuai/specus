@@ -839,6 +839,7 @@ static int test_concurrent_duplicate_is_externalized(void)
     capture_snapshot capture;
     int in_flight = held && capture_of("/race.mp4", 0, &capture) == 0
         && strcmp(capture.state, "CAPTURING") == 0;
+    long long first_id = capture.id;
     script.hold = 0;
     int second_ok = in_flight && capture_via_http("/race.mp4", &script) == 0;
     char *headers[] = {"Content-Type: video/mp4", "Content-Range: bytes 0-36/100", "Content-Length: 37"};
@@ -847,6 +848,15 @@ static int test_concurrent_duplicate_is_externalized(void)
                                 headers, sizeof(headers) / sizeof(headers[0]))
         : NULL;
     int externalized = duplicate != NULL && st_media_capture_externalized(duplicate)
+        && !st_media_capture_active(duplicate);
+    st_media_capture_free(duplicate);
+    /* HttpMediaCaptureSqliteRaceTests' exact response: 206, no Content-Length, no space after colons. */
+    char *java_headers[] = {"Content-Type:video/mp4", "Content-Range:bytes 0-36/100"};
+    duplicate = in_flight
+        ? st_media_capture_open(g_database_path, "Demo client", "media", "GET", "/race.mp4", 206,
+                                java_headers, sizeof(java_headers) / sizeof(java_headers[0]))
+        : NULL;
+    externalized = externalized && duplicate != NULL && st_media_capture_externalized(duplicate)
         && !st_media_capture_active(duplicate);
     st_media_capture_free(duplicate);
     int rows_while_held = (int)captures_of("/race.mp4");
@@ -858,8 +868,67 @@ static int test_concurrent_duplicate_is_externalized(void)
     pthread_join(first, NULL);
     if (!in_flight || !second_ok || !externalized || rows_while_held != 1 || uploads_while_held != 1
         || capture_of("/race.mp4", 0, &capture) != 0 || strcmp(capture.state, "COMPLETE") != 0
-        || capture.captured != 37) {
+        || capture.captured != 37 || capture.id != first_id) {
         fprintf(stderr, "concurrent capture of one media range was not an externalized duplicate\n");
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * HttpMediaCaptureSqliteTests.capturesListsPlaysBackReusesAndExpiresAMediaFile: Java's exact
+ * progressive response (200, "Content-Type:video/mp4", "Content-Length:10", ten zero bytes) is
+ * captured, listed as COMPLETE and playable under its stored id, opened for playback, served again
+ * without a second capture or upload, and removed with its object once expired.
+ */
+static int test_progressive_capture_lifecycle(void)
+{
+    static const char source[] = "/sqlite-lifecycle.mp4";
+    static const char long_ago[] = "2026-01-01T00:00:00Z";
+    char *headers[] = {"Content-Type:video/mp4", "Content-Length:10"};
+    static const uint8_t body[10];
+    int uploads = s3_log_lines("initiated.log", NULL);
+    st_media_capture_session *session = st_media_capture_open(g_database_path, "Demo client", "media", "GET",
+        source, 200, headers, sizeof(headers) / sizeof(headers[0]));
+    int active = session != NULL && st_media_capture_active(session);
+    if (active) {
+        active = st_media_capture_append(session, body, sizeof(body)) == 0;
+        st_media_capture_complete(session);
+    }
+    st_media_capture_free(session);
+    capture_snapshot capture;
+    int complete = 0;
+    for (int attempt = 0; active && !complete && attempt < 100; ++attempt) {
+        complete = capture_of(source, 0, &capture) == 0 && strcmp(capture.state, "COMPLETE") == 0;
+        if (!complete) {
+            struct timespec pause = {0, 50L * 1000L * 1000L};
+            nanosleep(&pause, NULL);
+        }
+    }
+    if (!active || !complete || captures_of(source) != 1 || capture.captured != 10
+        || strcmp(capture.kind, "PROGRESSIVE") != 0 || s3_log_lines("initiated.log", NULL) != uploads + 1) {
+        fprintf(stderr, "progressive media capture was not stored and completed\n");
+        return 1;
+    }
+    char view[4096];
+    char token[64];
+    if (capture_view(capture.id, view, sizeof(view)) != 0 || strstr(view, "\"state\":\"COMPLETE\"") == NULL
+        || strstr(view, "\"playable\":true") == NULL || create_ticket(capture.id, 0, token) != 0) {
+        fprintf(stderr, "completed media capture list view or playback access mismatch: %s\n", view);
+        return 1;
+    }
+    /* The same range again is served without a second capture. */
+    st_media_capture_session *repeat = st_media_capture_open(g_database_path, "Demo client", "media", "GET",
+        source, 200, headers, sizeof(headers) / sizeof(headers[0]));
+    int externalized = repeat != NULL && !st_media_capture_active(repeat) && st_media_capture_externalized(repeat);
+    st_media_capture_free(repeat);
+    if (!externalized || captures_of(source) != 1 || s3_log_lines("initiated.log", NULL) != uploads + 1) {
+        fprintf(stderr, "repeated progressive media response was not an externalized duplicate\n");
+        return 1;
+    }
+    if (db_update_times(capture.id, long_ago, long_ago) != 0 || st_media_capture_cleanup_expired(g_database_path) != 0
+        || s3_log_lines("deleted.log", capture.object_key) != 1 || captures_of(source) != 0) {
+        fprintf(stderr, "expired progressive media capture kept its object or row\n");
         return 1;
     }
     return 0;
@@ -1554,6 +1623,7 @@ int main(void)
         test_partial_range_can_be_retried,
         test_different_ranges_are_separate_objects,
         test_concurrent_duplicate_is_externalized,
+        test_progressive_capture_lifecycle,
         test_stale_deduplication_key_is_released,
         test_source_url_view_is_redacted,
         test_media_response_classification,

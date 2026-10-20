@@ -14,6 +14,7 @@
 
 #include "admin_http.h"
 #include "crypto.h"
+#include "instant.h"
 #include "json.h"
 #include "registration.h"
 #include "security.h"
@@ -181,6 +182,7 @@ static int test_registration_mailbox_vectors(const char *path, int mask_only)
         || version != 1 || st_json_get_raw_array(json, "cases", &cases, &count) != 0
         || count != (mask_only == 2 ? 14U : mask_only ? 24U : 36U)) return 1;
     mailbox box = {{0}, {0}, {0}};
+    size_t rejected = 0U;
     st_registration_set_handlers(fake_turnstile, fake_email, &box);
     for (size_t i = 0U; i < count; ++i) {
         char *name = st_json_get_string(cases[i], "name");
@@ -193,12 +195,13 @@ static int test_registration_mailbox_vectors(const char *path, int mask_only)
         char username[80];
         snprintf(username, sizeof(username), "mailbox-%s-%zu", mask_only == 2 ? "nul" : mask_only ? "mask" : "form", i);
         int result = !valid || (accepted && (normalized == NULL || masked == NULL));
+        memset(&box, 0, sizeof(box));
+        rejected += valid && !accepted;
         if (!result && mask_only == 2) {
             /* Keep escaped NUL and its suffix in the HTTP request, not in a C string
              * which would lose bytes when st_json_escape reads it. */
             char *raw_email = st_json_get_top_level_raw(cases[i], "email");
             char body[4096];
-            memset(&box, 0, sizeof(box));
             if (raw_email == NULL) result = 1;
             else {
                 snprintf(body, sizeof(body), "{\"username\":\"%s\",\"email\":%s,\"password\":\"pw\",\"turnstileToken\":\"ok\"}", username, raw_email);
@@ -218,6 +221,8 @@ static int test_registration_mailbox_vectors(const char *path, int mask_only)
             st_storage_registration_challenge stored;
             result = !valid_utf8(last_body) || !st_json_is_valid_object(last_body)
                 || !valid_utf8(actual_masked) || strcmp(box.email, normalized) != 0 || strcmp(actual_masked, masked) != 0
+                /* Java verifies sendVerificationCode(email, username, code, ttl) for each request. */
+                || strcmp(box.username, username) != 0
                 || st_storage_find_registration_challenge(db_path, username, normalized, &stored) != 0
                 || strcmp(stored.email, normalized) != 0;
         }
@@ -236,6 +241,11 @@ static int test_registration_mailbox_vectors(const char *path, int mask_only)
     }
     st_registration_set_handlers(NULL, NULL, NULL);
     st_json_free_string_array(cases, count);
+    /* Java registrationMvcResponsesPreserveUnicodeMaskBoundaries: exactly 12 NUL addresses are refused. */
+    if (mask_only == 2 && rejected != 12U) {
+        fprintf(stderr, "FAIL shared registration NUL vector: %zu refused cases, want 12\n", rejected);
+        failed = 1;
+    }
     return failed;
 }
 
@@ -301,6 +311,66 @@ static int test_registration_email_storage(void)
 }
 
 /*
+ * Java RegistrationServiceTests.challengeExpiryIsStoredSortableAndAnsweredAsAnInstant, end to end:
+ * the stored expiry is the 28-character sortable normalization of the answered expiresAt, which is
+ * in Instant.toString form. Java takes Instant.now() unrounded, so the expiry lies between the
+ * clock read before and after the request plus the TTL, sub-second digits included; created_at and
+ * resend_available_at come from the same instant. The purge compares the stored text strictly.
+ */
+static int test_registration_challenge_expiry(void)
+{
+    mailbox box = {{0}, {0}, {0}};
+    st_registration_set_handlers(fake_turnstile, fake_email, &box);
+    char before[ST_INSTANT_CAPACITY], after[ST_INSTANT_CAPACITY];
+    char low[ST_INSTANT_CAPACITY], high[ST_INSTANT_CAPACITY];
+    char expires_at[128] = "", registration_id[128] = "";
+    int failed = st_instant_now(before) != 0
+        || register_with("expiry-user", "expiry@example.com", "pw", "ok", 202, "\"expiresAt\"") != 0
+        || st_instant_now(after) != 0;
+    last_member("expiresAt", expires_at, sizeof(expires_at));
+    last_member("registrationId", registration_id, sizeof(registration_id));
+    st_storage_registration_challenge stored;
+    char normalized[ST_INSTANT_CAPACITY], answered[ST_INSTANT_CAPACITY], created[ST_INSTANT_CAPACITY];
+    char want[ST_INSTANT_CAPACITY], resend[ST_INSTANT_CAPACITY];
+    failed = failed || st_storage_get_registration_challenge(db_path, registration_id, &stored) != 0
+        || strlen(stored.expires_at) != 28U
+        || st_instant_normalize(expires_at, normalized) != 0 || strcmp(normalized, stored.expires_at) != 0
+        /* Instant.parse(expiresAt).toString() is expiresAt itself. */
+        || st_instant_public(stored.expires_at, answered, sizeof(answered)) != 0
+        || strcmp(answered, expires_at) != 0
+        || st_instant_add_seconds(before, 600, low) != 0 || st_instant_add_seconds(after, 600, high) != 0
+        || strcmp(stored.expires_at, low) < 0 || strcmp(stored.expires_at, high) > 0
+        /* now.toString() and now.plusSeconds(cooldown).toString() of the same instant. */
+        || st_instant_normalize(stored.created_at, created) != 0
+        || st_instant_public(created, answered, sizeof(answered)) != 0 || strcmp(answered, stored.created_at) != 0
+        || strcmp(stored.updated_at, stored.created_at) != 0
+        || st_instant_add_seconds(created, 600, want) != 0 || strcmp(want, stored.expires_at) != 0
+        || st_instant_add_seconds(created, 60, want) != 0
+        || st_instant_public(want, resend, sizeof(resend)) != 0 || strcmp(resend, stored.resend_available_at) != 0;
+    printf("%s registration challenge expiry stored %s answered %s (clock %s..%s)\n", failed ? "FAIL" : "ok  ",
+           stored.expires_at, expires_at, before, after);
+    /* A second request inside the cooldown waits whole epoch seconds, as Java's getEpochSecond difference. */
+    int waited = !failed && call("POST", "/auth/register",
+                                 "{\"username\":\"expiry-user\",\"email\":\"expiry@example.com\",\"password\":\"pw\","
+                                 "\"turnstileToken\":\"ok\"}", NULL) == 429
+        && last_body != NULL && (strstr(last_body, "\"error\":\"请在 60 秒后重新发送验证码\"") != NULL
+                                 || strstr(last_body, "\"error\":\"请在 59 秒后重新发送验证码\"") != NULL);
+    printf("%s registration resend cooldown answers 429 %s\n", waited ? "ok  " : "FAIL",
+           last_body == NULL ? "" : last_body);
+    failed = failed || !waited;
+    /* deleteByExpiresAtBefore: a cutoff equal to the expiry keeps it, one second later removes it. */
+    char later[ST_INSTANT_CAPACITY];
+    failed = failed || st_storage_delete_expired_registration_challenges(db_path, expires_at) != 0
+        || st_storage_get_registration_challenge(db_path, registration_id, &stored) != 0
+        || st_instant_add_seconds(normalized, 1, later) != 0
+        || st_storage_delete_expired_registration_challenges(db_path, later) != 0
+        || st_storage_get_registration_challenge(db_path, registration_id, &stored) == 0;
+    printf("%s registration challenge purge compares the stored expiry\n", failed ? "FAIL" : "ok  ");
+    st_registration_set_handlers(NULL, NULL, NULL);
+    return failed;
+}
+
+/*
  * AuthController.register runs the Turnstile check before RegistrationService.requestRegistration,
  * whose checks come in this order: username, reserved name, password, email, existing login name,
  * existing email. Lengths are Java's, in UTF-16 code units.
@@ -339,9 +409,11 @@ static int test_registration(void)
     }
     /* The stricter domain grammar must not reject punctuation in the local part or punycode. */
     failed = failed || register_with("local-punctuation", "a_b+tag@mx-1.example.test", "pw", "ok", 202,
-                                     "\"emailMasked\":\"a_***@mx-1.example.test\"") != 0;
+                                     "\"emailMasked\":\"a_***@mx-1.example.test\"") != 0
+        || strcmp(box.email, "a_b+tag@mx-1.example.test") != 0;
     failed = failed || register_with("punycode", "alice@xn--fsqu00a.example", "pw", "ok", 202,
-                                     "\"emailMasked\":\"al***@xn--fsqu00a.example\"") != 0;
+                                     "\"emailMasked\":\"al***@xn--fsqu00a.example\"") != 0
+        || strcmp(box.email, "alice@xn--fsqu00a.example") != 0;
     /*
      * 80 two-byte characters are within Java's 80 UTF-16 code units, but C stores a login name in
      * 80 bytes (as POST /api/admin/users does): refused here, not after the email went out. 40 of
@@ -1346,6 +1418,7 @@ int main(void)
         failed = test_registration_mailbox_vectors(ST_EMAIL_MASK_VECTOR_FILE, 1) != 0 || failed;
         failed = test_registration_mailbox_vectors(ST_EMAIL_NUL_VECTOR_FILE, 2) != 0 || failed;
         failed = test_registration_email_storage() != 0 || failed;
+        failed = test_registration_challenge_expiry() != 0 || failed;
         failed = test_me() != 0 || failed;
         failed = test_credentials() != 0 || failed;
         failed = test_mappings() != 0 || failed;

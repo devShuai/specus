@@ -446,6 +446,11 @@ static int test_deleted_account_tokens_do_not_pass_to_a_recreated_account(void)
         if (failed) fprintf(stderr, "first alice's token does not carry her account key: %s\n", response);
         if (!failed) snprintf(first_key, sizeof(first_key), "%s", stored.account_key);
     }
+    /* Before the delete the first alice's token resolves to her account. */
+    if (!failed) {
+        failed = !status_is(call("GET", "/api/admin/me", first, NULL), "HTTP/1.1 200 ");
+        if (failed) fprintf(stderr, "first alice's token before the delete: %.60s\n", response);
+    }
     if (!failed) {
         failed = !status_is(call("DELETE", "/api/admin/users/alice", tenant_admin, NULL), "HTTP/1.1 204 ")
             || !status_is(call("POST", "/api/admin/users", tenant_admin, create), "HTTP/1.1 201 ")
