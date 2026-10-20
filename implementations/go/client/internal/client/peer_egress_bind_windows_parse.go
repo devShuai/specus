@@ -30,6 +30,11 @@ const (
 	windowsForwardNextHopAddress = 48
 	windowsForwardMetric         = 84
 
+	// In an IPv6 row the SOCKADDR_INET is a SOCKADDR_IN6: family, port and flow information come
+	// before the address, so it starts eight bytes into the structure rather than four.
+	windowsForwardPrefixAddress6  = 20
+	windowsForwardNextHopAddress6 = 52
+
 	windowsInterfaceRowSize              = 168
 	windowsInterfaceFamily               = 0
 	windowsInterfaceIndex                = 16
@@ -38,15 +43,22 @@ const (
 	windowsInterfaceDisableDefaultRoutes = 166
 
 	windowsAddressFamilyIPv4 = 2
+	windowsAddressFamilyIPv6 = 23
 
 	// windowsIPUnicastIf is IP_UNICAST_IF, at level IPPROTO_IP.
 	windowsIPUnicastIf = 31
+	// windowsIPv6UnicastIf is IPV6_UNICAST_IF, at level IPPROTO_IPV6.
+	windowsIPv6UnicastIf = 31
+
+	// windowsOnLinkNextHop6 is the next hop of an IPv6 route with no gateway.
+	windowsOnLinkNextHop6 = "::"
 )
 
 type windowsForwardRow struct {
 	InterfaceIndex uint32
 	Prefix         string
-	// NextHop is the address as written, 0.0.0.0 for on-link, or empty when it is not IPv4.
+	// NextHop is the address as written, 0.0.0.0 (:: in the IPv6 table) for on-link, or empty when it
+	// is not of the table's family.
 	NextHop string
 	Metric  uint32
 }
@@ -80,23 +92,33 @@ func windowsMibRows(raw []byte, size int) ([][]byte, bool) {
 
 // parseWindowsForwardTable reads the IPv4 rows of a MIB_IPFORWARD_TABLE2, prefixes masked.
 func parseWindowsForwardTable(raw []byte) ([]windowsForwardRow, bool) {
+	return parseWindowsForwardTableFamily(raw, windowsAddressFamilyIPv4)
+}
+
+// parseWindowsForwardTable6 reads the IPv6 rows of a MIB_IPFORWARD_TABLE2, prefixes masked, as
+// GetIpForwardTable2(AF_INET6) returns them.
+func parseWindowsForwardTable6(raw []byte) ([]windowsForwardRow, bool) {
+	return parseWindowsForwardTableFamily(raw, windowsAddressFamilyIPv6)
+}
+
+func parseWindowsForwardTableFamily(raw []byte, family uint16) ([]windowsForwardRow, bool) {
 	rows, ok := windowsMibRows(raw, windowsForwardRowSize)
 	if !ok {
 		return nil, false
 	}
 	parsed := make([]windowsForwardRow, 0, len(rows))
 	for _, row := range rows {
-		if binary.LittleEndian.Uint16(row[windowsForwardPrefixFamily:]) != windowsAddressFamilyIPv4 {
+		if binary.LittleEndian.Uint16(row[windowsForwardPrefixFamily:]) != family {
 			continue
 		}
 		length := int(row[windowsForwardPrefixLength])
-		if length > 32 {
+		address := windowsRowAddress(row, family, windowsForwardPrefixAddress, windowsForwardPrefixAddress6)
+		if length > address.BitLen() {
 			continue
 		}
-		address := netip.AddrFrom4([4]byte(row[windowsForwardPrefixAddress : windowsForwardPrefixAddress+4]))
 		nextHop := ""
-		if binary.LittleEndian.Uint16(row[windowsForwardNextHopFamily:]) == windowsAddressFamilyIPv4 {
-			nextHop = netip.AddrFrom4([4]byte(row[windowsForwardNextHopAddress : windowsForwardNextHopAddress+4])).String()
+		if binary.LittleEndian.Uint16(row[windowsForwardNextHopFamily:]) == family {
+			nextHop = windowsRowAddress(row, family, windowsForwardNextHopAddress, windowsForwardNextHopAddress6).String()
 		}
 		parsed = append(parsed, windowsForwardRow{
 			InterfaceIndex: binary.LittleEndian.Uint32(row[windowsForwardInterfaceIndex:]),
@@ -108,15 +130,33 @@ func parseWindowsForwardTable(raw []byte) ([]windowsForwardRow, bool) {
 	return parsed, true
 }
 
+// windowsRowAddress reads the address of a SOCKADDR_INET in a row, at the offset its family puts it.
+func windowsRowAddress(row []byte, family uint16, offset4 int, offset6 int) netip.Addr {
+	if family == windowsAddressFamilyIPv6 {
+		return netip.AddrFrom16([16]byte(row[offset6 : offset6+16]))
+	}
+	return netip.AddrFrom4([4]byte(row[offset4 : offset4+4]))
+}
+
 // parseWindowsInterfaceTable reads the IPv4 rows of a MIB_IPINTERFACE_TABLE.
 func parseWindowsInterfaceTable(raw []byte) ([]windowsInterfaceRow, bool) {
+	return parseWindowsInterfaceTableFamily(raw, windowsAddressFamilyIPv4)
+}
+
+// parseWindowsInterfaceTable6 reads the IPv6 rows of a MIB_IPINTERFACE_TABLE. An interface has a row
+// per family, and the IPv6 one carries its own metric and its own connection state.
+func parseWindowsInterfaceTable6(raw []byte) ([]windowsInterfaceRow, bool) {
+	return parseWindowsInterfaceTableFamily(raw, windowsAddressFamilyIPv6)
+}
+
+func parseWindowsInterfaceTableFamily(raw []byte, family uint16) ([]windowsInterfaceRow, bool) {
 	rows, ok := windowsMibRows(raw, windowsInterfaceRowSize)
 	if !ok {
 		return nil, false
 	}
 	parsed := make([]windowsInterfaceRow, 0, len(rows))
 	for _, row := range rows {
-		if binary.LittleEndian.Uint16(row[windowsInterfaceFamily:]) != windowsAddressFamilyIPv4 {
+		if binary.LittleEndian.Uint16(row[windowsInterfaceFamily:]) != family {
 			continue
 		}
 		parsed = append(parsed, windowsInterfaceRow{
@@ -129,12 +169,12 @@ func parseWindowsInterfaceTable(raw []byte) ([]windowsInterfaceRow, bool) {
 	return parsed, true
 }
 
-// windowsBindRoutes joins the two tables into candidate routes.
+// windowsBindRoutes joins the two tables of one family into candidate routes.
 //
 // Windows ranks two routes of equal length by the route's metric plus its interface's metric. A
 // route on an interface that is not connected is not used, nor is a default route on an interface
 // that sets DisableDefaultRoutes -- which a VPN does to keep its default from taking over. A route
-// whose interface has no IPv4 row is not used either: there is nothing to say it is up.
+// whose interface has no row of the family is not used either: there is nothing to say it is up.
 func windowsBindRoutes(forward []windowsForwardRow, interfaces []windowsInterfaceRow) []egressBindRoute {
 	byIndex := make(map[uint32]windowsInterfaceRow, len(interfaces))
 	for _, row := range interfaces {
@@ -147,12 +187,13 @@ func windowsBindRoutes(forward []windowsForwardRow, interfaces []windowsInterfac
 			Interface: strconv.FormatUint(uint64(row.InterfaceIndex), 10),
 			Metric:    int64(row.Metric),
 		}
-		if row.NextHop != windowsOnLinkNextHop {
+		if row.NextHop != windowsOnLinkNextHop && row.NextHop != windowsOnLinkNextHop6 {
 			route.Gateway = row.NextHop
 		}
 		if iface, ok := byIndex[row.InterfaceIndex]; ok {
+			isDefault := row.Prefix == "0.0.0.0/0" || row.Prefix == "::/0"
 			route.Metric += int64(iface.Metric)
-			route.Usable = iface.Connected && !(row.Prefix == "0.0.0.0/0" && iface.DisableDefaultRoutes)
+			route.Usable = iface.Connected && !(isDefault && iface.DisableDefaultRoutes)
 		}
 		routes = append(routes, route)
 	}
@@ -166,5 +207,13 @@ func windowsBindRoutes(forward []windowsForwardRow, interfaces []windowsInterfac
 func windowsUnicastInterfaceOption(index uint32) []byte {
 	var value [4]byte
 	binary.BigEndian.PutUint32(value[:], index)
+	return value[:]
+}
+
+// windowsUnicastInterfaceOption6 is the IPV6_UNICAST_IF value: the index in host byte order, the
+// opposite of its IPv4 sibling.
+func windowsUnicastInterfaceOption6(index uint32) []byte {
+	var value [4]byte
+	binary.NativeEndian.PutUint32(value[:], index)
 	return value[:]
 }

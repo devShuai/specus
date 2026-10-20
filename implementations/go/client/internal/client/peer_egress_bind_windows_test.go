@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
 	"os/exec"
 	"sort"
 	"syscall"
@@ -124,4 +125,90 @@ func compareWindowsTestRows(t *testing.T, what string, native []string, cmdlet [
 		t.Errorf("%s disagree\nnative: %q\ncmdlet: %q", what, native, cmdlet)
 	}
 	t.Logf("%s: %d rows agree", what, len(native))
+}
+
+// egressBoundInterface6 reads IPV6_UNICAST_IF back from a connected socket, in host order as it went
+// in.
+func egressBoundInterface6(conn net.Conn) (int, error) {
+	source, ok := conn.(syscall.Conn)
+	if !ok {
+		return 0, fmt.Errorf("%T exposes no socket", conn)
+	}
+	raw, err := source.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var value [4]byte
+	length := int32(len(value))
+	var getErr error
+	if err := raw.Control(func(handle uintptr) {
+		getErr = syscall.Getsockopt(syscall.Handle(handle), syscall.IPPROTO_IPV6, windowsIPv6UnicastIf,
+			&value[0], &length)
+	}); err != nil {
+		return 0, err
+	}
+	if getErr != nil {
+		return 0, getErr
+	}
+	return int(binary.NativeEndian.Uint32(value[:])), nil
+}
+
+// The native IPv6 readings agree with Get-NetRoute and Get-NetIPInterface, as the IPv4 ones do: the
+// same rows asked for AF_INET6, where the address sits four bytes further into each SOCKADDR_INET.
+func TestWindowsIPv6BindTablesMatchGetNetRoute(t *testing.T) {
+	forwardRaw, err := readWindowsMibTableFamily(procGetIpForwardTable2, windowsForwardRowSize, syscall.AF_INET6)
+	if err != nil {
+		t.Fatalf("GetIpForwardTable2(AF_INET6): %v", err)
+	}
+	interfaceRaw, err := readWindowsMibTableFamily(procGetIpInterfaceTable, windowsInterfaceRowSize, syscall.AF_INET6)
+	if err != nil {
+		t.Fatalf("GetIpInterfaceTable(AF_INET6): %v", err)
+	}
+	forward, ok := parseWindowsForwardTable6(forwardRaw)
+	if !ok || len(forward) == 0 {
+		t.Fatalf("forward table did not parse (ok=%v rows=%d)", ok, len(forward))
+	}
+	interfaces, ok := parseWindowsInterfaceTable6(interfaceRaw)
+	if !ok || len(interfaces) == 0 {
+		t.Fatalf("interface table did not parse (ok=%v rows=%d)", ok, len(interfaces))
+	}
+
+	var cmdletRoutes []struct {
+		InterfaceIndex    int
+		DestinationPrefix string
+		NextHop           string
+		RouteMetric       int
+	}
+	runWindowsTestScript(t, "ConvertTo-Json -Compress -InputObject @(Get-NetRoute -AddressFamily IPv6 "+
+		"-PolicyStore ActiveStore -ErrorAction SilentlyContinue|Select-Object "+
+		"InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)", &cmdletRoutes)
+	var cmdletInterfaces []struct {
+		InterfaceIndex  int
+		InterfaceMetric int
+		Connected       bool
+	}
+	runWindowsTestScript(t, "ConvertTo-Json -Compress -InputObject @(Get-NetIPInterface -AddressFamily IPv6 "+
+		"-ErrorAction SilentlyContinue|Select-Object InterfaceIndex,InterfaceMetric,"+
+		"@{n='Connected';e={[string]$_.ConnectionState -eq 'Connected'}})", &cmdletInterfaces)
+
+	var native, cmdlet []string
+	for _, row := range forward {
+		native = append(native, fmt.Sprintf("%d %s %s %d", row.InterfaceIndex, row.Prefix, row.NextHop, row.Metric))
+	}
+	for _, row := range cmdletRoutes {
+		// Get-NetRoute writes prefixes and next hops in RFC 5952 form, which netip shares.
+		prefix := netip.MustParsePrefix(row.DestinationPrefix).Masked().String()
+		cmdlet = append(cmdlet, fmt.Sprintf("%d %s %s %d", row.InterfaceIndex, prefix,
+			netip.MustParseAddr(row.NextHop).String(), row.RouteMetric))
+	}
+	compareWindowsTestRows(t, "IPv6 routes", native, cmdlet)
+
+	native, cmdlet = nil, nil
+	for _, row := range interfaces {
+		native = append(native, fmt.Sprintf("%d metric=%d connected=%v", row.InterfaceIndex, row.Metric, row.Connected))
+	}
+	for _, row := range cmdletInterfaces {
+		cmdlet = append(cmdlet, fmt.Sprintf("%d metric=%d connected=%v", row.InterfaceIndex, row.InterfaceMetric, row.Connected))
+	}
+	compareWindowsTestRows(t, "IPv6 interfaces", native, cmdlet)
 }

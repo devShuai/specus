@@ -15,7 +15,8 @@ import (
 // forwarded traffic would go back into the mesh instead of out of the machine.
 //
 // On Windows and macOS the socket is bound to the interface the operating system would have picked
-// had the tunnel's routes not been there: IP_UNICAST_IF and IP_BOUND_IF. Neither needs elevation,
+// had the tunnel's routes not been there: IP_UNICAST_IF and IP_BOUND_IF, and for a socket to an IPv6
+// target IPV6_UNICAST_IF and IPV6_BOUND_IF, chosen from the IPv6 table. None needs elevation,
 // and the stack enforces both -- bound to an interface with no route to the destination, connect
 // fails rather than leaving by another one. That is also why the interface has to be chosen per
 // destination: binding everything to the default route's interface would break every target
@@ -54,10 +55,12 @@ type egressBindRoute struct {
 // routes left out: the tunnel's, and any prefix in owned.
 //
 // Longest prefix, then the lowest metric, then the route listed first. The tunnel is compared by
-// exact equality -- utun30 is not utun3 -- and an empty tunnel leaves nothing out.
+// exact equality -- utun30 is not utun3 -- and an empty tunnel leaves nothing out. Only a prefix of
+// the destination's own family can contain it. An IPv4-mapped destination is neither: no table holds
+// a route to it that a socket would follow.
 func selectEgressRoute(routes []egressBindRoute, tunnel string, owned []string, destination string) (egressBindRoute, bool) {
 	address, err := netip.ParseAddr(destination)
-	if err != nil || !address.Is4() {
+	if err != nil || address.Is4In6() || address.Zone() != "" {
 		return egressBindRoute{}, false
 	}
 	var best egressBindRoute
@@ -67,7 +70,7 @@ func selectEgressRoute(routes []egressBindRoute, tunnel string, owned []string, 
 			continue
 		}
 		prefix, err := netip.ParsePrefix(route.Prefix)
-		if err != nil || !prefix.Addr().Is4() || !prefix.Masked().Contains(address) {
+		if err != nil || prefix.Addr().Is4() != address.Is4() || !prefix.Masked().Contains(address) {
 			continue
 		}
 		// Strictly better only, so a full tie keeps the route listed first.
@@ -136,6 +139,8 @@ type egressSocketBinder struct {
 	// routes reads the candidate routes. A field so the real-socket tests can hand the stack a
 	// route it has to refuse.
 	routes func() ([]egressBindRoute, error)
+	// routes6 reads the candidate IPv6 routes, for a socket to an IPv6 target.
+	routes6 func() ([]egressBindRoute, error)
 	// tunnelKey turns the tunnel's name into what egressBindRoute.Interface holds on this
 	// platform, or "" when no such interface exists -- an interface that is not there carries no
 	// routes to leave out.
@@ -152,16 +157,14 @@ func (binder *egressSocketBinder) dial(protocol string, address string, timeout 
 	return dialer.Dial(protocol, address)
 }
 
-// egressLeftUnbound reports whether a socket to address ("host:port") is dialled without an
-// interface binding: one to an IPv6 target.
+// egressTargetIs6 reports whether a socket to address ("host:port") goes to an IPv6 target, and so
+// is bound with the IPv6 option to an interface chosen from the IPv6 table.
 //
-// The binding keeps forwarded traffic off routes this node's own tunnel installed, and the tunnel
-// installs no IPv6 route: the mesh is IPv4, and IPv6 consumer rules are not in force
-// (EGRESS_RULE_IPV6_UNSUPPORTED). IP_UNICAST_IF and IP_BOUND_IF are IPv4 options besides. The
-// consumer's IPv6 data plane, which will route IPv6 into the tunnel, has to bring IPV6_UNICAST_IF and
-// IPV6_BOUND_IF with it. An IPv4-mapped target is not IPv6 here and goes through the IPv4 choice,
-// which refuses it.
-func egressLeftUnbound(address string) bool {
+// IPv6 sockets are bound like IPv4 ones because this build announces ipv6PacketCapable: a device
+// that is also a consumer with the IPv6 data plane routes IPv6 into its tunnel, and an unbound IPv6
+// socket would follow those routes back into the mesh (protocol/spec/peer-egress.md, IPv6 数据面, 出站
+// socket). An IPv4-mapped target is not IPv6 here and goes through the IPv4 choice, which refuses it.
+func egressTargetIs6(address string) bool {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return false
@@ -170,18 +173,23 @@ func egressLeftUnbound(address string) bool {
 	return err == nil && target.Is6() && !target.Is4In6()
 }
 
-// choose returns the interface a socket to address ("host:port") is bound to.
+// choose returns the interface a socket to address ("host:port") is bound to, from the table of the
+// target's family.
 func (binder *egressSocketBinder) choose(address string) (string, error) {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return "", err
 	}
-	if binder.routes == nil {
-		return "", errors.New("no routing table reader on this platform")
+	read, table := binder.routes, "routing table"
+	if egressTargetIs6(address) {
+		read, table = binder.routes6, "IPv6 routing table"
 	}
-	routes, err := binder.routes()
+	if read == nil {
+		return "", fmt.Errorf("no %s reader on this platform", table)
+	}
+	routes, err := read()
 	if err != nil {
-		return "", fmt.Errorf("read the routing table: %w", err)
+		return "", fmt.Errorf("read the %s: %w", table, err)
 	}
 	tunnel := ""
 	if binder.tunnel != nil && binder.tunnelKey != nil {

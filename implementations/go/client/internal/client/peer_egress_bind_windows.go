@@ -10,7 +10,8 @@ import (
 	"unsafe"
 )
 
-// Binding an egress socket to an interface on Windows, with IP_UNICAST_IF.
+// Binding an egress socket to an interface on Windows, with IP_UNICAST_IF, or IPV6_UNICAST_IF for a
+// socket to an IPv6 target.
 //
 // The table is read natively on every connect; see peer_egress_bind_windows_parse.go for why.
 
@@ -22,7 +23,8 @@ var (
 )
 
 func newEgressSocketBinder(tunnel func() string) *egressSocketBinder {
-	return &egressSocketBinder{tunnel: tunnel, routes: readWindowsBindRoutes, tunnelKey: windowsInterfaceKey}
+	return &egressSocketBinder{tunnel: tunnel, routes: readWindowsBindRoutes, routes6: readWindowsBindRoutes6,
+		tunnelKey: windowsInterfaceKey}
 }
 
 // windowsInterfaceKey resolves an adapter's name to its index, the form the table carries.
@@ -38,9 +40,6 @@ func windowsInterfaceKey(name string) string {
 }
 
 func (binder *egressSocketBinder) control(_ string, address string, connection syscall.RawConn) error {
-	if egressLeftUnbound(address) {
-		return nil
-	}
 	chosen, err := binder.choose(address)
 	if err != nil {
 		return err
@@ -49,11 +48,13 @@ func (binder *egressSocketBinder) control(_ string, address string, connection s
 	if err != nil {
 		return fmt.Errorf("bind egress socket: interface %q is not an index", chosen)
 	}
-	option := windowsUnicastInterfaceOption(uint32(index))
+	level, name, option := int32(syscall.IPPROTO_IP), int32(windowsIPUnicastIf), windowsUnicastInterfaceOption(uint32(index))
+	if egressTargetIs6(address) {
+		level, name, option = syscall.IPPROTO_IPV6, windowsIPv6UnicastIf, windowsUnicastInterfaceOption6(uint32(index))
+	}
 	var setErr error
 	if err := connection.Control(func(handle uintptr) {
-		setErr = syscall.Setsockopt(syscall.Handle(handle), syscall.IPPROTO_IP, windowsIPUnicastIf,
-			&option[0], int32(len(option)))
+		setErr = syscall.Setsockopt(syscall.Handle(handle), level, name, &option[0], int32(len(option)))
 	}); err != nil {
 		return err
 	}
@@ -64,19 +65,29 @@ func (binder *egressSocketBinder) control(_ string, address string, connection s
 }
 
 func readWindowsBindRoutes() ([]egressBindRoute, error) {
-	forwardRaw, err := readWindowsMibTable(procGetIpForwardTable2, windowsForwardRowSize)
+	return readWindowsBindRoutesFamily(syscall.AF_INET, windowsAddressFamilyIPv4)
+}
+
+// readWindowsBindRoutes6 reads the IPv6 candidates the same way: GetIpForwardTable2 and
+// GetIpInterfaceTable asked for AF_INET6.
+func readWindowsBindRoutes6() ([]egressBindRoute, error) {
+	return readWindowsBindRoutesFamily(syscall.AF_INET6, windowsAddressFamilyIPv6)
+}
+
+func readWindowsBindRoutesFamily(addressFamily int, family uint16) ([]egressBindRoute, error) {
+	forwardRaw, err := readWindowsMibTableFamily(procGetIpForwardTable2, windowsForwardRowSize, addressFamily)
 	if err != nil {
 		return nil, err
 	}
-	interfaceRaw, err := readWindowsMibTable(procGetIpInterfaceTable, windowsInterfaceRowSize)
+	interfaceRaw, err := readWindowsMibTableFamily(procGetIpInterfaceTable, windowsInterfaceRowSize, addressFamily)
 	if err != nil {
 		return nil, err
 	}
-	forward, ok := parseWindowsForwardTable(forwardRaw)
+	forward, ok := parseWindowsForwardTableFamily(forwardRaw, family)
 	if !ok {
 		return nil, fmt.Errorf("GetIpForwardTable2 returned a table shorter than its count")
 	}
-	interfaces, ok := parseWindowsInterfaceTable(interfaceRaw)
+	interfaces, ok := parseWindowsInterfaceTableFamily(interfaceRaw, family)
 	if !ok {
 		return nil, fmt.Errorf("GetIpInterfaceTable returned a table shorter than its count")
 	}
@@ -84,12 +95,18 @@ func readWindowsBindRoutes() ([]egressBindRoute, error) {
 }
 
 // readWindowsMibTable copies one IPv4 MIB table out of the memory the API allocated, then frees it.
+func readWindowsMibTable(proc *syscall.LazyProc, rowSize int) ([]byte, error) {
+	return readWindowsMibTableFamily(proc, rowSize, syscall.AF_INET)
+}
+
+// readWindowsMibTableFamily copies one MIB table of an address family out of the memory the API
+// allocated, then frees it.
 //
 // The out parameter is a typed pointer rather than a uintptr, so the address never passes through an
 // integer on its way back to a pointer.
-func readWindowsMibTable(proc *syscall.LazyProc, rowSize int) ([]byte, error) {
+func readWindowsMibTableFamily(proc *syscall.LazyProc, rowSize int, addressFamily int) ([]byte, error) {
 	var table *uint32
-	status, _, _ := proc.Call(uintptr(syscall.AF_INET), uintptr(unsafe.Pointer(&table)))
+	status, _, _ := proc.Call(uintptr(addressFamily), uintptr(unsafe.Pointer(&table)))
 	if status != 0 {
 		return nil, fmt.Errorf("%s: %w", proc.Name, syscall.Errno(status))
 	}

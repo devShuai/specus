@@ -207,3 +207,133 @@ func egressBindDelivers(t *testing.T, binder *egressSocketBinder, packet net.Pac
 		}
 	}
 }
+
+// egressBindListeners6 starts a TCP and a UDP listener on ::1, or skips on a host without IPv6
+// loopback.
+func egressBindListeners6(t *testing.T) (string, net.PacketConn) {
+	t.Helper()
+	stream, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("no IPv6 loopback on this host (%v); the IPv6 binding tests need ::1", err)
+	}
+	t.Cleanup(func() { _ = stream.Close() })
+	go func() {
+		for {
+			conn, err := stream.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	packet, err := net.ListenPacket("udp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("no IPv6 loopback on this host (%v); the IPv6 binding tests need ::1", err)
+	}
+	t.Cleanup(func() { _ = packet.Close() })
+	return stream.Addr().String(), packet
+}
+
+// A dial to ::1 is bound to the loopback interface with the IPv6 option, chosen from the IPv6 table,
+// and the socket says so.
+func TestEgressIPv6DialBindsTheSocketToTheInterfaceItChose(t *testing.T) {
+	loopback := egressBindLoopback(t)
+	tcpAddress, packet := egressBindListeners6(t)
+	binder := newEgressSocketBinder(func() string { return "" })
+
+	for _, target := range []struct{ protocol, address string }{{"tcp", tcpAddress}, {"udp", packet.LocalAddr().String()}} {
+		conn, err := binder.dial(target.protocol, target.address, 2*time.Second)
+		if err != nil {
+			t.Fatalf("%s dial: %v", target.protocol, err)
+		}
+		bound, err := egressBoundInterface6(conn)
+		_ = conn.Close()
+		if err != nil {
+			t.Fatalf("%s read back the binding: %v", target.protocol, err)
+		}
+		if bound != loopback.Index {
+			t.Errorf("%s socket is bound to interface %d, want loopback %d", target.protocol, bound, loopback.Index)
+		}
+	}
+}
+
+// With only the tunnel's routes leading to an IPv6 target, the dial is refused, as for IPv4.
+func TestEgressIPv6DialIsRefusedWhenOnlyTheTunnelLeadsThere(t *testing.T) {
+	loopback := egressBindLoopback(t)
+	tcpAddress, packet := egressBindListeners6(t)
+	binder := newEgressSocketBinder(func() string { return loopback.Name })
+	key := binder.tunnelKey(loopback.Name)
+	real, err := binder.routes6()
+	if err != nil {
+		t.Fatalf("read the IPv6 routing table: %v", err)
+	}
+	var loopbackRoutes []egressBindRoute
+	for _, route := range real {
+		if route.Interface == key {
+			loopbackRoutes = append(loopbackRoutes, route)
+		}
+	}
+	if chosen, ok := selectEgressBindInterface(loopbackRoutes, "", "::1"); !ok || chosen != key {
+		t.Fatalf("the real IPv6 table's loopback routes do not lead to ::1 through %s (got %q)", key, chosen)
+	}
+	binder.routes6 = func() ([]egressBindRoute, error) { return loopbackRoutes, nil }
+
+	for _, target := range []struct{ protocol, address string }{{"tcp", tcpAddress}, {"udp", packet.LocalAddr().String()}} {
+		conn, err := binder.dial(target.protocol, target.address, 2*time.Second)
+		if err == nil {
+			_ = conn.Close()
+			t.Fatalf("%s dial succeeded with the only route to it named as the tunnel", target.protocol)
+		}
+		if !errors.Is(err, errEgressNoPhysicalRoute) {
+			t.Errorf("%s dial error = %v, want the no-physical-route refusal", target.protocol, err)
+		}
+	}
+}
+
+// The stack holds an IPv6 socket to the interface the IPv6 option names: told that ::1 is behind
+// another interface, the binder's TCP cannot connect and its UDP cannot deliver. The other interface
+// is any with a usable IPv6 route outside loopback; the link-local prefix every IPv6 interface has is
+// enough, so this runs without IPv6 connectivity.
+func TestEgressIPv6SocketIsHeldToTheBoundInterface(t *testing.T) {
+	loopback := egressBindLoopback(t)
+	tcpAddress, packet := egressBindListeners6(t)
+
+	real := newEgressSocketBinder(func() string { return "" })
+	routes, err := real.routes6()
+	if err != nil {
+		t.Fatalf("read the IPv6 routing table: %v", err)
+	}
+	loopbackKey := real.tunnelKey(loopback.Name)
+	other, ok := selectEgressBindInterface(routes, loopbackKey, "2001:db8::1")
+	if !ok {
+		other, ok = selectEgressBindInterface(routes, loopbackKey, "fe80::1")
+	}
+	if !ok {
+		t.Skip("no interface but loopback carries an IPv6 route; this test needs one to bind to")
+	}
+
+	lying := newEgressSocketBinder(func() string { return "" })
+	lying.routes6 = func() ([]egressBindRoute, error) {
+		return []egressBindRoute{{Prefix: "::1/128", Interface: other, Usable: true}}, nil
+	}
+
+	conn, err := lying.dial("tcp", tcpAddress, 2*time.Second)
+	if err == nil {
+		bound, _ := egressBoundInterface6(conn)
+		_ = conn.Close()
+		t.Fatalf("tcp reached ::1 while bound to %s (read back %d): the binding is not enforced", other, bound)
+	}
+	if errors.Is(err, errEgressNoPhysicalRoute) {
+		t.Fatalf("tcp dial was refused before any socket existed, so nothing was tested: %v", err)
+	}
+	t.Logf("tcp bound to %s: %v", other, err)
+
+	if delivered, detail := egressBindDelivers(t, real, packet, "control6"); !delivered {
+		t.Fatalf("udp bound to loopback did not deliver either (%s), so silence would prove nothing", detail)
+	}
+	delivered, detail := egressBindDelivers(t, lying, packet, "misbound6")
+	if delivered {
+		t.Fatalf("udp reached ::1 while bound to %s: the binding is not enforced", other)
+	}
+	t.Logf("udp bound to %s: %s", other, detail)
+}
