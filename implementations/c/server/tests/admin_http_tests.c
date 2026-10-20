@@ -6192,7 +6192,8 @@ int main(void)
              "\"attachments\":true,\"mediaPreview\":true,"
              "\"maxAttachmentBytes\":16777216},"
              "\"clientEgressCapabilities\":{\"version\":1,\"egressCapable\":true,"
-             "\"consumerCapable\":true,\"domainTargetCapable\":true,\"ipv6TargetCapable\":true},"
+             "\"consumerCapable\":true,\"domainTargetCapable\":true,\"ipv6TargetCapable\":true,"
+             "\"ipv6PacketCapable\":true},"
              "\"clientPeerServiceCapabilities\":{\"version\":2,"
              "\"applications\":[\"http\",\"tcp\",\"http\"]}}}",
              timestamp,
@@ -6265,17 +6266,23 @@ int main(void)
     {
         sqlite3 *ipv6_db = NULL;
         sqlite3_stmt *ipv6_statement = NULL;
-        int ipv6_stored = sqlite3_open(auth_db_path, &ipv6_db) == SQLITE_OK
+        int ipv6_row = sqlite3_open(auth_db_path, &ipv6_db) == SQLITE_OK
             && sqlite3_prepare_v2(ipv6_db,
-                "SELECT client_egress_ipv6_targets FROM specus_client_session WHERE id = ?",
+                "SELECT client_egress_ipv6_targets, client_egress_ipv6_packets "
+                "FROM specus_client_session WHERE id = ?",
                 -1, &ipv6_statement, NULL) == SQLITE_OK
             && sqlite3_bind_int64(ipv6_statement, 1, runtime_client_session_id) == SQLITE_OK
-            && sqlite3_step(ipv6_statement) == SQLITE_ROW
-            && sqlite3_column_int(ipv6_statement, 0) == 1;
+            && sqlite3_step(ipv6_statement) == SQLITE_ROW;
+        int ipv6_stored = ipv6_row && sqlite3_column_int(ipv6_statement, 0) == 1;
+        int ipv6_packets_stored = ipv6_row && sqlite3_column_int(ipv6_statement, 1) == 1;
         sqlite3_finalize(ipv6_statement);
         sqlite3_close(ipv6_db);
         if (!ipv6_stored) {
             fprintf(stderr, "HTTP login lost the declared IPv6 target socket capability\n");
+            return 1;
+        }
+        if (!ipv6_packets_stored) {
+            fprintf(stderr, "HTTP login lost the declared IPv6 packet capability\n");
             return 1;
         }
     }

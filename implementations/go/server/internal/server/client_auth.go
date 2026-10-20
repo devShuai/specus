@@ -65,15 +65,16 @@ type clientPeerServiceCapabilities struct {
 }
 
 // Peer egress split routing. Version 0 or absent means the client cannot take part, and the server
-// must not push egress-config or egress-catalog to it. domainTarget and ipv6Target are tracked
-// separately from the version so a later release adding domain rules can coexist with clients that
-// only understand address targets.
+// must not push egress-config or egress-catalog to it. domainTarget, ipv6Target and ipv6Packet are
+// tracked separately from the version so a later release adding domain rules can coexist with clients
+// that only understand address targets.
 type clientEgressCapabilities struct {
 	Version             int  `json:"version"`
 	ConsumerCapable     bool `json:"consumerCapable"`
 	EgressCapable       bool `json:"egressCapable"`
 	DomainTargetCapable bool `json:"domainTargetCapable"`
 	Ipv6TargetCapable   bool `json:"ipv6TargetCapable"`
+	Ipv6PacketCapable   bool `json:"ipv6PacketCapable"`
 }
 
 type clientAuthLoginResponse struct {
@@ -209,6 +210,7 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 		ClientEgressVersion:         peermesh.NormalizeEgressVersion(request.Environment.ClientEgressCapabilities.Version),
 		ClientEgressDomainTargets:   peermesh.EgressDomainTargets(request.Environment.ClientEgressCapabilities.Version, request.Environment.ClientEgressCapabilities.DomainTargetCapable),
 		ClientEgressIPv6Targets:     peermesh.EgressIPv6Targets(request.Environment.ClientEgressCapabilities.Version, request.Environment.ClientEgressCapabilities.Ipv6TargetCapable),
+		ClientEgressIPv6Packets:     peermesh.EgressIPv6Packets(request.Environment.ClientEgressCapabilities.Version, request.Environment.ClientEgressCapabilities.Ipv6PacketCapable),
 		HTTPLoginAt:                 now,
 		ExpiresAt:                   session.ExpiresAt,
 	}); err != nil {

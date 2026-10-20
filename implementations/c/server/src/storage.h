@@ -28,6 +28,7 @@ typedef struct {
      */
     int client_egress_domain_targets;
     int client_egress_ipv6_targets;
+    int client_egress_ipv6_packets;
     char client_version[81];
     long long upload_bytes;
     long long download_bytes;
@@ -171,6 +172,8 @@ typedef struct {
     int client_http_route_version;
     /* IPv6 target sockets announced by this session, not consumer packet support. */
     int client_egress_ipv6_targets;
+    /* IPv6 packets in SPEG1 announced by this session; independent of the target sockets above. */
+    int client_egress_ipv6_packets;
 } st_storage_client_session;
 
 typedef struct {

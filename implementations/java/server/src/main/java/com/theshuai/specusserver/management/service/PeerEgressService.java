@@ -559,6 +559,7 @@ public class PeerEgressService {
                     : EgressAnnouncement.NONE;
             entry.setDomainTargetCapable(announced.domainTargets());
             entry.setIpv6TargetCapable(announced.ipv6Targets());
+            entry.setIpv6PacketCapable(announced.ipv6Packets());
             entry.setEgressVersion(announced.version());
             entries.add(entry);
         }
@@ -567,8 +568,9 @@ public class PeerEgressService {
     }
 
     /** What an egress's current online session announced at login, as the catalogue passes it on. */
-    private record EgressAnnouncement(int version, boolean domainTargets, boolean ipv6Targets) {
-        static final EgressAnnouncement NONE = new EgressAnnouncement(0, false, false);
+    private record EgressAnnouncement(int version, boolean domainTargets, boolean ipv6Targets,
+                                      boolean ipv6Packets) {
+        static final EgressAnnouncement NONE = new EgressAnnouncement(0, false, false, false);
     }
 
     /**
@@ -578,7 +580,7 @@ public class PeerEgressService {
      * than from anything remembered about the device: an egress that went offline, or came back on
      * an older client, must not keep advertising what it no longer offers. Consumers rely on the
      * version to tell an egress that cannot take a flow at all (an old client, {@code 0}) and on
-     * domain targets to tell which egress can take a domain rule. All three values must describe
+     * domain targets to tell which egress can take a domain rule. All four values must describe
      * the same newest online session, never an OR/MAX across old and current declarations.
      */
     private EgressAnnouncement announcementOf(ClientAccount egress) {
@@ -611,7 +613,7 @@ public class PeerEgressService {
         }
         if (newest == null || newest.getClientEgressVersion() < 1) return EgressAnnouncement.NONE;
         return new EgressAnnouncement(newest.getClientEgressVersion(), newest.isClientEgressDomainTargets(),
-                newest.isClientEgressIpv6Targets());
+                newest.isClientEgressIpv6Targets(), newest.isClientEgressIpv6Packets());
     }
 
     /**

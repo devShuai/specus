@@ -258,6 +258,9 @@ type ClientSession struct {
 	// ClientEgressIPv6Targets reports the egress's IPv6 target socket support,
 	// not IPv6 packets on the consumer TUN. Missing declarations remain false.
 	ClientEgressIPv6Targets bool
+	// ClientEgressIPv6Packets reports whether the egress takes IPv6 packets carried in SPEG1
+	// (clientEgressCapabilities.ipv6PacketCapable). Independent of ClientEgressIPv6Targets.
+	ClientEgressIPv6Packets bool
 	HTTPLoginAt             time.Time
 	NettyConnectedAt        *time.Time
 	DisconnectedAt          *time.Time

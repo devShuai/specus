@@ -166,6 +166,7 @@ public sealed class PeerEgressServiceTests
         Assert.Equal(["tcp", "udp"], entry.Protocols);
         Assert.False(entry.DomainTargetCapable);
         Assert.False(entry.Ipv6TargetCapable);
+        Assert.False(entry.Ipv6PacketCapable);
         Assert.Null(catalog.DestinationRules);
     }
 
@@ -270,6 +271,91 @@ public sealed class PeerEgressServiceTests
         await fixture.UpsertAsync(EgressId, enabled: true, consumers: [ConsumerId]);
         var catalog = await fixture.Service.BuildEgressCatalogAsync(consumer, Capable(), default);
         Assert.Equal(expected, Assert.Single(catalog!.Egresses!).Ipv6TargetCapable);
+    }
+
+    public static IEnumerable<object[]> Ipv6PacketCatalogVectorCases()
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
+        {
+            var path = Path.Combine(directory.FullName, "protocol", "test-vectors", "peer-egress-ipv6-packet-announcement-v1.json");
+            if (!File.Exists(path)) continue;
+            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            var cases = document.RootElement.GetProperty("catalog");
+            Assert.Equal(10, cases.GetArrayLength());
+            foreach (var example in cases.EnumerateArray())
+                yield return [example.GetProperty("name").GetString()!, example.GetRawText()];
+            yield break;
+        }
+        throw new InvalidOperationException("Shared IPv6 packet announcement vector not found");
+    }
+
+    /// <summary>
+    /// ipv6PacketCapable travels from the same newest online session row as the version and the
+    /// other declarations, and an ipv6TargetCapable on that row never stands in for it.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Ipv6PacketCatalogVectorCases))]
+    public async Task TheCatalogCarriesTheSharedIpv6PacketAnnouncement(string caseName, string caseJson)
+    {
+        using var document = JsonDocument.Parse(caseJson);
+        var example = document.RootElement;
+        await using var fixture = await EgressFixture.CreateAsync();
+        var consumer = fixture.AddClient(ConsumerId, "consumer-owner", "laptop");
+        var egress = fixture.AddClient(EgressId, "egress-owner", "office-gateway");
+        fixture.AllowPeering(consumer, egress);
+        await fixture.SaveChangesAsync();
+        await fixture.UpsertAsync(EgressId, enabled: true, consumers: [ConsumerId]);
+        foreach (var declaration in example.GetProperty("sessions").EnumerateArray())
+        {
+            var id = declaration.GetProperty("id").GetInt64();
+            var connected = DateTimeOffset.Parse(declaration.GetProperty("connectedAt").GetString()!);
+            fixture.Db.ClientSessions.Add(new ClientSession
+            {
+                Id = id,
+                TenantId = declaration.GetProperty("tenantId").GetString() == "tenant-a" ? egress.TenantId : "tenant-b",
+                ClientId = egress.Id,
+                ClientName = egress.ClientName,
+                TokenHash = $"ipv6-packet-{id}",
+                Status = declaration.GetProperty("status").GetString()!,
+                MachineFingerprint = "fixture-machine", OsUser = "fixture-user",
+                ClientEgressVersion = declaration.GetProperty("version").GetInt32(),
+                ClientEgressIpv6Targets = declaration.TryGetProperty("ipv6TargetCapable", out var targets) && targets.GetBoolean(),
+                ClientEgressIpv6Packets = declaration.GetProperty("ipv6PacketCapable").GetBoolean(),
+                HttpLoginAt = connected,
+                NettyConnectedAt = connected,
+                ExpiresAt = DateTimeOffset.UtcNow.AddHours(1),
+            });
+        }
+        await fixture.SaveChangesAsync();
+        var catalog = await fixture.Service.BuildEgressCatalogAsync(consumer, Capable(), default);
+        var entry = Assert.Single(catalog!.Egresses!);
+        Assert.True(example.GetProperty("expected").GetBoolean() == entry.Ipv6PacketCapable, $"{caseName}: wrong IPv6 packet capability");
+        if (caseName == "target-flag-is-not-packet-flag") Assert.True(entry.Ipv6TargetCapable);
+    }
+
+    /// <summary>The two IPv6 declarations come from the same row but never from each other.</summary>
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task TheCatalogKeepsIpv6TargetsAndIpv6PacketsIndependent(bool targets, bool packets)
+    {
+        await using var fixture = await EgressFixture.CreateAsync();
+        var consumer = fixture.AddClient(ConsumerId, "consumer-owner", "laptop");
+        var egress = fixture.AddClient(EgressId, "egress-owner", "office-gateway");
+        fixture.AllowPeering(consumer, egress);
+        fixture.AddOnlineSession(egress, 4701, egressVersion: 1);
+        await fixture.SaveChangesAsync();
+        var session = await fixture.Db.ClientSessions.SingleAsync(row => row.Id == 4701);
+        session.ClientEgressIpv6Targets = targets;
+        session.ClientEgressIpv6Packets = packets;
+        await fixture.SaveChangesAsync();
+        await fixture.UpsertAsync(EgressId, enabled: true, consumers: [ConsumerId]);
+        var entry = Assert.Single((await fixture.Service.BuildEgressCatalogAsync(consumer, Capable(), default))!.Egresses!);
+        Assert.Equal(targets, entry.Ipv6TargetCapable);
+        Assert.Equal(packets, entry.Ipv6PacketCapable);
+        Assert.Equal(1, entry.EgressVersion);
     }
 
     public static IEnumerable<object[]> SessionOrderVectorCases()

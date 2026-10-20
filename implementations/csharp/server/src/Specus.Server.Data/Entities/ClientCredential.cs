@@ -81,6 +81,9 @@ public sealed class ClientSession
     /// <summary>IPv6 sockets on the egress, not IPv6 packets on the consumer TUN.</summary>
     public bool ClientEgressIpv6Targets { get; set; }
 
+    /// <summary>IPv6 packets in SPEG1 to the egress, independent of IPv6 target sockets.</summary>
+    public bool ClientEgressIpv6Packets { get; set; }
+
     public DateTimeOffset HttpLoginAt { get; set; }
     public DateTimeOffset? NettyConnectedAt { get; set; }
     public DateTimeOffset? DisconnectedAt { get; set; }

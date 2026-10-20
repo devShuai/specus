@@ -23,4 +23,8 @@ public static class PeerEgressProtocol
     /// <summary>IPv6 target sockets on the egress, not consumer IPv6 packet support.</summary>
     public static bool DeclaresIpv6Targets(int version, bool declared) =>
         NormalizeVersion(version) >= 1 && declared;
+
+    /// <summary>IPv6 packets carried in SPEG1 to the egress, independent of IPv6 target sockets.</summary>
+    public static bool DeclaresIpv6Packets(int version, bool declared) =>
+        NormalizeVersion(version) >= 1 && declared;
 }

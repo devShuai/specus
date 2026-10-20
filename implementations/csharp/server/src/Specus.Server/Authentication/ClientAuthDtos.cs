@@ -121,6 +121,9 @@ public sealed class ClientEgressCapabilities
 
     [JsonPropertyName("ipv6TargetCapable")]
     public bool Ipv6TargetCapable { get; set; }
+
+    [JsonPropertyName("ipv6PacketCapable")]
+    public bool Ipv6PacketCapable { get; set; }
 }
 
 /// <summary>

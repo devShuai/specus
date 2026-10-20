@@ -492,6 +492,8 @@ public class ClientAuthService {
         session.setClientEgressDomainTargets(egressVersion >= 1 && egress.isDomainTargetCapable());
         session.setClientEgressIpv6Targets(PeerEgressProtocol.declaresIpv6Targets(
                 egressVersion, egress.isIpv6TargetCapable()));
+        session.setClientEgressIpv6Packets(PeerEgressProtocol.declaresIpv6Packets(
+                egressVersion, egress.isIpv6PacketCapable()));
     }
 
     private List<ClientAuthLoginResponse.SpecusEndpoint> loadTcpMappings(ClientAccount account) {

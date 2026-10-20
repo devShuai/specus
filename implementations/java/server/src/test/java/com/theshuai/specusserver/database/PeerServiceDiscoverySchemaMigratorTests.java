@@ -57,14 +57,19 @@ class PeerServiceDiscoverySchemaMigratorTests {
         // egress and no domain targets.
         for (int id : new int[] {1, 2}) {
             Map<String, Object> egress = jdbc.queryForMap(
-                    "select client_egress_version, client_egress_domain_targets, client_egress_ipv6_targets from specus_client_session where id=?", id);
+                    "select client_egress_version, client_egress_domain_targets, client_egress_ipv6_targets, client_egress_ipv6_packets from specus_client_session where id=?", id);
             assertThat(((Number) egress.get("client_egress_version")).intValue()).isZero();
             assertThat(((Number) egress.get("client_egress_domain_targets")).intValue()).isZero();
             assertThat(((Number) egress.get("client_egress_ipv6_targets")).intValue()).isZero();
+            assertThat(((Number) egress.get("client_egress_ipv6_packets")).intValue()).isZero();
         }
         jdbc.update("update specus_client_session set client_egress_version=1, client_egress_ipv6_targets=1 where id=2");
         migrator.migrate();
         assertThat(jdbc.queryForObject("select client_egress_ipv6_targets from specus_client_session where id=2", Integer.class)).isEqualTo(1);
+        assertThat(jdbc.queryForObject("select client_egress_ipv6_packets from specus_client_session where id=2", Integer.class)).isZero();
+        jdbc.update("update specus_client_session set client_egress_ipv6_packets=1 where id=1");
+        migrator.migrate();
+        assertThat(jdbc.queryForObject("select client_egress_ipv6_packets from specus_client_session where id=1", Integer.class)).isEqualTo(1);
         assertThat(sharing).isNotEmpty();
     }
 

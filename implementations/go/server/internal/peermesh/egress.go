@@ -55,6 +55,7 @@ type EgressCatalogEntry struct {
 	Protocols           []string `json:"protocols"`
 	DomainTargetCapable bool     `json:"domainTargetCapable"`
 	IPv6TargetCapable   bool     `json:"ipv6TargetCapable"`
+	IPv6PacketCapable   bool     `json:"ipv6PacketCapable"`
 	// EgressVersion is always written, 0 included: a consumer reads an absent field as "old server,
 	// unknown" and keeps routing, but reads 0 as "this egress cannot take a flow" and stops counting
 	// on it. Omitting zero would turn the second answer into the first.
@@ -68,6 +69,7 @@ type EgressCapabilities struct {
 	EgressCapable       bool `json:"egressCapable"`
 	DomainTargetCapable bool `json:"domainTargetCapable"`
 	IPv6TargetCapable   bool `json:"ipv6TargetCapable"`
+	IPv6PacketCapable   bool `json:"ipv6PacketCapable"`
 }
 
 // EgressPolicyMutation is accepted by the management API; absent fields keep their stored value.
@@ -136,18 +138,25 @@ func EgressIPv6Targets(version int, declared bool) bool {
 	return NormalizeEgressVersion(version) >= 1 && declared
 }
 
+// EgressIPv6Packets normalizes whether the egress takes IPv6 packets carried in SPEG1. It is
+// declared on its own: an IPv6 target socket does not imply it, nor does it imply one.
+func EgressIPv6Packets(version int, declared bool) bool {
+	return NormalizeEgressVersion(version) >= 1 && declared
+}
+
 // egressAnnouncementOf reads, from the egress's current online session, what it announced at login:
 // its clientEgressCapabilities.version (already normalised when the session was stored) and whether
 // it resolves domain targets. Offline, or no such announcement, is version 0 and no domain targets:
 // a consumer must neither count on an egress that cannot take a flow nor send a name to one that
 // cannot resolve it. All capability fields come from the same newest online
 // session, including an explicit false after reconnecting with an older client.
-func (s *Service) egressAnnouncementOf(ctx context.Context, tenantID string, egressClientID int64) (version int, domainTargets, ipv6Targets bool) {
+func (s *Service) egressAnnouncementOf(ctx context.Context, tenantID string, egressClientID int64) (version int, domainTargets, ipv6Targets, ipv6Packets bool) {
 	online, err := s.db.GetOnlineClientSession(ctx, tenantID, egressClientID, auth.StatusNettyOnline)
 	if err != nil || online == nil || online.ClientEgressVersion < 1 {
-		return 0, false, false
+		return 0, false, false, false
 	}
-	return online.ClientEgressVersion, online.ClientEgressDomainTargets, online.ClientEgressIPv6Targets
+	return online.ClientEgressVersion, online.ClientEgressDomainTargets, online.ClientEgressIPv6Targets,
+		online.ClientEgressIPv6Packets
 }
 
 // egressCapabilitiesFor reads what the client announced at login. A client with no online session,
@@ -598,7 +607,7 @@ func (s *Service) BuildEgressCatalog(ctx context.Context, account store.ClientAc
 		}
 		device, err := s.db.FindPeerMeshDeviceByClientID(ctx, account.TenantID, policy.EgressClientID)
 		online := err == nil && device != nil && device.Enabled
-		egressVersion, domainTargets, ipv6Targets := s.egressAnnouncementOf(ctx, account.TenantID, policy.EgressClientID)
+		egressVersion, domainTargets, ipv6Targets, ipv6Packets := s.egressAnnouncementOf(ctx, account.TenantID, policy.EgressClientID)
 		message.Egresses = append(message.Egresses, EgressCatalogEntry{
 			ClientID:            policy.EgressClientID,
 			ClientName:          policy.EgressClientName,
@@ -607,6 +616,7 @@ func (s *Service) BuildEgressCatalog(ctx context.Context, account store.ClientAc
 			Protocols:           egressProtocols(DecodeEgressDestinationRules(policy.DestinationRules, s.logger)),
 			DomainTargetCapable: domainTargets,
 			IPv6TargetCapable:   ipv6Targets,
+			IPv6PacketCapable:   ipv6Packets,
 			EgressVersion:       egressVersion,
 		})
 	}

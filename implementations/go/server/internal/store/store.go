@@ -220,6 +220,7 @@ func (db *DB) ensureCompatibleColumns() error {
 		{"specus_client_session", "client_egress_version", "INTEGER NOT NULL DEFAULT 0"},
 		{"specus_client_session", "client_egress_domain_targets", clientCapabilityBoolType},
 		{"specus_client_session", "client_egress_ipv6_targets", clientCapabilityBoolType},
+		{"specus_client_session", "client_egress_ipv6_packets", clientCapabilityBoolType},
 		// Domain rules of an egress policy. A policy saved before them reads as granting no name.
 		{"peer_mesh_egress_policy", "domain_rules", egressDomainRulesType},
 		{"peer_mesh_service_sharing", "mdns_import_enabled", boolType},

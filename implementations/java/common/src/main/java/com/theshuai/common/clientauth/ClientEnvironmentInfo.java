@@ -53,6 +53,7 @@ public class ClientEnvironmentInfo {
         private boolean egressCapable;
         private boolean domainTargetCapable;
         private boolean ipv6TargetCapable;
+        private boolean ipv6PacketCapable;
     }
 
     /**

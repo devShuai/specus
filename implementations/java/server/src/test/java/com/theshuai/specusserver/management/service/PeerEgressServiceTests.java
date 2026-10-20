@@ -25,7 +25,10 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -367,6 +370,100 @@ class PeerEgressServiceTests {
                 Arguments.of("zero version", "NETTY_ONLINE", 0, true, false, false),
                 Arguments.of("new false must not borrow old true", "NETTY_ONLINE", 1, false, true, false),
                 Arguments.of("new old client clears capability", "NETTY_ONLINE", 0, false, true, false));
+    }
+
+    /**
+     * {@code ipv6PacketCapable} follows the shared vector's catalogue cases: the same newest online
+     * session as the version and the other flags, never borrowed from an older row, another tenant,
+     * or the separate {@code ipv6TargetCapable} declaration. The repository mock returns every row
+     * of a case, as a broad database collation might, so the service's own identity filter decides.
+     */
+    @ParameterizedTest(name = "IPv6 packet catalog {0}")
+    @MethodSource("ipv6PacketCatalogCases")
+    void theCatalogReflectsTheNewestOnlineIPv6PacketAnnouncement(String name, String json) {
+        JsonNode example = JsonUtil.readString(json);
+        catalogForOneEgress();
+        List<ClientSession> rows = new ArrayList<>();
+        for (JsonNode row : example.path("sessions")) {
+            ClientSession session = new ClientSession();
+            session.setId(row.path("id").asLong());
+            session.setTenantId("tenant-a".equals(row.path("tenantId").asText()) ? TENANT : row.path("tenantId").asText());
+            session.setClientId(egress.getId());
+            session.setStatus(row.path("status").asText());
+            session.setClientEgressVersion(row.path("version").asInt());
+            session.setClientEgressIpv6Targets(row.path("ipv6TargetCapable").asBoolean(false));
+            session.setClientEgressIpv6Packets(row.path("ipv6PacketCapable").asBoolean(false));
+            session.setNettyConnectedAt(row.path("connectedAt").asText());
+            session.setHttpLoginAt(row.path("connectedAt").asText());
+            rows.add(session);
+        }
+        when(clientSessionRepository.findByTenantIdAndClientIdInAndStatus(
+                TENANT, List.of(egress.getId()), ClientAuthService.STATUS_NETTY_ONLINE)).thenReturn(rows);
+
+        PeerControlMessage catalog = service.buildEgressCatalog(consumer, environment(1));
+
+        assertThat(catalog.getEgresses()).hasSize(1);
+        PeerEgressCatalogEntry entry = catalog.getEgresses().getFirst();
+        assertThat(entry.isIpv6PacketCapable()).as(name).isEqualTo(example.path("expected").asBoolean());
+        if (name.equals("target-flag-is-not-packet-flag")) {
+            assertThat(entry.isIpv6TargetCapable()).as(name + ": target flag still forwarded").isTrue();
+        }
+    }
+
+    private static Stream<Arguments> ipv6PacketCatalogCases() throws Exception {
+        for (Path directory = Path.of("").toAbsolutePath(); directory != null; directory = directory.getParent()) {
+            Path path = directory.resolve("protocol/test-vectors/peer-egress-ipv6-packet-announcement-v1.json");
+            if (!Files.isRegularFile(path)) continue;
+            JsonNode root = JsonUtil.readString(Files.readString(path));
+            assertThat(root.path("catalog")).hasSize(10);
+            List<Arguments> cases = new ArrayList<>();
+            root.path("catalog").forEach(example -> cases.add(Arguments.of(example.path("name").asText(), example.toString())));
+            return cases.stream();
+        }
+        throw new IllegalStateException("Shared IPv6 packet announcement vector not found");
+    }
+
+    /** The two IPv6 flags come from the same row but are forwarded independently, in wire order. */
+    @Test
+    void theCatalogForwardsIpv6PacketsIndependentlyRightAfterIpv6Targets() {
+        catalogForOneEgress();
+        ClientSession session = new ClientSession();
+        session.setId(92L);
+        session.setTenantId(TENANT);
+        session.setClientId(egress.getId());
+        session.setStatus(ClientAuthService.STATUS_NETTY_ONLINE);
+        session.setClientEgressVersion(1);
+        session.setClientEgressIpv6Packets(true);
+        session.setNettyConnectedAt("2026-10-18T00:01:00Z");
+        session.setHttpLoginAt("2026-10-18T00:01:00Z");
+        when(clientSessionRepository.findByTenantIdAndClientIdInAndStatus(
+                TENANT, List.of(egress.getId()), ClientAuthService.STATUS_NETTY_ONLINE)).thenReturn(List.of(session));
+
+        PeerControlMessage catalog = service.buildEgressCatalog(consumer, environment(1));
+
+        PeerEgressCatalogEntry entry = catalog.getEgresses().getFirst();
+        assertThat(entry.isIpv6PacketCapable()).isTrue();
+        assertThat(entry.isIpv6TargetCapable()).isFalse();
+        JsonNode wire = JsonUtil.readString(JsonUtil.objectToString(catalog)).get("egresses").get(0);
+        List<String> fields = new ArrayList<>();
+        for (Iterator<String> names = wire.fieldNames(); names.hasNext(); ) fields.add(names.next());
+        assertThat(fields).containsSubsequence("ipv6TargetCapable", "ipv6PacketCapable");
+        assertThat(fields.indexOf("ipv6PacketCapable")).isEqualTo(fields.indexOf("ipv6TargetCapable") + 1);
+        assertThat(wire.path("ipv6PacketCapable").isBoolean()).isTrue();
+    }
+
+    /** One enabled, online egress the consumer may use; its sessions are up to the caller. */
+    private void catalogForOneEgress() {
+        tenantEgressOn();
+        when(peerMeshService.isEnabled()).thenReturn(true);
+        when(peerMeshService.canPeer(any(), any())).thenReturn(true);
+        when(clientAccountRepository.findByTenantIdOrderByIdDesc(TENANT)).thenReturn(List.of(consumer, egress));
+        when(clientAccountRepository.findByIdAndTenantId(egress.getId(), TENANT)).thenReturn(Optional.of(egress));
+        PeerMeshDevice device = new PeerMeshDevice();
+        device.setEnabled(true);
+        when(deviceRepository.findByTenantIdAndClientId(TENANT, egress.getId())).thenReturn(Optional.of(device));
+        when(policyRepository.findByTenantIdAndEnabledTrueOrderByEgressClientNameAsc(TENANT))
+                .thenReturn(List.of(policy(List.of(consumer.getId()))));
     }
 
     private void onlineSession(ClientAccount account, boolean domainTargets) {

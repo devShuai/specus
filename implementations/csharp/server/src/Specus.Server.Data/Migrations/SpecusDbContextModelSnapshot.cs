@@ -371,6 +371,12 @@ namespace Specus.Server.Data.Migrations
                         .HasColumnType("INTEGER")
                         .HasColumnName("client_egress_domain_targets");
 
+                    b.Property<bool>("ClientEgressIpv6Packets")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER")
+                        .HasDefaultValue(false)
+                        .HasColumnName("client_egress_ipv6_packets");
+
                     b.Property<bool>("ClientEgressIpv6Targets")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("INTEGER")

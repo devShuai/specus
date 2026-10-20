@@ -161,6 +161,9 @@ public sealed record PeerEgressCatalogEntry
     [JsonPropertyName("ipv6TargetCapable")]
     public bool Ipv6TargetCapable { get; init; }
 
+    [JsonPropertyName("ipv6PacketCapable")]
+    public bool Ipv6PacketCapable { get; init; }
+
     /// <summary>
     /// The <c>clientEgressCapabilities.version</c> the egress's current online session announced;
     /// 0 when it is offline or announced none.
