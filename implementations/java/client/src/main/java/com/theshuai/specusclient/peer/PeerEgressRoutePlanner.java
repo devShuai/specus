@@ -1,6 +1,7 @@
 package com.theshuai.specusclient.peer;
 
 import com.theshuai.common.peeregress.Ipv4Cidr;
+import com.theshuai.common.peeregress.Ipv6Cidr;
 import com.theshuai.common.peeregress.PeerEgressRule;
 import com.theshuai.common.peeregress.PeerEgressRules;
 import java.util.ArrayList;
@@ -113,12 +114,27 @@ public final class PeerEgressRoutePlanner {
      * Domain rules install nothing themselves; the pool route is what carries their traffic.
      */
     public static Plan plan(List<PeerEgressRule> rules, List<String> bypass, String meshCidr, String fakeIpCidr) {
+        return plan(rules, bypass, meshCidr, fakeIpCidr, false);
+    }
+
+    /**
+     * As above, with the consumer's IPv6 data plane stated.
+     *
+     * <p>The two families are planned apart and by the same rules ({@code protocol/spec/peer-egress.md},
+     * IPv6 数据面, 消费端): exact IPv6 prefixes, nothing invented -- no {@code ::/0} and no {@code ::/1}
+     * plus {@code 8000::/1} -- nothing for a direct rule, a route for a block rule, and a /128 bypass
+     * for each IPv6 endpoint an IPv6 rule's prefix covers. A prefix of one family never covers an
+     * address of the other, so neither family's plan changes the other's. Without the data plane no
+     * IPv6 rule is in force, and the plan is exactly what it was before IPv6 existed.
+     */
+    public static Plan plan(List<PeerEgressRule> rules, List<String> bypass, String meshCidr, String fakeIpCidr,
+            boolean carriesIpv6) {
         List<PeerEgressRule> ruleList = rules == null ? List.of() : rules;
         List<Refusal> refused = new ArrayList<>();
         Set<Integer> skip = new LinkedHashSet<>();
         for (int index = 0; index < ruleList.size(); index++) {
             PeerEgressRule rule = ruleList.get(index);
-            String code = PeerEgressRules.validate(rule, meshCidr, fakeIpCidr);
+            String code = PeerEgressRules.validate(rule, meshCidr, fakeIpCidr, carriesIpv6);
             if (code != null) {
                 refused.add(new Refusal(index, rule == null ? "" : rule.getMatch(), code));
                 skip.add(index);
@@ -134,8 +150,11 @@ public final class PeerEgressRoutePlanner {
         // before it can be dropped, and the data plane is what drops it.
         record Captured(Ipv4Cidr cidr, String origin) {
         }
+        record Captured6(Ipv6Cidr cidr, String origin) {
+        }
         Set<String> seen = new LinkedHashSet<>();
         List<Captured> capturing = new ArrayList<>();
+        List<Captured6> capturing6 = new ArrayList<>();
         for (int index = 0; index < ruleList.size(); index++) {
             if (skip.contains(index)) {
                 continue;
@@ -143,6 +162,14 @@ public final class PeerEgressRoutePlanner {
             PeerEgressRule rule = ruleList.get(index);
             String action = rule.getAction() == null ? "" : rule.getAction().trim();
             if (!PeerEgressRule.ACTION_EGRESS.equals(action) && !PeerEgressRule.ACTION_BLOCK.equals(action)) {
+                continue;
+            }
+            if (PeerEgressRules.isIpv6(rule)) {
+                // In force only with the data plane, so validation has already let it through or not.
+                Ipv6Cidr cidr6 = Ipv6Cidr.parse(rule.getMatch().trim());
+                if (cidr6 != null && seen.add(cidr6.toString())) {
+                    capturing6.add(new Captured6(cidr6, "rule:" + rule.getMatch()));
+                }
                 continue;
             }
             Ipv4Cidr cidr = Ipv4Cidr.parse(rule.getMatch());
@@ -175,6 +202,22 @@ public final class PeerEgressRoutePlanner {
         for (String endpoint : bypass == null ? List.<String>of() : bypass) {
             Integer address = Ipv4Cidr.parseAddress(endpoint == null ? null : endpoint.trim());
             if (address == null) {
+                // An IPv6 endpoint gets its /128 the same way, when an IPv6 rule covers it.
+                long[] address6 = Ipv6Cidr.parseAddress(endpoint == null ? null : endpoint.trim());
+                if (address6 == null) {
+                    continue;
+                }
+                boolean covered6 = false;
+                for (Captured6 entry : capturing6) {
+                    if (entry.cidr().contains(address6)) {
+                        covered6 = true;
+                        break;
+                    }
+                }
+                String cidr = Ipv6Cidr.formatAddress(address6[0], address6[1]) + "/128";
+                if (covered6 && seen.add(cidr)) {
+                    routes.add(new Route(cidr, Kind.BYPASS, "bypass"));
+                }
                 continue;
             }
             boolean covered = false;
@@ -194,6 +237,14 @@ public final class PeerEgressRoutePlanner {
         }
 
         for (Captured entry : capturing) {
+            String normalised = entry.cidr().toString();
+            if (seen.add(normalised)) {
+                routes.add(new Route(normalised, Kind.TUN, entry.origin()));
+            }
+        }
+        for (Captured6 entry : capturing6) {
+            // Written the one way this feature writes an IPv6 prefix, RFC 5952 and the length, so a
+            // route installed in one run is recognised as the same route in the next.
             String normalised = entry.cidr().toString();
             if (seen.add(normalised)) {
                 routes.add(new Route(normalised, Kind.TUN, entry.origin()));
@@ -248,11 +299,14 @@ public final class PeerEgressRoutePlanner {
     }
 
     /**
-     * Orders bypass entries first, then by prefix.
+     * Orders bypass entries first, then IPv4 before IPv6, then by prefix.
      *
      * <p>Bypass first because installation happens in this order: the addresses that keep the
      * tunnel's own transport working are in place before anything is pointed into the tunnel.
      * Deterministic order also means the journal and every log line read the same way run to run.
+     * The family comes before the prefix so the order stays one order when both are present:
+     * compared as text across families and as numbers within one, three prefixes could each sort
+     * before the next.
      */
     public static void sort(List<Route> routes) {
         routes.sort(PeerEgressRoutePlanner::compare);
@@ -262,6 +316,23 @@ public final class PeerEgressRoutePlanner {
         int order = Integer.compare(rank(left.kind()), rank(right.kind()));
         if (order != 0) {
             return order;
+        }
+        boolean left6 = isIpv6(left);
+        boolean right6 = isIpv6(right);
+        if (left6 != right6) {
+            return left6 ? 1 : -1;
+        }
+        if (left6) {
+            Ipv6Cidr leftCidr6 = Ipv6Cidr.parse(left.cidr());
+            Ipv6Cidr rightCidr6 = Ipv6Cidr.parse(right.cidr());
+            if (leftCidr6 == null || rightCidr6 == null) {
+                return left.cidr().compareTo(right.cidr());
+            }
+            order = Long.compareUnsigned(leftCidr6.high(), rightCidr6.high());
+            if (order == 0) {
+                order = Long.compareUnsigned(leftCidr6.low(), rightCidr6.low());
+            }
+            return order != 0 ? order : Integer.compare(leftCidr6.prefixLength(), rightCidr6.prefixLength());
         }
         Ipv4Cidr leftCidr = Ipv4Cidr.parse(left.cidr());
         Ipv4Cidr rightCidr = Ipv4Cidr.parse(right.cidr());
@@ -273,6 +344,17 @@ public final class PeerEgressRoutePlanner {
         // Addresses are unsigned; comparing them as signed ints would order 10.x above 200.x.
         order = Integer.compareUnsigned(leftCidr.network(), rightCidr.network());
         return order != 0 ? order : Integer.compare(leftCidr.prefixLength(), rightCidr.prefixLength());
+    }
+
+    /** Whether a route's prefix is IPv6, which a colon settles. */
+    public static boolean isIpv6(Route route) {
+        return route.cidr().indexOf(':') >= 0;
+    }
+
+    /** The address a bypass route pins: its prefix without the /32 or /128. */
+    public static String bypassAddress(String cidr) {
+        String suffix = cidr.indexOf(':') >= 0 ? "/128" : "/32";
+        return cidr.endsWith(suffix) ? cidr.substring(0, cidr.length() - suffix.length()) : cidr;
     }
 
     private static int rank(Kind kind) {

@@ -58,16 +58,18 @@ public final class MacosPeerEgressRouteCommander implements PeerEgressRouteInsta
      */
     @Override
     public PeerEgressRouteInstaller.Conflict conflict(Route route) {
+        boolean ipv6 = PeerEgressRoutePlanner.isIpv6(route);
         Result result;
         try {
-            result = run(PeerEgressMacosRouteCommands.showTableArgs());
+            result = run(ipv6 ? PeerEgressSocketBinding.macosShowTableArgs6() : PeerEgressMacosRouteCommands.showTableArgs());
         } catch (IOException unableToAsk) {
             // Reporting no conflict lets the add proceed, and `route add` refuses an existing
             // prefix anyway, so the install path still fails safe.
             return PeerEgressRouteInstaller.Conflict.none();
         }
-        PeerEgressRouteCommands.ExistingRoute existing =
-                PeerEgressMacosRouteCommands.conflictFromTable(result.stdout(), route.cidr());
+        PeerEgressRouteCommands.ExistingRoute existing = ipv6
+                ? PeerEgressMacosRouteCommands.conflictFromTable6(result.stdout(), route.cidr())
+                : PeerEgressMacosRouteCommands.conflictFromTable(result.stdout(), route.cidr());
         return existing.present()
                 ? new PeerEgressRouteInstaller.Conflict(true, existing.description())
                 : PeerEgressRouteInstaller.Conflict.none();
@@ -79,7 +81,9 @@ public final class MacosPeerEgressRouteCommander implements PeerEgressRouteInsta
         // prefix of 203.0.113.0/33 is accepted by `route`, which prints a success line naming
         // 203.0.113.0, exits 0, and installs 128.0/1 -- half the IPv4 address space pointed at the
         // gateway. Nothing in the output says so, so nothing downstream could catch it.
-        if (!PeerEgressMacosRouteCommands.validPrefix(route.cidr())) {
+        boolean ipv6 = PeerEgressRoutePlanner.isIpv6(route);
+        if (ipv6 ? !PeerEgressMacosRouteCommands.validPrefix6(route.cidr())
+                : !PeerEgressMacosRouteCommands.validPrefix(route.cidr())) {
             throw new IllegalArgumentException(
                     PeerEgressMacosRouteCommands.REFUSAL + ": " + route.cidr());
         }
@@ -90,7 +94,10 @@ public final class MacosPeerEgressRouteCommander implements PeerEgressRouteInsta
         if (tun == null || tun.trim().isEmpty()) {
             throw new IOException("no TUN interface to route into");
         }
-        apply(PeerEgressMacosRouteCommands.installInterfaceArgs(route.cidr(), tun),
+        // The utun needs its derived IPv6 address before an IPv6 route can point at it, as it needs
+        // its IPv4 one; the device configures both before any plan is applied.
+        apply(ipv6 ? PeerEgressMacosRouteCommands.installInterfaceArgs6(route.cidr(), tun)
+                        : PeerEgressMacosRouteCommands.installInterfaceArgs(route.cidr(), tun),
                 "install " + route.cidr());
     }
 
@@ -105,13 +112,14 @@ public final class MacosPeerEgressRouteCommander implements PeerEgressRouteInsta
      * conflict nor a permissions problem.
      */
     private void installBypass(Route route) throws IOException {
-        String address = route.cidr().endsWith("/32")
-                ? route.cidr().substring(0, route.cidr().length() - 3)
-                : route.cidr();
+        boolean ipv6 = PeerEgressRoutePlanner.isIpv6(route);
+        String address = PeerEgressRoutePlanner.bypassAddress(route.cidr());
         PeerEgressRouteCommands.Hop hop = hops.get(address);
         if (hop == null) {
-            Result result = run(PeerEgressMacosRouteCommands.findRouteArgs(address));
-            hop = PeerEgressMacosRouteCommands.parseRouteGet(result.stdout(), result.stderr());
+            Result result = run(ipv6 ? PeerEgressMacosRouteCommands.findRouteArgs6(address)
+                    : PeerEgressMacosRouteCommands.findRouteArgs(address));
+            hop = ipv6 ? PeerEgressMacosRouteCommands.parseRouteGet6(result.stdout(), result.stderr())
+                    : PeerEgressMacosRouteCommands.parseRouteGet(result.stdout(), result.stderr());
             if (hop == null) {
                 throw new IOException("no route to " + address + " to bypass through");
             }
@@ -120,28 +128,48 @@ public final class MacosPeerEgressRouteCommander implements PeerEgressRouteInsta
                 // the bypass there would send the transport through the thing it carries; the table,
                 // read with the tunnel left out, says where it went before.
                 PeerEgressSocketBinding.Route fallback = PeerEgressSocketBinding.bypassHopFromTable(address, tun,
-                        () -> PeerEgressSocketBinding.macosRoutes(
-                                run(PeerEgressMacosRouteCommands.showTableArgs()).stdout()));
+                        ipv6 ? this::readTable6 : this::readTable);
                 hop = new PeerEgressRouteCommands.Hop(fallback.gateway(), fallback.iface());
             }
             hops.put(address, hop);
         }
-        List<String> command = hop.gateway().isEmpty()
-                ? PeerEgressMacosRouteCommands.installInterfaceArgs(route.cidr(), hop.device())
-                : PeerEgressMacosRouteCommands.installGatewayArgs(route.cidr(), hop.gateway());
+        List<String> command;
+        if (ipv6) {
+            command = hop.gateway().isEmpty()
+                    ? PeerEgressMacosRouteCommands.installInterfaceArgs6(route.cidr(), hop.device())
+                    : PeerEgressMacosRouteCommands.installGatewayArgs6(route.cidr(), hop.gateway());
+        } else {
+            command = hop.gateway().isEmpty()
+                    ? PeerEgressMacosRouteCommands.installInterfaceArgs(route.cidr(), hop.device())
+                    : PeerEgressMacosRouteCommands.installGatewayArgs(route.cidr(), hop.gateway());
+        }
         apply(command, "install bypass " + route.cidr());
+    }
+
+    private List<PeerEgressSocketBinding.Route> readTable() throws IOException {
+        return PeerEgressSocketBinding.macosRoutes(run(PeerEgressMacosRouteCommands.showTableArgs()).stdout());
+    }
+
+    /** The IPv6 table for a bypass hop, gateways kept with their zones. */
+    private List<PeerEgressSocketBinding.Route> readTable6() throws IOException {
+        return PeerEgressSocketBinding.macosBypassRoutes6(run(PeerEgressSocketBinding.macosShowTableArgs6()).stdout());
     }
 
     @Override
     public PeerEgressRouteInstaller.Table table() throws IOException {
-        return new PeerEgressRouteInstaller.Table(
-                PeerEgressSocketBinding.macosRoutes(run(PeerEgressMacosRouteCommands.showTableArgs()).stdout()), tun);
+        return new PeerEgressRouteInstaller.Table(readTable(), tun);
+    }
+
+    @Override
+    public PeerEgressRouteInstaller.Table table6() throws IOException {
+        return new PeerEgressRouteInstaller.Table(readTable6(), tun);
     }
 
     @Override
     public void remove(Route route) throws IOException {
-        hops.remove(route.cidr().endsWith("/32") ? route.cidr().substring(0, route.cidr().length() - 3) : route.cidr());
-        apply(PeerEgressMacosRouteCommands.removeArgs(route.cidr()), "remove " + route.cidr());
+        hops.remove(PeerEgressRoutePlanner.bypassAddress(route.cidr()));
+        apply(PeerEgressRoutePlanner.isIpv6(route) ? PeerEgressMacosRouteCommands.removeArgs6(route.cidr())
+                : PeerEgressMacosRouteCommands.removeArgs(route.cidr()), "remove " + route.cidr());
     }
 
     /**

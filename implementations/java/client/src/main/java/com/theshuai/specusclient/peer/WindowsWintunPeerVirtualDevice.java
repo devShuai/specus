@@ -37,10 +37,13 @@ final class WindowsWintunPeerVirtualDevice implements PeerVirtualDevice {
     private volatile Pointer session;
     private volatile Thread readerThread;
     private final Set<String> syncedPeerRoutes = ConcurrentHashMap.newKeySet();
+    /** The derived IPv6 address, and whether it was assigned. */
+    private final PeerDeviceIpv6 ipv6;
 
     WindowsWintunPeerVirtualDevice(PeerVirtualDeviceOptions options, ClientAuthLoginResponse.PeerMeshConfig config) {
         this.options = options;
         this.config = config;
+        this.ipv6 = new PeerDeviceIpv6(options, config);
     }
 
     @Override
@@ -74,6 +77,7 @@ final class WindowsWintunPeerVirtualDevice implements PeerVirtualDevice {
         session = nextSession;
         try {
             configureInterface(name(), config.getVirtualIp(), config.getCidr(), options.mtu());
+            ipv6.configure(this::assignAddress6, "adapter", log);
             running.set(true);
             Thread thread = new Thread(() -> readLoop(outboundHandler), "peer-mesh-wintun");
             thread.setDaemon(true);
@@ -124,6 +128,7 @@ final class WindowsWintunPeerVirtualDevice implements PeerVirtualDevice {
         } catch (Exception e) {
             log.debug("Peer mesh Wintun 清理 peer routes 失败: {}", e.getMessage());
         }
+        ipv6.closed("adapter");
         running.set(false);
         Wintun api = wintun;
         Pointer currentSession = session;
@@ -140,6 +145,47 @@ final class WindowsWintunPeerVirtualDevice implements PeerVirtualDevice {
         readerThread = null;
         if (thread != null) {
             thread.interrupt();
+        }
+    }
+
+    @Override
+    public PeerVirtualDevice.Ipv6Readiness ipv6Readiness() {
+        return ipv6.readiness();
+    }
+
+    /**
+     * Gives the adapter its derived IPv6 address and its IPv6 MTU, which Windows keeps apart from the
+     * IPv4 one netsh set. Through PowerShell, by interface index, as the route commander does: the
+     * adapter's name goes in, only its index comes back.
+     */
+    private void assignAddress6(String address) {
+        try {
+            int index = PeerEgressWindowsRouteCommands.parseInterfaceIndex(
+                    WindowsPeerEgressRouteCommander.runPowerShell(PeerEgressWindowsRouteCommands.interfaceIndexScript(name())));
+            if (index <= 0) {
+                throw new IllegalStateException("no adapter named " + name());
+            }
+            String output;
+            java.io.IOException runFailure = null;
+            try {
+                output = WindowsPeerEgressRouteCommander.runPowerShell(
+                        PeerEgressWindowsRouteCommands.assignAddress6Script(index, address, options.mtu()));
+            } catch (java.io.IOException failed) {
+                output = failed.getMessage() == null ? "" : failed.getMessage();
+                runFailure = failed;
+            }
+            String failure = PeerEgressWindowsRouteCommands.parseCommandFailure(output);
+            if (PeerEgressWindowsRouteCommands.FAILURE_PERMISSION_DENIED.equals(failure)) {
+                throw new IllegalStateException("assigning the address needs administrator rights");
+            }
+            if (PeerEgressWindowsRouteCommands.FAILURE_OTHER.equals(failure)) {
+                throw new IllegalStateException("assigning the address failed: " + output.trim());
+            }
+            if (runFailure != null && output.isBlank()) {
+                throw new IllegalStateException(runFailure.getMessage(), runFailure);
+            }
+        } catch (java.io.IOException failed) {
+            throw new IllegalStateException("resolve interface index for " + name() + ": " + failed.getMessage(), failed);
         }
     }
 

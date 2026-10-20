@@ -1,6 +1,7 @@
 package com.theshuai.specusclient.peer;
 
 import com.theshuai.common.peeregress.Ipv4Cidr;
+import com.theshuai.common.peeregress.Ipv6Cidr;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -110,6 +111,32 @@ public final class PeerEgressRouteCommands {
         return List.of("ip", "-4", "route", "show", "table", "main");
     }
 
+    /** Reads the IPv6 main table ({@code protocol/spec/peer-egress.md}, IPv6 数据面). */
+    public static List<String> showMainTableArgs6() {
+        return List.of("ip", "-6", "route", "show", "table", "main");
+    }
+
+    /**
+     * An {@code ip route} command for a prefix or address of either family: {@code ip route ...} for
+     * IPv4, exactly as it always was, and {@code ip -6 route ...} for IPv6. Argv entries, so nothing
+     * here is ever seen by a shell.
+     */
+    public static List<String> routeArgs(String target, String... args) {
+        List<String> command = new ArrayList<>(target != null && target.indexOf(':') >= 0
+                ? List.of("ip", "-6", "route") : List.of("ip", "route"));
+        command.addAll(List.of(args));
+        return List.copyOf(command);
+    }
+
+    /**
+     * The spec's {@code ip -6 address add <address>/128 dev <tun>}, which gives the TUN the device's
+     * derived address. Add rather than replace: the interface was created a moment ago and dies with
+     * the descriptor, so an address already on it is not this run's.
+     */
+    public static List<String> assignAddress6Args(String device, String address) {
+        return List.of("ip", "-6", "address", "add", address + "/128", "dev", device);
+    }
+
     private static final Set<String> LEADS_NOWHERE = Set.of("blackhole", "unreachable", "prohibit", "throw");
     private static final Set<String> NOT_FORWARDING = Set.of("local", "broadcast", "anycast", "multicast", "nat");
 
@@ -127,6 +154,20 @@ public final class PeerEgressRouteCommands {
      * <p>Shared vector: {@code protocol/test-vectors/peer-egress-socket-binding-v1.json}, linux.
      */
     public static List<PeerEgressSocketBinding.Route> parseRouteTable(String output) {
+        return parseRouteTable(output, false);
+    }
+
+    /**
+     * Reads {@code ip -6 route show table main} the same way: the layout is the same, the
+     * destinations and gateways are IPv6. A gateway is usually link-local; it is kept as written,
+     * since {@code ip -6 route add ... via fe80::1 dev eth0} names the interface that scopes it.
+     * Each reader is only ever given its own family's table, and reads the other's rows as nothing.
+     */
+    public static List<PeerEgressSocketBinding.Route> parseRouteTable6(String output) {
+        return parseRouteTable(output, true);
+    }
+
+    private static List<PeerEgressSocketBinding.Route> parseRouteTable(String output, boolean ipv6) {
         List<PeerEgressSocketBinding.Route> routes = new ArrayList<>();
         int pending = -1;
         List<Integer> deviceless = new ArrayList<>();
@@ -140,7 +181,7 @@ public final class PeerEgressRouteCommands {
                     String gateway = routes.get(pending).gateway();
                     String device = "";
                     for (int index = 1; index + 1 < fields.length; index++) {
-                        if ("via".equals(fields[index]) && Ipv4Cidr.parseAddress(fields[index + 1]) != null) {
+                        if ("via".equals(fields[index]) && gateway(fields[index + 1], ipv6)) {
                             gateway = fields[index + 1];
                         } else if ("dev".equals(fields[index])) {
                             device = fields[index + 1];
@@ -161,7 +202,7 @@ public final class PeerEgressRouteCommands {
             if (start >= fields.length) {
                 continue;
             }
-            String prefix = prefixOf(fields[start]);
+            String prefix = ipv6 ? prefixOf6(fields[start]) : prefixOf(fields[start]);
             if (prefix == null) {
                 continue;
             }
@@ -178,7 +219,7 @@ public final class PeerEgressRouteCommands {
                 }
                 switch (fields[index]) {
                     case "via" -> {
-                        if (Ipv4Cidr.parseAddress(fields[index + 1]) != null) {
+                        if (gateway(fields[index + 1], ipv6)) {
                             gateway = fields[index + 1];
                         }
                     }
@@ -211,6 +252,46 @@ public final class PeerEgressRouteCommands {
             }
         }
         return routes;
+    }
+
+    /** Whether a {@code via} names a next hop of the table's family. */
+    private static boolean gateway(String text, boolean ipv6) {
+        if (!ipv6) {
+            return Ipv4Cidr.parseAddress(text) != null;
+        }
+        long[] address = Ipv6Cidr.parseAddress(text);
+        // An IPv4-mapped address is no IPv6 next hop.
+        return address != null && !(address[0] == 0 && (address[1] >>> 32) == 0xFFFFL);
+    }
+
+    /**
+     * An IPv6 destination of {@code ip -6 route}: "default" is ::/0, a bare address a /128, and the
+     * prefix is written the way this feature writes its own, so a row for a route it installed
+     * compares equal to the journal's entry.
+     */
+    private static String prefixOf6(String text) {
+        if ("default".equals(text)) {
+            return "::/0";
+        }
+        int slash = text.indexOf('/');
+        long[] address = Ipv6Cidr.parseAddress(slash < 0 ? text : text.substring(0, slash));
+        if (address == null) {
+            return null;
+        }
+        int length = Ipv6Cidr.MAX_PREFIX;
+        if (slash >= 0) {
+            try {
+                length = Integer.parseInt(text.substring(slash + 1));
+            } catch (NumberFormatException notALength) {
+                return null;
+            }
+            if (length < 0 || length > Ipv6Cidr.MAX_PREFIX) {
+                return null;
+            }
+        }
+        long highMask = length <= 0 ? 0 : length >= 64 ? -1L : -1L << (64 - length);
+        long lowMask = length <= 64 ? 0 : length >= 128 ? -1L : -1L << (128 - length);
+        return Ipv6Cidr.formatAddress(address[0] & highMask, address[1] & lowMask) + "/" + length;
     }
 
     private static String prefixOf(String text) {

@@ -8,7 +8,7 @@ import java.util.TreeSet;
 
 /**
  * What this consumer has learned from {@code egress-catalog}: which egresses are listed, the
- * {@code egressVersion} each announced, and which resolve names.
+ * {@code egressVersion} each announced, which resolve names, and which take IPv6 packets.
  *
  * <p>The revision works as it does for {@code egress-config}: it rises within one control session,
  * a catalogue at or below the last accepted one is ignored, and a new session only resets that
@@ -101,12 +101,20 @@ final class PeerEgressCatalog {
      * @param listed         the egresses the last accepted catalogue lists
      * @param egressVersions the usable egressVersion of each listed egress that carries one
      * @param domainCapable  the egresses the last accepted catalogue says resolve names
+     * @param ipv6Capable    the egresses the last accepted catalogue says take IPv6 packets
+     *                       ({@code protocol/spec/peer-egress.md}, IPv6 数据面)
      */
-    record Snapshot(boolean received, Set<Long> listed, Map<Long, Long> egressVersions, Set<Long> domainCapable) {
+    record Snapshot(boolean received, Set<Long> listed, Map<Long, Long> egressVersions, Set<Long> domainCapable,
+            Set<Long> ipv6Capable) {
 
-        /** Before any catalogue: every egress unknown, none resolving names. */
+        /** Without the IPv6 capability: no egress takes IPv6 packets. */
+        Snapshot(boolean received, Set<Long> listed, Map<Long, Long> egressVersions, Set<Long> domainCapable) {
+            this(received, listed, egressVersions, domainCapable, Set.of());
+        }
+
+        /** Before any catalogue: every egress unknown, none resolving names or taking IPv6 packets. */
         static Snapshot empty() {
-            return new Snapshot(false, Set.of(), Map.of(), Set.of());
+            return new Snapshot(false, Set.of(), Map.of(), Set.of(), Set.of());
         }
 
         Standing standing(long egress) {
@@ -117,6 +125,7 @@ final class PeerEgressCatalog {
     /** The last accepted revision this control session, or null before the first. */
     private Long floor;
     private Set<Long> domainCapable = Set.of();
+    private Set<Long> ipv6Capable = Set.of();
     private Set<Long> listed = Set.of();
     private Map<Long, Long> egressVersions = Map.of();
     /** Whether a catalogue was accepted since the control session began. */
@@ -145,6 +154,7 @@ final class PeerEgressCatalog {
         }
         floor = message.revision();
         domainCapable = message.domainTargetCapable();
+        ipv6Capable = message.ipv6PacketCapable();
         listed = message.listed();
         egressVersions = message.egressVersions();
         received = true;
@@ -153,7 +163,7 @@ final class PeerEgressCatalog {
 
     /** What the consumer judges by now. */
     synchronized Snapshot snapshot() {
-        return new Snapshot(received, listed, egressVersions, domainCapable);
+        return new Snapshot(received, listed, egressVersions, domainCapable, ipv6Capable);
     }
 
     /**
@@ -180,6 +190,11 @@ final class PeerEgressCatalog {
     /** The same, sorted, for a log line or a test. */
     synchronized List<Long> domainCapableIds() {
         return List.copyOf(new TreeSet<>(domainCapable));
+    }
+
+    /** The egresses the last accepted catalogue says take IPv6 packets, sorted. */
+    synchronized List<Long> ipv6CapableIds() {
+        return List.copyOf(new TreeSet<>(ipv6Capable));
     }
 
     /** The egresses the last accepted catalogue lists, sorted. */

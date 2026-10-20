@@ -171,10 +171,11 @@ public final class PeerEgressSocketBinding {
             throw new IOException("resolve bypass hop for " + address + " past the tunnel: " + failed.getMessage(),
                     failed);
         }
-        // The bypass's own /32 is left out too. When one is being put back after a network change,
-        // the stale row is still in the table naming the old gateway, and it would win the lookup
-        // for its own address.
-        Route hop = selectBypassHop(routes, tunnel, List.of(address + "/32"), address);
+        // The bypass's own /32 (/128 for IPv6) is left out too. When one is being put back after a
+        // network change, the stale row is still in the table naming the old gateway, and it would
+        // win the lookup for its own address.
+        String own = address + (address.indexOf(':') >= 0 ? "/128" : "/32");
+        Route hop = selectBypassHop(routes, tunnel, List.of(own), address);
         if (hop == null) {
             throw new PeerEgressSocketBinder.NoPhysicalRouteException(address);
         }
@@ -248,9 +249,7 @@ public final class PeerEgressSocketBinding {
                         : new Drift(route, DRIFT_MOVED, DRIFT_CONFLICT, describe(rows.get(0))));
                 continue;
             }
-            String address = route.cidr().endsWith("/32")
-                    ? route.cidr().substring(0, route.cidr().length() - 3)
-                    : route.cidr();
+            String address = PeerEgressRoutePlanner.bypassAddress(route.cidr());
             Route hop = selectBypassHop(table, tunnel, prefixes, address);
             List<Route> present = new ArrayList<>();
             for (Route row : rows) {
@@ -525,8 +524,8 @@ public final class PeerEgressSocketBinding {
      * Candidate routes from {@code netstat -rn -f inet6}, with the same rule as IPv4: a route scoped
      * to its interface is not one an unbound socket would follow.
      *
-     * <p>No gateway is kept. Bypass routes, the only reader of it, are IPv4, and an IPv6 gateway is
-     * usually link-local, meaningful only with the zone this reading drops.
+     * <p>No gateway is kept: an egress socket is bound to an interface, never to a next hop. A
+     * consumer's IPv6 bypass reads {@link #macosBypassRoutes6}, which keeps it.
      */
     public static List<Route> macosRoutes6(String table) {
         List<Route> routes = new ArrayList<>();
@@ -552,6 +551,42 @@ public final class PeerEgressSocketBinding {
                 continue;
             }
             routes.add(new Route(prefix, fields[3], "", 0, !fields[2].contains(MACOS_SCOPED_FLAG)));
+        }
+        return routes;
+    }
+
+    /**
+     * Candidate routes from {@code netstat -rn -f inet6} for a consumer's IPv6 bypass hop: those of
+     * {@link #macosRoutes6}, with the gateway kept where the flags say the column is one, zone and
+     * all, since a link-local next hop -- which an IPv6 default route usually has -- means nothing
+     * without the interface that scopes it: {@code fe80::1%en0}.
+     */
+    public static List<Route> macosBypassRoutes6(String table) {
+        List<Route> routes = new ArrayList<>();
+        boolean inside = false;
+        for (String line : (table == null ? "" : table).split("\n", -1)) {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            if (trimmed.endsWith(":") && !trimmed.contains(" ")) {
+                inside = trimmed.equals("Internet6:");
+                continue;
+            }
+            if (!inside || trimmed.startsWith("Destination")) {
+                continue;
+            }
+            String[] fields = trimmed.split("\\s+");
+            if (fields.length < 4) {
+                continue;
+            }
+            String prefix = normaliseMacosPrefix6(fields[0]);
+            if (prefix.isEmpty()) {
+                continue;
+            }
+            String gateway = fields[2].contains(MACOS_GATEWAY_FLAG)
+                    && PeerEgressMacosRouteCommands.validAddress6(fields[1]) ? fields[1] : "";
+            routes.add(new Route(prefix, fields[3], gateway, 0, !fields[2].contains(MACOS_SCOPED_FLAG)));
         }
         return routes;
     }

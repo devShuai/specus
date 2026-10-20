@@ -49,8 +49,11 @@ final class ConfigDiagnostics {
         String pool = com.theshuai.common.peeregress.PeerEgressDns.configuredPool(
                 effective.isPeerEgressDnsTakeover(), effective.getPeerEgressFakeIpCidr());
         for (int index = 0; index < rules.size(); index++) {
+            // An IPv6 rule is judged with this device's IPv6 data plane as configured: its platform
+            // and its peerMeshMtu.
             String code = com.theshuai.common.peeregress.PeerEgressRules.validate(rules.get(index),
-                    com.theshuai.common.peeregress.PeerEgressRules.DEFAULT_MESH_CIDR, pool);
+                    com.theshuai.common.peeregress.PeerEgressRules.DEFAULT_MESH_CIDR, pool,
+                    com.theshuai.specusclient.peer.PeerEgressRouteCommanders.consumerCarriesIpv6(effective.getPeerMeshMtu()));
             if (code != null && !com.theshuai.common.peeregress.PeerEgressCodes.RULE_DISABLED.equals(code))
                 warning.accept("peerEgressRules[" + index + "] is not in force: " + code);
         }

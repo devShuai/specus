@@ -31,6 +31,35 @@ public final class PeerEgressRouteCommanders {
                 || name.contains("darwin");
     }
 
+    /**
+     * The smallest MTU IPv6 allows on any link (RFC 8200 5). A device whose Peer Mesh MTU is below it
+     * has no IPv6 data plane, and a peer path that probes below it carries no IPv6.
+     */
+    public static final int IPV6_MINIMUM_MTU = 1280;
+
+    /**
+     * Whether this platform reads IPv6 from its TUN, gives the TUN the device's derived IPv6 address
+     * and routes IPv6 into it ({@code protocol/spec/peer-egress.md}, IPv6 数据面): every platform with
+     * route takeover, since the three that have it have the IPv6 commands too.
+     */
+    public static boolean platformCarriesIpv6() {
+        return takeoverSupported();
+    }
+
+    /**
+     * Whether this consumer has an IPv6 data plane as configured: the platform's support and a Peer
+     * Mesh MTU of at least 1280, an unset one read as the default. Without either a well-formed IPv6
+     * rule is refused with {@code EGRESS_RULE_IPV6_UNSUPPORTED}, since installing nothing for it and
+     * reporting it in force would send its destinations straight out of the local interface.
+     *
+     * <p>This is the configuration's half. A running consumer also needs its TUN up and carrying its
+     * derived address ({@link PeerEgressMesh}), and judges by that.
+     */
+    public static boolean consumerCarriesIpv6(int peerMeshMtu) {
+        int mtu = peerMeshMtu <= 0 ? PeerVirtualDeviceOptions.DEFAULT_MTU : peerMeshMtu;
+        return platformCarriesIpv6() && mtu >= IPV6_MINIMUM_MTU;
+    }
+
     /** The commander for the platform this process is running on. */
     public static PeerEgressRouteInstaller.Commander forPlatform(String tun) {
         String name = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
@@ -69,6 +98,11 @@ public final class PeerEgressRouteCommanders {
 
         @Override
         public void remove(Route route) throws IOException {
+            throw new IOException("egress route takeover is not implemented on this platform");
+        }
+
+        @Override
+        public PeerEgressRouteInstaller.Table table6() throws IOException {
             throw new IOException("egress route takeover is not implemented on this platform");
         }
     }

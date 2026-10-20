@@ -1,12 +1,14 @@
 package com.theshuai.specusclient.cli;
 
 import com.theshuai.common.peeregress.Ipv4Cidr;
+import com.theshuai.common.peeregress.Ipv6Cidr;
 import com.theshuai.common.peeregress.PeerEgressCodes;
 import com.theshuai.common.peeregress.PeerEgressDns;
 import com.theshuai.common.peeregress.PeerEgressNames;
 import com.theshuai.common.peeregress.PeerEgressRule;
 import com.theshuai.common.peeregress.PeerEgressRules;
 import com.theshuai.specusclient.bean.ClientStartupConfig;
+import com.theshuai.specusclient.peer.PeerEgressRouteCommanders;
 
 import java.net.InetSocketAddress;
 import java.net.Socket;
@@ -109,10 +111,17 @@ public final class EgressEdit {
     /**
      * Why a rule is not in force as configured, or null; the master switch is not part of it. Judged
      * against the fake-IP pool when phase two is asked for over a usable one, as the running client
-     * would judge it.
+     * would judge it, and an IPv6 rule with this device's IPv6 data plane, which its platform and
+     * peerMeshMtu decide. Whether the egress takes IPv6 packets is only known once connected and is
+     * not judged here.
      */
     static String ruleCode(ClientStartupConfig config, PeerEgressRule rule) {
-        return PeerEgressRules.validate(rule, PeerEgressRules.DEFAULT_MESH_CIDR, pool(config));
+        return PeerEgressRules.validate(rule, PeerEgressRules.DEFAULT_MESH_CIDR, pool(config), carriesIpv6(config));
+    }
+
+    /** Whether this device would carry IPv6 as configured: its platform and its peerMeshMtu. */
+    static boolean carriesIpv6(ClientStartupConfig config) {
+        return PeerEgressRouteCommanders.consumerCarriesIpv6(config.getPeerMeshMtu());
     }
 
     /** The pool phase two would run with as configured, or null. */
@@ -130,7 +139,10 @@ public final class EgressEdit {
     static String explanation(String code) {
         return switch (code) {
             case PeerEgressCodes.RULE_DOMAIN_UNSUPPORTED -> "domain rules are not supported yet; use an IPv4 address or CIDR range";
+            // With the data plane it is what a platform without IPv6 support, or a peerMeshMtu below
+            // 1280, still reports.
             case PeerEgressCodes.RULE_IPV6_UNSUPPORTED -> "IPv6 rules are not in force yet: this client cannot carry IPv6 traffic";
+            case PeerEgressCodes.RULE_EGRESS_NO_IPV6 -> "the egress device is online but does not take IPv6 traffic; upgrade its client";
             case PeerEgressCodes.RULE_MALFORMED -> "not an IPv4 or IPv6 address or CIDR range with zero host bits (IPv4-mapped IPv6 is written as IPv4), or an unknown action";
             case PeerEgressCodes.RULE_DEFAULT_ROUTE -> "0.0.0.0/0 would take over the default route, which is not allowed";
             case PeerEgressCodes.RULE_MESH_OVERLAP -> "overlaps the Peer Mesh network";
@@ -349,15 +361,20 @@ public final class EgressEdit {
             + " with punycode (xn--) for international names.";
     static final String CONNECT_NEEDS_ADDRESS = "--connect needs an IPv4 address: a name would be resolved here, not by the egress.";
 
-    /** Whether ADDRESS is an IPv4 address rather than a name. */
+    /**
+     * Whether ADDRESS is an address rather than a name: IPv4, or IPv6 written as a rule's match is (no
+     * zone, no brackets, no dotted tail, no prefix).
+     */
     static boolean isAddress(String address) {
-        return Ipv4Cidr.parseAddress(address) != null && !address.contains("/");
+        return (Ipv4Cidr.parseAddress(address) != null && !address.contains("/")) || Ipv6Cidr.parseAddress(address) != null;
     }
 
     /**
-     * Why an address cannot be previewed, or null when it can: an IPv4 address, or a name a domain
-     * rule could match exactly, judged as a rule's match is (trailing dots and case ignored, IDN as
-     * punycode). A wildcard is a rule's pattern rather than a name, so it is refused as one.
+     * Why an address cannot be previewed, or null when it can: an IPv4 or IPv6 address, or a name a
+     * domain rule could match exactly, judged as a rule's match is (trailing dots and case ignored,
+     * IDN as punycode). A wildcard is a rule's pattern rather than a name, so it is refused as one.
+     * Anything else is still told it must be an IPv4 address, the wording the three clients and the
+     * CLI matrix share.
      */
     static String addressProblem(String address) {
         if (isAddress(address)) return null;
@@ -396,7 +413,8 @@ public final class EgressEdit {
      * says that. The command and the local page run the same probe and report it the same way.
      */
     static LinkedHashMap<String, Object> connectProbe(String address, int port, List<String> lines) {
-        String target = address + ":" + port;
+        // Bracketed for IPv6, as a host and port are written everywhere else.
+        String target = (address.contains(":") ? "[" + address + "]" : address) + ":" + port;
         long started = System.nanoTime();
         var probe = new LinkedHashMap<String, Object>();
         probe.put("port", port);
@@ -425,10 +443,15 @@ public final class EgressEdit {
         return isAddress(address) ? addressPreview(path, config, address, lines) : namePreview(path, config, address, lines);
     }
 
-    /** What the configured rules decide for one IPv4 address, and what takeover being on would change. */
+    /**
+     * What the configured rules decide for one address, and what takeover being on would change. An
+     * IPv6 address is decided by the IPv6 rules where this device would carry IPv6, so it is previewed
+     * the way it would go; without the data plane no IPv6 rule is in force and it stays local.
+     */
     private static LinkedHashMap<String, Object> addressPreview(Path path, ClientStartupConfig config, String address, List<String> lines) {
         var rules = rules(config);
-        var match = PeerEgressRules.match(rules, address, PeerEgressRules.DEFAULT_MESH_CIDR, pool(config));
+        var match = PeerEgressRules.match(rules, address, PeerEgressRules.DEFAULT_MESH_CIDR, pool(config),
+                carriesIpv6(config));
         int matched = match.matched() ? match.matchedRuleIndex() : -1;
         boolean takeover = config.isPeerEgressEnabled();
         var data = new LinkedHashMap<String, Object>();

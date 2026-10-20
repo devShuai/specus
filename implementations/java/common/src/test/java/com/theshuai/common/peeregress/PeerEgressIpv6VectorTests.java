@@ -74,9 +74,8 @@ class PeerEgressIpv6VectorTests {
     }
 
     /**
-     * What every client does today: the same list with no IPv6 data plane, through the production
-     * entry points, so turning {@link PeerEgressRules#CONSUMER_CARRIES_IPV6} on without the data plane
-     * fails here.
+     * The same list on a consumer without the IPv6 data plane, through the entry points that do not
+     * state it, so making those judge as though a data plane were there fails here.
      */
     @Test
     void ipv6RulesAreNotInForceWithoutAnIpv6DataPlane() throws IOException {
@@ -87,10 +86,14 @@ class PeerEgressIpv6VectorTests {
             String want = node.path("code").isNull() ? null : node.path("code").asText();
             assertEquals(want, PeerEgressRules.validate(rules.get(node.path("index").asInt()),
                     PeerEgressRules.DEFAULT_MESH_CIDR), "ipv6 rule " + node.path("index").asInt());
+            assertEquals(want, PeerEgressRules.validate(rules.get(node.path("index").asInt()),
+                    PeerEgressRules.DEFAULT_MESH_CIDR, null, false), "ipv6 rule " + node.path("index").asInt());
         }
         for (JsonNode node : without.path("cases")) {
             assertMatch(node, PeerEgressRules.match(rules, node.path("destination").asText(),
                     PeerEgressRules.DEFAULT_MESH_CIDR));
+            assertMatch(node, PeerEgressRules.match(rules, node.path("destination").asText(),
+                    PeerEgressRules.DEFAULT_MESH_CIDR, null, false));
         }
     }
 

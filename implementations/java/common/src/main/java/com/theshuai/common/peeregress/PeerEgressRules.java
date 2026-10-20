@@ -54,22 +54,38 @@ public final class PeerEgressRules {
      * a domain match is checked where phase one refused it, the pool after the mesh.
      */
     public static String validate(PeerEgressRule rule, String meshCidr, String fakeIpCidr) {
-        return validate(rule, meshCidr, fakeIpCidr, CONSUMER_CARRIES_IPV6);
+        return validate(rule, meshCidr, fakeIpCidr, false);
+    }
+
+    /*
+     * This and the other entry points without a carriesIpv6 argument judge a consumer without the
+     * IPv6 data plane, as every consumer was before it existed. Whether a device has one depends on
+     * its platform, its configured MTU and its TUN (protocol/spec/peer-egress.md, IPv6 数据面), all of
+     * which only the client knows, so every path that acts on rules -- the offline check, the route
+     * plan, the data plane, the status -- states it explicitly.
+     */
+
+    /**
+     * The prefix every device's IPv6 address lies in: the mesh IPv4 as the low 32 bits. To IPv6 it is
+     * what the Peer Mesh network is to IPv4.
+     */
+    public static final String MESH_PREFIX6 = "fd53:7065:6375:7300::/96";
+
+    private static final Ipv6Cidr MESH6 = Ipv6Cidr.parse(MESH_PREFIX6);
+
+    /** The derived prefix as a prefix. */
+    public static Ipv6Cidr meshPrefix6() {
+        return MESH6;
     }
 
     /**
-     * Whether this consumer has an IPv6 data plane: IPv6 packets read from the TUN, IPv6 routes
-     * installed into it, and IPv6 carried to the egress. It does not yet, so a well-formed IPv6 rule
-     * is refused with {@code EGRESS_RULE_IPV6_UNSUPPORTED}: installing nothing for it and reporting it
-     * in force would send its destinations straight out of the local interface.
+     * As above, with the consumer's IPv6 data plane stated.
      *
-     * <p>The rule is still read and checked in full first, so a mistake in it is reported as one, and
-     * how IPv6 rules match is pinned by the vector's {@code ipv6} section, which the tests run with
-     * this set.
+     * <p>With the data plane, the derived prefix ({@link #MESH_PREFIX6}) is to IPv6 what the Peer Mesh
+     * network is to IPv4, so an IPv6 rule overlapping it is refused with
+     * {@code EGRESS_RULE_MESH_OVERLAP}, at the same place in the order as the IPv4 check. Without it
+     * the rule is refused last for the data plane it lacks, as before.
      */
-    public static final boolean CONSUMER_CARRIES_IPV6 = false;
-
-    /** As above, with the consumer's IPv6 data plane stated. */
     public static String validate(PeerEgressRule rule, String meshCidr, String fakeIpCidr, boolean carriesIpv6) {
         if (rule == null) {
             return PeerEgressCodes.RULE_MALFORMED;
@@ -84,7 +100,7 @@ public final class PeerEgressRules {
             return PeerEgressCodes.RULE_MALFORMED;
         }
         // A colon is unambiguous: the match is an IPv6 address or prefix, or it is malformed. The
-        // mesh and the fake-IP pool are IPv4, so an IPv6 rule has neither to stay clear of.
+        // fake-IP pool is IPv4, so an IPv6 rule has only the derived prefix to stay clear of.
         if (match.indexOf(':') >= 0) {
             Ipv6Cidr prefix = Ipv6Cidr.parse(match);
             if (prefix == null || prefix.mapped()) {
@@ -94,6 +110,11 @@ public final class PeerEgressRules {
             }
             if (prefix.prefixLength() == 0) {
                 return PeerEgressCodes.RULE_DEFAULT_ROUTE;
+            }
+            if (carriesIpv6 && prefix.overlaps(MESH6)) {
+                // Device-to-device traffic stays IPv4, and a rule over the derived prefix would
+                // capture the addresses replies are checked against.
+                return PeerEgressCodes.RULE_MESH_OVERLAP;
             }
             String target = validateTarget(rule);
             if (target != null) {
@@ -179,7 +200,7 @@ public final class PeerEgressRules {
      * match an address, and an address rule the pool refuses takes no part, like any refused rule.
      */
     public static Match match(List<PeerEgressRule> rules, String destination, String meshCidr, String fakeIpCidr) {
-        return match(rules, destination, meshCidr, fakeIpCidr, CONSUMER_CARRIES_IPV6);
+        return match(rules, destination, meshCidr, fakeIpCidr, false);
     }
 
     /**
@@ -239,6 +260,11 @@ public final class PeerEgressRules {
     public static boolean isDomain(PeerEgressRule rule) {
         String match = rule == null || rule.getMatch() == null ? "" : rule.getMatch().trim();
         return !match.isEmpty() && match.indexOf(':') < 0 && looksLikeDomain(match);
+    }
+
+    /** Whether a rule's match is written as IPv6, which a colon settles. */
+    public static boolean isIpv6(PeerEgressRule rule) {
+        return rule != null && rule.getMatch() != null && rule.getMatch().indexOf(':') >= 0;
     }
 
     /** {@link #KIND_DOMAIN} or {@link #KIND_CIDR}. */

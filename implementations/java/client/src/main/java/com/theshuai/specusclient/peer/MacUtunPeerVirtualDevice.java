@@ -47,10 +47,13 @@ final class MacUtunPeerVirtualDevice implements PeerVirtualDevice {
     private volatile String ifName;
     private volatile Thread readerThread;
     private final Set<String> syncedPeerRoutes = ConcurrentHashMap.newKeySet();
+    /** The derived IPv6 address, and whether it was assigned. */
+    private final PeerDeviceIpv6 ipv6;
 
     MacUtunPeerVirtualDevice(PeerVirtualDeviceOptions options, ClientAuthLoginResponse.PeerMeshConfig config) {
         this.options = options;
         this.config = config;
+        this.ipv6 = new PeerDeviceIpv6(options, config);
     }
 
     @Override
@@ -70,6 +73,11 @@ final class MacUtunPeerVirtualDevice implements PeerVirtualDevice {
         fd = nextFd;
         try {
             configureInterface(name(), config.getVirtualIp(), config.getCidr(), options.mtu());
+            // Before any route is pointed at it: on macOS a route can only go to a utun that has an
+            // address of its family.
+            ipv6.configure(address -> runCommand(Duration.ofSeconds(10), false,
+                    PeerEgressMacosRouteCommands.assignAddress6Args(name(), address).toArray(String[]::new)),
+                    "utun", log);
             running.set(true);
             Thread thread = new Thread(() -> readLoop(outboundHandler), "peer-mesh-mac-utun");
             thread.setDaemon(true);
@@ -129,6 +137,7 @@ final class MacUtunPeerVirtualDevice implements PeerVirtualDevice {
         } catch (Exception e) {
             log.debug("Peer mesh macOS utun 清理 peer routes 失败: {}", e.getMessage());
         }
+        ipv6.closed("utun");
         running.set(false);
         int current = fd;
         fd = -1;
@@ -144,6 +153,11 @@ final class MacUtunPeerVirtualDevice implements PeerVirtualDevice {
         if (thread != null) {
             thread.interrupt();
         }
+    }
+
+    @Override
+    public PeerVirtualDevice.Ipv6Readiness ipv6Readiness() {
+        return ipv6.readiness();
     }
 
     private int openUtun(String requestedName) {

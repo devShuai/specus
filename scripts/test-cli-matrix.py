@@ -22,6 +22,9 @@ import time
 
 SECRET = "CLI_TEST_SECRET_MUST_NOT_LEAK"
 TOKEN = "CLI_TEST_TOKEN_MUST_NOT_LEAK"
+# The clients with the consumer side of the IPv6 data plane (protocol/spec/peer-egress.md, IPv6 数据面),
+# whose config validate does not warn about a well-formed IPv6 rule.
+IPV6_DATA_PLANE_CLIENTS = {"go", "java"}
 
 
 def compact(text):
@@ -171,10 +174,10 @@ class Matrix:
                     "peerEgressRules[4] is not in force: EGRESS_RULE_MESH_OVERLAP",
                     "peerEgressRules[5] is not in force: EGRESS_RULE_MISSING_TARGET"]
         # An IPv6 rule is in force where the client has the IPv6 data plane (protocol/spec/peer-egress.md,
-        # IPv6 数据面): the Go client on Linux, Windows and macOS at the default peerMeshMtu. The Java and
-        # .NET clients do not have it yet and still refuse it.
+        # IPv6 数据面): the Go and Java clients on Linux, Windows and macOS at the default
+        # peerMeshMtu. The clients without it still refuse it.
         ipv6_warning = "peerEgressRules[3] is not in force: EGRESS_RULE_IPV6_UNSUPPORTED"
-        if self.name == "go":
+        if self.name in IPV6_DATA_PLANE_CLIENTS:
             assert "peerEgressRules[3]" not in err, ("an IPv6 rule was refused with the data plane", err)
         else:
             expected.append(ipv6_warning)

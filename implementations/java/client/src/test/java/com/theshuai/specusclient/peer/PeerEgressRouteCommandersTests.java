@@ -130,6 +130,74 @@ class PeerEgressRouteCommandersTests {
         assertTrue(!commander.conflict(route).present());
         assertThrows(IOException.class, () -> commander.install(route));
         assertThrows(IOException.class, () -> commander.remove(route));
+        assertThrows(IOException.class, commander::table6);
+    }
+
+    // ---- IPv6 (protocol/spec/peer-egress.md, IPv6 数据面) -----------------------------------------
+
+    /** The macOS commander refuses an IPv6 prefix it would not write itself, before running anything. */
+    @Test
+    void theMacosCommanderRefusesAMalformedIpv6PrefixBeforeRunningAnything() {
+        var commander = new MacosPeerEgressRouteCommander("lo0");
+        for (String cidr : new String[] {"2001:DB8::/32", "2001:db8::/129", "2001:db8::1/32", "2001:db8::", "-inet6"}) {
+            Route route = new Route(cidr, Kind.TUN, "rule:" + cidr);
+            assertTrue(assertThrows(IllegalArgumentException.class,
+                    () -> commander.install(route), cidr).getMessage().contains(REFUSAL), cidr + " install");
+        }
+    }
+
+    /** On macOS every machine has the IPv6 loopback in its table, read from {@code netstat -rn -f inet6}. */
+    @Test
+    void onMacosTheIpv6LoopbackIsFoundAsAConflict() {
+        if (!isMacos()) {
+            return;
+        }
+        var commander = new MacosPeerEgressRouteCommander("utun99");
+        PeerEgressRouteInstaller.Conflict loopback = commander.conflict(new Route("::1/128", Kind.TUN, "rule:::1/128"));
+        assertTrue(loopback.present(), "the IPv6 loopback was not reported as a conflict");
+        assertTrue(loopback.existing().startsWith("::1/128 "), "conflict describes " + loopback.existing());
+        PeerEgressRouteInstaller.Conflict free = commander.conflict(
+                new Route("2001:db8:5ec5::/48", Kind.TUN, "rule:2001:db8:5ec5::/48"));
+        assertTrue(!free.present(), "a documentation prefix was reported as taken by " + free.existing());
+    }
+
+    /** The Windows commander refuses an injected or non-canonical IPv6 prefix before running anything. */
+    @Test
+    void theWindowsCommanderRefusesAnInjectedIpv6PrefixBeforeRunningAnything() {
+        var commander = new WindowsPeerEgressRouteCommander("specus0");
+        for (String cidr : new String[] {"2001:db8::/32';Remove-NetRoute -DestinationPrefix '::/0",
+                "2001:DB8::/32", "2001:db8::/129", "2001:db8::1/32", "fe80::1%3/128"}) {
+            Route route = new Route(cidr, Kind.TUN, "rule:" + cidr);
+            assertTrue(assertThrows(IOException.class, () -> commander.install(route), cidr)
+                    .getMessage().contains(REFUSAL), cidr + " install");
+            assertTrue(assertThrows(IOException.class, () -> commander.remove(route), cidr)
+                    .getMessage().contains(REFUSAL), cidr + " remove");
+        }
+    }
+
+    /**
+     * On Windows the IPv6 table is read through PowerShell for an IPv6 conflict, apart from the IPv4
+     * one: every machine with an IPv6 stack routes multicast on-link, so ff00::/8 is taken, and a
+     * documentation prefix is free.
+     */
+    @Test
+    void onWindowsTheIpv6TableIsReadForConflicts() {
+        if (!operatingSystem().contains("win")) {
+            return;
+        }
+        var commander = new WindowsPeerEgressRouteCommander("specus0");
+        PeerEgressRouteInstaller.Conflict multicast = commander.conflict(new Route("ff00::/8", Kind.TUN, "rule:ff00::/8"));
+        if (!multicast.present()) {
+            // No IPv6 stack to read on this machine.
+            return;
+        }
+        assertTrue(multicast.existing().startsWith("ff00::/8 on-link ifIndex "), "conflict describes " + multicast.existing());
+        long readAt = commander.table6ReadAtNanos();
+        assertTrue(readAt != 0 && !commander.tableRead(), "the IPv6 lookup did not use the IPv6 table alone");
+        PeerEgressRouteInstaller.Conflict free = commander.conflict(
+                new Route("2001:db8:ffff::/48", Kind.TUN, "rule:2001:db8:ffff::/48"));
+        assertTrue(!free.present(), "a documentation prefix was reported as taken by " + free.existing());
+        assertEquals(readAt, commander.table6ReadAtNanos(), "the second IPv6 lookup read the table again");
     }
 
     /** What the argument check says when it refuses, so a refusal is told apart from a failure. */

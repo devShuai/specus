@@ -368,7 +368,8 @@ public class SpecusClientApplication {
         egress.setIpv6TargetCapable(true);
         // The egress accepts IPv6 packets in SPEG1 frames (protocol/spec/peer-egress.md, IPv6 数据面;
         // PeerEgressIpv6Packet.PACKET_CAPABLE). Only consumers read it; it says nothing about whether
-        // this device sends IPv6 as a consumer, which it does not (PeerEgressRules.CONSUMER_CARRIES_IPV6).
+        // this device sends IPv6 as a consumer, which its platform, MTU and TUN decide
+        // (PeerEgressRouteCommanders.consumerCarriesIpv6).
         egress.setIpv6PacketCapable(true);
         info.setClientEgressCapabilities(egress);
         // HTTP route streams that fail before their response head say why on the RST, so the

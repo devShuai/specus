@@ -39,10 +39,13 @@ final class LinuxTunPeerVirtualDevice implements PeerVirtualDevice {
     private volatile String ifName;
     private volatile Thread readerThread;
     private final Set<String> syncedPeerRoutes = ConcurrentHashMap.newKeySet();
+    /** The derived IPv6 address, and whether it was assigned. */
+    private final PeerDeviceIpv6 ipv6;
 
     LinuxTunPeerVirtualDevice(PeerVirtualDeviceOptions options, ClientAuthLoginResponse.PeerMeshConfig config) {
         this.options = options;
         this.config = config;
+        this.ipv6 = new PeerDeviceIpv6(options, config);
     }
 
     @Override
@@ -62,6 +65,9 @@ final class LinuxTunPeerVirtualDevice implements PeerVirtualDevice {
         fd = nextFd;
         try {
             configureInterface(name(), config.getVirtualIp(), config.getCidr(), options.mtu());
+            // The link is up with its MTU already, which applies to both families.
+            ipv6.configure(address -> runCommand(Duration.ofSeconds(10),
+                    PeerEgressRouteCommands.assignAddress6Args(name(), address).toArray(String[]::new)), "TUN", log);
             running.set(true);
             Thread thread = new Thread(() -> readLoop(outboundHandler), "peer-mesh-linux-tun");
             thread.setDaemon(true);
@@ -113,6 +119,7 @@ final class LinuxTunPeerVirtualDevice implements PeerVirtualDevice {
         } catch (Exception e) {
             log.debug("Peer mesh Linux TUN 清理 peer routes 失败: {}", e.getMessage());
         }
+        ipv6.closed("TUN");
         running.set(false);
         int current = fd;
         fd = -1;
@@ -128,6 +135,11 @@ final class LinuxTunPeerVirtualDevice implements PeerVirtualDevice {
         if (thread != null) {
             thread.interrupt();
         }
+    }
+
+    @Override
+    public PeerVirtualDevice.Ipv6Readiness ipv6Readiness() {
+        return ipv6.readiness();
     }
 
     private int openTun(String requestedName) {

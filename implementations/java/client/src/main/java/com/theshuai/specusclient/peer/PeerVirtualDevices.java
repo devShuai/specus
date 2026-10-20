@@ -39,7 +39,8 @@ final class PeerVirtualDevices {
         int mtu = options == null ? PeerVirtualDeviceOptions.DEFAULT_MTU : options.mtu();
         String virtualIp = config == null ? "" : config.getVirtualIp();
         String cidr = config == null ? "" : config.getCidr();
-        return mode + "|" + name + "|" + mtu + "|" + virtualIp + "|" + cidr;
+        boolean ipv6 = options != null && options.egressIpv6();
+        return mode + "|" + name + "|" + mtu + "|" + virtualIp + "|" + cidr + "|" + ipv6;
     }
 
     private static PeerVirtualDevice createLinuxTun(PeerVirtualDeviceOptions options,

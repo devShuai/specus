@@ -4406,6 +4406,19 @@ public class PeerMeshClient implements AutoCloseable {
         }
 
         @Override
+        public PeerVirtualDevice.Ipv6Readiness deviceIpv6() {
+            PeerVirtualDevice device = virtualDevice;
+            return device == null
+                    ? PeerVirtualDevice.Ipv6Readiness.no("the virtual device is absent")
+                    : device.ipv6Readiness();
+        }
+
+        @Override
+        public int peerMeshMtu() {
+            return virtualDeviceOptions.mtu();
+        }
+
+        @Override
         public List<String> bypassHosts() {
             List<String> hosts = new ArrayList<>();
             // The control connection by its live address first, then by the name it was

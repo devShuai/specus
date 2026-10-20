@@ -103,8 +103,7 @@ public final class PeerEgressFrame {
 
     /**
      * Decodes one frame as a receiver without the IPv6 data plane does, refusing an IPv6 body with
-     * {@code EGRESS_IPV6_UNSUPPORTED}. The consumer reads frames this way: it does not carry IPv6
-     * ({@link PeerEgressRules#CONSUMER_CARRIES_IPV6}).
+     * {@code EGRESS_IPV6_UNSUPPORTED}. A consumer without the IPv6 data plane reads frames this way.
      */
     public static Decoded parse(byte[] payload) {
         return parse(payload, false);
