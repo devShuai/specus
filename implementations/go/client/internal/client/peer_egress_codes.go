@@ -49,6 +49,10 @@ const (
 	egressCodeRuleFakeIPOverlap  = "EGRESS_RULE_FAKE_IP_OVERLAP"
 	egressCodeFakeIPPoolInvalid  = "EGRESS_FAKE_IP_POOL_INVALID"
 	egressCodeRuleEgressNoDomain = "EGRESS_RULE_EGRESS_NO_DOMAIN"
+
+	// The IPv6 data plane (protocol/spec/peer-egress.md, IPv6 数据面): an IPv6 rule to an online egress
+	// whose catalogue entry does not say ipv6PacketCapable.
+	egressCodeRuleEgressNoIPv6 = "EGRESS_RULE_EGRESS_NO_IPV6"
 )
 
 // Policy scopes. Public and LAN access are authorised separately; neither implies the other.

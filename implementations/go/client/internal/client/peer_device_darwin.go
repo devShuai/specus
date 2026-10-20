@@ -35,6 +35,9 @@ type darwinUtunDevice struct {
 	cidr    string
 	mtu     int
 	logger  *log.Logger
+	// address6 is the derived IPv6 address the device is given, "" when it is given none
+	// (peerDeviceAddress6).
+	address6 string
 
 	mu     sync.Mutex
 	fd     int
@@ -64,7 +67,9 @@ func newPlatformPeerVirtualDevice(config Config, runtime PeerMeshConfig, logger 
 	if mode != "auto" && mode != "utun" && mode != "mac-utun" && mode != "macos-utun" && mode != "darwin-utun" {
 		return newUnsupportedPeerVirtualDevice(config, fmt.Sprintf("unsupported peerMeshDevice on macOS: %s", config.PeerMeshDevice))
 	}
+	address6, _ := peerDeviceAddress6(config, runtime.VirtualIP)
 	return &darwinUtunDevice{
+		address6:         address6,
 		name:             firstNonEmpty(config.PeerMeshTunName, darwinUtunDefaultPrefix),
 		virtual:          runtime.VirtualIP,
 		cidr:             runtime.CIDR,
@@ -250,7 +255,24 @@ func (device *darwinUtunDevice) configure() error {
 	if strings.TrimSpace(device.cidr) != "" {
 		device.runCommandQuiet("route", "-n", "delete", "-net", device.cidr)
 	}
+	device.configureIPv6()
 	return nil
+}
+
+// configureIPv6 gives the utun its derived IPv6 address, before any route is pointed at it: on macOS
+// a route can only go to a utun that has an address of its family. A failure is logged and the device
+// stays up, for the reason the Linux device gives.
+func (device *darwinUtunDevice) configureIPv6() {
+	if device.address6 == "" {
+		return
+	}
+	args, err := macosAssignAddress6Args(device.name, device.address6)
+	if err == nil {
+		err = runDarwinCommand(args...)
+	}
+	if err != nil && device.logger != nil {
+		device.logger.Printf("Peer Mesh utun IPv6 address not assigned; IPv6 rules cannot carry traffic: %v", err)
+	}
 }
 
 func (device *darwinUtunDevice) requestedUnit() uint32 {

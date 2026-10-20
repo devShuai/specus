@@ -138,6 +138,25 @@ func (c egressCIDR6) contains(address [16]byte) bool {
 	return maskEgressAddress6(address, c.prefixLen) == c.network
 }
 
+// egressCIDR6sOverlap reports whether two IPv6 prefixes share an address, which for prefixes is the
+// same as one containing the other's network.
+func egressCIDR6sOverlap(left, right egressCIDR6) bool {
+	return left.contains(right.network) || right.contains(left.network)
+}
+
+// egressMeshCIDR6 is the derived prefix (egressMeshPrefix6) as a prefix.
+func egressMeshCIDR6() egressCIDR6 {
+	var network [16]byte
+	copy(network[:12], egressMeshPrefix6Network[:])
+	return egressCIDR6{network: network, prefixLen: 96}
+}
+
+// formatEgressCIDR6 writes a prefix in the one form this feature writes it: the RFC 5952 address and
+// the length, so a route installed in one run is recognised as the same route in the next.
+func formatEgressCIDR6(cidr egressCIDR6) string {
+	return formatEgressAddress6(cidr.network) + "/" + strconv.Itoa(cidr.prefixLen)
+}
+
 // mapped reports whether the prefix lies in ::ffff:0:0/96, where IPv4 destinations are spelled in
 // IPv6 APIs. No packet on the wire carries one, so a consumer rule there would never match anything.
 func (c egressCIDR6) mapped() bool {

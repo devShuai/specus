@@ -130,21 +130,56 @@ func TestEgressIPv6RulesMatchSharedVectorWithAnIPv6DataPlane(t *testing.T) {
 	}
 }
 
-// What every client does today: the same list with no IPv6 data plane. The production entry points
-// are the ones exercised, so a change to egressConsumerCarriesIPv6 without the data plane fails here.
+// The same list on a consumer without the IPv6 data plane: a platform without it, or a peerMeshMtu
+// below 1280. The data plane is decided the way production decides it (egressConsumerCarriesIPv6),
+// with an MTU no platform carries IPv6 at, and the entry points without a "For" give the same answer.
 func TestEgressIPv6RulesAreNotInForceWithoutAnIPv6DataPlane(t *testing.T) {
 	vector, rules := loadEgressIPv6Vector(t)
+	carries := egressConsumerCarriesIPv6(MinPeerMeshMTU)
 	for _, entry := range vector.IPv6.WithoutIPv6DataPlane.RuleCodes {
 		want := ""
 		if entry.Code != nil {
 			want = *entry.Code
 		}
-		if code := validateEgressRuleIn(rules[entry.Index], egressDefaultMeshCIDR, ""); code != want {
+		if code := validateEgressRuleFor(rules[entry.Index], egressDefaultMeshCIDR, "", carries); code != want {
 			t.Errorf("ipv6 rule %d: code = %q, want %q", entry.Index, code, want)
+		}
+		if code := validateEgressRuleIn(rules[entry.Index], egressDefaultMeshCIDR, ""); code != want {
+			t.Errorf("ipv6 rule %d: code = %q without For, want %q", entry.Index, code, want)
 		}
 	}
 	for _, testCase := range vector.IPv6.WithoutIPv6DataPlane.Cases {
+		checkEgressIPv6Match(t, testCase.Destination,
+			matchEgressRulesFor(rules, testCase.Destination, egressDefaultMeshCIDR, "", carries), testCase)
 		checkEgressIPv6Match(t, testCase.Destination, matchEgressRules(rules, testCase.Destination, egressDefaultMeshCIDR), testCase)
+	}
+}
+
+// At the default MTU a platform with the data plane gets the data-plane section's answers, again by
+// the production decision, and one without gets the other section's.
+func TestEgressIPv6RulesFollowThisPlatformsDataPlane(t *testing.T) {
+	vector, rules := loadEgressIPv6Vector(t)
+	carries := egressConsumerCarriesIPv6(DefaultPeerMeshMTU)
+	if carries != egressPlatformCarriesIPv6 {
+		t.Fatalf("at the default MTU the data plane is %v, the platform says %v", carries, egressPlatformCarriesIPv6)
+	}
+	if !carries {
+		t.Skip("this platform has no IPv6 data plane; the section without one covers it")
+	}
+	refused := map[int]string{}
+	for _, entry := range vector.IPv6.RefusedRules {
+		refused[entry.Index] = entry.Code
+	}
+	for index, rule := range rules {
+		if code := EgressRuleCode(Config{PeerMeshMTU: DefaultPeerMeshMTU}, rule); code != refused[index] {
+			t.Errorf("ipv6 rule %d: code = %q, want %q", index, code, refused[index])
+		}
+	}
+	for _, testCase := range vector.IPv6.Cases {
+		preview := PreviewEgressDestination(Config{PeerEgressRules: rules, PeerMeshMTU: DefaultPeerMeshMTU}, testCase.Destination)
+		checkEgressIPv6Match(t, testCase.Name, egressRuleDecision{Action: preview.Action,
+			MatchedRuleIndex: preview.MatchedRuleIndex, EgressClientID: preview.EgressClientID,
+			Reason: map[bool]string{true: egressReasonMatched, false: egressReasonDefault}[preview.MatchedRuleIndex >= 0]}, testCase)
 	}
 }
 

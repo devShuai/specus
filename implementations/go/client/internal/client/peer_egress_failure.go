@@ -39,6 +39,55 @@ func egressFailurePacket(packet []byte, protocol int) []byte {
 	return nil
 }
 
+// egressFailurePacket6 answers an IPv6 packet the consumer refused to forward, the same way: a TCP
+// segment with a reset by RFC 793, a UDP datagram with an ICMPv6 address unreachable. Pinned by the
+// failure section of protocol/test-vectors/peer-egress-ipv6-v1.json.
+func egressFailurePacket6(packet []byte, nextHeader int) []byte {
+	switch nextHeader {
+	case ipv4ProtocolTCP:
+		segment, ok := parseTCPSegment6(packet)
+		if !ok {
+			return nil
+		}
+		return buildTCPReset(segment)
+	case ipv4ProtocolUDP:
+		return egressICMPv6AddressUnreachable(packet)
+	}
+	return nil
+}
+
+const (
+	icmpv6DestinationUnreachable = 1
+	// icmpv6AddressUnreachable is the counterpart of IPv4's host unreachable: the stack reports
+	// EHOSTUNREACH on the socket.
+	icmpv6AddressUnreachable = 3
+	icmpv6HeaderLen          = 8
+)
+
+// egressICMPv6AddressUnreachable builds an ICMPv6 destination unreachable, code 3, for an IPv6
+// packet: from the packet's destination back to its source, hop limit 64, quoting as much of the
+// packet as fits without the whole error passing the IPv6 minimum MTU (RFC 4443 2.4 c). The
+// checksum covers the RFC 8200 pseudo-header, as every ICMPv6 checksum does.
+func egressICMPv6AddressUnreachable(packet []byte) []byte {
+	if len(packet) < ipv6HeaderLen || packet[0]>>4 != 6 {
+		return nil
+	}
+	original := len(packet)
+	if stated := ipv6HeaderLen + int(binary.BigEndian.Uint16(packet[4:6])); stated < original {
+		original = stated
+	}
+	quoted := min(original, egressIPv6MinimumMTU-ipv6HeaderLen-icmpv6HeaderLen)
+	source, destination := [16]byte(packet[24:40]), [16]byte(packet[8:24])
+	response := make([]byte, ipv6HeaderLen+icmpv6HeaderLen+quoted)
+	writeIPv6Header(response, ipv6NextHeaderICMP, icmpv6HeaderLen+quoted, source, destination)
+	message := response[ipv6HeaderLen:]
+	message[0] = icmpv6DestinationUnreachable
+	message[1] = icmpv6AddressUnreachable
+	copy(message[icmpv6HeaderLen:], packet[:quoted])
+	binary.BigEndian.PutUint16(message[2:4], egressChecksum6(source, destination, ipv6NextHeaderICMP, message))
+	return response
+}
+
 // egressFlowResetPacket builds the reset for a flow the consumer closed, or returns nil when it
 // cannot: a datagram flow, or a TCP flow on which the application has not yet sent an
 // acknowledgement, whose retransmitted SYN will be answered when it arrives.
@@ -46,9 +95,13 @@ func egressFlowResetPacket(flow *egressConsumerFlow) []byte {
 	if flow == nil || flow.Key.protocol != ipv4ProtocolTCP || !flow.AppAckKnown {
 		return nil
 	}
+	// An IPv6 flow is reset by the same rule, only in its own family.
 	return buildTCPSegment(tcpSegment{
 		SourceIP:        flow.Key.remoteIP,
 		DestinationIP:   flow.Key.consumerIP,
+		IPv6:            flow.Key.ipv6,
+		SourceIP6:       flow.Key.remoteIP6,
+		DestinationIP6:  flow.Key.consumerIP6,
 		SourcePort:      flow.Key.remotePort,
 		DestinationPort: flow.Key.consumerPort,
 		Seq:             flow.AppAck,
@@ -63,6 +116,16 @@ func egressFlowResetPacket(flow *egressConsumerFlow) []byte {
 // packet, and a checksum over the whole segment for two numbers would be paid on every one.
 func (flow *egressConsumerFlow) noteApplicationProgress(packet []byte) {
 	ihl := int(packet[0]&0x0f) * 4
+	total := peerPacketTotalLength(packet)
+	if packet[0]>>4 == 6 {
+		// The fixed header, and the payload length it states: the data plane carries TCP only
+		// directly behind it.
+		ihl = ipv6HeaderLen
+		total = len(packet)
+		if len(packet) >= ipv6HeaderLen {
+			total = ipv6HeaderLen + int(binary.BigEndian.Uint16(packet[4:6]))
+		}
+	}
 	if len(packet) < ihl+tcpMinHeaderLen {
 		return
 	}
@@ -71,7 +134,6 @@ func (flow *egressConsumerFlow) noteApplicationProgress(packet []byte) {
 	if dataOffset < tcpMinHeaderLen {
 		return
 	}
-	total := peerPacketTotalLength(packet)
 	if total > len(packet) {
 		total = len(packet)
 	}

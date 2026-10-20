@@ -34,6 +34,8 @@ type egressRouteCommander interface {
 	// Table reads the platform's routing table as the routes this feature reasons about, and says
 	// how the tunnel appears in it: its interface index on Windows, its name elsewhere.
 	Table() (routes []egressBindRoute, tunnel string, err error)
+	// Table6 is Table for the IPv6 table, read only when this feature owns an IPv6 route.
+	Table6() (routes []egressBindRoute, tunnel string, err error)
 }
 
 // egressRouteJournal is the on-disk record of what this feature installed.
@@ -219,12 +221,34 @@ func (installer *egressRouteInstaller) repair() egressRouteRepairResult {
 	if len(installer.installed) == 0 {
 		return result
 	}
-	table, tunnel, err := installer.commander.Table()
-	if err != nil {
-		result.TableErr = err
-		return result
+	// Each family is compared with its own table, and a table is read only when a route of its
+	// family is owned: a machine that owns no IPv6 route reads exactly what it read before IPv6
+	// routes existed.
+	var owned4, owned6 []egressRoute
+	for _, route := range installer.installed {
+		if egressRouteIsIPv6(route) {
+			owned6 = append(owned6, route)
+		} else {
+			owned4 = append(owned4, route)
+		}
 	}
-	drifts := egressRouteDrifts(installer.installed, table, tunnel)
+	var drifts []egressRouteDrift
+	if len(owned4) > 0 {
+		table, tunnel, err := installer.commander.Table()
+		if err != nil {
+			result.TableErr = err
+			return result
+		}
+		drifts = append(drifts, egressRouteDrifts(owned4, table, tunnel)...)
+	}
+	if len(owned6) > 0 {
+		table, tunnel, err := installer.commander.Table6()
+		if err != nil {
+			result.TableErr = err
+			return result
+		}
+		drifts = append(drifts, egressRouteDrifts(owned6, table, tunnel)...)
+	}
 	changed := false
 	for _, drift := range drifts {
 		route := drift.Route

@@ -168,9 +168,16 @@ class Matrix:
         expected = ["peerEgressRules has 7 rule(s) but peerEgressEnabled is false: none is in force",
                     "peerEgressRules[1] is not in force: EGRESS_RULE_DEFAULT_ROUTE",
                     "peerEgressRules[2] is not in force: EGRESS_RULE_DOMAIN_UNSUPPORTED",
-                    "peerEgressRules[3] is not in force: EGRESS_RULE_IPV6_UNSUPPORTED",
                     "peerEgressRules[4] is not in force: EGRESS_RULE_MESH_OVERLAP",
                     "peerEgressRules[5] is not in force: EGRESS_RULE_MISSING_TARGET"]
+        # An IPv6 rule is in force where the client has the IPv6 data plane (protocol/spec/peer-egress.md,
+        # IPv6 数据面): the Go client on Linux, Windows and macOS at the default peerMeshMtu. The Java and
+        # .NET clients do not have it yet and still refuse it.
+        ipv6_warning = "peerEgressRules[3] is not in force: EGRESS_RULE_IPV6_UNSUPPORTED"
+        if self.name == "go":
+            assert "peerEgressRules[3]" not in err, ("an IPv6 rule was refused with the data plane", err)
+        else:
+            expected.append(ipv6_warning)
         for line in expected:
             assert line in err, ("missing egress rule warning", line, err)
         assert "peerEgressRules[0]" not in err, ("a usable rule was warned about", err)

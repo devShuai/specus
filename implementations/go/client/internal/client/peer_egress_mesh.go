@@ -200,6 +200,10 @@ func (mesh *peerMeshClient) ensureEgressConsumer() *egressConsumer {
 	consumer := newEgressConsumer(mesh.logger,
 		func(egress int64, frame []byte) error { return mesh.sendEgressFrameToPeer(egress, frame) },
 		func(packet []byte) error { return mesh.writeEgressPacketToDevice(packet) })
+	// Whether this device carries IPv6 is fixed by its platform and its configured MTU, so it is
+	// settled once, here, and every decision the consumer makes reads the same answer.
+	consumer.carriesIPv6 = mesh.egressCarriesIPv6()
+	consumer.pathMTU = mesh.egressPathMTU
 	// A catalogue that arrived before the consumer was built still says which egresses it lists and
 	// which resolve names; nothing else will repeat it until the server has a reason to. The consumer
 	// is not shared yet, so its lock is not needed.
@@ -238,6 +242,7 @@ func (mesh *peerMeshClient) applyEgressCatalog(payload string) {
 	accepted := mesh.egressCatalog.read([]byte(payload))
 	view := mesh.egressCatalog.view()
 	listed, capable := mesh.egressCatalog.listedIDs(), mesh.egressCatalog.capableIDs()
+	capable6 := mesh.egressCatalog.ipv6CapableIDs()
 	consumer := mesh.egressConsumer
 	mesh.mu.Unlock()
 	if !accepted {
@@ -252,7 +257,7 @@ func (mesh *peerMeshClient) applyEgressCatalog(payload string) {
 		}
 	}
 	mesh.logger.Printf("[peer-egress-consumer] egress catalogue applied; egresses listed: %v, "+
-		"resolving names: %v, announcing no peer egress: %v", listed, capable, unsupported)
+		"resolving names: %v, taking IPv6 packets: %v, announcing no peer egress: %v", listed, capable, capable6, unsupported)
 	if consumer != nil {
 		mesh.deliverEgressPurges(consumer.applyCatalog(view, time.Now()))
 	}
@@ -388,6 +393,32 @@ func (mesh *peerMeshClient) currentEgressPhaseTwo() egressPhaseTwo {
 	return egressPhaseTwo{CIDR: cidr, Code: code}
 }
 
+// egressCarriesIPv6 is whether this device has the IPv6 data plane (egressConsumerCarriesIPv6).
+func (mesh *peerMeshClient) egressCarriesIPv6() bool {
+	if mesh.egressIPv6 != nil {
+		return *mesh.egressIPv6
+	}
+	return egressConsumerCarriesIPv6(mesh.config.PeerMeshMTU)
+}
+
+// egressPathMTU is the effective MTU of the session to an egress, the SPMTU2 answer the IPv4 path
+// clamps to, or the configured MTU while there is no session or no probe yet. Called with no mesh
+// lock held.
+func (mesh *peerMeshClient) egressPathMTU(egress int64) int {
+	configured := mesh.config.PeerMeshMTU
+	if configured <= 0 {
+		// Unset reads as the default, as egressConsumerCarriesIPv6 reads it.
+		configured = DefaultPeerMeshMTU
+	}
+	mesh.mu.Lock()
+	session := mesh.sessions[egress]
+	mesh.mu.Unlock()
+	if session == nil || session.PathMTU == nil {
+		return normalizePeerPathMTU(configured)
+	}
+	return session.PathMTU.effectiveMTU(configured)
+}
+
 // sendEgressFrameToPeer carries one frame to the egress peer.
 //
 // Synchronous, unlike the egress role's own sender. It is called from the TUN read path with no
@@ -431,7 +462,10 @@ func (mesh *peerMeshClient) handleEgressOutbound(packet []byte) bool {
 	}
 	// A DNS query is the responder's business, answered or not, and one line per lookup would be
 	// a record of every name this device asked for.
-	if outcome != egressOutcomeForwarded && outcome != egressOutcomeDNS && mesh.logger != nil {
+	// Nor is the system's own IPv6 chatter on the TUN -- neighbour discovery, multicast reports --
+	// which arrives on its own schedule and is no one's traffic.
+	if outcome != egressOutcomeForwarded && outcome != egressOutcomeDNS && outcome != egressOutcomeIgnored &&
+		mesh.logger != nil {
 		// Logged without the destination: a per-destination record of what a user was blocked
 		// from reaching is their own browsing history.
 		mesh.logger.Printf("[peer-egress-consumer] packet not forwarded: %s", outcome)
@@ -556,7 +590,7 @@ func (mesh *peerMeshClient) reconcileEgressRoutesAt(now time.Time) {
 		mesh.egressDeviceWaitLogged = false
 		bypass := mesh.egressBypassAddresses(now)
 		var refused []egressRuleSetError
-		desired, refused = planEgressRoutesIn(rules, bypass, meshCIDR, phase.pool())
+		desired, refused = planEgressRoutesFor(rules, bypass, meshCIDR, phase.pool(), mesh.egressCarriesIPv6())
 		mesh.logEgressRefusals(refused)
 	} else if (len(rules) > 0 || phase.Active) && !mesh.egressDeviceWaitLogged {
 		mesh.egressDeviceWaitLogged = true
@@ -843,6 +877,11 @@ func (mesh *peerMeshClient) egressBypassAddresses(now time.Time) []string {
 			// line is the one that says it resolved.
 			mesh.logger.Printf("[peer-egress-consumer] bypass host %s did not resolve; a rule covering it would capture it", host)
 		}
+	}
+	if mesh.egressCarriesIPv6() {
+		// The IPv6 answers too, only once this device routes IPv6 at all; the plan pins one only
+		// when an IPv6 rule covers it.
+		resolved = append(resolved, mesh.egressBypass.resolve6(hosts, now)...)
 	}
 	return append(resolved, peers...)
 }

@@ -29,6 +29,9 @@ type linuxTunDevice struct {
 	cidr    string
 	mtu     int
 	logger  *log.Logger
+	// address6 is the derived IPv6 address the device is given, "" when it is given none
+	// (peerDeviceAddress6).
+	address6 string
 
 	mu     sync.Mutex
 	file   *os.File
@@ -40,7 +43,9 @@ type linuxTunDevice struct {
 }
 
 func newPlatformPeerVirtualDevice(config Config, runtime PeerMeshConfig, logger *log.Logger) peerVirtualDevice {
+	address6, _ := peerDeviceAddress6(config, runtime.VirtualIP)
 	return &linuxTunDevice{
+		address6:         address6,
 		name:             firstNonEmpty(config.PeerMeshTunName, DefaultPeerMeshTunName),
 		virtual:          runtime.VirtualIP,
 		cidr:             runtime.CIDR,
@@ -235,7 +240,23 @@ func (device *linuxTunDevice) configure() error {
 	if strings.TrimSpace(device.cidr) != "" {
 		device.runCommandQuiet("ip", "route", "del", device.cidr, "dev", device.name)
 	}
+	device.configureIPv6()
 	return nil
+}
+
+// configureIPv6 gives the device its derived IPv6 address. The link is up with its MTU already,
+// which applies to both families.
+//
+// A failure is logged and the device stays up: the IPv4 mesh does not depend on it, and IPv6 rules
+// cannot leak without it -- the routes they install into the device are refused by the kernel on a
+// host without IPv6, and a packet that does arrive with another source is refused by the data plane.
+func (device *linuxTunDevice) configureIPv6() {
+	if device.address6 == "" {
+		return
+	}
+	if err := runCommand(linuxAssignAddress6Args(device.name, device.address6)...); err != nil && device.logger != nil {
+		device.logger.Printf("Peer Mesh Linux TUN IPv6 address not assigned; IPv6 rules cannot carry traffic: %v", err)
+	}
 }
 
 func (device *linuxTunDevice) setStatus(status, errText string) {

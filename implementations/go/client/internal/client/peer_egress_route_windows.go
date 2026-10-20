@@ -48,9 +48,12 @@ type windowsEgressRouteCommander struct {
 	// see the note in peer_egress_route_windows_script.go.
 	tunIndex int
 
-	// table is one read of the whole routing table, and tableAt is when it was taken.
-	table   string
-	tableAt time.Time
+	// table is one read of the whole routing table, and tableAt is when it was taken; table6 and
+	// table6At the same for the IPv6 table, which a separate query reads.
+	table    string
+	tableAt  time.Time
+	table6   string
+	table6At time.Time
 
 	// hops caches where each bypass address goes, resolved before any tunnel route exists.
 	//
@@ -66,11 +69,26 @@ type windowsEgressRouteCommander struct {
 // Declared next to the commander it describes, so the two cannot disagree about the platform.
 const egressRouteTakeoverSupported = true
 
+// egressPlatformCarriesIPv6 is whether this build reads IPv6 from its TUN, gives the TUN the
+// device's derived IPv6 address and routes IPv6 into it (protocol/spec/peer-egress.md, IPv6 数据面).
+const egressPlatformCarriesIPv6 = true
+
 func newEgressRouteCommanderForPlatform(tun string) egressRouteCommander {
 	return &windowsEgressRouteCommander{tun: tun, hops: map[string]windowsEgressRouteHop{}}
 }
 
 func (c *windowsEgressRouteCommander) Conflict(route egressRoute) (bool, string) {
+	if egressRouteIsIPv6(route) {
+		if c.table6 == "" || time.Since(c.table6At) > windowsTableCacheLifetime {
+			output, err := c.run(windowsShowAllRoutesScript6())
+			if err != nil {
+				return false, ""
+			}
+			c.table6 = output
+			c.table6At = time.Now()
+		}
+		return windowsConflictFromTable6(c.table6, route.CIDR)
+	}
 	if c.table == "" || time.Since(c.tableAt) > windowsTableCacheLifetime {
 		output, err := c.run(windowsShowAllRoutesScript())
 		if err != nil {
@@ -88,7 +106,8 @@ func (c *windowsEgressRouteCommander) Install(route egressRoute) error {
 	// Checked before anything is run: an argument the script builder would refuse must not
 	// cost a process first, and on this platform that refusal is what keeps a prefix from
 	// becoming a second command.
-	if !validWindowsPrefix(route.CIDR) {
+	ipv6 := egressRouteIsIPv6(route)
+	if (!ipv6 && !validWindowsPrefix(route.CIDR)) || (ipv6 && !validWindowsPrefix6(route.CIDR)) {
 		return fmt.Errorf("install %s: %w", route.CIDR, errEgressRouteArgument)
 	}
 	if route.Kind == egressRouteBypass {
@@ -101,18 +120,31 @@ func (c *windowsEgressRouteCommander) Install(route egressRoute) error {
 	if err != nil {
 		return err
 	}
-	script, err := windowsInstallRouteScript(route.CIDR, index, "")
+	script, err := windowsInstallRouteScriptFor(ipv6, route.CIDR, index, "")
 	if err != nil {
 		return err
 	}
 	return c.apply(script, "install "+route.CIDR)
 }
 
+// windowsInstallRouteScriptFor picks the builder of the route's family.
+func windowsInstallRouteScriptFor(ipv6 bool, cidr string, interfaceIndex int, gateway string) (string, error) {
+	if ipv6 {
+		return windowsInstallRouteScript6(cidr, interfaceIndex, gateway)
+	}
+	return windowsInstallRouteScript(cidr, interfaceIndex, gateway)
+}
+
 func (c *windowsEgressRouteCommander) installBypass(route egressRoute) error {
-	address := strings.TrimSuffix(route.CIDR, "/32")
+	ipv6 := egressRouteIsIPv6(route)
+	address := egressBypassRouteAddress(route.CIDR)
 	hop, cached := c.hops[address]
 	if !cached {
-		script, err := windowsFindRoutesScript([]string{address})
+		find, read := windowsFindRoutesScript, readWindowsBindRoutes
+		if ipv6 {
+			find, read = windowsFindRoutesScript6, readWindowsBindRoutes6
+		}
+		script, err := find([]string{address})
 		if err != nil {
 			return err
 		}
@@ -129,7 +161,7 @@ func (c *windowsEgressRouteCommander) installBypass(route egressRoute) error {
 			// by index rather than by name, because the name is the one thing that cannot come
 			// back out of PowerShell intact. The native table, read with the tunnel left out,
 			// says where it went before.
-			fallback, err := egressBypassHopFromTable(address, strconv.Itoa(index), readWindowsBindRoutes)
+			fallback, err := egressBypassHopFromTable(address, strconv.Itoa(index), read)
 			if err != nil {
 				return err
 			}
@@ -142,7 +174,7 @@ func (c *windowsEgressRouteCommander) installBypass(route egressRoute) error {
 		c.hops[address] = resolved
 		hop = resolved
 	}
-	script, err := windowsInstallRouteScript(route.CIDR, hop.InterfaceIndex, hop.Gateway)
+	script, err := windowsInstallRouteScriptFor(ipv6, route.CIDR, hop.InterfaceIndex, hop.Gateway)
 	if err != nil {
 		return err
 	}
@@ -150,8 +182,12 @@ func (c *windowsEgressRouteCommander) installBypass(route egressRoute) error {
 }
 
 func (c *windowsEgressRouteCommander) Remove(route egressRoute) error {
-	delete(c.hops, strings.TrimSuffix(route.CIDR, "/32"))
-	script, err := windowsRemoveRouteScript(route.CIDR)
+	delete(c.hops, egressBypassRouteAddress(route.CIDR))
+	remove := windowsRemoveRouteScript
+	if egressRouteIsIPv6(route) {
+		remove = windowsRemoveRouteScript6
+	}
+	script, err := remove(route.CIDR)
 	if err != nil {
 		return err
 	}
@@ -166,6 +202,16 @@ func (c *windowsEgressRouteCommander) Table() ([]egressBindRoute, string, error)
 		return nil, "", err
 	}
 	routes, err := readWindowsBindRoutes()
+	return routes, strconv.Itoa(index), err
+}
+
+// Table6 reads the native IPv6 forwarding table, with the tunnel as its index.
+func (c *windowsEgressRouteCommander) Table6() ([]egressBindRoute, string, error) {
+	index, err := c.tunnelIndex()
+	if err != nil {
+		return nil, "", err
+	}
+	routes, err := readWindowsBindRoutes6()
 	return routes, strconv.Itoa(index), err
 }
 
@@ -225,6 +271,12 @@ func (c *windowsEgressRouteCommander) apply(script string, what string) error {
 // Exit codes are not consulted. A script that failed exits 1 after describing itself on stdout, and
 // that description is what the caller needs.
 func (c *windowsEgressRouteCommander) run(script string) (string, error) {
+	return runWindowsPowerShell(script)
+}
+
+// runWindowsPowerShell is the commander's run, shared with the device, which configures the TUN's
+// IPv6 address through the same kind of script.
+func runWindowsPowerShell(script string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), windowsCommandTimeout)
 	defer cancel()
 	command := exec.CommandContext(ctx, "powershell.exe",

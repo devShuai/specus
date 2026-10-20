@@ -30,6 +30,9 @@ type windowsWintunDevice struct {
 	cidr    string
 	mtu     int
 	logger  *log.Logger
+	// address6 is the derived IPv6 address the device is given, "" when it is given none
+	// (peerDeviceAddress6).
+	address6 string
 
 	mu      sync.Mutex
 	dll     *syscall.LazyDLL
@@ -60,7 +63,9 @@ func newPlatformPeerVirtualDevice(config Config, runtime PeerMeshConfig, logger 
 	if mode != "auto" && mode != "windows-wintun" && mode != "wintun" {
 		return newUnsupportedPeerVirtualDevice(config, fmt.Sprintf("unsupported peerMeshDevice on Windows: %s", config.PeerMeshDevice))
 	}
+	address6, _ := peerDeviceAddress6(config, runtime.VirtualIP)
 	return &windowsWintunDevice{
+		address6:         address6,
 		name:             firstNonEmpty(config.PeerMeshTunName, DefaultPeerMeshTunName),
 		virtual:          runtime.VirtualIP,
 		cidr:             runtime.CIDR,
@@ -260,7 +265,46 @@ func (device *windowsWintunDevice) configure() error {
 	if strings.TrimSpace(device.cidr) != "" {
 		device.runCommandQuiet("netsh", "interface", "ipv4", "delete", "route", device.cidr, device.name, "store=active")
 	}
+	device.configureIPv6()
 	return nil
+}
+
+// configureIPv6 gives the adapter its derived IPv6 address and its IPv6 MTU, which Windows keeps
+// apart from the IPv4 one netsh set. Through PowerShell, by interface index, as the route commander
+// does: the adapter's name goes in, only its index comes back. A failure is logged and the device
+// stays up, for the reason the Linux device gives.
+func (device *windowsWintunDevice) configureIPv6() {
+	if device.address6 == "" {
+		return
+	}
+	err := func() error {
+		output, err := runWindowsPowerShell(windowsInterfaceIndexScript(device.name))
+		if err != nil {
+			return fmt.Errorf("resolve interface index for %s: %w", device.name, err)
+		}
+		index, ok := parseWindowsInterfaceIndex(output)
+		if !ok {
+			return fmt.Errorf("no adapter named %s", device.name)
+		}
+		script, err := windowsAssignAddress6Script(index, device.address6, device.mtu)
+		if err != nil {
+			return err
+		}
+		output, runErr := runWindowsPowerShell(script)
+		switch parseWindowsCommandFailure(output) {
+		case windowsRouteFailureDenied:
+			return errors.New("assigning the address needs administrator rights")
+		case windowsRouteFailureOther:
+			return fmt.Errorf("assigning the address failed: %s", strings.TrimSpace(output))
+		}
+		if runErr != nil && strings.TrimSpace(output) == "" {
+			return runErr
+		}
+		return nil
+	}()
+	if err != nil && device.logger != nil {
+		device.logger.Printf("Peer Mesh Wintun IPv6 address not assigned; IPv6 rules cannot carry traffic: %v", err)
+	}
 }
 
 func (device *windowsWintunDevice) setStatus(status, errText string) {

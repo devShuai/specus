@@ -399,7 +399,7 @@ func egressPreview(path string, config client.Config, kind, target string) (map[
 // egressAddressPreview is what the configured rules decide for one IPv4 address, and what takeover
 // being on would change. No connection is made.
 func egressAddressPreview(path string, config client.Config, address string) (map[string]any, []string) {
-	preview := client.PreviewEgressDestination(config.PeerEgressRules, address)
+	preview := client.PreviewEgressDestination(config, address)
 	data := map[string]any{
 		"configPath": path, "address": address, "kind": egressTargetAddress, "takeover": config.PeerEgressEnabled,
 		"matchedRuleIndex": preview.MatchedRuleIndex,

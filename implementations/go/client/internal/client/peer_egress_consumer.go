@@ -36,6 +36,12 @@ const (
 	egressOutcomeBlockedFakeIP
 	// egressOutcomeDNS is a packet for the DNS responder, handled whatever became of it.
 	egressOutcomeDNS
+	// egressOutcomeIgnored is an IPv6 packet the system sends on any interface of its own accord --
+	// neighbour discovery, router solicitation, multicast reports -- dropped without a count.
+	egressOutcomeIgnored
+	// egressOutcomeBlockedIPv6 is an IPv6 packet the data plane cannot carry whatever the rules say:
+	// from an address that is not this device's, to another device's, or over a path below 1280.
+	egressOutcomeBlockedIPv6
 )
 
 func (o egressConsumerOutcome) String() string {
@@ -52,6 +58,10 @@ func (o egressConsumerOutcome) String() string {
 		return "blocked-fake-ip"
 	case egressOutcomeDNS:
 		return "dns"
+	case egressOutcomeIgnored:
+		return "ignored"
+	case egressOutcomeBlockedIPv6:
+		return "blocked-ipv6"
 	default:
 		return "not-mine"
 	}
@@ -95,6 +105,18 @@ type egressConsumer struct {
 	meshCIDR string
 	// virtualIP is this node's mesh address, which every reply must be addressed to.
 	virtualIP string
+
+	// The IPv6 data plane (protocol/spec/peer-egress.md, IPv6 数据面). carriesIPv6 is fixed when the
+	// consumer is built (egressConsumerCarriesIPv6); without it every IPv6 packet is left alone, as
+	// before the data plane existed. virtualIP6 is the address derived from virtualIP, the only
+	// source an IPv6 packet may leave with and the only destination a reply may come back to.
+	// capable6 is which egresses the catalogue says take IPv6 packets, and pathMTU the effective MTU
+	// of the session to an egress, asked with no consumer lock held.
+	carriesIPv6 bool
+	virtualIP6  [16]byte
+	hasVirtual6 bool
+	capable6    map[int64]bool
+	pathMTU     func(egress int64) int
 
 	// Phase two (protocol/spec/peer-egress-dns.md). fakeIPCIDR is the pool while phase two runs and
 	// "" while it does not; fakeIP hands out its addresses. capable is which egresses the catalogue
@@ -154,6 +176,7 @@ func newEgressConsumer(logger *log.Logger, send func(int64, []byte) error, toTun
 		logger:   logger,
 		meshCIDR: egressDefaultMeshCIDR,
 		capable:  map[int64]bool{},
+		capable6: map[int64]bool{},
 		listed:   map[int64]egressCatalogListing{},
 		clock:    time.Now,
 
@@ -192,6 +215,7 @@ func (c *egressConsumer) configureIn(rules []egressRule, meshCIDR, virtualIP, fa
 		c.meshCIDR = trimmed
 	}
 	c.virtualIP = strings.TrimSpace(virtualIP)
+	c.virtualIP6, c.hasVirtual6 = egressDeviceAddress6(c.virtualIP)
 	fakeIPCIDR = strings.TrimSpace(fakeIPCIDR)
 	if fakeIPCIDR != c.fakeIPCIDR {
 		c.fakeIPCIDR, c.fakeIP = "", nil
@@ -246,9 +270,11 @@ func (c *egressConsumer) setCatalogLocked(view egressCatalogView) {
 	c.catalogReceived = view.Received
 	c.listed = make(map[int64]egressCatalogListing, len(view.Listed))
 	c.capable = make(map[int64]bool, len(view.Listed))
+	c.capable6 = make(map[int64]bool, len(view.Listed))
 	for id, listing := range view.Listed {
 		c.listed[id] = listing
 		c.capable[id] = listing.DomainTargetCapable
+		c.capable6[id] = listing.IPv6PacketCapable
 	}
 }
 
@@ -328,6 +354,21 @@ func (c *egressConsumer) purgeInvalidatedLocked(now time.Time) (map[int64][]stri
 	purge := map[int64][]string{}
 	var resets [][]byte
 	for key, flow := range c.flows {
+		if key.ipv6 {
+			// An IPv6 flow is re-examined by the same decision a new IPv6 packet gets, and it also
+			// goes when the catalogue stops saying its egress takes IPv6 packets.
+			steering := c.steer6Locked(key.remoteIP6)
+			if steering.claimed && steering.blocked == "" && steering.egress == flow.Egress &&
+				c.egressBlockLocked(flow.Egress) == "" && c.capable6[flow.Egress] {
+				continue
+			}
+			delete(c.flows, key)
+			purge[flow.Egress] = append(purge[flow.Egress], formatEgressAddress6(key.remoteIP6)+"/128")
+			if reset := egressFlowResetPacket(flow); reset != nil {
+				resets = append(resets, reset)
+			}
+			continue
+		}
 		steering := c.steerLocked(key.remoteIP, now, false)
 		stillOurs := steering.claimed && steering.blocked == "" &&
 			steering.egress == flow.Egress &&
@@ -496,8 +537,10 @@ func (c *egressConsumer) handleOutbound(packet []byte, now time.Time) egressCons
 	if len(packet) < ipv4MinHeaderLen {
 		return egressOutcomeNotMine
 	}
+	if packet[0]>>4 == 6 {
+		return c.handleOutbound6(packet, now)
+	}
 	if packet[0]>>4 != 4 {
-		// IPv6 has no rules in this version, so nothing can claim it and it is not ours.
 		return egressOutcomeNotMine
 	}
 	destination, parsed := parseEgressAddress(peerPacketDestinationIPv4(packet))
@@ -656,7 +699,9 @@ func (c *egressConsumer) handleInbound(frame []byte, fromEgress int64, now time.
 	if !looksLikePeerEgressFrame(frame) {
 		return false
 	}
-	parsed, code := parsePeerEgressFrame(frame)
+	// A consumer with the IPv6 data plane reads an IPv6 body; one without leaves it, refused, to the
+	// egress role, as before.
+	parsed, code := parsePeerEgressFrameFor(frame, c.carriesIPv6)
 	if code != "" {
 		// A frame nobody can read is not claimed. The egress runtime refuses it with its own
 		// code, which is the one an operator needs, and counting it here as well would report
@@ -673,6 +718,9 @@ func (c *egressConsumer) handleInbound(frame []byte, fromEgress int64, now time.
 	}
 	if parsed.Type != peerEgressTypeIPPacket {
 		return false
+	}
+	if parsed.Inner.IPv6 {
+		return c.handleInbound6(parsed, fromEgress, now)
 	}
 
 	c.mu.Lock()
@@ -731,8 +779,12 @@ func (c *egressConsumer) hasReturnFlowLocked(inner peerEgressInner, packet []byt
 	return true
 }
 
-// tcpPacketFlags reads the flags of an IPv4 TCP packet, or 0 for anything else.
+// tcpPacketFlags reads the flags of a TCP packet, IPv4 or IPv6 with TCP as its next header, or 0 for
+// anything else.
 func tcpPacketFlags(packet []byte) byte {
+	if len(packet) >= ipv6HeaderLen+14 && packet[0]>>4 == 6 && int(packet[6]) == ipv4ProtocolTCP {
+		return packet[ipv6HeaderLen+13]
+	}
 	if len(packet) < ipv4MinHeaderLen || packet[0]>>4 != 4 || int(packet[9]) != ipv4ProtocolTCP {
 		return 0
 	}
@@ -757,14 +809,10 @@ func (c *egressConsumer) handleInboundControl(frame peerEgressFrame, fromEgress 
 	if !ok || control.Type != peerEgressControlFlowReject {
 		return
 	}
-	remote, remoteOK := parseEgressAddress(control.DestinationIP)
-	local, localOK := parseEgressAddress(control.SourceIP)
-	if !remoteOK || !localOK {
+	key, ok := consumerFlowKeyForReject(control)
+	if !ok {
 		return
 	}
-	key := egressFlowKey{protocol: protocolNumberForEgressName(control.Protocol),
-		consumerIP: local, consumerPort: uint16(control.SourcePort),
-		remoteIP: remote, remotePort: uint16(control.DestinationPort)}
 	c.mu.Lock()
 	flow, known := c.flows[key]
 	if !known || flow.Egress != fromEgress {

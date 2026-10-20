@@ -29,6 +29,10 @@ type linuxEgressRouteCommander struct {
 // Declared next to the commander it describes, so the two cannot disagree about the platform.
 const egressRouteTakeoverSupported = true
 
+// egressPlatformCarriesIPv6 is whether this build reads IPv6 from its TUN, gives the TUN the
+// device's derived IPv6 address and routes IPv6 into it (protocol/spec/peer-egress.md, IPv6 数据面).
+const egressPlatformCarriesIPv6 = true
+
 func newEgressRouteCommanderForPlatform(tun string) egressRouteCommander {
 	return newLinuxEgressRouteCommander(tun)
 }
@@ -38,7 +42,7 @@ func newLinuxEgressRouteCommander(tun string) *linuxEgressRouteCommander {
 }
 
 func (c *linuxEgressRouteCommander) Conflict(route egressRoute) (bool, string) {
-	output, err := runCommandOutput("ip", "route", "show", "exact", route.CIDR)
+	output, err := runCommandOutput(linuxRouteArgs(route.CIDR, "show", "exact", route.CIDR)...)
 	if err != nil {
 		// Unable to ask. Reporting no conflict would let the add proceed, and `ip route add`
 		// refuses an existing prefix anyway, so the install path still fails safe.
@@ -54,14 +58,14 @@ func (c *linuxEgressRouteCommander) Install(route egressRoute) error {
 	if strings.TrimSpace(c.tun) == "" {
 		return errors.New("no TUN interface to route into")
 	}
-	return runCommand("ip", "route", "add", route.CIDR, "dev", c.tun)
+	return runCommand(linuxRouteArgs(route.CIDR, "add", route.CIDR, "dev", c.tun)...)
 }
 
 func (c *linuxEgressRouteCommander) installBypass(route egressRoute) error {
-	address := strings.TrimSuffix(route.CIDR, "/32")
+	address := egressBypassRouteAddress(route.CIDR)
 	hop, cached := c.hops[address]
 	if !cached {
-		output, err := runCommandOutput("ip", "route", "get", address)
+		output, err := runCommandOutput(linuxRouteArgs(route.CIDR, "get", address)...)
 		if err != nil {
 			return fmt.Errorf("resolve bypass hop for %s: %w", address, err)
 		}
@@ -73,7 +77,11 @@ func (c *linuxEgressRouteCommander) installBypass(route egressRoute) error {
 			// A rule's route covers the address, so the query can only see the tunnel. Pinning
 			// the bypass there would send the transport through the thing it carries; the main
 			// table, read with the tunnel left out, says where it went before.
-			fallback, err := egressBypassHopFromTable(address, c.tun, readLinuxMainTable)
+			read := readLinuxMainTable
+			if strings.Contains(address, ":") {
+				read = readLinuxMainTable6
+			}
+			fallback, err := egressBypassHopFromTable(address, c.tun, read)
 			if err != nil {
 				return err
 			}
@@ -83,9 +91,9 @@ func (c *linuxEgressRouteCommander) installBypass(route egressRoute) error {
 		hop = resolved
 	}
 	if hop.Gateway == "" {
-		return runCommand("ip", "route", "add", route.CIDR, "dev", hop.Device)
+		return runCommand(linuxRouteArgs(route.CIDR, "add", route.CIDR, "dev", hop.Device)...)
 	}
-	return runCommand("ip", "route", "add", route.CIDR, "via", hop.Gateway, "dev", hop.Device)
+	return runCommand(linuxRouteArgs(route.CIDR, "add", route.CIDR, "via", hop.Gateway, "dev", hop.Device)...)
 }
 
 // readLinuxMainTable reads the main table for a bypass hop.
@@ -101,13 +109,27 @@ func readLinuxMainTable() ([]egressBindRoute, error) {
 	return parseIPRouteTable(output), nil
 }
 
+// readLinuxMainTable6 is readLinuxMainTable for the IPv6 main table.
+func readLinuxMainTable6() ([]egressBindRoute, error) {
+	output, err := runCommandOutput(linuxShowMainTableArgs6()...)
+	if err != nil {
+		return nil, err
+	}
+	return parseIPRouteTable6(output), nil
+}
+
 func (c *linuxEgressRouteCommander) Remove(route egressRoute) error {
-	delete(c.hops, strings.TrimSuffix(route.CIDR, "/32"))
-	return runCommand("ip", "route", "del", route.CIDR)
+	delete(c.hops, egressBypassRouteAddress(route.CIDR))
+	return runCommand(linuxRouteArgs(route.CIDR, "del", route.CIDR)...)
 }
 
 func (c *linuxEgressRouteCommander) Table() ([]egressBindRoute, string, error) {
 	routes, err := readLinuxMainTable()
+	return routes, c.tun, err
+}
+
+func (c *linuxEgressRouteCommander) Table6() ([]egressBindRoute, string, error) {
+	routes, err := readLinuxMainTable6()
 	return routes, c.tun, err
 }
 

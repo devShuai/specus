@@ -51,8 +51,11 @@ type consumerStatusSnapshot struct {
 	Blocked  map[string]int64
 	// Phase two: the pool while it runs ("" otherwise), which egresses resolve names, and the
 	// pool's live mappings and quarantined addresses as of the snapshot.
-	FakeIPCIDR  string
-	Capable     map[int64]bool
+	FakeIPCIDR string
+	Capable    map[int64]bool
+	// The IPv6 data plane: whether this consumer has it, and which egresses take IPv6 packets.
+	CarriesIPv6 bool
+	Capable6    map[int64]bool
 	Mappings    int
 	Quarantined int
 	// The responder: where it listens ("" while phase two does not run), what it forwards to, and
@@ -74,6 +77,10 @@ func (c *egressConsumer) statusSnapshot() consumerStatusSnapshot {
 	capable := make(map[int64]bool, len(c.capable))
 	for id, able := range c.capable {
 		capable[id] = able
+	}
+	capable6 := make(map[int64]bool, len(c.capable6))
+	for id, able := range c.capable6 {
+		capable6[id] = able
 	}
 	blocked := make(map[string]int64, len(c.blocked))
 	for reason, count := range c.blocked {
@@ -99,6 +106,8 @@ func (c *egressConsumer) statusSnapshot() consumerStatusSnapshot {
 		Blocked:       blocked,
 		FakeIPCIDR:    c.fakeIPCIDR,
 		Capable:       capable,
+		CarriesIPv6:   c.carriesIPv6,
+		Capable6:      capable6,
 		Upstreams:     append([]string{}, c.dnsUpstreams...),
 		DNSQueries:    c.dnsQueries,
 	}
@@ -281,7 +290,9 @@ func consumerStatusJSON(consumer *egressConsumer, installer *egressRouteInstalle
 	for index, rule := range snapshot.Rules {
 		// With phase two's pool and the catalogue's capabilities, so a domain rule reads as in
 		// force exactly when steering would act on it.
-		code := egressRuleStatusCode(rule, snapshot.MeshCIDR, snapshot.FakeIPCIDR, snapshot.Online, snapshot.Capable)
+		// And with the IPv6 data plane and which egresses take IPv6 packets, for the same reason.
+		code := egressRuleStatusCodeFor(rule, snapshot.MeshCIDR, snapshot.FakeIPCIDR, snapshot.CarriesIPv6,
+			snapshot.Online, snapshot.Capable, snapshot.Capable6)
 		// inForce is the field worth having. A rule that is configured but refused reads
 		// false and carries its code, which is the difference between "this rule is
 		// protecting me" and "this rule is text in a file".

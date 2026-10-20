@@ -60,7 +60,8 @@ func warnEgressRules(config Config, warn func(string)) {
 			warn("peerEgressFakeIpCidr is not usable: " + code + "; domain rules are not in force")
 		}
 	}
-	for _, refused := range validateEgressRuleSetIn(rules, egressDefaultMeshCIDR, offlineEgressFakeIPPool(config)) {
+	for _, refused := range validateEgressRuleSetFor(rules, egressDefaultMeshCIDR, offlineEgressFakeIPPool(config),
+		egressConsumerCarriesIPv6(config.PeerMeshMTU)) {
 		if refused.Code == egressCodeRuleDisabled {
 			continue
 		}

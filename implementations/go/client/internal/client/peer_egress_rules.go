@@ -77,20 +77,42 @@ func validateEgressRule(rule egressRule, meshCIDR string) string {
 // stay out of the pool: addresses there are handed out to names, so an address rule over them would
 // compete with the domain rule that handed each one out. Not running, a domain rule is refused
 // exactly as in phase one, and the pool means nothing to an address rule.
+//
+// This and the other entry points without a "For" judge a consumer without the IPv6 data plane, as
+// every consumer was before it existed. Whether this device has one depends on its platform and its
+// configured MTU (egressConsumerCarriesIPv6), so every path that acts on rules -- the offline check,
+// the route plan, the data plane, the status -- states it through the For variants.
 func validateEgressRuleIn(rule egressRule, meshCIDR, fakeIPPool string) string {
-	return validateEgressRuleFor(rule, meshCIDR, fakeIPPool, egressConsumerCarriesIPv6)
+	return validateEgressRuleFor(rule, meshCIDR, fakeIPPool, false)
 }
 
+// egressIPv6MinimumMTU is the smallest MTU IPv6 allows on any link (RFC 8200 5). A device whose Peer
+// Mesh MTU is below it has no IPv6 data plane, and a peer path that probes below it carries no IPv6.
+const egressIPv6MinimumMTU = 1280
+
 // egressConsumerCarriesIPv6 says whether this consumer has an IPv6 data plane: IPv6 packets read
-// from the TUN, IPv6 routes installed into it, and IPv6 carried to the egress. It does not yet, so a
-// well-formed IPv6 rule is refused with EGRESS_RULE_IPV6_UNSUPPORTED: installing nothing for it and
-// reporting it in force would send its destinations straight out of the local interface.
+// from the TUN, IPv6 routes installed into it, and IPv6 carried to the egress
+// (protocol/spec/peer-egress.md, IPv6 数据面). It needs the platform's TUN and route support for IPv6
+// (egressPlatformCarriesIPv6) and a Peer Mesh MTU of at least 1280; without either a well-formed IPv6
+// rule is refused with EGRESS_RULE_IPV6_UNSUPPORTED, since installing nothing for it and reporting it
+// in force would send its destinations straight out of the local interface.
 //
-// The rule is still read and checked in full first, so a mistake in it is reported as one, and how
-// IPv6 rules match is pinned by the vector's ipv6 section, which the tests run with this set.
-const egressConsumerCarriesIPv6 = false
+// A noop device carries nothing at all: no route is installed for any rule while the device is not
+// up, which is what keeps an IPv6 rule from being reported as protecting traffic that never enters a
+// TUN. The rule still reads as in force there, exactly as an IPv4 rule does.
+func egressConsumerCarriesIPv6(peerMeshMTU int) bool {
+	if peerMeshMTU <= 0 {
+		peerMeshMTU = DefaultPeerMeshMTU
+	}
+	return egressPlatformCarriesIPv6 && peerMeshMTU >= egressIPv6MinimumMTU
+}
 
 // validateEgressRuleFor is validateEgressRuleIn with the consumer's IPv6 data plane stated.
+//
+// With the data plane, the prefix every device's IPv6 address lies in is to IPv6 what the Peer Mesh
+// network is to IPv4, so an IPv6 rule overlapping it is refused with EGRESS_RULE_MESH_OVERLAP, at the
+// same place in the order as the IPv4 check. Without it the rule is refused last for the data plane
+// it lacks, as before.
 func validateEgressRuleFor(rule egressRule, meshCIDR, fakeIPPool string, carriesIPv6 bool) string {
 	// First, ahead of anything about the rule's content: switching a rule off is the user's choice,
 	// and a rule should not have to be fixed before it is allowed to sit in the list switched off.
@@ -113,6 +135,11 @@ func validateEgressRuleFor(rule egressRule, meshCIDR, fakeIPPool string, carries
 		}
 		if cidr.prefixLen == 0 {
 			return egressCodeRuleDefaultRoute
+		}
+		if carriesIPv6 && egressCIDR6sOverlap(cidr, egressMeshCIDR6()) {
+			// Device-to-device traffic stays IPv4, and a rule over the derived prefix would capture
+			// the addresses replies are checked against.
+			return egressCodeRuleMeshOverlap
 		}
 		if code := validateEgressRuleTarget(rule); code != "" {
 			return code
@@ -263,14 +290,36 @@ func selectEgressDomainRule(rules []egressRule, name, meshCIDR, fakeIPPool strin
 // reporting it as pointed at a device that can never take it would send the operator after the rule
 // rather than the device.
 func egressRuleStatusCode(rule egressRule, meshCIDR, fakeIPPool string, online, capable map[int64]bool) string {
-	if code := validateEgressRuleIn(rule, meshCIDR, fakeIPPool); code != "" {
+	return egressRuleStatusCodeFor(rule, meshCIDR, fakeIPPool, false, online, capable, nil)
+}
+
+// egressRuleStatusCodeFor is egressRuleStatusCode with the consumer's IPv6 data plane stated, and
+// capable6 the egresses the catalogue says take IPv6 packets.
+//
+// An IPv6 rule to an online egress that does not is EGRESS_RULE_EGRESS_NO_IPV6, by the same rule as
+// EGRESS_RULE_EGRESS_NO_DOMAIN: the capability only counts for an egress that is online. Like that
+// code it is about the egress at this moment, not about the rule, so it is never a validation code:
+// the rule's route stays installed and its destinations are blocked as egress-no-ipv6 rather than
+// falling through to a shorter rule or out of the local interface.
+func egressRuleStatusCodeFor(rule egressRule, meshCIDR, fakeIPPool string, carriesIPv6 bool,
+	online, capable, capable6 map[int64]bool) string {
+	if code := validateEgressRuleFor(rule, meshCIDR, fakeIPPool, carriesIPv6); code != "" {
 		return code
 	}
 	if rule.Action == egressActionEgress && egressRuleKind(rule.Match) == "domain" &&
 		online[rule.EgressClientID] && !capable[rule.EgressClientID] {
 		return egressCodeRuleEgressNoDomain
 	}
+	if rule.Action == egressActionEgress && egressRuleIsIPv6(rule.Match) &&
+		online[rule.EgressClientID] && !capable6[rule.EgressClientID] {
+		return egressCodeRuleEgressNoIPv6
+	}
 	return ""
+}
+
+// egressRuleIsIPv6 reports whether a rule's match is written as IPv6, which a colon settles.
+func egressRuleIsIPv6(match string) bool {
+	return strings.Contains(strings.TrimSpace(match), ":")
 }
 
 // egressRuleKind names what a rule matches on, for the status: an address or prefix, or a name.
@@ -335,7 +384,7 @@ func matchEgressRules(rules []egressRule, destination string, meshCIDR string) e
 // rules are in force. Domain rules never match an address: a destination in the pool is steered by
 // the name it was handed out for, and one outside it by address rules alone.
 func matchEgressRulesIn(rules []egressRule, destination, meshCIDR, fakeIPPool string) egressRuleDecision {
-	return matchEgressRulesFor(rules, destination, meshCIDR, fakeIPPool, egressConsumerCarriesIPv6)
+	return matchEgressRulesFor(rules, destination, meshCIDR, fakeIPPool, false)
 }
 
 // matchEgressRulesFor is matchEgressRulesIn with the consumer's IPv6 data plane stated.
@@ -403,9 +452,14 @@ func validateEgressRuleSet(rules []egressRule, meshCIDR string) []egressRuleSetE
 }
 
 func validateEgressRuleSetIn(rules []egressRule, meshCIDR, fakeIPPool string) []egressRuleSetError {
+	return validateEgressRuleSetFor(rules, meshCIDR, fakeIPPool, false)
+}
+
+// validateEgressRuleSetFor is validateEgressRuleSetIn with the consumer's IPv6 data plane stated.
+func validateEgressRuleSetFor(rules []egressRule, meshCIDR, fakeIPPool string, carriesIPv6 bool) []egressRuleSetError {
 	var refused []egressRuleSetError
 	for index, rule := range rules {
-		if code := validateEgressRuleIn(rule, meshCIDR, fakeIPPool); code != "" {
+		if code := validateEgressRuleFor(rule, meshCIDR, fakeIPPool, carriesIPv6); code != "" {
 			refused = append(refused, egressRuleSetError{Index: index, Match: rule.Match, Code: code})
 		}
 	}

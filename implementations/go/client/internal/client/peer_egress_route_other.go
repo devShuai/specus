@@ -19,6 +19,10 @@ var errEgressRoutesUnsupported = errors.New("egress route takeover is not implem
 // Declared next to the commander it describes, so the two cannot disagree about the platform.
 const egressRouteTakeoverSupported = false
 
+// egressPlatformCarriesIPv6 is whether this build reads IPv6 from its TUN and routes IPv6 into it.
+// Nothing is routed here at all.
+const egressPlatformCarriesIPv6 = false
+
 func newEgressRouteCommanderForPlatform(_ string) egressRouteCommander {
 	return unsupportedEgressRouteCommander{}
 }
@@ -27,5 +31,8 @@ func (unsupportedEgressRouteCommander) Conflict(egressRoute) (bool, string) { re
 func (unsupportedEgressRouteCommander) Install(egressRoute) error           { return errEgressRoutesUnsupported }
 func (unsupportedEgressRouteCommander) Remove(egressRoute) error            { return errEgressRoutesUnsupported }
 func (unsupportedEgressRouteCommander) Table() ([]egressBindRoute, string, error) {
+	return nil, "", errEgressRoutesUnsupported
+}
+func (unsupportedEgressRouteCommander) Table6() ([]egressBindRoute, string, error) {
 	return nil, "", errEgressRoutesUnsupported
 }
