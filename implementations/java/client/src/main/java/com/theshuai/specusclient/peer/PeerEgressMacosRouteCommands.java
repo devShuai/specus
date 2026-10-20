@@ -364,7 +364,8 @@ public final class PeerEgressMacosRouteCommands {
 
     /**
      * Reads the whole table. IPv4 only: the IPv6 section has a different column layout and this
-     * feature does not route IPv6 yet.
+     * feature does not route IPv6 yet. The egress socket binder reads the IPv6 table with
+     * {@link PeerEgressSocketBinding#macosShowTableArgs6()}.
      */
     public static List<String> showTableArgs() {
         return List.of("netstat", "-rn", "-f", "inet");

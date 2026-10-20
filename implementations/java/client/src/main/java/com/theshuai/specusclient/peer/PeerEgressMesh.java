@@ -454,6 +454,15 @@ final class PeerEgressMesh implements AutoCloseable {
      * first costs nothing and keeps a reply from being judged as an egress request.
      */
     boolean handleInboundFrame(long peerId, byte[] payload) {
+        return handleInboundFrame(peerId, null, payload);
+    }
+
+    /**
+     * handleInboundFrame for a session whose peer's mesh address is peerVirtualIp, as the
+     * authenticated session has it. That address, not whatever an IPv6 packet claims, is what the
+     * egress checks the packet's source against.
+     */
+    boolean handleInboundFrame(long peerId, String peerVirtualIp, byte[] payload) {
         if (!PeerEgressFrame.looksLikeFrame(payload)) {
             return false;
         }
@@ -478,7 +487,7 @@ final class PeerEgressMesh implements AutoCloseable {
         if (pathMtu != null) {
             plane.setPathMtu(pathMtu - PeerEgressFrame.HEADER_BYTES);
         }
-        return plane.handleFrame(peerId, payload, nowMs);
+        return plane.handleFrame(peerId, peerVirtualIp, payload, nowMs);
     }
 
     /**

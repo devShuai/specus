@@ -942,13 +942,13 @@ class PeerEgressRuntimeTests {
         assertEquals(List.of(PeerEgressCodes.FORBIDDEN_DESTINATION), harness.rejectCodes());
     }
 
-    /** Only an IPv6 target is dialled unbound. */
+    /** Only an IPv6 target is bound from the IPv6 table; an IPv4-mapped one goes through the IPv4 choice. */
     @Test
-    void socketsToIpv6TargetsAreLeftUnbound() throws java.io.IOException {
-        assertTrue(PeerEgressSocketBinder.leftUnbound(java.net.InetAddress.getByName("2001:db8::10")));
-        assertTrue(!PeerEgressSocketBinder.leftUnbound(java.net.InetAddress.getByName("203.0.113.10")));
-        // Java reads an IPv4-mapped literal as the IPv4 address, which goes through the choice.
-        assertTrue(!PeerEgressSocketBinder.leftUnbound(java.net.InetAddress.getByName("::ffff:203.0.113.10")));
+    void socketsToIpv6TargetsUseTheIpv6Table() throws java.io.IOException {
+        assertTrue(PeerEgressSocketBinder.targetIs6(java.net.InetAddress.getByName("2001:db8::10")));
+        assertTrue(!PeerEgressSocketBinder.targetIs6(java.net.InetAddress.getByName("203.0.113.10")));
+        // Java reads an IPv4-mapped literal as the IPv4 address, which goes through the IPv4 choice.
+        assertTrue(!PeerEgressSocketBinder.targetIs6(java.net.InetAddress.getByName("::ffff:203.0.113.10")));
     }
 
     /**

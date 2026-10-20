@@ -13,7 +13,7 @@ namespace Specus.Client.Tests;
 /// stack holds to any other interface cannot reach it -- which is what turns "the option was set" into
 /// "the option is doing something". Each test returns early everywhere but Windows and macOS.
 /// </remarks>
-public class PeerEgressSocketBinderTests
+public partial class PeerEgressSocketBinderTests
 {
     private static bool Supported => OperatingSystem.IsWindows() || OperatingSystem.IsMacOS();
 
@@ -150,13 +150,17 @@ public class PeerEgressSocketBinderTests
     }
 
     /// <summary>Dials the listener through the binder, sends one datagram, and says whether it arrived or what stopped it.</summary>
-    private static string Delivers(PeerEgressSocketBinder binder, Socket listener, string label)
+    private static string Delivers(PeerEgressSocketBinder binder, Socket listener, string label) =>
+        Delivers(binder, listener, "127.0.0.1", label);
+
+    /// <summary>As <see cref="Delivers(PeerEgressSocketBinder, Socket, string)"/>, to the listener at <paramref name="host"/>.</summary>
+    private static string Delivers(PeerEgressSocketBinder binder, Socket listener, string host, string label)
     {
         var payload = System.Text.Encoding.ASCII.GetBytes("specus-bind-" + label);
         IPeerEgressSocket socket;
         try
         {
-            socket = new PeerEgressSocketDialer(binder).Dial("udp", "127.0.0.1",
+            socket = new PeerEgressSocketDialer(binder).Dial("udp", host,
                 ((IPEndPoint)listener.LocalEndPoint!).Port, 2000);
         }
         catch (PeerEgressNoPhysicalRouteException)

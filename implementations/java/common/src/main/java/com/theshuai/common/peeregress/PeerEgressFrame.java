@@ -46,6 +46,7 @@ public final class PeerEgressFrame {
 
     private static final byte[] MAGIC = "SPEG1".getBytes(StandardCharsets.US_ASCII);
     private static final int IPV4_MIN_HEADER_BYTES = 20;
+    private static final int IPV6_HEADER_BYTES = 40;
     private static final int PROTOCOL_TCP = 6;
     private static final int PROTOCOL_UDP = 17;
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -53,13 +54,21 @@ public final class PeerEgressFrame {
     private PeerEgressFrame() {
     }
 
-    /** The parsed IPv4 tuple of a type=1 body, filled only for that type. */
+    /**
+     * The parsed tuple of a type=1 body, filled only for that type. For an IPv6 body the addresses
+     * are in RFC 5952 form and protocol is the next header.
+     */
     public record Inner(
             String sourceIp,
             String destinationIp,
             int protocol,
             int sourcePort,
-            int destinationPort) {
+            int destinationPort,
+            boolean ipv6) {
+
+        public Inner(String sourceIp, String destinationIp, int protocol, int sourcePort, int destinationPort) {
+            this(sourceIp, destinationIp, protocol, sourcePort, destinationPort, false);
+        }
 
         static Inner empty() {
             return new Inner("", "", 0, 0, 0);
@@ -93,12 +102,23 @@ public final class PeerEgressFrame {
     }
 
     /**
-     * Decodes one frame, returning the failing result code on rejection.
+     * Decodes one frame as a receiver without the IPv6 data plane does, refusing an IPv6 body with
+     * {@code EGRESS_IPV6_UNSUPPORTED}. The consumer reads frames this way: it does not carry IPv6
+     * ({@link PeerEgressRules#CONSUMER_CARRIES_IPV6}).
+     */
+    public static Decoded parse(byte[] payload) {
+        return parse(payload, false);
+    }
+
+    /**
+     * Decodes one frame, returning the failing result code on rejection. ipv6 says whether this
+     * receiver accepts an IPv6 body: an egress that announces {@code ipv6PacketCapable}
+     * ({@code protocol/spec/peer-egress.md}, IPv6 数据面).
      *
      * <p>The checks run in a fixed order so every implementation reports the same code for a frame
      * that violates more than one constraint.
      */
-    public static Decoded parse(byte[] payload) {
+    public static Decoded parse(byte[] payload, boolean ipv6) {
         if (payload == null || payload.length < HEADER_BYTES) {
             return Decoded.refused(PeerEgressCodes.FRAME_TRUNCATED);
         }
@@ -129,16 +149,25 @@ public final class PeerEgressFrame {
             return new Decoded(type, false, body, Inner.empty(), null);
         }
 
-        Decoded innerResult = parseInnerPacket(body);
+        Decoded innerResult = parseInnerPacket(body, ipv6);
         if (!innerResult.accepted()) {
             return innerResult;
         }
         return new Decoded(type, false, body, innerResult.inner(), null);
     }
 
-    private static Decoded parseInnerPacket(byte[] body) {
+    /**
+     * Reads a type=1 body. A body shorter than the smallest IPv4 header is truncated whatever its
+     * version, as it was before IPv6 bodies were read: no IPv6 header fits in it either. Then the
+     * version decides: 4 reads as IPv4, 6 as IPv6 when ipv6 is set, and anything else is
+     * {@code EGRESS_IPV6_UNSUPPORTED}.
+     */
+    private static Decoded parseInnerPacket(byte[] body, boolean ipv6) {
         if (body.length < IPV4_MIN_HEADER_BYTES) {
             return Decoded.refused(PeerEgressCodes.FRAME_TRUNCATED);
+        }
+        if (ipv6 && ((body[0] >>> 4) & 0x0F) == 6) {
+            return parseInnerPacket6(body);
         }
         if (((body[0] >>> 4) & 0x0F) != 4) {
             return Decoded.refused(PeerEgressCodes.IPV6_UNSUPPORTED);
@@ -167,6 +196,48 @@ public final class PeerEgressFrame {
         Inner inner = new Inner(
                 dotted(body, 12), dotted(body, 16), protocol, sourcePort, destinationPort);
         return new Decoded(TYPE_IP_PACKET, false, body, inner, null);
+    }
+
+    /**
+     * Reads an IPv6 body ({@code protocol/spec/peer-egress.md}, IPv6 数据面, 出口).
+     *
+     * <p>Only the fixed header is read: the next header is the protocol, and ports are taken when it
+     * is TCP or UDP. An extension header is not walked; a packet that starts with one is refused
+     * later by protocol, the way ICMP over IPv4 is. There are no jumbograms, so a payload length of
+     * zero with bytes behind the header is trailing bytes like any other mismatch.
+     */
+    private static Decoded parseInnerPacket6(byte[] body) {
+        if (body.length < IPV6_HEADER_BYTES) {
+            return Decoded.refused(PeerEgressCodes.FRAME_TRUNCATED);
+        }
+        int total = IPV6_HEADER_BYTES + (((body[4] & 0xFF) << 8) | (body[5] & 0xFF));
+        if (total > body.length) {
+            return Decoded.refused(PeerEgressCodes.FRAME_TRUNCATED);
+        }
+        if (total < body.length) {
+            return Decoded.refused(PeerEgressCodes.FRAME_TRAILING_BYTES);
+        }
+        int protocol = body[6] & 0xFF;
+        int sourcePort = 0;
+        int destinationPort = 0;
+        if ((protocol == PROTOCOL_TCP || protocol == PROTOCOL_UDP) && body.length >= IPV6_HEADER_BYTES + 4) {
+            sourcePort = ((body[IPV6_HEADER_BYTES] & 0xFF) << 8) | (body[IPV6_HEADER_BYTES + 1] & 0xFF);
+            destinationPort = ((body[IPV6_HEADER_BYTES + 2] & 0xFF) << 8) | (body[IPV6_HEADER_BYTES + 3] & 0xFF);
+        }
+        Inner inner = new Inner(
+                hex6(body, 8), hex6(body, 24), protocol, sourcePort, destinationPort, true);
+        return new Decoded(TYPE_IP_PACKET, false, body, inner, null);
+    }
+
+    /** Sixteen bytes of a packet as an IPv6 address in RFC 5952 form. */
+    private static String hex6(byte[] packet, int offset) {
+        long high = 0;
+        long low = 0;
+        for (int index = 0; index < 8; index++) {
+            high = (high << 8) | (packet[offset + index] & 0xFFL);
+            low = (low << 8) | (packet[offset + 8 + index] & 0xFFL);
+        }
+        return Ipv6Cidr.formatAddress(high, low);
     }
 
     private static String dotted(byte[] packet, int offset) {

@@ -25,13 +25,19 @@ internal static class PeerEgressDatagram
     /// </summary>
     public const int MaxPayload = 65535 - PeerEgressSegment.Ipv4MinHeaderBytes - UdpHeaderBytes;
 
-    /// <summary>One parsed UDP datagram together with the IPv4 addresses that carried it.</summary>
+    /// <summary>
+    /// One parsed UDP datagram together with the addresses that carried it: the IPv4 ones, or, when
+    /// <see cref="Ipv6"/> is set, the IPv6 ones with the IPv4 fields left zero.
+    /// </summary>
     internal sealed record Datagram(
         uint SourceIp,
         uint DestinationIp,
         ushort SourcePort,
         ushort DestinationPort,
-        byte[] Payload);
+        byte[] Payload,
+        bool Ipv6 = false,
+        UInt128 SourceIp6 = default,
+        UInt128 DestinationIp6 = default);
 
     /// <summary>
     /// Reads an IPv4 packet carrying UDP, or returns null for anything it cannot fully validate.
@@ -82,10 +88,60 @@ internal static class PeerEgressDatagram
             packet[(ihl + UdpHeaderBytes)..total].ToArray());
     }
 
-    /// <summary>Renders a datagram as a complete IPv4 packet, checksums included.</summary>
+    /// <summary>
+    /// Reads an IPv6 packet whose next header is UDP.
+    /// </summary>
+    /// <remarks>
+    /// A zero checksum is refused rather than read as "none": IPv4 lets a sender leave it out, IPv6
+    /// does not (RFC 8200 8.1), because there is no header checksum underneath to catch a damaged
+    /// address.
+    /// </remarks>
+    public static Datagram? Parse6(ReadOnlySpan<byte> packet)
+    {
+        if (!PeerEgressIpv6.TryPayload(packet, Ipv4ProtocolUdp, out var udp) || udp.Length < UdpHeaderBytes)
+        {
+            return null;
+        }
+        if (BinaryPrimitives.ReadUInt16BigEndian(udp[4..6]) != udp.Length)
+        {
+            return null;
+        }
+        var source = PeerEgressIpv6.SourceOf(packet);
+        var destination = PeerEgressIpv6.DestinationOf(packet);
+        if (BinaryPrimitives.ReadUInt16BigEndian(udp[6..8]) == 0
+            || PeerEgressIpv6.Checksum(source, destination, Ipv4ProtocolUdp, udp) != 0)
+        {
+            return null;
+        }
+        return new Datagram(
+            0, 0,
+            BinaryPrimitives.ReadUInt16BigEndian(udp[0..2]),
+            BinaryPrimitives.ReadUInt16BigEndian(udp[2..4]),
+            udp[UdpHeaderBytes..].ToArray(),
+            Ipv6: true, SourceIp6: source, DestinationIp6: destination);
+    }
+
+    /// <summary>
+    /// Renders a datagram as a complete IPv4 packet, or IPv6 packet when the datagram is IPv6,
+    /// checksums included.
+    /// </summary>
     public static byte[] Build(Datagram datagram)
     {
         var length = UdpHeaderBytes + datagram.Payload.Length;
+        if (datagram.Ipv6)
+        {
+            var packet6 = new byte[PeerEgressIpv6.HeaderBytes + length];
+            PeerEgressIpv6.WriteHeader(packet6, Ipv4ProtocolUdp, length, datagram.SourceIp6, datagram.DestinationIp6);
+            var udp6 = packet6.AsSpan(PeerEgressIpv6.HeaderBytes);
+            BinaryPrimitives.WriteUInt16BigEndian(udp6[0..2], datagram.SourcePort);
+            BinaryPrimitives.WriteUInt16BigEndian(udp6[2..4], datagram.DestinationPort);
+            BinaryPrimitives.WriteUInt16BigEndian(udp6[4..6], (ushort)length);
+            datagram.Payload.CopyTo(udp6[UdpHeaderBytes..]);
+            var checksum6 = PeerEgressIpv6.Checksum(datagram.SourceIp6, datagram.DestinationIp6, Ipv4ProtocolUdp, udp6);
+            // Zero would read as "no checksum", which IPv6 does not allow; its complement is the same sum.
+            BinaryPrimitives.WriteUInt16BigEndian(udp6[6..8], (ushort)(checksum6 == 0 ? 0xFFFF : checksum6));
+            return packet6;
+        }
         var packet = new byte[PeerEgressSegment.Ipv4MinHeaderBytes + length];
 
         packet[0] = 0x45;

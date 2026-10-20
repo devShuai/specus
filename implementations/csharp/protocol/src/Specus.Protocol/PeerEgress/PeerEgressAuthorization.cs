@@ -184,7 +184,7 @@ public static class PeerEgressAuthorization
     {
         var denied = new List<string>(ForcedDenyCidrs.Count + CloudMetadataCidrs.Count
             + ForcedDenyCidrs6.Count + CloudMetadataCidrs6.Count
-            + context.DeploymentDenyCidrs.Count + request.LocalInterfaceCidrs.Count + 1);
+            + context.DeploymentDenyCidrs.Count + request.LocalInterfaceCidrs.Count + 2);
         denied.AddRange(ForcedDenyCidrs);
         denied.AddRange(CloudMetadataCidrs);
         denied.AddRange(ForcedDenyCidrs6);
@@ -192,6 +192,10 @@ public static class PeerEgressAuthorization
         denied.Add(string.IsNullOrWhiteSpace(context.MeshCidr)
             ? PeerEgressRules.DefaultMeshCidr
             : context.MeshCidr);
+        // The prefix devices' IPv6 addresses are derived in is the mesh network's IPv6 counterpart, and
+        // is refused for the same reason: forwarding into it would let a consumer reach another peer
+        // through this egress, past the mesh ACL.
+        denied.Add(PeerEgressMeshAddress.Prefix);
         denied.AddRange(context.DeploymentDenyCidrs);
         denied.AddRange(request.LocalInterfaceCidrs);
         return denied;

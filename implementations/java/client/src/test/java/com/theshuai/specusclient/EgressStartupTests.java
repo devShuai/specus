@@ -180,5 +180,14 @@ class EgressStartupTests {
         assertThat(capabilities.path("domainTargetCapable").asBoolean()).isTrue();
         assertThat(capabilities.path("ipv6TargetCapable").isBoolean()).isTrue();
         assertThat(capabilities.path("ipv6TargetCapable").asBoolean()).isTrue();
+        // The egress side of the IPv6 data plane is here; the consumer side is not, and announcing
+        // the packet capability must not have switched it on.
+        assertThat(capabilities.path("ipv6PacketCapable").isBoolean()).isTrue();
+        assertThat(capabilities.path("ipv6PacketCapable").asBoolean())
+                .as("the egress accepts IPv6 packets in SPEG1")
+                .isTrue();
+        assertThat(com.theshuai.common.peeregress.PeerEgressRules.CONSUMER_CARRIES_IPV6)
+                .as("only the egress side of the data plane exists")
+                .isFalse();
     }
 }

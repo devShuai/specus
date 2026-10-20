@@ -1,6 +1,7 @@
 package com.theshuai.specusclient.peer;
 
 import com.theshuai.common.peeregress.Ipv4Cidr;
+import com.theshuai.common.peeregress.Ipv6Cidr;
 import com.theshuai.common.peeregress.PeerEgressAuthorization;
 import com.theshuai.common.peeregress.PeerEgressPolicy;
 import com.theshuai.common.peeregress.PeerEgressRequest;
@@ -39,8 +40,32 @@ final class PeerEgressFlowTable {
      * <p>Keying on the consumer's source port alone would be wrong, not merely coarse. Two
      * datagrams leaving the same consumer port for different destinations are separate sessions;
      * collapsing them onto one socket would send the second destination's traffic to the first.
+     *
+     * <p>An IPv6 flow ({@code protocol/spec/peer-egress.md}, IPv6 数据面) holds its addresses in
+     * consumerIp6 and remoteIp6 and leaves the two IPv4 ones zero; an IPv4 flow leaves the IPv6 ones
+     * null, which also keeps it apart from an IPv6 flow.
      */
-    record Key(int protocol, int consumerIp, int consumerPort, int remoteIp, int remotePort) {
+    record Key(int protocol, int consumerIp, int consumerPort, int remoteIp, int remotePort,
+            PeerEgressIpv6Packet.Address consumerIp6, PeerEgressIpv6Packet.Address remoteIp6) {
+
+        /** An IPv4 flow. */
+        Key(int protocol, int consumerIp, int consumerPort, int remoteIp, int remotePort) {
+            this(protocol, consumerIp, consumerPort, remoteIp, remotePort, null, null);
+        }
+
+        boolean ipv6() {
+            return remoteIp6 != null;
+        }
+
+        /** The remote address as the judgment and flow-reject write it, of either family. */
+        String remoteAddress() {
+            return ipv6() ? remoteIp6.format() : Ipv4Cidr.format(remoteIp);
+        }
+
+        /** The consumer's address as flow-reject writes it, of either family. */
+        String consumerAddress() {
+            return consumerIp6 != null ? consumerIp6.format() : Ipv4Cidr.format(consumerIp);
+        }
 
         String protocolName() {
             return switch (protocol) {
@@ -94,7 +119,7 @@ final class PeerEgressFlowTable {
             this.consumer = consumer;
             this.openedAtMs = nowMs;
             this.lastSeenMs = nowMs;
-            this.address = Ipv4Cidr.format(key.remoteIp());
+            this.address = key.remoteAddress();
         }
     }
 
@@ -248,7 +273,8 @@ final class PeerEgressFlowTable {
 
     /**
      * Closes every flow of one consumer whose remote address falls inside one of the given
-     * prefixes, which serves the flow-purge control message.
+     * prefixes, IPv4 or IPv6, which serves the flow-purge control message. A prefix only ever
+     * matches flows of its own family.
      *
      * <p>Scoped to its sender: a purge arrives over one consumer's session and speaks only for that
      * consumer, so applying it to everyone would let any peer tear down every other peer's traffic
@@ -260,19 +286,35 @@ final class PeerEgressFlowTable {
      */
     List<Flow> purgeDestinations(long consumer, List<String> destinations) {
         List<Ipv4Cidr> prefixes = new ArrayList<>();
+        List<Ipv6Cidr> prefixes6 = new ArrayList<>();
         if (destinations != null) {
             for (String text : destinations) {
+                if (text != null && text.indexOf(':') >= 0) {
+                    Ipv6Cidr cidr = Ipv6Cidr.parse(text.trim());
+                    if (cidr != null) {
+                        prefixes6.add(cidr);
+                    }
+                    continue;
+                }
                 Ipv4Cidr cidr = Ipv4Cidr.parse(text);
                 if (cidr != null) {
                     prefixes.add(cidr);
                 }
             }
         }
-        if (prefixes.isEmpty()) {
+        if (prefixes.isEmpty() && prefixes6.isEmpty()) {
             return List.of();
         }
         return reap(flow -> {
             if (consumer != 0 && flow.consumer != consumer) {
+                return false;
+            }
+            if (flow.key.ipv6()) {
+                for (Ipv6Cidr prefix : prefixes6) {
+                    if (prefix.contains(flow.key.remoteIp6().halves())) {
+                        return true;
+                    }
+                }
                 return false;
             }
             for (Ipv4Cidr prefix : prefixes) {
@@ -290,10 +332,11 @@ final class PeerEgressFlowTable {
      * went to the fake address itself and can never work, yet the consumer's retransmitted SYN or
      * next datagram would be taken as part of it; closed, the next packet opens a flow by name. A
      * flow opened for another name goes with it when the address is bound to a new one. The same
-     * name bound again closes nothing.
+     * name bound again closes nothing. Names are bound to IPv4 fake addresses only, so no IPv6 flow
+     * is ever one of them.
      */
     List<Flow> closeUnbound(long consumer, int address, String name) {
-        return reap(flow -> flow.consumer == consumer && flow.key.remoteIp() == address
+        return reap(flow -> flow.consumer == consumer && !flow.key.ipv6() && flow.key.remoteIp() == address
                 && !java.util.Objects.equals(flow.name, name));
     }
 
@@ -388,11 +431,17 @@ final class PeerEgressFlowTable {
     }
 
     static void sort(List<Flow> entries) {
+        // IPv4 flows before IPv6 ones; within a family the addresses of the other are equal.
+        Comparator<PeerEgressIpv6Packet.Address> address6 =
+                Comparator.nullsFirst(Comparator.<PeerEgressIpv6Packet.Address>naturalOrder());
         entries.sort(Comparator
                 .comparingInt((Flow flow) -> flow.key.protocol())
+                .thenComparing(flow -> flow.key.ipv6())
                 .thenComparing(flow -> flow.key.consumerIp(), PeerEgressFlowTable::compareUnsigned)
+                .thenComparing(flow -> flow.key.consumerIp6(), address6)
                 .thenComparingInt(flow -> flow.key.consumerPort())
                 .thenComparing(flow -> flow.key.remoteIp(), PeerEgressFlowTable::compareUnsigned)
+                .thenComparing(flow -> flow.key.remoteIp6(), address6)
                 .thenComparingInt(flow -> flow.key.remotePort()));
     }
 

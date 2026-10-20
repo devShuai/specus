@@ -1,3 +1,5 @@
+using Specus.Protocol.PeerEgress;
+
 namespace Specus.Client.PeerMesh;
 
 /// <summary>One row of <c>netstat -rn</c>.</summary>
@@ -240,6 +242,93 @@ internal static class PeerEgressMacosRouteCommands
         return routes;
     }
 
+    /// <summary>
+    /// Reads the IPv6 rows of <c>netstat -rn</c>, the ones under the "Internet6:" heading: the IPv6
+    /// counterpart of <see cref="ParseTable"/>. Rows whose destination does not read as IPv6 are
+    /// skipped.
+    /// </summary>
+    /// <remarks>
+    /// A heading is a single word ending in a colon; an IPv6 row can end in one too, but it has
+    /// columns after its destination.
+    /// </remarks>
+    public static List<PeerEgressNetstatRoute> ParseTable6(string? stdout)
+    {
+        var routes = new List<PeerEgressNetstatRoute>();
+        var inside = false;
+        foreach (var line in (stdout ?? string.Empty).Split('\n'))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.Length == 0)
+            {
+                continue;
+            }
+            if (trimmed.EndsWith(':') && trimmed.IndexOfAny(Whitespace) < 0)
+            {
+                inside = trimmed == "Internet6:";
+                continue;
+            }
+            if (!inside || trimmed.StartsWith("Destination", StringComparison.Ordinal))
+            {
+                continue;
+            }
+            var fields = trimmed.Split(Whitespace, StringSplitOptions.RemoveEmptyEntries);
+            if (fields.Length < 4)
+            {
+                continue;
+            }
+            var prefix = NormalisePrefix6(fields[0]);
+            if (prefix.Length == 0)
+            {
+                continue;
+            }
+            routes.Add(new PeerEgressNetstatRoute(prefix, fields[0], fields[1], fields[2], fields[3]));
+        }
+        return routes;
+    }
+
+    /// <summary>
+    /// Turns a destination of the IPv6 table into a canonical prefix, or "" when it is not one.
+    /// </summary>
+    /// <remarks>
+    /// netstat writes "default" for ::/0, a host route without a length, and a link-local destination
+    /// with its zone: <c>fe80::%lo0/64</c>, <c>fe80::1%lo0</c>. The zone goes; the interface is in the
+    /// Netif column anyway. A length is decimal without a leading zero, 0-128, and the host bits are
+    /// masked off, as netstat's own output never sets them.
+    /// </remarks>
+    public static string NormalisePrefix6(string? text)
+    {
+        var value = (text ?? string.Empty).Trim();
+        if (value == "default")
+        {
+            return "::/0";
+        }
+        var slash = value.IndexOf('/');
+        var address = slash < 0 ? value : value[..slash];
+        var zone = address.IndexOf('%');
+        if (zone >= 0)
+        {
+            address = address[..zone];
+        }
+        if (!Ipv6Cidr.TryParseAddress(address, out var parsed))
+        {
+            return "";
+        }
+        var bits = Ipv6Cidr.MaxPrefix;
+        if (slash >= 0)
+        {
+            var length = value[(slash + 1)..];
+            if (!int.TryParse(length, System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out bits)
+                || bits > Ipv6Cidr.MaxPrefix
+                || bits.ToString(System.Globalization.CultureInfo.InvariantCulture) != length)
+            {
+                return "";
+            }
+        }
+        var mask = bits == 0 ? UInt128.Zero : UInt128.MaxValue << (Ipv6Cidr.MaxPrefix - bits);
+        return Ipv6Cidr.FormatAddress(parsed & mask) + "/" + bits.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    }
+
     /// <summary>Whether anything already owns this exact prefix.</summary>
     /// <remarks>
     /// Exact prefix, not a longest-prefix lookup, for the same reason as on Windows: the question
@@ -399,9 +488,13 @@ internal static class PeerEgressMacosRouteCommands
 
     /// <summary>
     /// Reads the whole table. IPv4 only: the IPv6 section has a different column layout and this
-    /// feature does not route IPv6 yet.
+    /// feature does not route IPv6 yet. The egress socket binder reads the IPv6 table with
+    /// <see cref="ShowTableArgs6"/>.
     /// </summary>
     public static string[] ShowTableArgs() => ["netstat", "-rn", "-f", "inet"];
+
+    /// <summary>Reads the IPv6 table, for an egress socket to an IPv6 target.</summary>
+    public static string[] ShowTableArgs6() => ["netstat", "-rn", "-f", "inet6"];
 
     /// <summary>
     /// Asks where an address would go right now, which is how a bypass next hop is resolved.

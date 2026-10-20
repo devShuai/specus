@@ -128,6 +128,10 @@ internal sealed class PeerEgressTcpConnection
     private readonly uint _remoteIp;
     private readonly ushort _localPort;
     private readonly ushort _remotePort;
+    // An IPv6 flow keeps its addresses here instead, with the IPv4 ones zero.
+    private readonly bool _ipv6;
+    private readonly UInt128 _localIp6;
+    private readonly UInt128 _remoteIp6;
 
     private State _state;
 
@@ -176,6 +180,9 @@ internal sealed class PeerEgressTcpConnection
         _remoteIp = syn.SourceIp;
         _localPort = syn.DestinationPort;
         _remotePort = syn.SourcePort;
+        _ipv6 = syn.Ipv6;
+        _localIp6 = syn.DestinationIp6;
+        _remoteIp6 = syn.SourceIp6;
         _state = State.SynReceived;
         _sndUna = iss;
         _sndNxt = iss;
@@ -204,7 +211,7 @@ internal sealed class PeerEgressTcpConnection
         Func<byte[], bool>? transmit)
     {
         var connection = new PeerEgressTcpConnection(syn, iss, idleTimeoutMs, nowMs);
-        var advertised = AdvertisedMss(pathMtu);
+        var advertised = AdvertisedMss(pathMtu, connection.IpHeaderBytes);
         connection._sndMss = syn.Mss > 0 ? Math.Min(syn.Mss, advertised) : advertised;
         connection.TryTransmit = transmit;
         connection._synAckMss = advertised;
@@ -219,11 +226,25 @@ internal sealed class PeerEgressTcpConnection
 
     public int SendMss => _sndMss;
 
-    private static int AdvertisedMss(int pathMtu)
+    private static int AdvertisedMss(int pathMtu, int ipHeaderBytes)
     {
-        var mss = pathMtu - PeerEgressSegment.Ipv4MinHeaderBytes - PeerEgressSegment.TcpMinHeaderBytes;
+        var mss = pathMtu - ipHeaderBytes - PeerEgressSegment.TcpMinHeaderBytes;
         return Math.Max(mss, PeerEgressSegment.DefaultMss);
     }
+
+    /// <summary>
+    /// What the flow's IP header takes out of the path MTU. An IPv6 header has no options here: the
+    /// egress writes none, and a consumer's packet with an extension header never reaches a flow.
+    /// </summary>
+    private int IpHeaderBytes => _ipv6 ? PeerEgressIpv6.HeaderBytes : PeerEgressSegment.Ipv4MinHeaderBytes;
+
+    /// <summary>
+    /// A segment of this flow, addressed in whichever family it was opened, so every segment it sends
+    /// goes back the way the consumer's came.
+    /// </summary>
+    private Segment Addressed(uint seq, uint ack, int flags, int window, int mss, byte[] payload) =>
+        new(_localIp, _remoteIp, _localPort, _remotePort, seq, ack, flags, window, mss, payload,
+            _ipv6, _localIp6, _remoteIp6);
 
     /// <summary>
     /// Renders one segment, queues it for retransmission when it occupies sequence space, and
@@ -243,8 +264,7 @@ internal sealed class PeerEgressTcpConnection
 
     private bool Emit(Output output, int flags, byte[] payload, long nowMs, int mss)
     {
-        var segment = new Segment(
-            _localIp, _remoteIp, _localPort, _remotePort,
+        var segment = Addressed(
             _sndNxt, _rcvNxt, flags,
             PeerEgressSegment.AdvertisedWindow(_rcvWnd), mss, payload);
         if (!Transmit(output, PeerEgressSegment.Build(segment))) { return false; }
@@ -283,8 +303,7 @@ internal sealed class PeerEgressTcpConnection
     /// </remarks>
     private void ResetFlow(Output output)
     {
-        output.Send(PeerEgressSegment.Build(new Segment(
-            _localIp, _remoteIp, _localPort, _remotePort,
+        output.Send(PeerEgressSegment.Build(Addressed(
             _sndNxt, 0, PeerEgressSegment.FlagRst, 0, 0, [])));
         _state = State.Closed;
         _retransmit.Clear();
@@ -752,7 +771,7 @@ internal sealed class PeerEgressTcpConnection
                     seq = entry.Seq;
                     payload = entry.Payload[..1];
                 }
-                Transmit(output, PeerEgressSegment.Build(new Segment(_localIp, _remoteIp, _localPort, _remotePort,
+                Transmit(output, PeerEgressSegment.Build(Addressed(
                     seq, _rcvNxt, PeerEgressSegment.FlagAck, PeerEgressSegment.AdvertisedWindow(_rcvWnd), 0, payload)));
             }
             return output;
@@ -774,8 +793,7 @@ internal sealed class PeerEgressTcpConnection
                 ResetFlow(output);
                 return output;
             }
-            if (!Transmit(output, PeerEgressSegment.Build(new Segment(
-                _localIp, _remoteIp, _localPort, _remotePort,
+            if (!Transmit(output, PeerEgressSegment.Build(Addressed(
                 entry.Seq, _rcvNxt, entry.Flags,
                 PeerEgressSegment.AdvertisedWindow(_rcvWnd), 0, _state == State.SynReceived ? entry.Payload
                     : entry.Payload[..Math.Min(entry.Payload.Length, _sndWnd)]))))
@@ -821,8 +839,7 @@ internal sealed class PeerEgressTcpConnection
         _keepaliveProbes++;
         _probed = true;
         _lastProbeMs = nowMs;
-        output.Send(PeerEgressSegment.Build(new Segment(
-            _localIp, _remoteIp, _localPort, _remotePort,
+        output.Send(PeerEgressSegment.Build(Addressed(
             _sndNxt - 1, _rcvNxt, PeerEgressSegment.FlagAck,
             PeerEgressSegment.AdvertisedWindow(_rcvWnd), 0, [])));
         return false;
