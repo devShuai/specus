@@ -157,6 +157,29 @@ int main(void)
         fprintf(stderr, "a GitHub release tag with surrounding spaces was not read trimmed\n");
         return 1;
     }
+    /* Java GitHubReleaseCatalogTests.mapsOnlyTrustedAssetsAndNormalizesReleaseTag: a trusted asset name
+     * whose URL carries a query (?raw=1) is not the exact release download URL, so it is dropped. */
+    count = 99U;
+    if (st_github_release_map(
+            "{\"tag_name\":\"v1.2.3\",\"published_at\":\"2026-08-22T00:00:00Z\",\"assets\":["
+            "{\"id\":101,\"name\":\"specus-client-java-v1.2.3.jar\","
+            "\"browser_download_url\":\"https://github.com/devShuai/specus/releases/download/v1.2.3/"
+            "specus-client-java-v1.2.3.jar\","
+            "\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"size\":4096},"
+            "{\"id\":102,\"name\":\"specus-client-go-v1.2.3-windows-x64.zip\","
+            "\"browser_download_url\":\"https://attacker.test/specus-client-go-v1.2.3-windows-x64.zip\","
+            "\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"size\":4096},"
+            "{\"id\":103,\"name\":\"specus-client-android-v1.2.3.apk\","
+            "\"browser_download_url\":\"https://github.com/devShuai/specus/releases/download/v1.2.3/"
+            "specus-client-android-v1.2.3.apk?raw=1\","
+            "\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"size\":4096}]}",
+            packages, ST_GITHUB_RELEASE_MAX_PACKAGES, &count) != 0
+        || count != 1U || strcmp(packages[0].implementation, "java") != 0
+        || strcmp(packages[0].version, "1.2.3") != 0 || packages[0].file_size != 4096
+        || strcmp(packages[0].sha256, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") != 0) {
+        fprintf(stderr, "a trusted asset name with a query-string URL was not dropped (count %zu)\n", count);
+        return 1;
+    }
     printf("github release tests passed\n");
     return 0;
 }

@@ -1318,6 +1318,21 @@ static int check_unknown_streams(test_server *server, client_pair *pair)
           "WINDOW_UPDATE");
     CHECK(expect_alive_without_rst(pair->data, UNKNOWN_STREAM_BASE + 3U) == 0,
           "credit for an unknown stream must be ignored");
+    /*
+     * Java NatServerHandlerTests.shouldResetUnknownTcpStreamWithoutClosingDataConnection: DATA then
+     * FIN on the same unknown stream each get RST, the crossing RST is ignored, the connection stays.
+     */
+    CHECK(send_nat(pair->data, ST_NAT_DATA, 0U, UNKNOWN_STREAM_BASE + 4U, 0U, NULL, "\x01\x02\x03", 3U) == 0,
+          "DATA on the shared stream");
+    CHECK(expect_rst(pair->data, UNKNOWN_STREAM_BASE + 4U, 7U) == 0, "DATA for an unknown stream must get RST 7");
+    CHECK(send_nat(pair->data, ST_NAT_FIN, 0U, UNKNOWN_STREAM_BASE + 4U, 0U, NULL, NULL, 0U) == 0,
+          "FIN on the shared stream");
+    CHECK(expect_rst(pair->data, UNKNOWN_STREAM_BASE + 4U, 7U) == 0,
+          "FIN after DATA on the same unknown stream must get RST 7 again");
+    CHECK(send_nat(pair->data, ST_NAT_RST, 0U, UNKNOWN_STREAM_BASE + 4U, 7U, NULL, NULL, 0U) == 0,
+          "crossing RST on the shared stream");
+    CHECK(expect_alive_without_rst(pair->data, UNKNOWN_STREAM_BASE + 4U) == 0,
+          "an RST crossing the server's resets must be ignored");
     return expect_data_connection_served(server, pair);
 }
 

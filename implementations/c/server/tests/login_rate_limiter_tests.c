@@ -36,6 +36,55 @@ static int expect_limited(const char *ip,
     return 0;
 }
 
+/* Java LoginRateLimiterTests, with its inputs: each budget leaves the other dimension's keys alone. */
+static int test_java_dimension_cases(void)
+{
+    st_login_rate_limit_config config = { .enabled = 1, .per_ip = 3U, .per_account = 100U, .window_seconds = 300 };
+    const int64_t now = 6000;
+
+    /* blocksPerSourceIpAcrossDifferentAccounts: another source IP is unaffected. */
+    st_login_rate_limiter_reset();
+    if (expect_allowed("203.0.113.10", "user-1", &config, now) != 0
+        || expect_allowed("203.0.113.10", "user-2", &config, now) != 0
+        || expect_allowed("203.0.113.10", "user-3", &config, now) != 0
+        || expect_limited("203.0.113.10", "user-4", &config, now, 300) != 0
+        || expect_allowed("203.0.113.11", "user-4", &config, now) != 0) {
+        fprintf(stderr, "per-IP budget leaked onto another source IP\n");
+        return 1;
+    }
+
+    /* blocksPerAccountAcrossRotatingSourceIps: casing cannot reset it; another account is unaffected. */
+    st_login_rate_limiter_reset();
+    config.per_ip = 100U;
+    config.per_account = 3U;
+    if (expect_allowed("203.0.113.1", "victim", &config, now) != 0
+        || expect_allowed("203.0.113.2", "victim", &config, now) != 0
+        || expect_allowed("203.0.113.3", "victim", &config, now) != 0
+        || expect_limited("203.0.113.99", "victim", &config, now, 300) != 0
+        || expect_limited("203.0.113.98", "VICTIM", &config, now, 300) != 0
+        || expect_allowed("203.0.113.97", "other-account", &config, now) != 0) {
+        fprintf(stderr, "per-account budget leaked onto another account\n");
+        return 1;
+    }
+
+    /*
+     * rejectionCarriesRetryAfterAndIdenticalMessageForKnownAndUnknownAccounts: the limiter never asks
+     * whether an account exists, so a known and an unknown name are refused alike with the same
+     * Retry-After; the message itself is written by the login handler, the same for both.
+     */
+    st_login_rate_limiter_reset();
+    config.per_ip = 1U;
+    config.per_account = 100U;
+    if (expect_allowed("203.0.113.10", "known-account", &config, now) != 0
+        || expect_limited("203.0.113.10", "known-account", &config, now, 300) != 0
+        || expect_limited("203.0.113.10", "does-not-exist", &config, now, 300) != 0) {
+        fprintf(stderr, "known and unknown accounts were not refused alike\n");
+        return 1;
+    }
+    st_login_rate_limiter_reset();
+    return 0;
+}
+
 int main(void)
 {
     st_login_rate_limit_config config = {
@@ -94,5 +143,5 @@ int main(void)
         }
     }
     st_login_rate_limiter_reset();
-    return 0;
+    return test_java_dimension_cases();
 }
