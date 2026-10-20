@@ -1539,6 +1539,13 @@ static int test_close_credit_timeout(void)
     CHECK(browser_send_close(fd, 1000U, "") == 0, "browser close failed");
     if (browser_expect_close(fd, 1000U, "") != 0) return 1;
     if (expect_nat_end(1, ST_ADMIN_DIRECT_WS_RST_BROWSER_GONE) != 0) return 1;
+    /* Java WebSocketSpecusHandlerTests.resetsCloseWhenPeerDoesNotReturnCredit sends reason
+     * "websocket close credit timeout"; C's RST reason differs only in case (src/admin_http.c). */
+    pthread_mutex_lock(&nat.lock);
+    char reason[128];
+    snprintf(reason, sizeof(reason), "%s", nat.end_reason);
+    pthread_mutex_unlock(&nat.lock);
+    CHECK(strcmp(reason, "WebSocket close credit timeout") == 0, "close credit reset reason %s", reason);
     long long waited = now_ms() - started;
     CHECK(waited >= 4500 && waited < 9000, "close credit wait took %lld ms", waited);
     CHECK(nat_envelope_count() == envelopes, "an envelope was sent without credit");

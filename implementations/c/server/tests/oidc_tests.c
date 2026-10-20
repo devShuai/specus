@@ -808,6 +808,27 @@ static void test_login_issues_local_token(void)
     CHECK(stored_issuer != NULL && strcmp(stored_issuer, issuer) == 0, "binding issuer not stored");
     CHECK(hash != NULL && strncmp(hash, "$pbkdf2-sha256$v=1$i=", strlen("$pbkdf2-sha256$v=1$i=")) == 0,
           "provisioned account has no real password hash");
+
+    /* The account key (the username column) is a generated UUID, not the login name, and the local
+     * token's uid claim names it (OidcControllerTests, ManagementUserServiceTests). */
+    char *account_key = db_text("SELECT username FROM specus_management_user WHERE login_name = ?", "alice");
+    CHECK(account_key != NULL && strlen(account_key) == 36 && strcmp(account_key, "alice") != 0,
+          "provisioned account key is not a generated UUID");
+    CHECK(account_key != NULL && strcmp(claims.account_key, account_key) == 0,
+          "local token uid claim does not name the provisioned account key");
+    char *subject = db_text("SELECT oidc_subject FROM specus_management_user WHERE login_name = ?", "alice");
+    char *enabled = db_text("SELECT enabled FROM specus_management_user WHERE login_name = ?", "alice");
+    char *created_at = db_text("SELECT created_at FROM specus_management_user WHERE login_name = ?", "alice");
+    char *updated_at = db_text("SELECT updated_at FROM specus_management_user WHERE login_name = ?", "alice");
+    CHECK(subject != NULL && strcmp(subject, "subject-alice") == 0, "binding subject not stored");
+    CHECK(enabled != NULL && strcmp(enabled, "1") == 0, "provisioned account is not enabled");
+    CHECK(created_at != NULL && created_at[0] != '\0' && updated_at != NULL && strcmp(created_at, updated_at) == 0,
+          "provisioned account's updated_at differs from created_at");
+    free(account_key);
+    free(subject);
+    free(enabled);
+    free(created_at);
+    free(updated_at);
     free(id_token);
     free(echoed);
     free(token_type);
@@ -1393,6 +1414,18 @@ static void test_direct_bearer_tokens(void)
               && contains(response, "\"tenantId\":\"default\"")
               && contains(response, "\"role\":\"USER\""),
           "a bound bearer did not resolve to its local user, tenant and role");
+    /* The bound row decides the tenant: moved to another tenant, the same bearer follows the row, and
+     * its tenant_id/role claims still choose nothing (ManagementContextResolverTests). */
+    CHECK(db_exec("UPDATE specus_management_user SET tenant_id='bound-tenant' WHERE login_name='alice'") == 0,
+          "cannot move alice to another tenant");
+    CHECK(admin_request("GET", "/api/admin/me", alice) == 200
+              && contains(response, "\"username\":\"alice\"")
+              && contains(response, "\"tenantId\":\"bound-tenant\"")
+              && contains(response, "\"role\":\"USER\"")
+              && !contains(response, "tenant-evil"),
+          "a bound bearer did not follow its account's tenant");
+    CHECK(db_exec("UPDATE specus_management_user SET tenant_id='default' WHERE login_name='alice'") == 0,
+          "cannot move alice back to the default tenant");
     CHECK(admin_request("GET", "/api/admin/users", alice) == 403, "a USER bearer reached an admin endpoint");
     test_oidc_ticket_account_binding(alice);
     CHECK(admin_request("POST", "/auth/refresh", alice) == 400

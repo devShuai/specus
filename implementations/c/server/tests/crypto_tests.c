@@ -1,5 +1,7 @@
 #include "crypto.h"
+#include "password_hash.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -9,6 +11,56 @@ static int expect_hex(const char *name, const uint8_t *bytes, size_t len, const 
     st_hex_encode(bytes, len, actual);
     if (strcmp(actual, expected) != 0) {
         fprintf(stderr, "%s mismatch\nexpected: %s\nactual:   %s\n", name, expected, actual);
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * The machine-secret comparison of src/admin_http.c (password_hash_matches, static there): SHA-256 of
+ * the secret as lowercase hex, compared in constant time against the stored hex decoded as 32 bytes.
+ * Composed here from the same primitives, as Java PasswordService.hashToken/tokenMatches.
+ */
+static int token_hash(const char *token, char out[ST_SHA256_HEX_LEN + 1U])
+{
+    uint8_t digest[ST_SHA256_LEN];
+    st_sha256((const uint8_t *)token, strlen(token), digest);
+    st_hex_encode(digest, sizeof(digest), out);
+    return 0;
+}
+
+static int token_matches(const char *token, const char *expected_hash)
+{
+    char actual_hex[ST_SHA256_HEX_LEN + 1U];
+    uint8_t actual[ST_SHA256_LEN];
+    uint8_t expected[ST_SHA256_LEN];
+    if (token_hash(token, actual_hex) != 0
+        || st_hex_decode_32(actual_hex, actual) != 0
+        || st_hex_decode_32(expected_hash, expected) != 0) {
+        return 0;
+    }
+    return st_constant_time_eq(actual, expected, sizeof(actual));
+}
+
+/* Java PasswordServiceTests.tokenHashingStaysADeterministicDigest. */
+static int test_token_digest(void)
+{
+    char token[ST_SHA256_HEX_LEN + 1U];
+    char again[ST_SHA256_HEX_LEN + 1U];
+    char upper[ST_SHA256_HEX_LEN + 1U];
+    char password_format[ST_PASSWORD_HASH_MAX_LEN + 1U];
+    token_hash("a-high-entropy-token", token);
+    token_hash("a-high-entropy-token", again);
+    for (size_t i = 0U; i <= ST_SHA256_HEX_LEN; ++i) {
+        upper[i] = (char)toupper((unsigned char)token[i]);
+    }
+    if (strlen(token) != ST_SHA256_HEX_LEN || strcmp(token, again) != 0 || token[0] == '$'
+        || !token_matches("a-high-entropy-token", token)
+        || token_matches("other", token)
+        || !token_matches("a-high-entropy-token", upper)
+        || st_password_hash("x", password_format) != 0
+        || token_matches("x", password_format)) {
+        fprintf(stderr, "token digest is not a deterministic, case-insensitive SHA-256 hex comparison\n");
         return 1;
     }
     return 0;
@@ -101,5 +153,5 @@ int main(void)
         return 1;
     }
 
-    return 0;
+    return test_token_digest();
 }

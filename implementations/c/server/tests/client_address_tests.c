@@ -97,6 +97,13 @@ int main(void)
                           "203.0.113.9",
                           NULL,
                           "10.0.0.0/8",
+                          "unknown") != 0
+        /* Java missingRequestOrAddressResolvesToUnknown: resolve("", null, null). */
+        || expect_address("empty remote",
+                          "",
+                          NULL,
+                          NULL,
+                          "",
                           "unknown") != 0) {
         return 1;
     }
