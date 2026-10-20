@@ -245,6 +245,11 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | `database/initialize` 的 `orm`/`dialect` 为 `sqlite3`/`sqlite` | 报的是实际实现：C 直接用 sqlite3 API，没有 JPA 与 Hibernate 方言 |
 | 不建 Java 的演示凭据 `demo-client`（secret `test1234`） | 公开的固定凭据，C 从不写入（test-map `LegacyDemoCredentialSanitizerIntegrationTests` 行）；演示客户端照常建 |
 | 流量统计同步写库，`/api/admin/traffic*` 的 `flush=true` 无事可做 | Java 在内存累计、定时写库，`flush` 先写出；C 每次转发即写 SQLite |
+| 每个 TURN allocation 同时有效的 permission 与 channel 各 32 个，一个 CreatePermission 最多 32 个对端，超出回 `400 bad-request` | Java/Go 用 Map 保存、不设上限。C 给单个已认证客户端能占用的内存设上界；过期的条目每秒清理并让出位置，浏览器 ICE 与 Peer Mesh relay 同时用到的对端远少于 32 个（`stun_turn_tests` 的 `test_expired_permissions_and_channels_recycled`；Issue #35 第 45 项） |
+| 备用端口上的 TURN 消息与未知方法：只对请求回 `400 unsupported-endpoint` / `400 unsupported-method`，指示与响应静默丢弃 | Java 对能解析的任何 STUN 消息都回 400。对错误响应再回一个错误响应，会在两台服务器之间、或源地址伪造成服务器自己时来回反弹；请求得到的应答与 Java 相同（`test_turn_wire_details`） |
+| Allocate 找不到可用的 relay 端口或 socket 时回 `508 insufficient-capacity` | Java `bindRelaySocket` 抛出异常，被接收循环吞掉，客户端收不到应答、只能重传到超时；C 立即回一个明确的错误 |
+| 没有中继相关的 Micrometer 指标：`specus.peer_mesh.turn.*`（relay 队列深度、高水位与丢弃，发送失败，通用中继字节、配额拒绝、目的地址拒绝与字节配额关闭）与 `specus.peer_mesh.relay.traffic.*`（flush 失败、待写字节、flush 滞后） | C 没有指标注册表与导出端点（`/api/admin/metrics` 是管理概览，不是 Micrometer），Java 默认的 actuator 也只暴露 health。对应事件 C 写日志：配额拒绝、字节配额关闭与目的地址拒绝写 `[peer-mesh][audit]` 行，批量写库失败写 `[peer-mesh] relay traffic flush failed` 行；relay 发送没有工作队列，见 test-map `StunTurnServerMetricsTests` 行 |
+| 会话关闭后，关闭前已经中继、还没写库的那批 relay 字节照记 | Java 本实例关闭会话（`markClosed`）时丢弃这部分 `pendingRelayBytes`，别的实例关闭的会话则照记（`persistRelayTrafficBatch`）；C 一律照记，只会少丢数据 |
 
 ## 9. 待办（按影响排序）
 
