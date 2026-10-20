@@ -3,6 +3,8 @@
 #include <string.h>
 
 #define CHECK(ok) do { if (!(ok)) { fprintf(stderr, "instant migration failed line%d: %s\n", __LINE__, sqlite3_errmsg(db)); return 1; } } while (0)
+static int commits = 0;
+static int count_commit(void *unused) { (void)unused; ++commits; return 0; }
 static const char *old[] = {"2026-09-15T12:00:00Z", "2026-09-15T12:00:00.125Z",
     "2026-09-15T12:00:00.000123Z", "2026-09-15T12:00:00.000000123Z"};
 static const char *normalized[] = {"2026-09-15T12:00:00.0000000Z", "2026-09-15T12:00:00.1250000Z",
@@ -51,9 +53,19 @@ int main(void)
     }
     long long changed = -1;
     CHECK(st_instant_migrate_column(db, "missing_table", "id", "at", &changed) == 0 && changed == 0);
+    /*
+     * Autocommit (records): one commit per batch of rewritten rows, not one per row. Inside a caller's
+     * transaction (tickets): no commit of its own, and the transaction is still open afterwards.
+     */
+    (void)sqlite3_commit_hook(db, count_commit, NULL);
     for (int mode = 0; mode < 2; ++mode) {
         const char *table = mode == 0 ? "records" : "tickets", *key = mode == 0 ? "id" : "token";
+        commits = 0;
+        if (mode == 1) CHECK(sqlite3_exec(db, "BEGIN", NULL, NULL, NULL) == SQLITE_OK);
         CHECK(st_instant_migrate_column(db, table, key, "at", &changed) == 0 && changed == row_count - row_count / 97);
+        if (mode == 0) CHECK(commits == (row_count + (int)ST_INSTANT_MIGRATION_BATCH - 1) / (int)ST_INSTANT_MIGRATION_BATCH);
+        if (mode == 1) CHECK(commits == 0 && sqlite3_get_autocommit(db) == 0
+                             && sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK);
         for (int repeat = 0; repeat < 2; ++repeat) {
             sqlite3_stmt *stmt = NULL;
             CHECK(sqlite3_prepare_v2(db, mode == 0 ? "SELECT id,at FROM records ORDER BY id" : "SELECT token,at FROM tickets ORDER BY token", -1, &stmt, NULL) == SQLITE_OK);

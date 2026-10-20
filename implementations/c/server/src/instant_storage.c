@@ -108,6 +108,12 @@ int st_instant_migrate_column(sqlite3 *db, const char *table, const char *key, c
         sqlite3_finalize(stmt); stmt = NULL;
         if (rc != SQLITE_ROW && rc != SQLITE_DONE) result = -1;
         if (result == 0 && count > 0U) {
+            /*
+             * One transaction per batch, unless the caller already holds one: in autocommit mode every
+             * UPDATE would be its own commit and fsync, so a database with thousands of legacy rows
+             * took one disk sync per row to start. Opened only once a row actually changes.
+             */
+            int own_transaction = 0;
             n = snprintf(sql, sizeof(sql), "UPDATE \"%s\" SET \"%s\"=?1 WHERE \"%s\"=?2 AND \"%s\"=?3", table, column, key, column);
             if (n < 0 || (size_t)n >= sizeof(sql) || sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) result = -1;
             for (size_t i = 0U; result == 0 && i < count; ++i) {
@@ -117,6 +123,10 @@ int st_instant_migrate_column(sqlite3 *db, const char *table, const char *key, c
                 char normalized[ST_INSTANT_CAPACITY];
                 if (old == NULL) { result = -1; break; }
                 if (bytes < 0 || bytes >= 48 || (int)strlen(old) != bytes || st_instant_normalize(old, normalized) != 0) continue;
+                if (!own_transaction && sqlite3_get_autocommit(db)) {
+                    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) { result = -1; break; }
+                    own_transaction = 1;
+                }
                 rc = sqlite3_bind_text(stmt, 1, normalized, -1, SQLITE_TRANSIENT);
                 if (rc == SQLITE_OK) rc = sqlite3_bind_value(stmt, 2, rows[i].key);
                 if (rc == SQLITE_OK) rc = sqlite3_bind_value(stmt, 3, rows[i].value);
@@ -126,6 +136,8 @@ int st_instant_migrate_column(sqlite3 *db, const char *table, const char *key, c
                 if (sqlite3_reset(stmt) != SQLITE_OK || sqlite3_clear_bindings(stmt) != SQLITE_OK) { result = -1; break; }
             }
             sqlite3_finalize(stmt); stmt = NULL;
+            if (own_transaction && result == 0 && sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) result = -1;
+            if (own_transaction && result != 0) (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
         }
         sqlite3_value_free(after); after = NULL;
         if (result == 0 && count == ST_INSTANT_MIGRATION_BATCH) {
