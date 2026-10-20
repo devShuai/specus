@@ -19,8 +19,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 #include <utf8proc.h>
@@ -64,9 +66,31 @@ typedef struct st_public_peer {
     st_public_cluster_participant cluster;
     time_t rate_window_started;
     unsigned int rate_window_count;
+    long write_timeout_ms;
+    /*
+     * Under public_peer_lock: refs counts threads that took the peer from the list and write to
+     * it after releasing the lock; its owner waits for zero before freeing it. linked is 1 while
+     * it is in public_peers (a peer dropped as Java's dropLocal drops one is unlinked at once).
+     */
+    unsigned int refs;
+    int linked;
+    /* Under send_lock: a frame failed or timed out, so the stream may be cut mid-frame. */
+    int dead;
     pthread_mutex_t send_lock;
     struct st_public_peer *next;
 } st_public_peer;
+
+/* Peers written to outside public_peer_lock; each entry holds a reference. */
+typedef struct {
+    st_public_peer *peer;
+    char *text; /* this recipient's own text, or NULL for the shared one */
+} st_public_delivery;
+
+typedef struct {
+    st_public_delivery *items;
+    size_t count;
+    size_t capacity;
+} st_public_deliveries;
 
 typedef struct {
     char *data;
@@ -74,7 +98,13 @@ typedef struct {
     size_t cap;
 } st_public_builder;
 
+/*
+ * Guards the peer list and the per-peer bookkeeping above. No socket write happens while it is
+ * held, so one slow browser only delays the threads writing to that browser (Java synchronizes
+ * a send on the target session alone).
+ */
 static pthread_mutex_t public_peer_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t public_peer_released = PTHREAD_COND_INITIALIZER;
 static st_public_peer *public_peers = NULL;
 static uint64_t public_roster_revision = 0U;
 static pthread_mutex_t public_discovery_init_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -844,7 +874,22 @@ static char *public_websocket_accept(const char *client_key)
     return accept;
 }
 
-static int public_send_frame_fd(int fd, uint8_t opcode, const uint8_t *payload, size_t payload_len)
+static long long public_now_ms(void)
+{
+    struct timespec now;
+    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000L;
+}
+
+/*
+ * Writes one whole frame, header and payload, within timeout_ms in total (a trickling reader
+ * cannot stretch it); -1 when it fails or does not finish in time.
+ */
+static int public_send_frame_fd(int fd,
+                                uint8_t opcode,
+                                const uint8_t *payload,
+                                size_t payload_len,
+                                long timeout_ms)
 {
     uint8_t header[10];
     size_t header_len;
@@ -864,9 +909,67 @@ static int public_send_frame_fd(int fd, uint8_t opcode, const uint8_t *payload, 
         }
         header_len = 10U;
     }
-    return public_send_all(fd, header, header_len) != 0
-        || (payload_len > 0U && public_send_all(fd, payload, payload_len) != 0)
-        ? -1 : 0;
+    struct iovec parts[2] = {
+        {.iov_base = header, .iov_len = header_len},
+        {.iov_base = (void *)payload, .iov_len = payload_len}
+    };
+    size_t part_count = payload_len > 0U ? 2U : 1U;
+    size_t part = 0U;
+    long long deadline = public_now_ms() + (timeout_ms < 0L ? 0L : timeout_ms);
+    while (part < part_count) {
+        struct msghdr message;
+        memset(&message, 0, sizeof(message));
+        message.msg_iov = parts + part;
+        message.msg_iovlen = part_count - part;
+        ssize_t written = sendmsg(fd, &message, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (written < 0 && errno == EINTR) continue;
+        if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            long long remaining = deadline - public_now_ms();
+            if (remaining <= 0) return -1;
+            struct pollfd poller = {.fd = fd, .events = POLLOUT, .revents = 0};
+            int ready = poll(&poller, 1, remaining > INT_MAX ? INT_MAX : (int)remaining);
+            if (ready < 0 && errno != EINTR) return -1;
+            if (ready > 0 && (poller.revents & (POLLERR | POLLNVAL)) != 0) return -1;
+            continue;
+        }
+        if (written <= 0) return -1;
+        size_t advance = (size_t)written;
+        while (advance > 0U && part < part_count) {
+            if (advance >= parts[part].iov_len) {
+                advance -= parts[part].iov_len;
+                ++part;
+            } else {
+                parts[part].iov_base = (uint8_t *)parts[part].iov_base + advance;
+                parts[part].iov_len -= advance;
+                advance = 0U;
+            }
+        }
+    }
+    return 0;
+}
+
+/*
+ * Tomcat closes a session whose blocking send fails or exceeds its timeout. Here the failed frame
+ * may already be partly written, so the peer is marked dead (no further frame can follow the cut
+ * one) and its socket shut down; its own thread then sees the end and removes it.
+ */
+static int public_peer_send_within(st_public_peer *peer,
+                                   uint8_t opcode,
+                                   const uint8_t *payload,
+                                   size_t payload_len,
+                                   long timeout_ms)
+{
+    pthread_mutex_lock(&peer->send_lock);
+    int result = -1;
+    if (!peer->dead) {
+        result = public_send_frame_fd(peer->fd, opcode, payload, payload_len, timeout_ms);
+        if (result != 0) {
+            peer->dead = 1;
+            (void)shutdown(peer->fd, SHUT_RDWR);
+        }
+    }
+    pthread_mutex_unlock(&peer->send_lock);
+    return result;
 }
 
 static int public_peer_send(st_public_peer *peer,
@@ -874,10 +977,7 @@ static int public_peer_send(st_public_peer *peer,
                             const uint8_t *payload,
                             size_t payload_len)
 {
-    pthread_mutex_lock(&peer->send_lock);
-    int result = public_send_frame_fd(peer->fd, opcode, payload, payload_len);
-    pthread_mutex_unlock(&peer->send_lock);
-    return result;
+    return public_peer_send_within(peer, opcode, payload, payload_len, peer->write_timeout_ms);
 }
 
 static int public_peer_send_text(st_public_peer *peer, const char *text)
@@ -1011,7 +1111,61 @@ static char *public_build_cluster_roster_text(const st_public_cluster_participan
     return builder.data;
 }
 
-static int public_send_roster_locked(st_public_peer *recipient, uint64_t revision)
+/* With public_peer_lock held: adds a reference to peer; text (owned, may be NULL) goes with it. */
+static int public_deliveries_add_locked(st_public_deliveries *list, st_public_peer *peer, char *text)
+{
+    if (list->count == list->capacity) {
+        size_t next = list->capacity == 0U ? 8U : list->capacity * 2U;
+        st_public_delivery *grown = (st_public_delivery *)realloc(list->items, next * sizeof(*grown));
+        if (grown == NULL) {
+            free(text);
+            return -1;
+        }
+        list->items = grown;
+        list->capacity = next;
+    }
+    list->items[list->count].peer = peer;
+    list->items[list->count].text = text;
+    ++list->count;
+    ++peer->refs;
+    return 0;
+}
+
+static void public_deliveries_release(st_public_deliveries *list)
+{
+    if (list->count > 0U) {
+        pthread_mutex_lock(&public_peer_lock);
+        int released = 0;
+        for (size_t i = 0U; i < list->count; ++i) {
+            if (--list->items[i].peer->refs == 0U) released = 1;
+        }
+        if (released) pthread_cond_broadcast(&public_peer_released);
+        pthread_mutex_unlock(&public_peer_lock);
+    }
+    for (size_t i = 0U; i < list->count; ++i) free(list->items[i].text);
+    free(list->items);
+    memset(list, 0, sizeof(*list));
+}
+
+/* Writes each entry's text, or the shared one, outside public_peer_lock. */
+static void public_deliver_texts(const st_public_deliveries *list, const char *shared)
+{
+    for (size_t i = 0U; i < list->count; ++i) {
+        const char *text = list->items[i].text != NULL ? list->items[i].text : shared;
+        if (text != NULL) (void)public_peer_send(list->items[i].peer, 0x1U,
+                                                 (const uint8_t *)text, strlen(text));
+    }
+}
+
+/* The owner's last step before freeing peer: no other thread may still write to it. */
+static void public_wait_unreferenced(st_public_peer *peer)
+{
+    pthread_mutex_lock(&public_peer_lock);
+    while (peer->refs > 0U) pthread_cond_wait(&public_peer_released, &public_peer_lock);
+    pthread_mutex_unlock(&public_peer_lock);
+}
+
+static char *public_build_roster_text_locked(const st_public_peer *recipient, uint64_t revision)
 {
     st_public_builder builder = {0};
     char number[32];
@@ -1032,17 +1186,22 @@ static int public_send_roster_locked(st_public_peer *recipient, uint64_t revisio
         first = 0;
     }
     if (!failed && public_builder_append(&builder, "]}") != 0) failed = 1;
-    int result = failed ? -1 : public_peer_send_text(recipient, builder.data);
-    free(builder.data);
-    return result;
+    if (failed) {
+        free(builder.data);
+        return NULL;
+    }
+    return builder.data;
 }
 
-static void public_broadcast_roster_locked(const st_public_peer *scope, uint64_t revision)
+/* Java emitRoster in process-local mode: every connection in scope's group or net gets its view. */
+static void public_collect_rosters_locked(st_public_deliveries *list,
+                                          const st_public_peer *scope,
+                                          uint64_t revision)
 {
     for (st_public_peer *peer = public_peers; peer != NULL; peer = peer->next) {
-        if (public_same_scope(scope, peer)) {
-            (void)public_send_roster_locked(peer, revision);
-        }
+        if (!public_same_scope(scope, peer)) continue;
+        char *text = public_build_roster_text_locked(peer, revision);
+        if (text != NULL) (void)public_deliveries_add_locked(list, peer, text);
     }
 }
 
@@ -1102,11 +1261,14 @@ static void public_cluster_event_handler(const st_public_cluster_event *event, v
             snapshot_of[i] = found;
             char *text = public_build_cluster_roster_text(&recipients[i], &snapshots[found]);
             if (text == NULL) continue;
+            st_public_deliveries target = {0};
             pthread_mutex_lock(&public_peer_lock);
             st_public_peer *peer = public_find_cluster_peer_locked(recipients[i].lease_id);
-            if (peer != NULL) (void)public_peer_send_text(peer, text);
+            if (peer != NULL) (void)public_deliveries_add_locked(&target, peer, text);
+            else free(text);
             pthread_mutex_unlock(&public_peer_lock);
-            free(text);
+            public_deliver_texts(&target, NULL);
+            public_deliveries_release(&target);
         }
         for (size_t i = 0U; snapshots != NULL && i < snapshot_count; ++i)
             st_public_coordination_roster_free(&snapshots[i]);
@@ -1124,6 +1286,7 @@ static void public_cluster_event_handler(const st_public_cluster_event *event, v
             free(payload);
             return;
         }
+        st_public_deliveries targets = {0};
         pthread_mutex_lock(&public_peer_lock);
         for (st_public_peer *peer = public_peers; peer != NULL; peer = peer->next) {
             if (strcmp(peer->cluster.group_id, event->group_id) != 0
@@ -1132,27 +1295,38 @@ static void public_cluster_event_handler(const st_public_cluster_event *event, v
                 && strcmp(peer->peer_id, event->target_peer_id) != 0) continue;
             if (event->exclude_source
                 && strcmp(peer->cluster.lease_id, event->source_lease_id) == 0) continue;
-            (void)public_peer_send_text(peer, payload);
+            (void)public_deliveries_add_locked(&targets, peer, NULL);
         }
         pthread_mutex_unlock(&public_peer_lock);
+        public_deliver_texts(&targets, payload);
+        public_deliveries_release(&targets);
         free(payload);
         return;
     }
     if (event->kind == ST_PUBLIC_CLUSTER_EVENT_BINARY
         && event->payload_len <= ST_PUBLIC_MAX_BINARY_BYTES) {
+        st_public_deliveries target = {0};
         pthread_mutex_lock(&public_peer_lock);
         for (st_public_peer *peer = public_peers; peer != NULL; peer = peer->next) {
             if ((strcmp(peer->cluster.group_id, event->group_id) == 0
                  || strcmp(peer->cluster.net_id, event->group_id) == 0)
                 && strcmp(peer->peer_id, event->target_peer_id) == 0) {
-                (void)public_peer_send(peer, 0x2U, event->payload, event->payload_len);
+                (void)public_deliveries_add_locked(&target, peer, NULL);
                 break;
             }
         }
         pthread_mutex_unlock(&public_peer_lock);
+        for (size_t i = 0U; i < target.count; ++i)
+            (void)public_peer_send(target.items[i].peer, 0x2U, event->payload, event->payload_len);
+        public_deliveries_release(&target);
     }
 }
 
+/*
+ * The hello is written while public_peer_lock still hides the new peer from other writers, so it
+ * is always the first frame. It is the first data on a fresh socket and fits its send buffer;
+ * the write is attempted once and never waits there.
+ */
 static int public_send_hello(st_public_peer *peer, uint64_t revision)
 {
     st_public_builder builder = {0};
@@ -1174,9 +1348,32 @@ static int public_send_hello(st_public_peer *peer, uint64_t revision)
         || public_builder_append(&builder, ",\"connectedAt\":")
         || public_builder_append_json(&builder, peer->connected_at)
         || public_builder_append(&builder, "}");
-    int result = failed ? -1 : public_peer_send_text(peer, builder.data);
+    int result = failed ? -1 : public_peer_send_within(peer, 0x1U, (const uint8_t *)builder.data,
+                                                         builder.len, 0L);
     free(builder.data);
     return result;
+}
+
+/* With public_peer_lock held: appends peer to the list. */
+static void public_link_locked(st_public_peer *peer)
+{
+    st_public_peer **tail = &public_peers;
+    while (*tail != NULL) tail = &(*tail)->next;
+    peer->next = NULL;
+    *tail = peer;
+    peer->linked = 1;
+}
+
+/* With public_peer_lock held: takes peer out of the list; 1 when it was in it. */
+static int public_unlink_locked(st_public_peer *peer)
+{
+    if (!peer->linked) return 0;
+    st_public_peer **cursor = &public_peers;
+    while (*cursor != NULL && *cursor != peer) cursor = &(*cursor)->next;
+    if (*cursor == peer) *cursor = peer->next;
+    peer->next = NULL;
+    peer->linked = 0;
+    return 1;
 }
 
 enum {
@@ -1210,11 +1407,9 @@ static int public_register_peer(st_public_peer *peer)
             }
         }
         pthread_mutex_lock(&public_peer_lock);
-        st_public_peer **tail = &public_peers;
-        while (*tail != NULL) tail = &(*tail)->next;
-        *tail = peer;
+        public_link_locked(peer);
         int send_result = public_send_hello(peer, revision);
-        if (send_result != 0) *tail = NULL;
+        if (send_result != 0) (void)public_unlink_locked(peer);
         pthread_mutex_unlock(&public_peer_lock);
         if (send_result != 0) {
             if (peer->discoverable) {
@@ -1229,22 +1424,23 @@ static int public_register_peer(st_public_peer *peer)
         }
         return PUBLIC_JOIN_OK;
     }
+    st_public_deliveries rosters = {0};
     size_t room_count = 0U;
     pthread_mutex_lock(&public_peer_lock);
     if (!peer->discoverable) {
-        st_public_peer **hidden_tail = &public_peers;
-        while (*hidden_tail != NULL) hidden_tail = &(*hidden_tail)->next;
-        *hidden_tail = peer;
+        public_link_locked(peer);
         int hidden_send = public_send_hello(peer, 0U);
-        if (hidden_send == 0) public_broadcast_roster_locked(peer, 0U);
-        else *hidden_tail = NULL;
+        if (hidden_send == 0) public_collect_rosters_locked(&rosters, peer, 0U);
+        else (void)public_unlink_locked(peer);
         pthread_mutex_unlock(&public_peer_lock);
-        return hidden_send == 0 ? 0 : -1;
+        public_deliver_texts(&rosters, NULL);
+        public_deliveries_release(&rosters);
+        return hidden_send == 0 ? PUBLIC_JOIN_OK : PUBLIC_JOIN_IO;
     }
     for (st_public_peer *existing = public_peers; existing != NULL; existing = existing->next) {
         if (public_same_scope(existing, peer) && strcmp(existing->peer_id, peer->peer_id) == 0) {
             pthread_mutex_unlock(&public_peer_lock);
-            return -2;
+            return PUBLIC_JOIN_DUPLICATE;
         }
         if (public_same_group(existing, peer)) {
             ++room_count;
@@ -1253,43 +1449,40 @@ static int public_register_peer(st_public_peer *peer)
     for (st_public_peer *existing = public_peers; existing != NULL; existing = existing->next) {
         if (public_names_equal_ignore_case(existing->display_name, peer->display_name)) {
             pthread_mutex_unlock(&public_peer_lock);
-            return -4;
+            return PUBLIC_JOIN_NAME;
         }
     }
     if (room_count >= (size_t)max_room) {
         pthread_mutex_unlock(&public_peer_lock);
-        return -3;
+        return PUBLIC_JOIN_FULL;
     }
-    st_public_peer **tail = &public_peers;
-    while (*tail != NULL) tail = &(*tail)->next;
-    *tail = peer;
+    public_link_locked(peer);
     uint64_t revision = ++public_roster_revision;
     int send_result = public_send_hello(peer, revision);
-    if (send_result == 0) {
-        public_broadcast_roster_locked(peer, revision);
-    } else {
-        *tail = NULL;
-    }
+    if (send_result == 0) public_collect_rosters_locked(&rosters, peer, revision);
+    else (void)public_unlink_locked(peer);
     pthread_mutex_unlock(&public_peer_lock);
-    return send_result == 0 ? 0 : -1;
+    /* The new peer is last in the list, so the others' rosters go out before its own. */
+    public_deliver_texts(&rosters, NULL);
+    public_deliveries_release(&rosters);
+    return send_result == 0 ? PUBLIC_JOIN_OK : PUBLIC_JOIN_IO;
 }
 
+/* Java afterConnectionClosed; a peer this instance dropped (dropLocal) is already forgotten. */
 static void public_remove_peer(st_public_peer *peer)
 {
-    int removed = 0;
+    st_public_deliveries rosters = {0};
+    int cluster = st_public_coordination_enabled();
     pthread_mutex_lock(&public_peer_lock);
-    st_public_peer **cursor = &public_peers;
-    while (*cursor != NULL && *cursor != peer) cursor = &(*cursor)->next;
-    if (*cursor == peer) {
-        *cursor = peer->next;
-        removed = 1;
-        if (peer->discoverable && !st_public_coordination_enabled()) {
-            uint64_t revision = ++public_roster_revision;
-            public_broadcast_roster_locked(peer, revision);
-        }
+    int removed = public_unlink_locked(peer);
+    if (removed && peer->discoverable && !cluster) {
+        uint64_t revision = ++public_roster_revision;
+        public_collect_rosters_locked(&rosters, peer, revision);
     }
     pthread_mutex_unlock(&public_peer_lock);
-    if (removed && peer->discoverable && st_public_coordination_enabled()) {
+    public_deliver_texts(&rosters, NULL);
+    public_deliveries_release(&rosters);
+    if (removed && peer->discoverable && cluster) {
         uint64_t revision = 0U;
         if (st_public_coordination_unregister(&peer->cluster, &revision) == 0
             && revision > 0U) {
@@ -1297,6 +1490,35 @@ static void public_remove_peer(st_public_peer *peer)
             (void)st_public_coordination_publish_roster(peer->cluster.net_id, revision);
         }
     }
+    public_wait_unreferenced(peer);
+}
+
+/*
+ * Java dropLocal(session, SERVER_ERROR): forgets the connection at once (so it is neither
+ * unregistered nor announced when it ends), closes it with 1011 and ends it. lease_id NULL drops
+ * every local connection, hidden ones included.
+ */
+static void public_drop_peers(const char *lease_id)
+{
+    st_public_deliveries dropped = {0};
+    pthread_mutex_lock(&public_peer_lock);
+    st_public_peer *peer = public_peers;
+    while (peer != NULL) {
+        st_public_peer *next = peer->next;
+        if (lease_id == NULL || strcmp(peer->cluster.lease_id, lease_id) == 0) {
+            if (public_deliveries_add_locked(&dropped, peer, NULL) == 0) (void)public_unlink_locked(peer);
+            if (lease_id != NULL) break;
+        }
+        peer = next;
+    }
+    pthread_mutex_unlock(&public_peer_lock);
+    for (size_t i = 0U; i < dropped.count; ++i) {
+        st_public_peer *target = dropped.items[i].peer;
+        uint8_t code[2] = {(uint8_t)(1011U >> 8U), (uint8_t)(1011U & 0xffU)};
+        (void)public_peer_send(target, 0x8U, code, sizeof(code));
+        (void)shutdown(target->fd, SHUT_RDWR);
+    }
+    public_deliveries_release(&dropped);
 }
 
 static int public_allow_message(st_public_peer *peer)
@@ -1327,29 +1549,6 @@ static int public_allow_message(st_public_peer *peer)
     if (peer->rate_window_count >= (unsigned long)limit) return 0;
     ++peer->rate_window_count;
     return 1;
-}
-
-/*
- * Java dropLocal(session, SERVER_ERROR): forgets the connection at once (so it is neither
- * unregistered nor announced when it ends), closes it with 1011 and ends it. lease_id NULL drops
- * every local connection, hidden ones included.
- */
-static void public_drop_peers(const char *lease_id)
-{
-    pthread_mutex_lock(&public_peer_lock);
-    st_public_peer **cursor = &public_peers;
-    while (*cursor != NULL) {
-        st_public_peer *peer = *cursor;
-        if (lease_id != NULL && strcmp(peer->cluster.lease_id, lease_id) != 0) {
-            cursor = &peer->next;
-            continue;
-        }
-        *cursor = peer->next;
-        public_peer_close(peer, 1011U);
-        (void)shutdown(peer->fd, SHUT_RDWR);
-        if (lease_id != NULL) break;
-    }
-    pthread_mutex_unlock(&public_peer_lock);
 }
 
 /* Appends value unless an equal string is already among the first count entries. */
@@ -1594,6 +1793,7 @@ static void public_route_text(st_public_peer *source, const char *json)
             (void)public_peer_send_error(source, "invalid message");
         }
     } else if (!failed) {
+        st_public_deliveries targets = {0};
         pthread_mutex_lock(&public_peer_lock);
         for (st_public_peer *peer = public_peers; peer != NULL; peer = peer->next) {
             int targeted = target != NULL && *target != '\0';
@@ -1602,10 +1802,12 @@ static void public_route_text(st_public_peer *source, const char *json)
             } else if (peer == source || !public_same_group(source, peer)) {
                 continue;
             }
-            (void)public_peer_send_text(peer, envelope.data);
+            (void)public_deliveries_add_locked(&targets, peer, NULL);
             if (targeted) break;
         }
         pthread_mutex_unlock(&public_peer_lock);
+        public_deliver_texts(&targets, envelope.data);
+        public_deliveries_release(&targets);
     }
     free(envelope.data);
     free(payload);
@@ -1683,14 +1885,18 @@ static int public_route_binary(st_public_peer *source, const uint8_t *frame, siz
             return -1;
         }
     } else {
+        st_public_deliveries target_peer = {0};
         pthread_mutex_lock(&public_peer_lock);
         for (st_public_peer *peer = public_peers; peer != NULL; peer = peer->next) {
             if (public_same_scope(source, peer) && strcmp(peer->peer_id, target) == 0) {
-                (void)public_peer_send(peer, 0x2U, outgoing, outgoing_len);
+                (void)public_deliveries_add_locked(&target_peer, peer, NULL);
                 break;
             }
         }
         pthread_mutex_unlock(&public_peer_lock);
+        for (size_t i = 0U; i < target_peer.count; ++i)
+            (void)public_peer_send(target_peer.items[i].peer, 0x2U, outgoing, outgoing_len);
+        public_deliveries_release(&target_peer);
     }
     free(outgoing);
     return 0;
@@ -1903,15 +2109,15 @@ int st_public_discovery_handle_websocket(int fd,
         free(peer);
         return 1;
     }
+    /*
+     * Each frame must be written within this time in total, as Tomcat bounds a blocking send
+     * (20 s there); a peer that does not take its frame in time is closed.
+     */
     long write_timeout = public_env_long(
         "SPECUS_PUBLIC_TRANSFER_DISCOVERY_WRITE_TIMEOUT_SECONDS",
         5L);
     if (write_timeout > 300L) write_timeout = 300L;
-    struct timeval send_timeout = {
-        .tv_sec = write_timeout,
-        .tv_usec = 0
-    };
-    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
+    peer->write_timeout_ms = write_timeout * 1000L;
     pthread_mutex_init(&peer->send_lock, NULL);
     free(ticket);
     /* Java normalizeDisplayName refuses ISO control characters when the connection joins. */
