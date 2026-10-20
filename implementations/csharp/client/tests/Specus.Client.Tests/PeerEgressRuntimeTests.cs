@@ -898,13 +898,13 @@ public partial class PeerEgressRuntimeTests
         Assert.Equal([PeerEgressCodes.ForbiddenDestination], harness.RejectCodes());
     }
 
-    /// <summary>Only an IPv6 target is dialled unbound; an IPv4-mapped one goes through the IPv4 choice.</summary>
+    /// <summary>Only an IPv6 target is bound from the IPv6 table; an IPv4-mapped one goes through the IPv4 choice.</summary>
     [Theory]
     [InlineData("2001:db8::10", true)]
     [InlineData("203.0.113.10", false)]
     [InlineData("::ffff:203.0.113.10", false)]
-    public void SocketsToIpv6TargetsAreLeftUnbound(string target, bool unbound) =>
-        Assert.Equal(unbound, PeerEgressSocketBinder.LeftUnbound(System.Net.IPAddress.Parse(target)));
+    public void SocketsToIpv6TargetsUseTheIpv6Table(string target, bool ipv6) =>
+        Assert.Equal(ipv6, PeerEgressSocketBinder.TargetIs6(System.Net.IPAddress.Parse(target)));
 
     /// <summary>
     /// A name that resolves only to what the policy forbids is refused, which is where DNS rebinding
