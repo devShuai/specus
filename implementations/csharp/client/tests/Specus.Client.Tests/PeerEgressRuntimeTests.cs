@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text;
+using Microsoft.Extensions.Logging;
 using Specus.Client.PeerMesh;
 using Specus.Protocol.PeerEgress;
 using Segment = Specus.Client.PeerMesh.PeerEgressSegment.Segment;
@@ -167,6 +168,11 @@ public partial class PeerEgressRuntimeTests
         /// flows can also leave their readers unstarted, since nothing it checks needs them.
         /// </summary>
         public Harness(Func<long>? rateClock, Action<Action>? executor, params string[] destinations)
+            : this(null, rateClock, executor, destinations)
+        {
+        }
+
+        public Harness(ILogger? logger, Func<long>? rateClock, Action<Action>? executor, params string[] destinations)
         {
             Runtime = new PeerEgressRuntime(
                 (_, frame) =>
@@ -179,6 +185,7 @@ public partial class PeerEgressRuntimeTests
                 this,
                 executor ?? (reader => new Thread(() => reader()) { IsBackground = true }.Start()),
                 () => Epoch,
+                logger,
                 rateClock: rateClock);
             Runtime.ApplyPolicy(Policy(destinations), PeerEgressContext.Default, Epoch);
         }
@@ -409,6 +416,65 @@ public partial class PeerEgressRuntimeTests
 
         WaitFor("payload to reach the socket", () => harness.Socket(0).Written.Count > 0);
         Assert.Equal("GET / HTTP/1.0\r\n\r\n", Encoding.ASCII.GetString(harness.Socket(0).Written[0]));
+    }
+
+    /// <summary>
+    /// The #256 signature: a new connection's SYN on a four-tuple the egress still holds is answered
+    /// with a reset without ACK, which the consumer's socket ignores. The egress logs what it was
+    /// holding, so the next occurrence in the lab says where the flow came from, and leaves the tuple
+    /// out of the log.
+    /// </summary>
+    [Fact]
+    public void LogsANewSynMeetingAHeldFlow()
+    {
+        var logger = new LinesLogger();
+        var harness = new Harness(logger, null, null);
+        var opening = Syn("100.96.0.1", 40000, "203.0.113.10", 443);
+        harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(opening)), Epoch);
+        harness.CompleteHandshake(7, opening);
+
+        var again = new Segment(opening.SourceIp, opening.DestinationIp, opening.SourcePort, opening.DestinationPort,
+            opening.Seq + 100000, 0, PeerEgressSegment.FlagSyn, 65535, 0, []);
+        var before = harness.Segments().Count;
+        harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(again)), Epoch + 2000);
+
+        var answers = harness.Segments().Skip(before).ToList();
+        Assert.Single(answers);
+        Assert.Equal(PeerEgressSegment.FlagRst, answers[0].Flags);
+        Assert.Equal(1, harness.DialCount);
+        var line = logger.Lines.FirstOrDefault(l => l.Contains("new SYN met an existing flow")) ?? "";
+        Assert.Contains("consumer=7 state=Established lingering=False age=2000ms", line);
+        Assert.DoesNotContain("203.0.113.10", line);
+        Assert.DoesNotContain("40000", line);
+    }
+
+    private sealed class LinesLogger : ILogger
+    {
+        private readonly List<string> _lines = [];
+
+        public List<string> Lines
+        {
+            get
+            {
+                lock (_lines)
+                {
+                    return [.. _lines];
+                }
+            }
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            lock (_lines)
+            {
+                _lines.Add(formatter(state, exception));
+            }
+        }
     }
 
     /// <summary>
