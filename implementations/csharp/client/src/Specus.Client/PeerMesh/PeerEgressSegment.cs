@@ -29,7 +29,10 @@ internal static class PeerEgressSegment
     /// <summary>What we advertise when the peer sends no MSS option: the IPv4 minimum everyone must accept.</summary>
     public const int DefaultMss = 536;
 
-    /// <summary>One parsed TCP segment together with the IPv4 addresses that carried it.</summary>
+    /// <summary>
+    /// One parsed TCP segment together with the addresses that carried it: the IPv4 ones, or, when
+    /// <see cref="Ipv6"/> is set, the IPv6 ones with the IPv4 fields left zero.
+    /// </summary>
     internal sealed record Segment(
         uint SourceIp,
         uint DestinationIp,
@@ -40,7 +43,10 @@ internal static class PeerEgressSegment
         int Flags,
         int Window,
         int Mss,
-        byte[] Payload)
+        byte[] Payload,
+        bool Ipv6 = false,
+        UInt128 SourceIp6 = default,
+        UInt128 DestinationIp6 = default)
     {
         public bool Has(int flag) => (Flags & flag) != 0;
 
@@ -106,6 +112,42 @@ internal static class PeerEgressSegment
             packet[(ihl + dataOffset)..total].ToArray());
     }
 
+    /// <summary>
+    /// Reads an IPv6 packet whose next header is TCP. Like <see cref="Parse"/> it returns null for
+    /// anything it cannot fully validate, a bad checksum included. A TCP header behind an extension
+    /// header is not read: the frame layer has already sent anything but a bare TCP or UDP payload to
+    /// the protocol refusal.
+    /// </summary>
+    public static Segment? Parse6(ReadOnlySpan<byte> packet)
+    {
+        if (!PeerEgressIpv6.TryPayload(packet, Ipv4ProtocolTcp, out var tcp) || tcp.Length < TcpMinHeaderBytes)
+        {
+            return null;
+        }
+        var dataOffset = (tcp[12] >> 4) * 4;
+        if (dataOffset < TcpMinHeaderBytes || dataOffset > tcp.Length)
+        {
+            return null;
+        }
+        var source = PeerEgressIpv6.SourceOf(packet);
+        var destination = PeerEgressIpv6.DestinationOf(packet);
+        if (PeerEgressIpv6.Checksum(source, destination, Ipv4ProtocolTcp, tcp) != 0)
+        {
+            return null;
+        }
+        return new Segment(
+            0, 0,
+            BinaryPrimitives.ReadUInt16BigEndian(tcp[0..2]),
+            BinaryPrimitives.ReadUInt16BigEndian(tcp[2..4]),
+            BinaryPrimitives.ReadUInt32BigEndian(tcp[4..8]),
+            BinaryPrimitives.ReadUInt32BigEndian(tcp[8..12]),
+            tcp[13],
+            BinaryPrimitives.ReadUInt16BigEndian(tcp[14..16]),
+            ParseMss(tcp[TcpMinHeaderBytes..dataOffset]),
+            tcp[dataOffset..].ToArray(),
+            Ipv6: true, SourceIp6: source, DestinationIp6: destination);
+    }
+
     private static int ParseMss(ReadOnlySpan<byte> options)
     {
         var cursor = 0;
@@ -140,8 +182,8 @@ internal static class PeerEgressSegment
     }
 
     /// <summary>
-    /// Renders a segment as a complete IPv4 packet, checksums included. An mss above zero emits the
-    /// MSS option, which is only meaningful on a SYN.
+    /// Renders a segment as a complete IPv4 packet, or IPv6 packet when the segment is IPv6, checksums
+    /// included. An mss above zero emits the MSS option, which is only meaningful on a SYN.
     /// </summary>
     public static byte[] Build(Segment segment)
     {
@@ -151,16 +193,23 @@ internal static class PeerEgressSegment
         optionBytes = (optionBytes + 3) / 4 * 4;
 
         var tcpLength = TcpMinHeaderBytes + optionBytes + segment.Payload.Length;
-        var packet = new byte[Ipv4MinHeaderBytes + tcpLength];
+        var tcp = segment.Ipv6 ? PeerEgressIpv6.HeaderBytes : Ipv4MinHeaderBytes;
+        var packet = new byte[tcp + tcpLength];
 
-        packet[0] = 0x45;
-        BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(2, 2), (ushort)packet.Length);
-        packet[8] = 64;
-        packet[9] = Ipv4ProtocolTcp;
-        BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(12, 4), segment.SourceIp);
-        BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(16, 4), segment.DestinationIp);
+        if (segment.Ipv6)
+        {
+            PeerEgressIpv6.WriteHeader(packet, Ipv4ProtocolTcp, tcpLength, segment.SourceIp6, segment.DestinationIp6);
+        }
+        else
+        {
+            packet[0] = 0x45;
+            BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(2, 2), (ushort)packet.Length);
+            packet[8] = 64;
+            packet[9] = Ipv4ProtocolTcp;
+            BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(12, 4), segment.SourceIp);
+            BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(16, 4), segment.DestinationIp);
+        }
 
-        const int tcp = Ipv4MinHeaderBytes;
         BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(tcp, 2), segment.SourcePort);
         BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(tcp + 2, 2), segment.DestinationPort);
         BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(tcp + 4, 4), segment.Seq);
@@ -177,6 +226,12 @@ internal static class PeerEgressSegment
         }
         segment.Payload.CopyTo(packet.AsSpan(tcp + TcpMinHeaderBytes + optionBytes));
 
+        if (segment.Ipv6)
+        {
+            BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(tcp + 16, 2), (ushort)PeerEgressIpv6.Checksum(
+                segment.SourceIp6, segment.DestinationIp6, Ipv4ProtocolTcp, packet.AsSpan(tcp)));
+            return packet;
+        }
         BinaryPrimitives.WriteUInt16BigEndian(
             packet.AsSpan(10, 2), (ushort)Checksum(packet.AsSpan(0, Ipv4MinHeaderBytes)));
         BinaryPrimitives.WriteUInt16BigEndian(
@@ -209,7 +264,8 @@ internal static class PeerEgressSegment
         return Build(new Segment(
             segment.DestinationIp, segment.SourceIp,
             segment.DestinationPort, segment.SourcePort,
-            seq, ack, flags, 0, 0, []));
+            seq, ack, flags, 0, 0, [],
+            segment.Ipv6, segment.DestinationIp6, segment.SourceIp6));
     }
 
     /// <summary>Reports a &lt; b in TCP's wrapping sequence space.</summary>

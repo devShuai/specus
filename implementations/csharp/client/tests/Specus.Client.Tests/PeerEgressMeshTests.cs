@@ -244,6 +244,33 @@ public class PeerEgressMeshTests : IDisposable
     }
 
     /// <summary>
+    /// An IPv6 packet is checked against the address derived from the session peer's mesh IPv4, which
+    /// the mesh hands the egress with the frame. Without it every IPv6 packet is dropped unanswered.
+    /// </summary>
+    [Fact]
+    public void AnIpv6PacketIsJudgedAgainstTheSessionPeersAddress()
+    {
+        var wiring = NewMesh();
+        wiring.ApplyEgressConfig(ConfigFor(1, "2001:db8:1::/48"));
+        Assert.True(PeerEgressMeshAddress.TryDerive("100.96.0.5", out var consumer));
+        Assert.True(Ipv6Cidr.TryParseAddress("2001:db8:1::c8", out var destination));
+        var syn = PeerEgressFrame.Encode(PeerEgressFrame.TypeIpPacket, false,
+            PeerEgressSegment.Build(new Segment(0, 0, 40000, 443, 1000, 0, PeerEgressSegment.FlagSyn, 65535, 1360, [],
+                Ipv6: true, SourceIp6: consumer, DestinationIp6: destination)));
+
+        Assert.True(wiring.HandleInboundFrame(7, syn), "the frame was not claimed");
+        Assert.True(wiring.HandleInboundFrame(7, "100.96.0.6", syn), "the frame was not claimed");
+        Thread.Sleep(50);
+        Assert.True(Frames().Count == 0, "an IPv6 packet from a source the session does not hold was answered");
+
+        Assert.True(wiring.HandleInboundFrame(7, "100.96.0.5", syn), "the frame was not claimed");
+        WaitFor("the SYN-ACK to be sent", () => Frames().Count > 0);
+        var decoded = PeerEgressFrame.Parse(Frames()[0], ipv6: true);
+        Assert.True(decoded.Accepted && decoded.Inner.Ipv6, "the answer is not an IPv6 packet");
+        Assert.Equal("fd53:7065:6375:7300::6460:5", decoded.Inner.DestinationIp);
+    }
+
+    /// <summary>
     /// A destination the policy does not cover is refused, and the refusal reaches the consumer as a
     /// control message rather than as silence.
     /// </summary>

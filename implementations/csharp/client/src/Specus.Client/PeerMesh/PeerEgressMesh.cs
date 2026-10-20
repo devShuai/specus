@@ -509,7 +509,14 @@ internal sealed class PeerEgressMesh(
     /// receive type=1 frames; the consumer claims only what is addressed to its own virtual IP, so
     /// trying it first costs nothing and keeps a reply from being judged as an egress request.</para>
     /// </remarks>
-    public bool HandleInboundFrame(long peerId, byte[] payload)
+    public bool HandleInboundFrame(long peerId, byte[] payload) => HandleInboundFrame(peerId, null, payload);
+
+    /// <summary>
+    /// <see cref="HandleInboundFrame(long, byte[])"/> from a peer whose mesh IPv4, as its authenticated
+    /// session has it, is <paramref name="peerMeshIp"/>: the address an IPv6 packet's source is checked
+    /// against. Without it the egress drops every IPv6 packet.
+    /// </summary>
+    public bool HandleInboundFrame(long peerId, string? peerMeshIp, byte[] payload)
     {
         if (!PeerEgressFrame.LooksLikeFrame(payload))
         {
@@ -537,7 +544,7 @@ internal sealed class PeerEgressMesh(
         {
             plane.SetPathMtu(pathMtu - PeerEgressFrame.HeaderBytes);
         }
-        return plane.HandleFrame(peerId, payload, nowMs);
+        return plane.HandleFrameFrom(peerId, peerMeshIp, payload, nowMs);
     }
 
     /// <summary>

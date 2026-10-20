@@ -18,7 +18,7 @@ namespace Specus.Client.Tests;
 /// <para>The dialer is injected, so an unreachable target, a hung connect and a connection that
 /// breaks mid-stream are all produced without a network.</para>
 /// </remarks>
-public class PeerEgressRuntimeTests
+public partial class PeerEgressRuntimeTests
 {
     private const long Epoch = 1_800_000_000_000L;
 
@@ -145,7 +145,7 @@ public class PeerEgressRuntimeTests
     }
 
     /// <summary>Everything a test needs to observe: what was sent, what was dialled, and which sockets.</summary>
-    private sealed class Harness : IPeerEgressDialer
+    private sealed partial class Harness : IPeerEgressDialer
     {
         private readonly List<byte[]> _frames = [];
         private readonly List<string> _dialed = [];
