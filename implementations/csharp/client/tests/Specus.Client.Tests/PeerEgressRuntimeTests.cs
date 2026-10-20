@@ -18,7 +18,7 @@ namespace Specus.Client.Tests;
 /// <para>The dialer is injected, so an unreachable target, a hung connect and a connection that
 /// breaks mid-stream are all produced without a network.</para>
 /// </remarks>
-public class PeerEgressRuntimeTests
+public partial class PeerEgressRuntimeTests
 {
     private const long Epoch = 1_800_000_000_000L;
 
@@ -145,7 +145,7 @@ public class PeerEgressRuntimeTests
     }
 
     /// <summary>Everything a test needs to observe: what was sent, what was dialled, and which sockets.</summary>
-    private sealed class Harness : IPeerEgressDialer
+    private sealed partial class Harness : IPeerEgressDialer
     {
         private readonly List<byte[]> _frames = [];
         private readonly List<string> _dialed = [];
@@ -898,13 +898,13 @@ public class PeerEgressRuntimeTests
         Assert.Equal([PeerEgressCodes.ForbiddenDestination], harness.RejectCodes());
     }
 
-    /// <summary>Only an IPv6 target is dialled unbound; an IPv4-mapped one goes through the IPv4 choice.</summary>
+    /// <summary>Only an IPv6 target is bound from the IPv6 table; an IPv4-mapped one goes through the IPv4 choice.</summary>
     [Theory]
     [InlineData("2001:db8::10", true)]
     [InlineData("203.0.113.10", false)]
     [InlineData("::ffff:203.0.113.10", false)]
-    public void SocketsToIpv6TargetsAreLeftUnbound(string target, bool unbound) =>
-        Assert.Equal(unbound, PeerEgressSocketBinder.LeftUnbound(System.Net.IPAddress.Parse(target)));
+    public void SocketsToIpv6TargetsUseTheIpv6Table(string target, bool ipv6) =>
+        Assert.Equal(ipv6, PeerEgressSocketBinder.TargetIs6(System.Net.IPAddress.Parse(target)));
 
     /// <summary>
     /// A name that resolves only to what the policy forbids is refused, which is where DNS rebinding

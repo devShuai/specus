@@ -448,6 +448,13 @@ public sealed class ClientEgressCapabilities
     [JsonPropertyName("ipv6TargetCapable")]
     public bool Ipv6TargetCapable { get; set; }
 
+    /// <summary>
+    /// The egress accepts IPv6 packets in SPEG1 frames (protocol/spec/peer-egress.md, IPv6 数据面).
+    /// Only consumers read it; it says nothing about whether this device sends IPv6 as a consumer.
+    /// </summary>
+    [JsonPropertyName("ipv6PacketCapable")]
+    public bool Ipv6PacketCapable { get; set; }
+
     /// <summary>What this build announces.</summary>
     /// <remarks>
     /// A consumer has to take over routes, which only the platforms with a route commander can do;
@@ -462,6 +469,7 @@ public sealed class ClientEgressCapabilities
         // records (PeerEgressRuntime.ResolveName).
         DomainTargetCapable = true,
         Ipv6TargetCapable = Specus.Client.PeerMesh.PeerEgressRuntime.Ipv6TargetCapable,
+        Ipv6PacketCapable = Specus.Client.PeerMesh.PeerEgressRuntime.Ipv6PacketCapable,
     };
 }
 

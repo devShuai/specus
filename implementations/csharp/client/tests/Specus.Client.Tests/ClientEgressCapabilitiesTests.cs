@@ -36,5 +36,12 @@ public class ClientEgressCapabilitiesTests
         // The egress honours name-bind, and dials a name with no A record over IPv6.
         Assert.True(capabilities.GetProperty("domainTargetCapable").GetBoolean());
         Assert.True(capabilities.GetProperty("ipv6TargetCapable").GetBoolean());
+        // The egress side of the IPv6 data plane is here; the consumer side is not, and announcing the
+        // packet capability must not have switched it on.
+        Assert.True(capabilities.TryGetProperty("ipv6PacketCapable", out var packets),
+            "ipv6PacketCapable must be present: the egress accepts IPv6 packets in SPEG1");
+        Assert.True(packets.GetBoolean(), "ipv6PacketCapable must be true: the egress accepts IPv6 packets in SPEG1");
+        Assert.False(PeerEgressRules.ConsumerCarriesIpv6,
+            "the consumer carries IPv6, but only the egress side of the data plane exists");
     }
 }

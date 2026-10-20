@@ -38,16 +38,21 @@ public static class PeerEgressFrame
 
     private static readonly byte[] Magic = Encoding.ASCII.GetBytes("SPEG1");
     private const int Ipv4MinHeaderBytes = 20;
+    private const int Ipv6HeaderBytes = 40;
     private const int ProtocolTcp = 6;
     private const int ProtocolUdp = 17;
 
-    /// <summary>The parsed IPv4 tuple of a type=1 body, filled only for that type.</summary>
+    /// <summary>
+    /// The parsed tuple of a type=1 body, filled only for that type. For an IPv6 body the addresses
+    /// are in RFC 5952 form and <see cref="Protocol"/> is the next header.
+    /// </summary>
     public sealed record Inner(
         string SourceIp,
         string DestinationIp,
         int Protocol,
         int SourcePort,
-        int DestinationPort)
+        int DestinationPort,
+        bool Ipv6 = false)
     {
         public static Inner Empty { get; } = new("", "", 0, 0, 0);
     }
@@ -72,13 +77,21 @@ public static class PeerEgressFrame
         payload.Length >= Magic.Length && payload[..Magic.Length].SequenceEqual(Magic);
 
     /// <summary>
-    /// Decodes one frame, returning the failing result code on rejection.
+    /// Decodes one frame as a receiver without the IPv6 data plane does, refusing an IPv6 body with
+    /// <c>EGRESS_IPV6_UNSUPPORTED</c>. The consumer reads frames this way: it does not carry IPv6
+    /// (<see cref="PeerEgressRules.ConsumerCarriesIpv6"/>).
+    /// </summary>
+    public static Decoded Parse(ReadOnlySpan<byte> payload) => Parse(payload, ipv6: false);
+
+    /// <summary>
+    /// Decodes one frame, returning the failing result code on rejection. <paramref name="ipv6"/> says
+    /// whether this receiver accepts an IPv6 body: an egress that announces <c>ipv6PacketCapable</c>.
     /// </summary>
     /// <remarks>
     /// The checks run in a fixed order so every implementation reports the same code for a frame
     /// that violates more than one constraint.
     /// </remarks>
-    public static Decoded Parse(ReadOnlySpan<byte> payload)
+    public static Decoded Parse(ReadOnlySpan<byte> payload, bool ipv6)
     {
         if (payload.Length < HeaderBytes)
         {
@@ -114,17 +127,27 @@ public static class PeerEgressFrame
                 : Decoded.Refused(code);
         }
 
-        var innerResult = ParseInnerPacket(body);
+        var innerResult = ParseInnerPacket(body, ipv6);
         return innerResult.Accepted
             ? new Decoded(type, false, body, innerResult.Inner, null)
             : innerResult;
     }
 
-    private static Decoded ParseInnerPacket(byte[] body)
+    /// <summary>
+    /// Reads a type=1 body. A body shorter than the smallest IPv4 header is truncated whatever its
+    /// version, as it was before IPv6 bodies were read: no IPv6 header fits in it either. Then the
+    /// version decides: 4 reads as IPv4, 6 as IPv6 when <paramref name="ipv6"/> is set, and anything
+    /// else is <c>EGRESS_IPV6_UNSUPPORTED</c>.
+    /// </summary>
+    private static Decoded ParseInnerPacket(byte[] body, bool ipv6)
     {
         if (body.Length < Ipv4MinHeaderBytes)
         {
             return Decoded.Refused(PeerEgressCodes.FrameTruncated);
+        }
+        if (ipv6 && (body[0] >> 4) == 6)
+        {
+            return ParseInnerPacket6(body);
         }
         if ((body[0] >> 4) != 4)
         {
@@ -158,6 +181,53 @@ public static class PeerEgressFrame
         var inner = new Inner(
             Dotted(body, 12), Dotted(body, 16), protocol, sourcePort, destinationPort);
         return new Decoded(TypeIpPacket, false, body, inner, null);
+    }
+
+    /// <summary>
+    /// Reads an IPv6 body (protocol/spec/peer-egress.md, IPv6 数据面, 出口).
+    /// </summary>
+    /// <remarks>
+    /// Only the fixed header is read: the next header is the protocol, and ports are taken when it is
+    /// TCP or UDP. An extension header is not walked; a packet that starts with one is refused later
+    /// by protocol, the way ICMP over IPv4 is. There are no jumbograms, so a payload length of zero
+    /// with bytes behind the header is trailing bytes like any other mismatch.
+    /// </remarks>
+    private static Decoded ParseInnerPacket6(byte[] body)
+    {
+        if (body.Length < Ipv6HeaderBytes)
+        {
+            return Decoded.Refused(PeerEgressCodes.FrameTruncated);
+        }
+        var total = Ipv6HeaderBytes + ((body[4] << 8) | body[5]);
+        if (total > body.Length)
+        {
+            return Decoded.Refused(PeerEgressCodes.FrameTruncated);
+        }
+        if (total < body.Length)
+        {
+            return Decoded.Refused(PeerEgressCodes.FrameTrailingBytes);
+        }
+        int nextHeader = body[6];
+        var sourcePort = 0;
+        var destinationPort = 0;
+        if ((nextHeader == ProtocolTcp || nextHeader == ProtocolUdp) && body.Length >= Ipv6HeaderBytes + 4)
+        {
+            sourcePort = (body[Ipv6HeaderBytes] << 8) | body[Ipv6HeaderBytes + 1];
+            destinationPort = (body[Ipv6HeaderBytes + 2] << 8) | body[Ipv6HeaderBytes + 3];
+        }
+        var inner = new Inner(Address6(body, 8), Address6(body, 24), nextHeader, sourcePort, destinationPort,
+            Ipv6: true);
+        return new Decoded(TypeIpPacket, false, body, inner, null);
+    }
+
+    private static string Address6(byte[] packet, int offset)
+    {
+        var value = UInt128.Zero;
+        for (var index = 0; index < 16; index++)
+        {
+            value = (value << 8) | packet[offset + index];
+        }
+        return Ipv6Cidr.FormatAddress(value);
     }
 
     private static string Dotted(byte[] packet, int offset) =>

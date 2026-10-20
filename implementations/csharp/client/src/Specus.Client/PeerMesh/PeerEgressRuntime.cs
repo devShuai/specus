@@ -265,20 +265,28 @@ internal sealed class PeerEgressRuntime
     }
 
     /// <summary>
-    /// The SPEG1 entry point: one decrypted payload from one consumer.
+    /// <see cref="HandleFrameFrom"/> for a consumer whose mesh address is not known, which carries
+    /// IPv4 only: an IPv6 packet's source has nothing to be checked against, so every one is dropped.
+    /// </summary>
+    public bool HandleFrame(long consumer, byte[] payload, long nowMs) =>
+        HandleFrameFrom(consumer, "", payload, nowMs);
+
+    /// <summary>
+    /// The SPEG1 entry point: one decrypted payload from one consumer, whose mesh IPv4 address, as the
+    /// authenticated session has it, is <paramref name="consumerMeshIp"/>.
     /// </summary>
     /// <remarks>
     /// Returns false when the payload is not an egress frame at all, so the mesh dispatch can go on
     /// to its other cases. A payload that carries the magic but nothing valid returns true, because
     /// it was addressed here and has already been refused with its own code.
     /// </remarks>
-    public bool HandleFrame(long consumer, byte[] payload, long nowMs)
+    public bool HandleFrameFrom(long consumer, string? consumerMeshIp, byte[] payload, long nowMs)
     {
         if (!PeerEgressFrame.LooksLikeFrame(payload))
         {
             return false;
         }
-        var frame = PeerEgressFrame.Parse(payload);
+        var frame = PeerEgressFrame.Parse(payload, Ipv6PacketCapable);
         if (!frame.Accepted)
         {
             Refuse(consumer, null, frame.Code!, nowMs);
@@ -286,7 +294,14 @@ internal sealed class PeerEgressRuntime
         }
         if (frame.Type == PeerEgressFrame.TypeIpPacket)
         {
-            HandleInnerPacket(consumer, frame, nowMs);
+            if (frame.Inner.Ipv6)
+            {
+                HandleInnerPacket6(consumer, consumerMeshIp, frame, nowMs);
+            }
+            else
+            {
+                HandleInnerPacket(consumer, frame, nowMs);
+            }
         }
         else if (frame.Type == PeerEgressFrame.TypeControl)
         {
@@ -327,6 +342,55 @@ internal sealed class PeerEgressRuntime
             return;
         }
         Refuse(consumer, new PeerEgressFlowTable.Key(protocol, 0, 0, 0, 0),
+            PeerEgressCodes.FrameTruncated, nowMs);
+    }
+
+    /// <summary>
+    /// <see cref="HandleInnerPacket"/> for an IPv6 body (protocol/spec/peer-egress.md, IPv6 数据面, 出口).
+    /// </summary>
+    /// <remarks>
+    /// The protocol goes first, as for IPv4: anything but TCP and UDP -- ICMPv6, and any packet that
+    /// starts with an extension or fragment header -- is refused with <c>EGRESS_PROTOCOL_DENIED</c>.
+    ///
+    /// <para>Then the source. It has to be the address derived from the session peer's mesh IPv4, or a
+    /// consumer could speak for another device the policy allows. IPv4 has no counterpart to this in
+    /// this client: the session alone identifies the consumer there. A forged source is dropped with
+    /// no answer and no count; nothing is owed to an address the sender does not hold.</para>
+    ///
+    /// <para>The destination is judged when the flow opens, as for IPv4: the derived prefix stands in
+    /// the forced-deny list the way the mesh network does.</para>
+    /// </remarks>
+    private void HandleInnerPacket6(long consumer, string? consumerMeshIp, PeerEgressFrame.Decoded frame, long nowMs)
+    {
+        var protocol = frame.Inner.Protocol;
+        if (protocol != PeerEgressSegment.Ipv4ProtocolTcp && protocol != PeerEgressDatagram.Ipv4ProtocolUdp)
+        {
+            Refuse(
+                consumer,
+                new PeerEgressFlowTable.Key(protocol, 0, 0, 0, (ushort)frame.Inner.DestinationPort, Ipv6: true),
+                PeerEgressCodes.ProtocolDenied,
+                nowMs);
+            return;
+        }
+        if (!PeerEgressMeshAddress.TryDerive(consumerMeshIp, out var expected)
+            || PeerEgressIpv6.SourceOf(frame.Body) != expected)
+        {
+            return;
+        }
+        if (protocol == PeerEgressSegment.Ipv4ProtocolTcp)
+        {
+            if (PeerEgressSegment.Parse6(frame.Body) is { } segment)
+            {
+                HandleSegment(consumer, segment, nowMs);
+                return;
+            }
+        }
+        else if (PeerEgressDatagram.Parse6(frame.Body) is { } datagram)
+        {
+            HandleDatagram(consumer, datagram, nowMs);
+            return;
+        }
+        Refuse(consumer, new PeerEgressFlowTable.Key(protocol, 0, 0, 0, 0, Ipv6: true),
             PeerEgressCodes.FrameTruncated, nowMs);
     }
 
@@ -386,9 +450,7 @@ internal sealed class PeerEgressRuntime
     /// <summary>Drives one TCP segment from a consumer.</summary>
     private void HandleSegment(long consumer, PeerEgressSegment.Segment segment, long nowMs)
     {
-        var key = new PeerEgressFlowTable.Key(
-            PeerEgressSegment.Ipv4ProtocolTcp,
-            segment.SourceIp, segment.SourcePort, segment.DestinationIp, segment.DestinationPort);
+        var key = PeerEgressFlowTable.Key.Of(segment);
 
         Monitor.Enter(_lock);
         var flow = _flows.Lookup(key);
@@ -685,9 +747,7 @@ internal sealed class PeerEgressRuntime
     /// </summary>
     private void HandleDatagram(long consumer, PeerEgressDatagram.Datagram datagram, long nowMs)
     {
-        var key = new PeerEgressFlowTable.Key(
-            PeerEgressDatagram.Ipv4ProtocolUdp,
-            datagram.SourceIp, datagram.SourcePort, datagram.DestinationIp, datagram.DestinationPort);
+        var key = PeerEgressFlowTable.Key.Of(datagram);
 
         Monitor.Enter(_lock);
         var flow = _flows.Lookup(key);
@@ -833,7 +893,8 @@ internal sealed class PeerEgressRuntime
                 // reply can only ever claim the address the consumer asked us to contact.
                 EmitSegment(consumer, PeerEgressDatagram.Build(new PeerEgressDatagram.Datagram(
                     flow.Key.RemoteIp, flow.Key.ConsumerIp,
-                    flow.Key.RemotePort, flow.Key.ConsumerPort, payload)));
+                    flow.Key.RemotePort, flow.Key.ConsumerPort, payload,
+                    flow.Key.Ipv6, flow.Key.RemoteIp6, flow.Key.ConsumerIp6)));
             }
         });
     }
@@ -919,7 +980,7 @@ internal sealed class PeerEgressRuntime
     /// </remarks>
     private (PeerEgressFlowTable.Flow? Flow, string? Code, bool Opened) Reserve(
         long consumer, PeerEgressFlowTable.Key key, long nowMs) =>
-        ReserveTo(consumer, key, TargetOf(key.RemoteIp), nowMs);
+        ReserveTo(consumer, key, key.RemoteAddress(), nowMs);
 
     /// <summary>
     /// Reserve for a flow whose socket goes to destination, which differs from the key's remote
@@ -1030,6 +1091,14 @@ internal sealed class PeerEgressRuntime
     internal const bool Ipv6TargetCapable = true;
 
     /// <summary>
+    /// Whether this egress accepts IPv6 packets in SPEG1 type=1 frames, and so announces
+    /// <c>ipv6PacketCapable</c> (protocol/spec/peer-egress.md, IPv6 数据面). The consumer side is
+    /// separate: <see cref="PeerEgressRules.ConsumerCarriesIpv6"/> says whether this device sends IPv6
+    /// to an egress, and stays false until the consumer data plane exists.
+    /// </summary>
+    internal const bool Ipv6PacketCapable = true;
+
+    /// <summary>
     /// An address the way the judgment reads it: dotted for IPv4 and RFC 5952 for IPv6, never the
     /// dotted form <see cref="IPAddress.ToString()"/> uses for an IPv4-mapped one, and without a scope.
     /// </summary>
@@ -1061,6 +1130,11 @@ internal sealed class PeerEgressRuntime
     /// <remarks>Null for a second packet of a flow whose name is still resolving: the first one is opening it.</remarks>
     private Choice? ResolveDestination(long consumer, PeerEgressFlowTable.Key key)
     {
+        if (key.Ipv6)
+        {
+            // Names are bound to IPv4 fake addresses only.
+            return new Choice(key.RemoteAddress(), null);
+        }
         string? name;
         Func<string, IReadOnlyList<IPAddress>> resolver;
         lock (_lock)
@@ -1098,7 +1172,7 @@ internal sealed class PeerEgressRuntime
     /// closes the flow it makes stale or is in place before the flow opens, never in between.
     /// </summary>
     private bool BindingMoved(long consumer, PeerEgressFlowTable.Key key, string? name) =>
-        !string.Equals(_names.Lookup(consumer, key.RemoteIp), name, StringComparison.Ordinal);
+        !key.Ipv6 && !string.Equals(_names.Lookup(consumer, key.RemoteIp), name, StringComparison.Ordinal);
 
     /// <summary>
     /// This device's own resolver: the egress resolves in its own network, which is the point of
@@ -1164,8 +1238,8 @@ internal sealed class PeerEgressRuntime
         }
         EmitFrame(consumer, PeerEgressFrame.TypeControl,
             PeerEgressFrame.EncodeControl(PeerEgressFrame.Control.FlowReject(
-                subject.ProtocolName(), Ipv4Cidr.FormatAddress(subject.ConsumerIp),
-                subject.ConsumerPort, Ipv4Cidr.FormatAddress(subject.RemoteIp),
+                subject.ProtocolName(), subject.ConsumerText(),
+                subject.ConsumerPort, subject.RemoteText(),
                 subject.RemotePort, code)));
     }
 
@@ -1260,8 +1334,8 @@ internal sealed class PeerEgressRuntime
             Rejections.Record(flow.Consumer, entry.Code, nowMs);
             EmitFrame(flow.Consumer, PeerEgressFrame.TypeControl,
                 PeerEgressFrame.EncodeControl(PeerEgressFrame.Control.FlowReject(
-                    flow.Key.ProtocolName(), Ipv4Cidr.FormatAddress(flow.Key.ConsumerIp),
-                    flow.Key.ConsumerPort, Ipv4Cidr.FormatAddress(flow.Key.RemoteIp),
+                    flow.Key.ProtocolName(), flow.Key.ConsumerText(),
+                    flow.Key.ConsumerPort, flow.Key.RemoteText(),
                     flow.Key.RemotePort, entry.Code)));
         }
         if (revoked.Count > 0)

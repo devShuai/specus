@@ -35,10 +35,39 @@ internal sealed class PeerEgressFlowTable
     /// Keying on the consumer's source port alone would be wrong, not merely coarse. Two datagrams
     /// leaving the same consumer port for different destinations are separate sessions; collapsing
     /// them onto one socket would send the second destination's traffic to the first.
+    ///
+    /// <para>An IPv6 flow (protocol/spec/peer-egress.md, IPv6 数据面) holds its addresses in
+    /// <see cref="ConsumerIp6"/> and <see cref="RemoteIp6"/> and leaves the IPv4 ones zero;
+    /// <see cref="Ipv6"/> keeps it apart from an IPv4 flow whose addresses are zero.</para>
     /// </remarks>
     internal readonly record struct Key(
-        int Protocol, uint ConsumerIp, ushort ConsumerPort, uint RemoteIp, ushort RemotePort)
+        int Protocol, uint ConsumerIp, ushort ConsumerPort, uint RemoteIp, ushort RemotePort,
+        bool Ipv6 = false, UInt128 ConsumerIp6 = default, UInt128 RemoteIp6 = default)
     {
+        /// <summary>The key of a segment arriving from a consumer.</summary>
+        public static Key Of(PeerEgressSegment.Segment segment) => new(
+            PeerEgressSegment.Ipv4ProtocolTcp, segment.SourceIp, segment.SourcePort,
+            segment.DestinationIp, segment.DestinationPort,
+            segment.Ipv6, segment.SourceIp6, segment.DestinationIp6);
+
+        /// <summary>The key of a datagram arriving from a consumer.</summary>
+        public static Key Of(PeerEgressDatagram.Datagram datagram) => new(
+            PeerEgressDatagram.Ipv4ProtocolUdp, datagram.SourceIp, datagram.SourcePort,
+            datagram.DestinationIp, datagram.DestinationPort,
+            datagram.Ipv6, datagram.SourceIp6, datagram.DestinationIp6);
+
+        /// <summary>The remote address, of either family, in the form a dialled address takes.</summary>
+        public System.Net.IPAddress RemoteAddress() =>
+            Ipv6 ? PeerEgressIpv6.ToAddress(RemoteIp6) : PeerEgressRuntime.TargetOf(RemoteIp);
+
+        /// <summary>The consumer address as a flow-reject writes it: dotted, or RFC 5952.</summary>
+        public string ConsumerText() =>
+            Ipv6 ? Ipv6Cidr.FormatAddress(ConsumerIp6) : Ipv4Cidr.FormatAddress(ConsumerIp);
+
+        /// <summary>The remote address as a flow-reject writes it: dotted, or RFC 5952.</summary>
+        public string RemoteText() =>
+            Ipv6 ? Ipv6Cidr.FormatAddress(RemoteIp6) : Ipv4Cidr.FormatAddress(RemoteIp);
+
         public string ProtocolName() => Protocol switch
         {
             PeerEgressSegment.Ipv4ProtocolTcp => "tcp",
@@ -70,7 +99,7 @@ internal sealed class PeerEgressFlowTable
         /// address; for a flow opened for a name, the address the name resolved to, while the key
         /// keeps the consumer's fake address. Re-authorization judges this one, as admission did.
         /// </summary>
-        public System.Net.IPAddress Dialed { get; set; } = PeerEgressRuntime.TargetOf(key.RemoteIp);
+        public System.Net.IPAddress Dialed { get; set; } = key.RemoteAddress();
 
         /// <summary>
         /// A TCP flow in TIME_WAIT: its socket is closed and it no longer counts against the limits,
@@ -250,18 +279,30 @@ internal sealed class PeerEgressFlowTable
     ///
     /// <para>An unparseable prefix is skipped rather than treated as matching everything: a
     /// malformed purge should close nothing, not the whole table.</para>
+    ///
+    /// <para>A prefix is IPv4 or IPv6, and only ever matches flows of its own family: ::/0 holds no
+    /// IPv4 flow, 0.0.0.0/0 no IPv6 one.</para>
     /// </remarks>
     public List<Flow> PurgeDestinations(long consumer, IReadOnlyList<string>? destinations)
     {
         var prefixes = new List<Ipv4Cidr>();
+        var prefixes6 = new List<Ipv6Cidr>();
         foreach (var text in destinations ?? [])
         {
+            if (text is not null && text.Contains(':', StringComparison.Ordinal))
+            {
+                if (Ipv6Cidr.TryParse(text.Trim(), out var cidr6))
+                {
+                    prefixes6.Add(cidr6);
+                }
+                continue;
+            }
             if (Ipv4Cidr.TryParse(text, out var cidr))
             {
                 prefixes.Add(cidr);
             }
         }
-        if (prefixes.Count == 0)
+        if (prefixes.Count == 0 && prefixes6.Count == 0)
         {
             return [];
         }
@@ -270,6 +311,10 @@ internal sealed class PeerEgressFlowTable
             if (consumer != 0 && flow.Consumer != consumer)
             {
                 return false;
+            }
+            if (flow.Key.Ipv6)
+            {
+                return prefixes6.Exists(prefix => prefix.Contains(flow.Key.RemoteIp6));
             }
             foreach (var prefix in prefixes)
             {
@@ -292,10 +337,12 @@ internal sealed class PeerEgressFlowTable
     /// more of it. Closed, the next packet opens the flow by name. A flow opened for another name is
     /// closed for the same reason: the address stands for something else now. The same name bound
     /// again closes nothing. Whether the consumer hears of a closed flow is the caller's to decide,
-    /// by <see cref="Flow.Name"/>.
+    /// by <see cref="Flow.Name"/>. Names are bound to IPv4 fake addresses only, so no IPv6 flow is
+    /// ever one of them.
     /// </remarks>
     public List<Flow> Rebind(long consumer, uint address, string name) =>
         Reap(flow => flow.Consumer == consumer
+            && !flow.Key.Ipv6
             && flow.Key.RemoteIp == address
             && !string.Equals(flow.Name, name, StringComparison.Ordinal));
 
@@ -412,8 +459,19 @@ internal sealed class PeerEgressFlowTable
             {
                 return order;
             }
+            // IPv4 flows first, then IPv6 ones.
+            order = left.Key.Ipv6.CompareTo(right.Key.Ipv6);
+            if (order != 0)
+            {
+                return order;
+            }
             // Addresses are unsigned; comparing them as signed would order 10.x above 200.x.
             order = left.Key.ConsumerIp.CompareTo(right.Key.ConsumerIp);
+            if (order != 0)
+            {
+                return order;
+            }
+            order = left.Key.ConsumerIp6.CompareTo(right.Key.ConsumerIp6);
             if (order != 0)
             {
                 return order;
@@ -424,6 +482,11 @@ internal sealed class PeerEgressFlowTable
                 return order;
             }
             order = left.Key.RemoteIp.CompareTo(right.Key.RemoteIp);
+            if (order != 0)
+            {
+                return order;
+            }
+            order = left.Key.RemoteIp6.CompareTo(right.Key.RemoteIp6);
             return order != 0 ? order : left.Key.RemotePort.CompareTo(right.Key.RemotePort);
         });
 }

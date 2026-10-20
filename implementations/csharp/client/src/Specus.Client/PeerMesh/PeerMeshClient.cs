@@ -2325,7 +2325,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         // Before the authenticated-endpoint check below: a payload carrying the SPEG1 magic is
         // addressed to the egress path and must be refused with its own code rather than dropped
         // here as an unrecognised mesh packet.
-        if (_egress.HandleInboundFrame(session.PeerId, frame.Payload))
+        // The session's peer address is what an IPv6 packet's source is checked against: the
+        // consumer's derived address, not whatever the packet claims.
+        if (_egress.HandleInboundFrame(session.PeerId, session.PeerVirtualIp, frame.Payload))
         {
             return;
         }
