@@ -107,13 +107,28 @@ internal static class PeerEgressRoutePlanner
     /// </remarks>
     public static PeerEgressRoutePlan Plan(
         IReadOnlyList<PeerEgressRule> rules, IReadOnlyList<string>? bypass, string? meshCidr,
-        Ipv4Cidr? fakeIpPool)
+        Ipv4Cidr? fakeIpPool) => Plan(rules, bypass, meshCidr, fakeIpPool, carriesIpv6: false);
+
+    /// <summary>
+    /// Works out the routes with the consumer's IPv6 data plane stated.
+    /// </summary>
+    /// <remarks>
+    /// The two families are planned apart and by the same rules (protocol/spec/peer-egress.md, IPv6
+    /// 数据面, 消费端): exact IPv6 prefixes, nothing invented -- no <c>::/0</c> and no <c>::/1</c> plus
+    /// <c>8000::/1</c> -- nothing for a direct rule, a route for a block rule, and a /128 bypass for
+    /// each IPv6 endpoint an IPv6 rule's prefix covers. A prefix of one family never covers an address
+    /// of the other, so neither family's plan changes the other's. Without the data plane no IPv6 rule
+    /// is in force, and the plan is exactly what it was before IPv6 existed.
+    /// </remarks>
+    public static PeerEgressRoutePlan Plan(
+        IReadOnlyList<PeerEgressRule> rules, IReadOnlyList<string>? bypass, string? meshCidr,
+        Ipv4Cidr? fakeIpPool, bool carriesIpv6)
     {
         var refused = new List<PeerEgressRuleRefusal>();
         var skip = new HashSet<int>();
         for (var index = 0; index < rules.Count; index++)
         {
-            var code = PeerEgressRules.Validate(rules[index], meshCidr, fakeIpPool);
+            var code = PeerEgressRules.Validate(rules[index], meshCidr, fakeIpPool, carriesIpv6);
             if (code is not null)
             {
                 refused.Add(new PeerEgressRuleRefusal(index, rules[index].Match, code));
@@ -130,6 +145,7 @@ internal static class PeerEgressRoutePlanner
         // before it can be dropped, and the data plane is what drops it.
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var capturing = new List<(Ipv4Cidr Cidr, string Match)>(rules.Count);
+        var capturing6 = new List<(Ipv6Cidr Cidr, string Match)>();
         for (var index = 0; index < rules.Count; index++)
         {
             if (skip.Contains(index))
@@ -140,6 +156,15 @@ internal static class PeerEgressRoutePlanner
             var action = rule.Action?.Trim() ?? string.Empty;
             if (action is not (PeerEgressRules.ActionEgress or PeerEgressRules.ActionBlock))
             {
+                continue;
+            }
+            if (PeerEgressRules.IsIpv6Match(rule.Match))
+            {
+                // In force only with the data plane, so validation has already let it through or not.
+                if (Ipv6Cidr.TryParse(rule.Match.Trim(), out var cidr6) && seen.Add(cidr6.ToString()))
+                {
+                    capturing6.Add((cidr6, rule.Match));
+                }
                 continue;
             }
             if (!Ipv4Cidr.TryParse(rule.Match, out var cidr))
@@ -176,6 +201,16 @@ internal static class PeerEgressRoutePlanner
         {
             if (!Ipv4Cidr.TryParseAddress(endpoint?.Trim(), out var address))
             {
+                // An IPv6 endpoint gets its /128 the same way, when an IPv6 rule covers it.
+                if (Ipv6Cidr.TryParseAddress(endpoint?.Trim(), out var address6)
+                    && capturing6.Exists(entry => entry.Cidr.Contains(address6)))
+                {
+                    var pinned6 = Ipv6Cidr.FormatAddress(address6) + "/128";
+                    if (seen.Add(pinned6))
+                    {
+                        routes.Add(new PeerEgressRoute(pinned6, PeerEgressRouteKind.Bypass, "bypass"));
+                    }
+                }
                 continue;
             }
             var covered = false;
@@ -206,6 +241,14 @@ internal static class PeerEgressRoutePlanner
             {
                 routes.Add(new PeerEgressRoute(normalised, PeerEgressRouteKind.Tun,
                     index == poolIndex ? FakeIpPoolOrigin : "rule:" + entry.Match));
+            }
+        }
+        foreach (var entry in capturing6)
+        {
+            var normalised = entry.Cidr.ToString();
+            if (seen.Add(normalised))
+            {
+                routes.Add(new PeerEgressRoute(normalised, PeerEgressRouteKind.Tun, "rule:" + entry.Match));
             }
         }
 
@@ -251,12 +294,15 @@ internal static class PeerEgressRoutePlanner
     }
 
     /// <summary>
-    /// Orders bypass entries first, then by prefix.
+    /// Orders bypass entries first, then IPv4 before IPv6, then by prefix.
     /// </summary>
     /// <remarks>
     /// Bypass first because installation happens in this order: the addresses that keep the
     /// tunnel's own transport working are in place before anything is pointed into the tunnel.
     /// Deterministic order also means the journal and every log line read the same way run to run.
+    /// The family comes before the prefix so the order stays one order when both are present: compared
+    /// as text across families and as numbers within one, three prefixes could each sort before the
+    /// next.
     /// </remarks>
     public static void Sort(List<PeerEgressRoute> routes) => routes.Sort(Compare);
 
@@ -266,6 +312,17 @@ internal static class PeerEgressRoutePlanner
         if (order != 0)
         {
             return order;
+        }
+        var leftIs6 = TryParse6(left.Cidr, out var left6);
+        var rightIs6 = TryParse6(right.Cidr, out var right6);
+        if (leftIs6 != rightIs6)
+        {
+            return leftIs6 ? 1 : -1;
+        }
+        if (leftIs6)
+        {
+            order = left6.Network.CompareTo(right6.Network);
+            return order != 0 ? order : left6.PrefixLength.CompareTo(right6.PrefixLength);
         }
         if (!Ipv4Cidr.TryParse(left.Cidr, out var leftCidr) || !Ipv4Cidr.TryParse(right.Cidr, out var rightCidr))
         {
@@ -278,6 +335,27 @@ internal static class PeerEgressRoutePlanner
     }
 
     private static int Rank(PeerEgressRouteKind kind) => kind == PeerEgressRouteKind.Bypass ? 0 : 1;
+
+    /// <summary>A route's prefix read as IPv6, false for anything else.</summary>
+    private static bool TryParse6(string cidr, out Ipv6Cidr prefix)
+    {
+        prefix = default;
+        return cidr.Contains(':', StringComparison.Ordinal) && Ipv6Cidr.TryParse(cidr, out prefix);
+    }
+
+    /// <summary>Whether a route's prefix is IPv6.</summary>
+    public static bool IsIpv6(PeerEgressRoute route) => route.Cidr.Contains(':', StringComparison.Ordinal);
+
+    /// <summary>The address a bypass route pins: its prefix without the /32 or /128.</summary>
+    public static string BypassAddress(string cidr)
+    {
+        var suffix = cidr.Contains(':', StringComparison.Ordinal) ? "/128" : "/32";
+        return cidr.EndsWith(suffix, StringComparison.Ordinal) ? cidr[..^suffix.Length] : cidr;
+    }
+
+    /// <summary>The prefix a bypass for one address is installed as: a /32, or a /128.</summary>
+    public static string BypassPrefix(string address) =>
+        address + (address.Contains(':', StringComparison.Ordinal) ? "/128" : "/32");
 
     /// <summary>
     /// Reports what to add and what to withdraw to get from one set to another.

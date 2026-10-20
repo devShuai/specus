@@ -35,6 +35,15 @@ internal sealed record PeerEgressConsumerStatus(IReadOnlyList<PeerEgressRule> Ru
     public PeerEgressCatalogSnapshot? Catalog { get; init; }
 
     /// <summary>
+    /// Whether this consumer has the IPv6 data plane now (protocol/spec/peer-egress.md, IPv6 数据面):
+    /// IPv6 rules are judged with it, so a rule reads as in force exactly when steering would act on it.
+    /// </summary>
+    public bool CarriesIpv6 { get; init; }
+
+    /// <summary>Which egresses the last catalogue says take IPv6 packets.</summary>
+    public IReadOnlyDictionary<long, bool>? Ipv6Capable { get; init; }
+
+    /// <summary>
     /// <c>consumer.catalog</c>: <c>waiting</c>, <c>none</c> or <c>received</c>
     /// (<see cref="PeerEgressCatalog.State"/>). It depends on the clock and the control session,
     /// which the consumer knows nothing of, so the mesh sets it; null leaves the field out.
@@ -209,9 +218,13 @@ internal static class PeerEgressStatus
             // this section end up disagreeing about the same rule. It is the validation steering
             // uses, plus phase two's one check about the egress rather than the rule: a domain rule
             // to an online egress that does not resolve names.
+            // And with the IPv6 data plane and which egresses take IPv6 packets, for the same reason: an
+            // IPv6 rule to an online egress that does not is out of force for that egress.
             var code = PeerEgressRules.RuleStatus(rule, consumer.MeshCidr, consumer.FakeIpPool,
                 egress => consumer.Online.TryGetValue(egress, out var up) && up,
-                egress => consumer.Capable is not null && consumer.Capable.TryGetValue(egress, out var able) && able)
+                egress => consumer.Capable is not null && consumer.Capable.TryGetValue(egress, out var able) && able,
+                consumer.CarriesIpv6,
+                egress => consumer.Ipv6Capable is not null && consumer.Ipv6Capable.TryGetValue(egress, out var six) && six)
                 ?? string.Empty;
             // inForce is the field worth having. A rule that is configured but refused reads false
             // and carries its code, which is the difference between "this rule is protecting me"

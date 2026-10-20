@@ -52,10 +52,11 @@ internal sealed class MacosPeerEgressRouteCommander(string? tun) : IPeerEgressRo
     /// </remarks>
     public PeerEgressRouteConflictCheck Conflict(PeerEgressRoute route)
     {
+        var ipv6 = PeerEgressRoutePlanner.IsIpv6(route);
         string stdout;
         try
         {
-            (stdout, _) = Run(PeerEgressMacosRouteCommands.ShowTableArgs());
+            (stdout, _) = Run(ipv6 ? PeerEgressMacosRouteCommands.ShowTableArgs6() : PeerEgressMacosRouteCommands.ShowTableArgs());
         }
         catch (Exception unableToAsk) when (unableToAsk is not OutOfMemoryException)
         {
@@ -63,7 +64,9 @@ internal sealed class MacosPeerEgressRouteCommander(string? tun) : IPeerEgressRo
             // prefix anyway, so the install path still fails safe.
             return PeerEgressRouteConflictCheck.None;
         }
-        var existing = PeerEgressMacosRouteCommands.ConflictFromTable(stdout, route.Cidr);
+        var existing = ipv6
+            ? PeerEgressMacosRouteCommands.ConflictFromTable6(stdout, route.Cidr)
+            : PeerEgressMacosRouteCommands.ConflictFromTable(stdout, route.Cidr);
         return existing.Present
             ? new PeerEgressRouteConflictCheck(true, existing.Description)
             : PeerEgressRouteConflictCheck.None;
@@ -75,7 +78,8 @@ internal sealed class MacosPeerEgressRouteCommander(string? tun) : IPeerEgressRo
         // prefix of 203.0.113.0/33 is accepted by `route`, which prints a success line naming
         // 203.0.113.0, exits 0, and installs 128.0/1 -- half the IPv4 address space pointed at the
         // gateway. Nothing in the output says so, so nothing downstream could catch it.
-        if (!PeerEgressMacosRouteCommands.ValidPrefix(route.Cidr))
+        var ipv6 = PeerEgressRoutePlanner.IsIpv6(route);
+        if (ipv6 ? !PeerEgressMacosRouteCommands.ValidPrefix6(route.Cidr) : !PeerEgressMacosRouteCommands.ValidPrefix(route.Cidr))
         {
             throw new ArgumentException(
                 $"{PeerEgressMacosRouteCommands.Refusal}: {route.Cidr}", nameof(route));
@@ -89,7 +93,9 @@ internal sealed class MacosPeerEgressRouteCommander(string? tun) : IPeerEgressRo
         {
             throw new InvalidOperationException("no TUN interface to route into");
         }
-        Apply(PeerEgressMacosRouteCommands.InstallInterfaceArgs(route.Cidr, tun),
+        Apply(ipv6
+                ? PeerEgressMacosRouteCommands.InstallInterfaceArgs6(route.Cidr, tun)
+                : PeerEgressMacosRouteCommands.InstallInterfaceArgs(route.Cidr, tun),
             $"install {route.Cidr}");
     }
 
@@ -104,13 +110,16 @@ internal sealed class MacosPeerEgressRouteCommander(string? tun) : IPeerEgressRo
     /// </remarks>
     private void InstallBypass(PeerEgressRoute route)
     {
-        var address = route.Cidr.EndsWith("/32", StringComparison.Ordinal)
-            ? route.Cidr[..^3]
-            : route.Cidr;
+        var address = PeerEgressRoutePlanner.BypassAddress(route.Cidr);
+        var ipv6 = PeerEgressRoutePlanner.IsIpv6(route);
         if (!_hops.TryGetValue(address, out var hop))
         {
-            var (stdout, stderr) = Run(PeerEgressMacosRouteCommands.FindRouteArgs(address));
-            var resolved = PeerEgressMacosRouteCommands.ParseRouteGet(stdout, stderr)
+            var (stdout, stderr) = Run(ipv6
+                ? PeerEgressMacosRouteCommands.FindRouteArgs6(address)
+                : PeerEgressMacosRouteCommands.FindRouteArgs(address));
+            var resolved = (ipv6
+                    ? PeerEgressMacosRouteCommands.ParseRouteGet6(stdout, stderr)
+                    : PeerEgressMacosRouteCommands.ParseRouteGet(stdout, stderr))
                 ?? throw new InvalidOperationException(
                     $"no route to {address} to bypass through");
             if (PeerEgressRouteCommands.HopIsDevice(resolved, tun))
@@ -119,26 +128,41 @@ internal sealed class MacosPeerEgressRouteCommander(string? tun) : IPeerEgressRo
                 // the bypass there would send the transport through the thing it carries; the table,
                 // read with the tunnel left out, says where it went before.
                 var fallback = PeerEgressSocketBinding.BypassHopFromTable(address, tun,
-                    () => PeerEgressSocketBinding.MacosRoutes(Run(PeerEgressMacosRouteCommands.ShowTableArgs()).Stdout));
+                    ipv6 ? ReadTable6 : ReadTable);
                 resolved = new PeerEgressRouteHop(fallback.Gateway, fallback.Interface);
             }
             _hops[address] = resolved;
             hop = resolved;
         }
-        var command = hop.Gateway.Length == 0
-            ? PeerEgressMacosRouteCommands.InstallInterfaceArgs(route.Cidr, hop.Device)
-            : PeerEgressMacosRouteCommands.InstallGatewayArgs(route.Cidr, hop.Gateway);
+        var command = (hop.Gateway.Length == 0, ipv6) switch
+        {
+            (true, false) => PeerEgressMacosRouteCommands.InstallInterfaceArgs(route.Cidr, hop.Device),
+            (false, false) => PeerEgressMacosRouteCommands.InstallGatewayArgs(route.Cidr, hop.Gateway),
+            (true, true) => PeerEgressMacosRouteCommands.InstallInterfaceArgs6(route.Cidr, hop.Device),
+            (false, true) => PeerEgressMacosRouteCommands.InstallGatewayArgs6(route.Cidr, hop.Gateway),
+        };
         Apply(command, $"install bypass {route.Cidr}");
     }
 
     public void Remove(PeerEgressRoute route)
     {
-        _hops.Remove(route.Cidr.EndsWith("/32", StringComparison.Ordinal) ? route.Cidr[..^3] : route.Cidr);
-        Apply(PeerEgressMacosRouteCommands.RemoveArgs(route.Cidr), $"remove {route.Cidr}");
+        _hops.Remove(PeerEgressRoutePlanner.BypassAddress(route.Cidr));
+        Apply(PeerEgressRoutePlanner.IsIpv6(route)
+            ? PeerEgressMacosRouteCommands.RemoveArgs6(route.Cidr)
+            : PeerEgressMacosRouteCommands.RemoveArgs(route.Cidr), $"remove {route.Cidr}");
     }
 
-    public PeerEgressRouteTable Table() => new(
-        PeerEgressSocketBinding.MacosRoutes(Run(PeerEgressMacosRouteCommands.ShowTableArgs()).Stdout), tun ?? string.Empty);
+    public PeerEgressRouteTable Table() => new(ReadTable(), tun ?? string.Empty);
+
+    public PeerEgressRouteTable Table6() => new(ReadTable6(), tun ?? string.Empty);
+
+    /// <summary>The IPv4 table, for a bypass hop and for the repair.</summary>
+    private static List<PeerEgressBindRoute> ReadTable() =>
+        PeerEgressSocketBinding.MacosRoutes(Run(PeerEgressMacosRouteCommands.ShowTableArgs()).Stdout);
+
+    /// <summary>The IPv6 table, gateways kept with their zones.</summary>
+    private static List<PeerEgressBindRoute> ReadTable6() =>
+        PeerEgressSocketBinding.MacosBypassRoutes6(Run(PeerEgressMacosRouteCommands.ShowTableArgs6()).Stdout);
 
     /// <summary>Runs a mutation and decides whether it worked.</summary>
     /// <remarks>

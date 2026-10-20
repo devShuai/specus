@@ -33,7 +33,19 @@ internal enum PeerEgressConsumerOutcome
     DnsQuery,
 
     /// <summary>A DNS query to the listen address from a source that is not this machine.</summary>
-    BlockedDnsNotLocal
+    BlockedDnsNotLocal,
+
+    /// <summary>
+    /// An IPv6 packet the system sends on any interface of its own accord -- neighbour discovery,
+    /// router solicitation, multicast reports -- dropped without a count.
+    /// </summary>
+    Ignored,
+
+    /// <summary>
+    /// An IPv6 packet the data plane cannot carry whatever the rules say: from an address that is not
+    /// this device's, to another device's, or over a path below 1280.
+    /// </summary>
+    BlockedIpv6
 }
 
 /// <summary>
@@ -55,7 +67,7 @@ internal enum PeerEgressConsumerOutcome
 /// <para>Time arrives as an argument. Not safe for concurrent use on its own; the caller serialises
 /// access the same way the Go consumer's mutex does.</para>
 /// </remarks>
-internal sealed class PeerEgressConsumer(
+internal sealed partial class PeerEgressConsumer(
     Func<long, byte[], bool>? send, Action<byte[]>? toTun, ILogger? logger = null,
     int flowCapacity = PeerEgressConsumer.DefaultFlowCapacity)
 {
@@ -195,6 +207,14 @@ internal sealed class PeerEgressConsumer(
         public void NoteApplicationProgress(byte[] packet)
         {
             var ihl = (packet[0] & 0x0f) * 4;
+            var stated = packet.Length >= 4 ? (packet[2] << 8) | packet[3] : packet.Length;
+            if (packet[0] >> 4 == 6)
+            {
+                // The fixed header, and the payload length it states: the data plane carries TCP only
+                // directly behind it.
+                ihl = PeerEgressIpv6.HeaderBytes;
+                stated = packet.Length >= ihl ? ihl + ((packet[4] << 8) | packet[5]) : packet.Length;
+            }
             if (packet.Length < ihl + 20)
             {
                 return;
@@ -204,7 +224,7 @@ internal sealed class PeerEgressConsumer(
             {
                 return;
             }
-            var total = Math.Min((packet[2] << 8) | packet[3], packet.Length);
+            var total = Math.Min(stated, packet.Length);
             var payload = Math.Max(total - ihl - dataOffset, 0);
             int flags = packet[ihl + 13];
             var next = ReadUInt32(packet, ihl + 4) + (uint)payload;
@@ -292,6 +312,8 @@ internal sealed class PeerEgressConsumer(
             Capable = _catalog.Listed.ToDictionary(entry => entry.Key, entry => entry.Value.DomainTargetCapable),
             Catalog = _catalog,
             FakeIpPool = _pool?.Cidr,
+            CarriesIpv6 = CarriesIpv6,
+            Ipv6Capable = _catalog.Listed.ToDictionary(entry => entry.Key, entry => entry.Value.Ipv6PacketCapable),
         };
     }
 
@@ -307,10 +329,14 @@ internal sealed class PeerEgressConsumer(
     /// <para><paramref name="fakeIpPool"/> is the pool while phase two runs and null while it does
     /// not. The pool is the caller's and outlives a reconfiguration: its mappings are answers
     /// applications already hold, and a rule change is no reason to take them back.</para>
+    ///
+    /// <para><paramref name="carriesIpv6"/> is whether the device carries IPv6 now
+    /// (protocol/spec/peer-egress.md, IPv6 数据面), or null to keep what it was. Turned off, every IPv6
+    /// flow is closed like any flow whose rule stopped applying.</para>
     /// </remarks>
     public IReadOnlyDictionary<long, IReadOnlyList<string>> Configure(
         IReadOnlyList<PeerEgressRule>? rules, string? meshCidr, string? virtualIp, long nowMs,
-        PeerEgressFakeIpPool? fakeIpPool = null)
+        PeerEgressFakeIpPool? fakeIpPool = null, bool? carriesIpv6 = null)
     {
         _rules = rules ?? [];
         if (!string.IsNullOrWhiteSpace(meshCidr))
@@ -318,7 +344,12 @@ internal sealed class PeerEgressConsumer(
             _meshCidr = meshCidr.Trim();
         }
         _virtualIp = virtualIp?.Trim() ?? string.Empty;
+        _virtualIp6 = PeerEgressMeshAddress.TryDerive(_virtualIp, out var derived) ? derived : null;
         _pool = fakeIpPool;
+        if (carriesIpv6 is { } carries)
+        {
+            CarriesIpv6 = carries;
+        }
         return PurgeInvalidated(nowMs);
     }
 
@@ -388,7 +419,9 @@ internal sealed class PeerEgressConsumer(
         var resets = new List<byte[]>();
         foreach (var (key, flow) in _flows)
         {
-            if (StillOurs(key.RemoteIp, flow.Egress))
+            // An IPv6 flow is re-examined by the same decision a new IPv6 packet gets, and it also
+            // goes when the catalogue stops saying its egress takes IPv6 packets.
+            if (key.Ipv6 ? StillOurs6(key.RemoteIp6, flow.Egress) : StillOurs(key.RemoteIp, flow.Egress))
             {
                 continue;
             }
@@ -398,7 +431,9 @@ internal sealed class PeerEgressConsumer(
                 destinations = new SortedSet<string>(StringComparer.Ordinal);
                 purge[flow.Egress] = destinations;
             }
-            destinations.Add(Ipv4Cidr.FormatAddress(key.RemoteIp) + "/32");
+            destinations.Add(key.Ipv6
+                ? Ipv6Cidr.FormatAddress(key.RemoteIp6) + "/128"
+                : Ipv4Cidr.FormatAddress(key.RemoteIp) + "/32");
             if (FlowResetPacket(key, flow) is { } reset)
             {
                 resets.Add(reset);
@@ -472,9 +507,12 @@ internal sealed class PeerEgressConsumer(
         {
             return PeerEgressConsumerOutcome.NotMine;
         }
+        if (packet[0] >> 4 == 6)
+        {
+            return HandleOutbound6(packet, nowMs);
+        }
         if (packet[0] >> 4 != 4)
         {
-            // IPv6 has no rules in this version, so nothing can claim it and it is not ours.
             return PeerEgressConsumerOutcome.NotMine;
         }
         var destination = PeerIpPacket.DestinationIPv4(packet);
@@ -702,9 +740,11 @@ internal sealed class PeerEgressConsumer(
         {
             return null;
         }
+        // An IPv6 flow is reset by the same rule, only in its own family.
         return PeerEgressSegment.Build(new PeerEgressSegment.Segment(
             key.RemoteIp, key.ConsumerIp, key.RemotePort, key.ConsumerPort,
-            flow.AppAck, flow.AppSeqNext, PeerEgressSegment.FlagRst | PeerEgressSegment.FlagAck, 0, 0, []));
+            flow.AppAck, flow.AppSeqNext, PeerEgressSegment.FlagRst | PeerEgressSegment.FlagAck, 0, 0, [],
+            key.Ipv6, key.RemoteIp6, key.ConsumerIp6));
     }
 
     /// <summary>
@@ -727,13 +767,13 @@ internal sealed class PeerEgressConsumer(
     }
 
     /// <summary>
-    /// The TCP flags of an IPv4 packet, or zero when it is too short to carry them. Read from the
-    /// header directly, like <see cref="Flow.NoteApplicationProgress"/>, because it runs on every
-    /// packet either way.
+    /// The TCP flags of a packet, IPv4 or IPv6 with TCP directly behind the fixed header, or zero when
+    /// it is too short to carry them. Read from the header directly, like
+    /// <see cref="Flow.NoteApplicationProgress"/>, because it runs on every packet either way.
     /// </summary>
     private static int TcpFlags(byte[] packet)
     {
-        var ihl = (packet[0] & 0x0f) * 4;
+        var ihl = packet[0] >> 4 == 6 ? PeerEgressIpv6.HeaderBytes : (packet[0] & 0x0f) * 4;
         return packet.Length > ihl + 13 ? packet[ihl + 13] : 0;
     }
 
@@ -893,7 +933,9 @@ internal sealed class PeerEgressConsumer(
         {
             return false;
         }
-        var parsed = PeerEgressFrame.Parse(frame);
+        // A consumer with the IPv6 data plane reads an IPv6 body; one without leaves it, refused, to the
+        // egress role, as before.
+        var parsed = PeerEgressFrame.Parse(frame, CarriesIpv6);
         if (!parsed.Accepted)
         {
             // A frame nobody can read is not claimed. The egress runtime refuses it with its own
@@ -914,6 +956,10 @@ internal sealed class PeerEgressConsumer(
         if (parsed.Type != PeerEgressFrame.TypeIpPacket)
         {
             return false;
+        }
+        if (parsed.Inner.Ipv6)
+        {
+            return HandleInbound6(parsed.Body, parsed.Inner, fromEgress, nowMs);
         }
 
         if (_virtualIp.Length == 0 || parsed.Inner.DestinationIp != _virtualIp)
@@ -971,13 +1017,10 @@ internal sealed class PeerEgressConsumer(
     /// </summary>
     private void HandleFlowReject(PeerEgressFrame.Control control, long fromEgress, long nowMs)
     {
-        if (!Ipv4Cidr.TryParseAddress(control.DestinationIp, out var remote)
-            || !Ipv4Cidr.TryParseAddress(control.SourceIp, out var local))
+        if (FlowKeyForReject(control) is not { } key)
         {
             return;
         }
-        var key = new PeerEgressFlowTable.Key(ProtocolNumberFor(control.Protocol),
-            local, (ushort)control.SourcePort, remote, (ushort)control.DestinationPort);
         if (Remembered(key, nowMs) is not { } flow || flow.Egress != fromEgress)
         {
             return;
@@ -1009,6 +1052,34 @@ internal sealed class PeerEgressConsumer(
         {
             toTun?.Invoke(reset);
         }
+    }
+
+    /// <summary>
+    /// The flow a flow-reject names: its source is the consumer's side and its destination the
+    /// target's. An egress writes IPv6 addresses for an IPv6 flow, and both must then be IPv6; a family
+    /// mix names no flow.
+    /// </summary>
+    private static PeerEgressFlowTable.Key? FlowKeyForReject(PeerEgressFrame.Control control)
+    {
+        var protocol = ProtocolNumberFor(control.Protocol);
+        if ((control.SourceIp?.Contains(':', StringComparison.Ordinal) ?? false)
+            || (control.DestinationIp?.Contains(':', StringComparison.Ordinal) ?? false))
+        {
+            if (!Ipv6Cidr.TryParseAddress(control.SourceIp?.Trim(), out var local6)
+                || !Ipv6Cidr.TryParseAddress(control.DestinationIp?.Trim(), out var remote6))
+            {
+                return null;
+            }
+            return new PeerEgressFlowTable.Key(protocol, 0, (ushort)control.SourcePort, 0,
+                (ushort)control.DestinationPort, Ipv6: true, ConsumerIp6: local6, RemoteIp6: remote6);
+        }
+        if (!Ipv4Cidr.TryParseAddress(control.DestinationIp, out var remote)
+            || !Ipv4Cidr.TryParseAddress(control.SourceIp, out var local))
+        {
+            return null;
+        }
+        return new PeerEgressFlowTable.Key(protocol, local, (ushort)control.SourcePort, remote,
+            (ushort)control.DestinationPort);
     }
 
     private static int ProtocolNumberFor(string? name) => name?.Trim().ToLowerInvariant() switch

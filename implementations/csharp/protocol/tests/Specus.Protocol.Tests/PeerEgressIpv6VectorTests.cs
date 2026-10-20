@@ -68,9 +68,34 @@ public sealed class PeerEgressIpv6VectorTests
     }
 
     /// <summary>
-    /// What every client does today: the same list with no IPv6 data plane, through the production
-    /// entry points, so turning <see cref="PeerEgressRules.ConsumerCarriesIpv6"/> on without the data
-    /// plane fails here.
+    /// The <c>ruleValidation</c> section of peer-egress-ipv6-v1.json: with the data plane, a rule over
+    /// the derived prefix is a mesh overlap, and one to an online egress without
+    /// <c>ipv6PacketCapable</c> is out of force for that egress only.
+    /// </summary>
+    [Fact]
+    public void RuleStatusMatchesTheIpv6PlaneVector()
+    {
+        using var vector = ReadVector("peer-egress-ipv6-v1.json");
+        var cases = vector.RootElement.GetProperty("ruleValidation").GetProperty("cases").EnumerateArray().ToList();
+        Assert.NotEmpty(cases);
+        foreach (var testCase in cases)
+        {
+            var rule = testCase.GetProperty("rule").Deserialize<PeerEgressRule>()!;
+            var online = testCase.GetProperty("egressOnline").GetBoolean();
+            var capable = testCase.GetProperty("egressIpv6PacketCapable").GetBoolean();
+            var code = testCase.GetProperty("code");
+            Assert.True((code.ValueKind == JsonValueKind.Null ? null : code.GetString())
+                == PeerEgressRules.RuleStatus(rule, PeerEgressRules.DefaultMeshCidr, null, _ => online, _ => false,
+                    carriesIpv6: true, _ => capable), testCase.GetProperty("name").GetString());
+            // Without the data plane every one of them is refused for the data plane it lacks.
+            Assert.Equal(PeerEgressCodes.RuleIpv6Unsupported, PeerEgressRules.RuleStatus(rule,
+                PeerEgressRules.DefaultMeshCidr, null, _ => online, _ => false));
+        }
+    }
+
+    /// <summary>
+    /// What a client without the IPv6 data plane does: the same list through the entry points that do
+    /// not state one, so those cannot quietly start judging with it.
     /// </summary>
     [Fact]
     public void Ipv6RulesAreNotInForceWithoutAnIpv6DataPlane()

@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Text.Json.Nodes;
 using Specus.Client.Configuration;
+using Specus.Client.PeerMesh;
 using Specus.Protocol.PeerEgress;
 
 namespace Specus.Client.Cli;
@@ -93,16 +94,28 @@ internal static class EgressEdit
 
     private static long Id(long? value) => value ?? 0;
 
-    /// <summary>Why a rule is not in force as configured, or null; the master switch is not part of it.</summary>
-    internal static string? RuleCode(PeerEgressRule rule) => PeerEgressRules.Validate(rule, PeerEgressRules.DefaultMeshCidr);
+    /// <summary>
+    /// Why a rule is not in force as configured, or null; the master switch is not part of it. An IPv6
+    /// rule is judged with this device's IPv6 data plane at the default peerMeshMtu.
+    /// </summary>
+    internal static string? RuleCode(PeerEgressRule rule) => PeerEgressRules.Validate(rule,
+        PeerEgressRules.DefaultMeshCidr, null, PeerEgressIpv6Plane.ConsumerCarriesIpv6(SpecusClientConfig.DefaultPeerMeshMtu));
 
     /// <summary>
     /// Why a rule is not in force under a configuration, or null. Phase two counts as the rule's own
     /// setting -- with peerEgressDnsTakeover on and a usable pool a domain rule is accepted -- and
     /// the master switch, as ever, does not.
     /// </summary>
+    /// <remarks>
+    /// An IPv6 rule is judged with this device's IPv6 data plane, which its platform and peerMeshMtu
+    /// decide. Whether the TUN takes its address, and whether the egress takes IPv6 packets, are only
+    /// known once connected and are not judged here.
+    /// </remarks>
     internal static string? RuleCode(SpecusClientConfig config, PeerEgressRule rule) =>
-        PeerEgressRules.Validate(rule, PeerEgressRules.DefaultMeshCidr, PhaseTwoPool(config));
+        PeerEgressRules.Validate(rule, PeerEgressRules.DefaultMeshCidr, PhaseTwoPool(config), CarriesIpv6(config));
+
+    /// <summary>Whether this device has the IPv6 data plane under a configuration: its platform and its peerMeshMtu.</summary>
+    internal static bool CarriesIpv6(SpecusClientConfig config) => PeerEgressIpv6Plane.ConsumerCarriesIpv6(config.PeerMeshMtu);
 
     /// <summary>The pool domain rules would run over with the master switch on, or null.</summary>
     internal static Ipv4Cidr? PhaseTwoPool(SpecusClientConfig config) =>
@@ -121,7 +134,10 @@ internal static class EgressEdit
     internal static string Explanation(string code) => code switch
     {
         PeerEgressCodes.RuleDomainUnsupported => "domain rules are not supported yet; use an IPv4 address or CIDR range",
+        // With the data plane it is what a platform without IPv6 support, or a peerMeshMtu below 1280,
+        // still reports; worded as the Go and Java clients word it.
         PeerEgressCodes.RuleIpv6Unsupported => "IPv6 rules are not in force yet: this client cannot carry IPv6 traffic",
+        PeerEgressCodes.RuleEgressNoIpv6 => "the egress device is online but does not take IPv6 traffic; upgrade its client",
         PeerEgressCodes.RuleMalformed => "not an IPv4 or IPv6 address or CIDR range with zero host bits (IPv4-mapped IPv6 is written as IPv4), or an unknown action",
         PeerEgressCodes.RuleDefaultRoute => "0.0.0.0/0 would take over the default route, which is not allowed",
         PeerEgressCodes.RuleMeshOverlap => "overlaps the Peer Mesh network",
@@ -208,7 +224,7 @@ internal static class EgressEdit
             return new Planned("peerEgressEnabled", "true", preface);
         }
         return new Planned("peerEgressRules",
-            EncodeRules(ApplyRules(config.PeerEgressRules, change, PhaseTwoPool(config))), []);
+            EncodeRules(ApplyRules(config.PeerEgressRules, change, PhaseTwoPool(config), CarriesIpv6(config))), []);
     }
 
     /// <summary>Whether a peerMeshDevice value leaves takeover no interface to route into.</summary>
@@ -218,10 +234,11 @@ internal static class EgressEdit
     /// <summary>
     /// The rule list after one edit. The commands and the local page write it into the configuration
     /// file; the desktop page keeps it in its own settings. Either way the same edits are refused.
-    /// A domain rule is accepted only with a phase-two pool, which the desktop page never has.
+    /// A domain rule is accepted only with a phase-two pool, which the desktop page never has. An IPv6
+    /// rule is accepted with this device's IPv6 data plane, at the default peerMeshMtu unless said.
     /// </summary>
     internal static List<PeerEgressRule> ApplyRules(IReadOnlyList<PeerEgressRule> current, Change change,
-        Ipv4Cidr? fakeIpPool = null)
+        Ipv4Cidr? fakeIpPool = null, bool? carriesIpv6 = null)
     {
         var rules = current.ToList();
         var count = rules.Count;
@@ -237,7 +254,8 @@ internal static class EgressEdit
                 };
                 // Refused rules are allowed in the file, where they are warned about, but an edit that
                 // adds one on request would only be writing a rule that steers nothing.
-                if (PeerEgressRules.Validate(rule, PeerEgressRules.DefaultMeshCidr, fakeIpPool) is { } code)
+                if (PeerEgressRules.Validate(rule, PeerEgressRules.DefaultMeshCidr, fakeIpPool,
+                        carriesIpv6 ?? PeerEgressIpv6Plane.ConsumerCarriesIpv6(SpecusClientConfig.DefaultPeerMeshMtu)) is { } code)
                     throw new PlanFailure($"Rule not added: {code} ({Explanation(code)})");
                 if (change.Disabled) rule = rule with { Enabled = false };
                 var at = count;
@@ -428,7 +446,11 @@ internal static class EgressEdit
     internal const string ConnectNeedsAddress =
         "--connect needs an IPv4 address: a name would be resolved here, not by the egress.";
 
-    /// <summary>Why an address cannot be previewed, or null when it can: an IPv4 address, or a name a domain rule could match.</summary>
+    /// <summary>
+    /// Why an address cannot be previewed, or null when it can: an IPv4 or IPv6 address, or a name a
+    /// domain rule could match. Anything else is still told it must be an IPv4 address, the wording the
+    /// three clients and the CLI matrix share.
+    /// </summary>
     internal static string? AddressProblem(string address)
     {
         if (IsAddress(address)) return null;
@@ -436,8 +458,12 @@ internal static class EgressEdit
         return PreviewName(address) is null ? NameProblem : null;
     }
 
-    /// <summary>Whether what was given to preview is an IPv4 address rather than a name.</summary>
-    internal static bool IsAddress(string address) => Ipv4Cidr.TryParseAddress(address, out _) && !address.Contains('/');
+    /// <summary>
+    /// Whether what was given to preview is an address rather than a name: IPv4, or IPv6 written as a
+    /// rule's match is (no zone, no brackets, no dotted tail).
+    /// </summary>
+    internal static bool IsAddress(string address) =>
+        (Ipv4Cidr.TryParseAddress(address, out _) || Ipv6Cidr.TryParseAddress(address, out _)) && !address.Contains('/');
 
     /// <summary>
     /// The name as a domain rule compares it -- trailing dots gone, lower case -- or null when no
@@ -483,7 +509,7 @@ internal static class EgressEdit
     /// </summary>
     internal static Dictionary<string, object?> ConnectProbe(string address, int port, List<string> lines)
     {
-        var target = $"{address}:{port}";
+        var target = address.Contains(':') ? $"[{address}]:{port}" : $"{address}:{port}";
         var watch = Stopwatch.StartNew();
         var probe = new Dictionary<string, object?> { ["port"] = port };
         try
@@ -517,11 +543,16 @@ internal static class EgressEdit
             ? AddressPreview(path, config, address, lines)
             : NamePreview(path, config, PreviewName(address) ?? throw new ArgumentException(NameProblem, nameof(address)), lines);
 
-    /// <summary>What the configured rules decide for one IPv4 address, and what takeover being on would change.</summary>
+    /// <summary>
+    /// What the configured rules decide for one IPv4 or IPv6 address, and what takeover being on would
+    /// change. IPv6 rules take part only when this device has the IPv6 data plane, so an IPv6
+    /// destination is previewed the way it would go.
+    /// </summary>
     private static Dictionary<string, object?> AddressPreview(string path, SpecusClientConfig config, string address, List<string> lines)
     {
         var rules = config.PeerEgressRules;
-        var match = PeerEgressRules.Match(rules, address, PeerEgressRules.DefaultMeshCidr, PhaseTwoPool(config));
+        var match = PeerEgressRules.Match(rules, address, PeerEgressRules.DefaultMeshCidr, PhaseTwoPool(config),
+            CarriesIpv6(config));
         var matched = match.Matched ? match.MatchedRuleIndex : -1;
         var takeover = config.PeerEgressEnabled;
         var data = new Dictionary<string, object?>

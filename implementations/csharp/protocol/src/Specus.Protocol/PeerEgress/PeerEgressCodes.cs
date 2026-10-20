@@ -55,6 +55,12 @@ public static class PeerEgressCodes
     public const string RuleEgressNoDomain = "EGRESS_RULE_EGRESS_NO_DOMAIN";
 
     /// <summary>
+    /// The IPv6 data plane (protocol/spec/peer-egress.md, IPv6 数据面): an IPv6 rule to an online egress
+    /// whose catalogue entry does not say <c>ipv6PacketCapable</c>.
+    /// </summary>
+    public const string RuleEgressNoIpv6 = "EGRESS_RULE_EGRESS_NO_IPV6";
+
+    /// <summary>
     /// Every code this build defines.
     /// </summary>
     /// <remarks>
@@ -71,6 +77,7 @@ public static class PeerEgressCodes
         FrameBadMagic, FrameUnknownType, FrameReservedSet, FrameTruncated,
         FrameTrailingBytes, Ipv6Unsupported, FrameMalformedControl, ControlUnsupported,
         NameUnresolved, NameUnsupported, RuleFakeIpOverlap, FakeIpPoolInvalid, RuleEgressNoDomain,
+        RuleEgressNoIpv6,
     };
 
     /// <summary>

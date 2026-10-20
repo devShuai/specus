@@ -74,7 +74,7 @@ internal sealed class NoopPeerVirtualDevice : IPeerVirtualDevice
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 }
 
-internal sealed class LinuxTunPeerVirtualDevice : IPeerVirtualDevice
+internal sealed class LinuxTunPeerVirtualDevice : IPeerVirtualDevice, IPeerVirtualDeviceIpv6
 {
     private const int OpenReadWrite = 0x0002;
     private const int InterfaceNameSize = 16;
@@ -93,11 +93,17 @@ internal sealed class LinuxTunPeerVirtualDevice : IPeerVirtualDevice
     private Task? _readTask;
     private CancellationTokenSource? _readerStop;
 
+    /// <summary>The derived IPv6 address the device is given, null when it is given none.</summary>
+    private readonly string? _address6;
+
+    private readonly PeerDeviceIpv6State _ipv6 = new();
+
     public LinuxTunPeerVirtualDevice(SpecusClientConfig config, PeerMeshConfig peerMesh, ILogger logger)
     {
         _config = config;
         _peerMesh = peerMesh;
         _logger = logger;
+        _address6 = PeerEgressIpv6Plane.DeviceAddress(config, peerMesh.VirtualIp);
         Name = string.IsNullOrWhiteSpace(config.PeerMeshTunName) ? SpecusClientConfig.DefaultPeerMeshTunName : config.PeerMeshTunName;
         Status = "INIT";
         Error = "";
@@ -198,8 +204,12 @@ internal sealed class LinuxTunPeerVirtualDevice : IPeerVirtualDevice
         await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
     }
 
+    /// <inheritdoc />
+    public (bool Ready, string Reason) Ipv6Ready() => _ipv6.Get();
+
     public async ValueTask DisposeAsync()
     {
+        _ipv6.Set(false, "the TUN is closed");
         try
         {
             await SyncPeerRoutesAsync([], CancellationToken.None).ConfigureAwait(false);
@@ -289,6 +299,38 @@ internal sealed class LinuxTunPeerVirtualDevice : IPeerVirtualDevice
         {
             await RunCommandQuietAsync(_logger, cancellationToken, "ip", "route", "del", _peerMesh.Cidr!, "dev", Name).ConfigureAwait(false);
         }
+        await ConfigureIpv6Async(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Gives the device its derived IPv6 address. The link is up with its MTU already, which applies
+    /// to both families.
+    /// </summary>
+    /// <remarks>
+    /// A failure is logged and the device stays up: the IPv4 mesh does not depend on it. The device
+    /// then reports no IPv6 data plane (<see cref="Ipv6Ready"/>), so IPv6 rules are refused with
+    /// <c>EGRESS_RULE_IPV6_UNSUPPORTED</c> and no IPv6 route is planned -- an IPv6 install that would
+    /// fail must not roll the IPv4 routes back.
+    /// </remarks>
+    private async Task ConfigureIpv6Async(CancellationToken cancellationToken)
+    {
+        if (_address6 is null)
+        {
+            _ipv6.Set(false, PeerEgressIpv6Plane.NotAsked);
+            return;
+        }
+        try
+        {
+            await RunCommandAsync(_logger, cancellationToken, PeerEgressIpv6Plane.LinuxAssignAddressArgs(Name, _address6))
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _ipv6.Set(false, "the TUN's IPv6 address could not be assigned: " + ex.Message);
+            _logger.LogWarning("Peer Mesh Linux TUN IPv6 address not assigned; IPv6 rules are not in force: {Error}", ex.Message);
+            return;
+        }
+        _ipv6.Set(true, string.Empty);
     }
 
     private static string ReadInterfaceName(byte[] ifreq)
@@ -348,7 +390,7 @@ internal sealed class LinuxTunPeerVirtualDevice : IPeerVirtualDevice
     private static extern int Close(int fd);
 }
 
-internal sealed class DarwinUtunPeerVirtualDevice : IPeerVirtualDevice
+internal sealed class DarwinUtunPeerVirtualDevice : IPeerVirtualDevice, IPeerVirtualDeviceIpv6
 {
     private const int AfSystem = 32;
     private const int SockDgram = 2;
@@ -373,11 +415,17 @@ internal sealed class DarwinUtunPeerVirtualDevice : IPeerVirtualDevice
     private int _fd = -1;
     private Task? _readTask;
 
+    /// <summary>The derived IPv6 address the device is given, null when it is given none.</summary>
+    private readonly string? _address6;
+
+    private readonly PeerDeviceIpv6State _ipv6 = new();
+
     public DarwinUtunPeerVirtualDevice(SpecusClientConfig config, PeerMeshConfig peerMesh, ILogger logger)
     {
         _config = config;
         _peerMesh = peerMesh;
         _logger = logger;
+        _address6 = PeerEgressIpv6Plane.DeviceAddress(config, peerMesh.VirtualIp);
         Name = string.IsNullOrWhiteSpace(config.PeerMeshTunName) ? UtunDefaultPrefix : config.PeerMeshTunName;
         Status = "INIT";
         Error = "";
@@ -489,8 +537,12 @@ internal sealed class DarwinUtunPeerVirtualDevice : IPeerVirtualDevice
         return ValueTask.CompletedTask;
     }
 
+    /// <inheritdoc />
+    public (bool Ready, string Reason) Ipv6Ready() => _ipv6.Get();
+
     public async ValueTask DisposeAsync()
     {
+        _ipv6.Set(false, "the utun is closed");
         try
         {
             await SyncPeerRoutesAsync([], CancellationToken.None).ConfigureAwait(false);
@@ -557,6 +609,33 @@ internal sealed class DarwinUtunPeerVirtualDevice : IPeerVirtualDevice
             await RunCommandQuietAsync(_logger, cancellationToken, "route", "-n", "delete", "-net", _peerMesh.Cidr!)
                 .ConfigureAwait(false);
         }
+        await ConfigureIpv6Async(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Gives the utun its derived IPv6 address, before any route is pointed at it: on macOS a route
+    /// can only go to a utun that has an address of its family. A failure is logged and the device
+    /// stays up, for the reason the Linux device gives.
+    /// </summary>
+    private async Task ConfigureIpv6Async(CancellationToken cancellationToken)
+    {
+        if (_address6 is null)
+        {
+            _ipv6.Set(false, PeerEgressIpv6Plane.NotAsked);
+            return;
+        }
+        try
+        {
+            await RunCommandAsync(_logger, cancellationToken, PeerEgressMacosRouteCommands.AssignAddress6Args(Name, _address6))
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _ipv6.Set(false, "the utun's IPv6 address could not be assigned: " + ex.Message);
+            _logger.LogWarning("Peer Mesh utun IPv6 address not assigned; IPv6 rules are not in force: {Error}", ex.Message);
+            return;
+        }
+        _ipv6.Set(true, string.Empty);
     }
 
     private uint RequestedUnit()
@@ -629,7 +708,7 @@ internal sealed class DarwinUtunPeerVirtualDevice : IPeerVirtualDevice
     private static extern int Close(int fd);
 }
 
-internal sealed class WindowsWintunPeerVirtualDevice : IPeerVirtualDevice
+internal sealed class WindowsWintunPeerVirtualDevice : IPeerVirtualDevice, IPeerVirtualDeviceIpv6
 {
     private const uint RingCapacity = 0x400000;
     private readonly SpecusClientConfig _config;
@@ -643,11 +722,17 @@ internal sealed class WindowsWintunPeerVirtualDevice : IPeerVirtualDevice
     private WintunApi? _api;
     private Task? _readTask;
 
+    /// <summary>The derived IPv6 address the device is given, null when it is given none.</summary>
+    private readonly string? _address6;
+
+    private readonly PeerDeviceIpv6State _ipv6 = new();
+
     public WindowsWintunPeerVirtualDevice(SpecusClientConfig config, PeerMeshConfig peerMesh, ILogger logger)
     {
         _config = config;
         _peerMesh = peerMesh;
         _logger = logger;
+        _address6 = PeerEgressIpv6Plane.DeviceAddress(config, peerMesh.VirtualIp);
         Name = string.IsNullOrWhiteSpace(config.PeerMeshTunName) ? SpecusClientConfig.DefaultPeerMeshTunName : config.PeerMeshTunName;
         Status = "INIT";
         Error = "";
@@ -749,8 +834,12 @@ internal sealed class WindowsWintunPeerVirtualDevice : IPeerVirtualDevice
         return ValueTask.CompletedTask;
     }
 
+    /// <inheritdoc />
+    public (bool Ready, string Reason) Ipv6Ready() => _ipv6.Get();
+
     public async ValueTask DisposeAsync()
     {
+        _ipv6.Set(false, "the adapter is closed");
         try
         {
             await SyncPeerRoutesAsync([], CancellationToken.None).ConfigureAwait(false);
@@ -818,6 +907,54 @@ internal sealed class WindowsWintunPeerVirtualDevice : IPeerVirtualDevice
             await RunCommandQuietAsync(_logger, cancellationToken, "netsh", "interface", "ipv4", "delete", "route",
                 _peerMesh.Cidr!, Name, "store=active").ConfigureAwait(false);
         }
+        await ConfigureIpv6Async(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Gives the adapter its derived IPv6 address and its IPv6 MTU, which Windows keeps apart from the
+    /// IPv4 one netsh set. Through PowerShell, by interface index, as the route commander does: the
+    /// adapter's name goes in, only its index comes back. A failure is logged and the device stays up,
+    /// for the reason the Linux device gives.
+    /// </summary>
+    private async Task ConfigureIpv6Async(CancellationToken cancellationToken)
+    {
+        if (_address6 is null)
+        {
+            _ipv6.Set(false, PeerEgressIpv6Plane.NotAsked);
+            return;
+        }
+        var address = _address6;
+        var mtu = _config.PeerMeshMtu <= 0 ? SpecusClientConfig.DefaultPeerMeshMtu : _config.PeerMeshMtu;
+        try
+        {
+            await Task.Run(() =>
+            {
+                var index = PeerEgressWindowsRouteCommands.ParseInterfaceIndex(
+                    WindowsPeerEgressRouteCommander.Run(PeerEgressWindowsRouteCommands.InterfaceIndexScript(Name)));
+                if (index <= 0)
+                {
+                    throw new InvalidOperationException($"no adapter named {Name}");
+                }
+                var output = WindowsPeerEgressRouteCommander.Run(
+                    PeerEgressWindowsRouteCommands.AssignAddress6Script(index, address, mtu));
+                var failure = PeerEgressWindowsRouteCommands.ParseCommandFailure(output);
+                if (failure == PeerEgressWindowsRouteCommands.FailurePermissionDenied)
+                {
+                    throw new UnauthorizedAccessException("assigning the address needs administrator rights");
+                }
+                if (failure == PeerEgressWindowsRouteCommands.FailureOther)
+                {
+                    throw new InvalidOperationException("assigning the address failed: " + output.Trim());
+                }
+            }, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _ipv6.Set(false, "the adapter's IPv6 address could not be assigned: " + ex.Message);
+            _logger.LogWarning("Peer Mesh Wintun IPv6 address not assigned; IPv6 rules are not in force: {Error}", ex.Message);
+            return;
+        }
+        _ipv6.Set(true, string.Empty);
     }
 
     private static (IntPtr Library, WintunApi Api) LoadWintun()
@@ -900,6 +1037,29 @@ internal sealed class WindowsWintunPeerVirtualDevice : IPeerVirtualDevice
         public delegate IntPtr AllocateSendPacketDelegate(IntPtr session, uint packetSize);
         [UnmanagedFunctionPointer(CallingConvention.Winapi)]
         public delegate void SendPacketDelegate(IntPtr session, IntPtr packet);
+    }
+}
+
+/// <summary>What a device keeps for <see cref="IPeerVirtualDeviceIpv6.Ipv6Ready"/>, under its own lock.</summary>
+internal sealed class PeerDeviceIpv6State
+{
+    private readonly Lock _gate = new();
+    private (bool Ready, string Reason) _state = (false, PeerEgressIpv6Plane.NotAsked);
+
+    public (bool Ready, string Reason) Get()
+    {
+        lock (_gate)
+        {
+            return _state;
+        }
+    }
+
+    public void Set(bool ready, string reason)
+    {
+        lock (_gate)
+        {
+            _state = (ready, reason);
+        }
     }
 }
 

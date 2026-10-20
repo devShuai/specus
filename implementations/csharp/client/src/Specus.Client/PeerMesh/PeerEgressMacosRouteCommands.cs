@@ -487,13 +487,15 @@ internal static class PeerEgressMacosRouteCommands
     }
 
     /// <summary>
-    /// Reads the whole table. IPv4 only: the IPv6 section has a different column layout and this
-    /// feature does not route IPv6 yet. The egress socket binder reads the IPv6 table with
+    /// Reads the whole IPv4 table. The IPv6 section has a different column layout and is read with
     /// <see cref="ShowTableArgs6"/>.
     /// </summary>
     public static string[] ShowTableArgs() => ["netstat", "-rn", "-f", "inet"];
 
-    /// <summary>Reads the IPv6 table, for an egress socket to an IPv6 target.</summary>
+    /// <summary>
+    /// Reads the IPv6 table: for an egress socket to an IPv6 target, and for the consumer's IPv6 routes
+    /// (protocol/spec/peer-egress.md, IPv6 数据面).
+    /// </summary>
     public static string[] ShowTableArgs6() => ["netstat", "-rn", "-f", "inet6"];
 
     /// <summary>
@@ -560,6 +562,170 @@ internal static class PeerEgressMacosRouteCommands
             throw new ArgumentException($"{Refusal}: {prefix}", nameof(prefix));
         }
         return ["route", "-n", "delete", "-net", prefix!];
+    }
+
+    // ---- IPv6 (protocol/spec/peer-egress.md, IPv6 数据面) ----------------------------------------------
+    //
+    // `route -n ... -inet6`, read back from `netstat -rn -f inet6`. Separate builders, so the IPv4 ones
+    // stay what the shared vector pins.
+
+    /// <summary>
+    /// Whether this is an IPv6 prefix in the form this feature writes it: RFC 5952 address, slash,
+    /// decimal length. Requiring the canonical form keeps the text checked the text sent: <c>route</c>
+    /// has its own reading of an address, and one spelling leaves it nothing to read differently.
+    /// </summary>
+    public static bool ValidPrefix6(string? value) =>
+        Ipv6Cidr.TryParse(value, out var cidr, out var hadLength) && hadLength && cidr.ToString() == value;
+
+    /// <summary>
+    /// Whether this is an IPv6 address, optionally with a zone naming an interface -- a link-local next
+    /// hop means nothing without one -- and nothing else: no brackets, no dotted tail, and a zone that
+    /// passes the same whitelist as an interface name.
+    /// </summary>
+    public static bool ValidAddress6(string? value)
+    {
+        if (value is null)
+        {
+            return false;
+        }
+        var zone = value.IndexOf('%');
+        if (zone >= 0 && !ValidInterfaceName(value[(zone + 1)..]))
+        {
+            return false;
+        }
+        return Ipv6Cidr.TryParseAddress(zone < 0 ? value : value[..zone], out _);
+    }
+
+    /// <summary>Asks where an IPv6 address would go right now. No zone: a bypass address has none.</summary>
+    public static string[] FindRouteArgs6(string? address)
+    {
+        if (!ValidAddress6(address) || address!.Contains('%', StringComparison.Ordinal))
+        {
+            throw new ArgumentException($"{Refusal}: {address}", nameof(address));
+        }
+        return ["route", "-n", "get", "-inet6", address];
+    }
+
+    /// <summary>
+    /// Sends an IPv6 prefix out of an interface: a rule's route into the TUN, or an on-link bypass.
+    /// The utun needs its derived IPv6 address before a route can point at it, as it needs its IPv4
+    /// one; the device is configured before any plan is applied.
+    /// </summary>
+    public static string[] InstallInterfaceArgs6(string? prefix, string? name)
+    {
+        if (!ValidPrefix6(prefix))
+        {
+            throw new ArgumentException($"{Refusal}: {prefix}", nameof(prefix));
+        }
+        if (!ValidInterfaceName(name))
+        {
+            throw new ArgumentException($"{Refusal}: {name}", nameof(name));
+        }
+        return ["route", "-n", "add", "-inet6", "-net", prefix!, "-interface", name!];
+    }
+
+    /// <summary>
+    /// Sends an IPv6 prefix to a next hop, which for IPv6 is usually link-local and so carries its zone:
+    /// <c>fe80::1%en0</c>.
+    /// </summary>
+    public static string[] InstallGatewayArgs6(string? prefix, string? gateway)
+    {
+        if (!ValidPrefix6(prefix))
+        {
+            throw new ArgumentException($"{Refusal}: {prefix}", nameof(prefix));
+        }
+        if (!ValidAddress6(gateway))
+        {
+            throw new ArgumentException($"{Refusal}: {gateway}", nameof(gateway));
+        }
+        return ["route", "-n", "add", "-inet6", "-net", prefix!, gateway!];
+    }
+
+    /// <summary>Withdraws an IPv6 prefix, unscoped like the install.</summary>
+    public static string[] RemoveArgs6(string? prefix)
+    {
+        if (!ValidPrefix6(prefix))
+        {
+            throw new ArgumentException($"{Refusal}: {prefix}", nameof(prefix));
+        }
+        return ["route", "-n", "delete", "-inet6", "-net", prefix!];
+    }
+
+    /// <summary>
+    /// The spec's <c>ifconfig &lt;utun&gt; inet6 &lt;address&gt; prefixlen 128</c>, with the same
+    /// whitelists as the route commands: an interface name that cannot read as an option, and an
+    /// address in the form this feature writes.
+    /// </summary>
+    public static string[] AssignAddress6Args(string? device, string? address)
+    {
+        if (!ValidInterfaceName(device) || !Ipv6Cidr.TryParseAddress(address, out _))
+        {
+            throw new ArgumentException($"{Refusal}: {device} {address}", nameof(address));
+        }
+        return ["ifconfig", device!, "inet6", address!, "prefixlen", "128"];
+    }
+
+    /// <summary>
+    /// Reads <c>route -n get -inet6 &lt;address&gt;</c>. The same shape as IPv4; the gateway is an IPv6
+    /// address, a link-local one with its zone -- <c>gateway: fe80::1%en0</c> -- and anything that is
+    /// not one (a link#N, a MAC) is read as on-link, as for IPv4.
+    /// </summary>
+    public static PeerEgressRouteHop? ParseRouteGet6(string? stdout, string? stderr)
+    {
+        if (!string.IsNullOrWhiteSpace(stderr))
+        {
+            return null;
+        }
+        var gateway = string.Empty;
+        var device = string.Empty;
+        foreach (var line in (stdout ?? string.Empty).Split('\n'))
+        {
+            // The first colon ends the key; an IPv6 value has colons of its own.
+            var separator = line.IndexOf(':');
+            if (separator < 0)
+            {
+                continue;
+            }
+            var key = line[..separator].Trim();
+            var value = line[(separator + 1)..].Trim();
+            if (key == "gateway")
+            {
+                gateway = value;
+            }
+            else if (key == "interface")
+            {
+                device = value;
+            }
+        }
+        if (device.Length == 0)
+        {
+            return null;
+        }
+        return new PeerEgressRouteHop(ValidAddress6(gateway) ? gateway : string.Empty, device);
+    }
+
+    /// <summary>
+    /// Whether anything already owns this exact IPv6 prefix, from the Internet6 section, with the same
+    /// exclusion of kernel-generated rows as IPv4: neighbour entries are host routes the kernel makes
+    /// for every address it has talked to.
+    /// </summary>
+    public static PeerEgressExistingRoute ConflictFromTable6(string? table, string? prefix)
+    {
+        var wanted = NormalisePrefix6(prefix);
+        if (wanted.Length == 0)
+        {
+            return new PeerEgressExistingRoute(false, string.Empty);
+        }
+        var matching = new List<PeerEgressNetstatRoute>();
+        foreach (var route in ParseTable6(table))
+        {
+            if (route.Prefix == wanted &&
+                !route.Flags.Contains(KernelGeneratedFlag, StringComparison.Ordinal))
+            {
+                matching.Add(route);
+            }
+        }
+        return DescribeRoutes(matching);
     }
 
     /// <summary>

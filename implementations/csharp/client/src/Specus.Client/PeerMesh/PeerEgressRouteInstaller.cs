@@ -56,6 +56,13 @@ internal interface IPeerEgressRouteCommander
     /// the table cannot be read, in which case nothing is repaired.
     /// </summary>
     PeerEgressRouteTable Table() => throw new InvalidOperationException("this commander cannot read the routing table");
+
+    /// <summary>
+    /// <see cref="Table"/> for the IPv6 table, read only when this feature owns an IPv6 route
+    /// (protocol/spec/peer-egress.md, IPv6 数据面). Prefixes are in the form this feature writes its
+    /// own: RFC 5952 and the length.
+    /// </summary>
+    PeerEgressRouteTable Table6() => throw new InvalidOperationException("this commander cannot read the IPv6 routing table");
 }
 
 /// <summary>The routing table as read for a repair, and how the tunnel appears in it.</summary>
@@ -340,10 +347,24 @@ internal sealed class PeerEgressRouteInstaller(IPeerEgressRouteCommander command
         {
             return new PeerEgressRouteRepairResult(null, [], [], null);
         }
-        PeerEgressRouteTable table;
+        // Each family is compared with its own table, and a table is read only when a route of its
+        // family is owned: a machine that owns no IPv6 route reads exactly what it read before IPv6
+        // routes existed.
+        var owned4 = _installed.Where(route => !PeerEgressRoutePlanner.IsIpv6(route)).ToList();
+        var owned6 = _installed.Where(PeerEgressRoutePlanner.IsIpv6).ToList();
+        var drifts = new List<PeerEgressRouteDrift>();
         try
         {
-            table = commander.Table();
+            if (owned4.Count > 0)
+            {
+                var table = commander.Table();
+                drifts.AddRange(PeerEgressSocketBinding.Drifts(owned4, table.Routes, table.Tunnel));
+            }
+            if (owned6.Count > 0)
+            {
+                var table6 = commander.Table6();
+                drifts.AddRange(PeerEgressSocketBinding.Drifts(owned6, table6.Routes, table6.Tunnel));
+            }
         }
         catch (Exception unreadable)
         {
@@ -353,7 +374,7 @@ internal sealed class PeerEgressRouteInstaller(IPeerEgressRouteCommander command
         var lost = new List<PeerEgressRouteConflict>();
         Exception? error = null;
         var changed = false;
-        foreach (var drift in PeerEgressSocketBinding.Drifts([.. _installed], table.Routes, table.Tunnel))
+        foreach (var drift in drifts)
         {
             var route = drift.Route;
             if (drift.Action == PeerEgressSocketBinding.DriftConflict)

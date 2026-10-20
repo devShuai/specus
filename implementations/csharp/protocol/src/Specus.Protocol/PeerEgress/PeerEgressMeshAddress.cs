@@ -16,6 +16,9 @@ public static class PeerEgressMeshAddress
 
     private static readonly UInt128 Network = new(0xfd53_7065_6375_7300UL, 0);
 
+    /// <summary><see cref="Prefix"/> as a prefix.</summary>
+    public static Ipv6Cidr PrefixCidr { get; } = new(Network, 96);
+
     /// <summary>The IPv6 address derived from a mesh IPv4 address.</summary>
     public static UInt128 Derive(uint meshIpv4) => Network | meshIpv4;
 

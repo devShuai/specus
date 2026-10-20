@@ -153,10 +153,10 @@ internal static class PeerEgressSocketBinding
         {
             throw new IOException($"resolve bypass hop for {address} past the tunnel: {failed.Message}", failed);
         }
-        // The bypass's own /32 is left out too. When one is being put back after a network change,
-        // the stale row is still in the table naming the old gateway, and it would win the lookup
-        // for its own address.
-        return SelectBypassHop(routes, tunnel, [address + "/32"], address)
+        // The bypass's own /32 (or /128) is left out too. When one is being put back after a network
+        // change, the stale row is still in the table naming the old gateway, and it would win the
+        // lookup for its own address.
+        return SelectBypassHop(routes, tunnel, [PeerEgressRoutePlanner.BypassPrefix(address)], address)
             ?? throw new PeerEgressNoPhysicalRouteException(address);
     }
 
@@ -213,7 +213,7 @@ internal static class PeerEgressSocketBinding
                     : new PeerEgressRouteDrift(route, DriftMoved, DriftConflict, Describe(rows[0])));
                 continue;
             }
-            var address = route.Cidr.EndsWith("/32", StringComparison.Ordinal) ? route.Cidr[..^3] : route.Cidr;
+            var address = PeerEgressRoutePlanner.BypassAddress(route.Cidr);
             var hop = SelectBypassHop(table, tunnel, prefixes, address);
             var present = rows.Where(row => row.Interface != tunnel).ToList();
             if (present.Count == 0)
@@ -501,8 +501,8 @@ internal static class PeerEgressSocketBinding
     /// its interface is not one an unbound socket would follow.
     /// </summary>
     /// <remarks>
-    /// No gateway is kept. Bypass routes, the only reader of it, are IPv4 for now, and an IPv6 gateway
-    /// is usually link-local, meaningful only with the zone this reading drops.
+    /// No gateway is kept: choosing an interface for a socket needs none. A bypass route does, and
+    /// reads the table with <see cref="MacosBypassRoutes6"/>.
     /// </remarks>
     public static List<PeerEgressBindRoute> MacosRoutes6(string? table)
     {
@@ -510,6 +510,26 @@ internal static class PeerEgressSocketBinding
         foreach (var row in PeerEgressMacosRouteCommands.ParseTable6(table))
         {
             routes.Add(new PeerEgressBindRoute(row.Prefix, row.Netif, "", 0,
+                !row.Flags.Contains(MacosScopedFlag, StringComparison.Ordinal)));
+        }
+        return routes;
+    }
+
+    /// <summary>
+    /// The IPv6 table for a consumer's bypass hop and repair: <see cref="MacosRoutes6"/>'s candidates,
+    /// with the gateway kept where the flags say the column is one, zone and all, since a link-local
+    /// next hop is meaningless without it.
+    /// </summary>
+    public static List<PeerEgressBindRoute> MacosBypassRoutes6(string? table)
+    {
+        var routes = new List<PeerEgressBindRoute>();
+        foreach (var row in PeerEgressMacosRouteCommands.ParseTable6(table))
+        {
+            var gateway = row.Flags.Contains(MacosGatewayFlag, StringComparison.Ordinal)
+                && PeerEgressMacosRouteCommands.ValidAddress6(row.Gateway)
+                    ? row.Gateway
+                    : "";
+            routes.Add(new PeerEgressBindRoute(row.Prefix, row.Netif, gateway, 0,
                 !row.Flags.Contains(MacosScopedFlag, StringComparison.Ordinal)));
         }
         return routes;

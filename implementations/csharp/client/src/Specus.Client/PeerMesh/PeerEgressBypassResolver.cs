@@ -27,7 +27,12 @@ internal sealed class PeerEgressBypassResolver(Func<string, IPAddress[]>? lookup
     /// <summary>The addresses behind the entries, and the hosts whose lookup failed.</summary>
     public sealed record Resolution(IReadOnlyList<string> Addresses, IReadOnlyList<string> Failed);
 
-    private sealed record Answer(IReadOnlyList<string> Addresses, bool Failed, long AtMillis);
+    /// <param name="Addresses6">
+    /// The IPv6 answers, in RFC 5952 form, for a consumer with the IPv6 data plane. Kept apart: the
+    /// IPv4 answer is what <see cref="Resolve"/> has always returned.
+    /// </param>
+    private sealed record Answer(IReadOnlyList<string> Addresses, bool Failed, long AtMillis,
+        IReadOnlyList<string> Addresses6);
 
     private readonly Func<string, IPAddress[]> _lookup = lookup ?? Dns.GetHostAddresses;
     private readonly Dictionary<string, Answer> _cache = new(StringComparer.Ordinal);
@@ -82,6 +87,73 @@ internal sealed class PeerEgressBypassResolver(Func<string, IPAddress[]>? lookup
         return new Resolution(addresses, failed);
     }
 
+    /// <summary>
+    /// Returns the IPv6 addresses behind each entry, in input order without duplicates and in RFC 5952
+    /// form, for a consumer with the IPv6 data plane: an IPv6 rule can cover an endpoint the tunnel's
+    /// transport uses as surely as an IPv4 one can. Failures are left to <see cref="Resolve"/>, which
+    /// asks the same lookups and says so once.
+    /// </summary>
+    public IReadOnlyList<string> Resolve6(IEnumerable<string?> entries, long nowMillis)
+    {
+        var addresses = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        lock (_gate)
+        {
+            foreach (var entry in entries)
+            {
+                IReadOnlyList<string> resolved = [];
+                if (Literal6(entry) is { } literal)
+                {
+                    resolved = [literal];
+                }
+                else if (HostOf(entry) is { Length: > 0 } host && !Ipv4Cidr.TryParseAddress(host, out _))
+                {
+                    resolved = LookupCached(host, nowMillis).Addresses6;
+                }
+                foreach (var address in resolved)
+                {
+                    if (seen.Add(address))
+                    {
+                        addresses.Add(address);
+                    }
+                }
+            }
+        }
+        return addresses;
+    }
+
+    /// <summary>
+    /// An IPv6 literal read out of a URL, a bracketed host with a port, or a bare address, in RFC 5952
+    /// form; null for anything else. A zone is not an address a route can name, and neither is an
+    /// IPv4-mapped one, which the IPv4 side covers.
+    /// </summary>
+    public static string? Literal6(string? entry)
+    {
+        var text = entry?.Trim() ?? string.Empty;
+        if (text.Contains("://", StringComparison.Ordinal))
+        {
+            if (!Uri.TryCreate(text, UriKind.Absolute, out var parsed))
+            {
+                return null;
+            }
+            text = parsed.Host;
+        }
+        if (text.StartsWith('['))
+        {
+            var close = text.IndexOf(']');
+            if (close < 0)
+            {
+                return null;
+            }
+            text = text[1..close];
+        }
+        if (!Ipv6Cidr.TryParseAddress(text, out var address) || new Ipv6Cidr(address, Ipv6Cidr.MaxPrefix).Mapped)
+        {
+            return null;
+        }
+        return Ipv6Cidr.FormatAddress(address);
+    }
+
     private Answer LookupCached(string host, long nowMillis)
     {
         if (_cache.TryGetValue(host, out var cached) && nowMillis - cached.AtMillis < ResolveTtlMillis)
@@ -89,16 +161,22 @@ internal sealed class PeerEgressBypassResolver(Func<string, IPAddress[]>? lookup
             return cached;
         }
         var resolved = new List<string>();
+        var resolved6 = new List<string>();
         var failed = false;
         try
         {
             foreach (var address in _lookup(host))
             {
-                // IPv4 only: the rules are IPv4 and so are the routes they install, so an IPv6
-                // answer has nothing to be routed around.
+                // The IPv4 answers are what Resolve returns; the IPv6 ones are routed around only by
+                // a consumer with the IPv6 data plane, through Resolve6.
                 if (address.AddressFamily == AddressFamily.InterNetwork)
                 {
                     resolved.Add(address.ToString());
+                }
+                else if (address.AddressFamily == AddressFamily.InterNetworkV6 && !address.IsIPv4MappedToIPv6)
+                {
+                    // Kept apart, for Resolve6: the IPv4 answer is what Resolve has always returned.
+                    resolved6.Add(Ipv6Cidr.FormatAddress(PeerEgressIpv6.FromAddress(address)));
                 }
             }
         }
@@ -109,14 +187,14 @@ internal sealed class PeerEgressBypassResolver(Func<string, IPAddress[]>? lookup
         // A failure is cached too. Retrying a name that does not resolve on every tick would be the
         // same query storm the cache exists to prevent, and the next tick after the TTL will ask
         // again.
-        var answer = new Answer(resolved, failed, nowMillis);
+        var answer = new Answer(resolved, failed, nowMillis, resolved6);
         _cache[host] = answer;
         return answer;
     }
 
     /// <summary>
     /// The host in a URL, a host:port pair, or a bare host. Empty when there is nothing to resolve,
-    /// which includes IPv6 literals: the routes are IPv4.
+    /// which includes IPv6 literals: <see cref="Literal6"/> reads those.
     /// </summary>
     public static string HostOf(string? entry)
     {

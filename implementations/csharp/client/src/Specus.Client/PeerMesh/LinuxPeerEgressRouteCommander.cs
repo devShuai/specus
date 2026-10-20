@@ -34,7 +34,7 @@ internal sealed class LinuxPeerEgressRouteCommander(string? tun) : IPeerEgressRo
         string output;
         try
         {
-            output = RunForOutput("ip", ["route", "show", "exact", route.Cidr]);
+            output = RunForOutput("ip", PeerEgressRouteCommands.RouteArgs(route.Cidr, "show", "exact", route.Cidr));
         }
         catch (Exception)
         {
@@ -59,17 +59,17 @@ internal sealed class LinuxPeerEgressRouteCommander(string? tun) : IPeerEgressRo
         {
             throw new InvalidOperationException("no TUN interface to route into");
         }
-        RunForOutput("ip", ["route", "add", route.Cidr, "dev", tun]);
+        RunForOutput("ip", PeerEgressRouteCommands.RouteArgs(route.Cidr, "add", route.Cidr, "dev", tun));
     }
 
     private void InstallBypass(PeerEgressRoute route)
     {
-        var address = route.Cidr.EndsWith("/32", StringComparison.Ordinal)
-            ? route.Cidr[..^3]
-            : route.Cidr;
+        var address = PeerEgressRoutePlanner.BypassAddress(route.Cidr);
+        var ipv6 = PeerEgressRoutePlanner.IsIpv6(route);
         if (!_hops.TryGetValue(address, out var hop))
         {
-            var resolved = PeerEgressRouteCommands.ParseRouteGet(RunForOutput("ip", ["route", "get", address]));
+            var resolved = PeerEgressRouteCommands.ParseRouteGet(
+                RunForOutput("ip", PeerEgressRouteCommands.RouteArgs(route.Cidr, "get", address)));
             if (resolved is null)
             {
                 throw new InvalidOperationException($"no route to {address} to bypass through");
@@ -82,24 +82,33 @@ internal sealed class LinuxPeerEgressRouteCommander(string? tun) : IPeerEgressRo
                 // table, read with the tunnel left out, says where it went before. Only the main
                 // table: the query followed policy routing and this reading does not.
                 var fallback = PeerEgressSocketBinding.BypassHopFromTable(address, tun,
-                    () => PeerEgressRouteCommands.ParseRouteTable(RunForOutput("ip", PeerEgressRouteCommands.ShowMainTableArgs())));
+                    ipv6 ? ReadMainTable6 : ReadMainTable);
                 hop = new PeerEgressRouteHop(fallback.Gateway, fallback.Interface);
             }
             _hops[address] = hop;
         }
         RunForOutput("ip", hop.Gateway.Length == 0
-            ? ["route", "add", route.Cidr, "dev", hop.Device]
-            : ["route", "add", route.Cidr, "via", hop.Gateway, "dev", hop.Device]);
+            ? PeerEgressRouteCommands.RouteArgs(route.Cidr, "add", route.Cidr, "dev", hop.Device)
+            : PeerEgressRouteCommands.RouteArgs(route.Cidr, "add", route.Cidr, "via", hop.Gateway, "dev", hop.Device));
     }
 
     public void Remove(PeerEgressRoute route)
     {
-        _hops.Remove(route.Cidr.EndsWith("/32", StringComparison.Ordinal) ? route.Cidr[..^3] : route.Cidr);
-        RunForOutput("ip", ["route", "del", route.Cidr]);
+        _hops.Remove(PeerEgressRoutePlanner.BypassAddress(route.Cidr));
+        RunForOutput("ip", PeerEgressRouteCommands.RouteArgs(route.Cidr, "del", route.Cidr));
     }
 
-    public PeerEgressRouteTable Table() => new(
-        PeerEgressRouteCommands.ParseRouteTable(RunForOutput("ip", PeerEgressRouteCommands.ShowMainTableArgs())), tun ?? string.Empty);
+    public PeerEgressRouteTable Table() => new(ReadMainTable(), tun ?? string.Empty);
+
+    public PeerEgressRouteTable Table6() => new(ReadMainTable6(), tun ?? string.Empty);
+
+    /// <summary>The main table, for a bypass hop and for the repair.</summary>
+    private static List<PeerEgressBindRoute> ReadMainTable() =>
+        PeerEgressRouteCommands.ParseRouteTable(RunForOutput("ip", PeerEgressRouteCommands.ShowMainTableArgs()));
+
+    /// <summary>The IPv6 main table, the same way.</summary>
+    private static List<PeerEgressBindRoute> ReadMainTable6() =>
+        PeerEgressRouteCommands.ParseRouteTable6(RunForOutput("ip", PeerEgressRouteCommands.ShowMainTableArgs6()));
 
     private static string RunForOutput(string program, string[] arguments)
     {
