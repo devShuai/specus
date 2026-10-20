@@ -3,6 +3,7 @@
 #include "stun_turn.h"
 
 #include "crypto.h"
+#include "instant.h"
 #include "json.h"
 #include "storage.h"
 #include "turn_auth.h"
@@ -14,6 +15,7 @@
 #include <openssl/rand.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +64,9 @@
 #define ATTR_RESPONSE_ORIGIN 0x802bU
 #define ATTR_OTHER_ADDRESS 0x802cU
 #define STUN_MAX_ENDPOINTS 4U
+/* Java PeerMeshService: RELAY_AUTH_CACHE_TTL_NANOS and relay-traffic-flush-interval-ms. */
+#define RELAY_GRANT_TTL_MS 30000LL
+#define RELAY_TRAFFIC_FLUSH_DEFAULT_MS 5000L
 
 typedef struct {
     int used;
@@ -100,13 +105,30 @@ typedef struct {
     socklen_t advertised_len;
 } stun_server_endpoint;
 
+/*
+ * A Peer Mesh session the relay has seen (Java relayAuthorizationCache plus pendingRelayBytes).
+ * The grant answers its frames for RELAY_GRANT_TTL_MS while the session neither expires nor
+ * changes (st_storage_peer_mesh_session_version); the bytes of its outbound frames wait in
+ * pending_bytes for the next batch. Keyed by database and session, since the database path is
+ * read per frame.
+ */
+typedef struct {
+    char *database_path;
+    long long session_id;
+    st_storage_peer_mesh_relay_grant grant;
+    int granted;
+    unsigned long long version;
+    long long grant_expires_ms;
+    long long pending_bytes;
+} relay_session;
+
 struct st_stun_turn_server {
     int control_fd;
     int port;
     stun_server_endpoint endpoints[STUN_MAX_ENDPOINTS];
     size_t endpoint_count;
     int rfc5780;
-    int running;
+    atomic_int running;
     int auth_required;
     int allow_private_peers;
     int allocation_ttl;
@@ -130,6 +152,22 @@ struct st_stun_turn_server {
     struct pollfd *poll_fds;
     turn_allocation **poll_owners;
     size_t poll_capacity;
+    /*
+     * Relay sessions, shared by the STUN/TURN thread and the flusher. relay_lock guards the table
+     * and flush_stopping and is never held over database work; flush_lock lets one batch be
+     * written at a time, and only a flush removes entries.
+     */
+    pthread_mutex_t relay_lock;
+    pthread_cond_t relay_wake;
+    pthread_mutex_t flush_lock;
+    int sync_ready;
+    relay_session *relay_sessions;
+    size_t relay_session_count;
+    size_t relay_session_capacity;
+    long flush_interval_ms;
+    int flush_stopping;
+    int flusher_started;
+    pthread_t flusher;
 };
 
 typedef struct {
@@ -652,13 +690,203 @@ static uint64_t read_u64(const uint8_t *data)
     return ((uint64_t)read_u32(data) << 32U) | read_u32(data + 4U);
 }
 
+static long long monotonic_ms(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000L;
+}
+
+static long long saturated_add(long long current, long long delta)
+{
+    return delta > 0 && current > LLONG_MAX - delta ? LLONG_MAX : current + delta;
+}
+
+/* Caller holds relay_lock. */
+static relay_session *find_relay_session(st_stun_turn_server *server, const char *database_path,
+                                         long long session_id)
+{
+    for (size_t i = 0; i < server->relay_session_count; ++i) {
+        relay_session *entry = &server->relay_sessions[i];
+        if (entry->session_id == session_id && strcmp(entry->database_path, database_path) == 0) return entry;
+    }
+    return NULL;
+}
+
+/* Caller holds relay_lock. */
+static relay_session *add_relay_session(st_stun_turn_server *server, const char *database_path,
+                                        long long session_id)
+{
+    if (server->relay_session_count == server->relay_session_capacity) {
+        size_t capacity = server->relay_session_capacity == 0U ? 16U : server->relay_session_capacity * 2U;
+        if (capacity > SIZE_MAX / sizeof(*server->relay_sessions)) return NULL;
+        relay_session *grown = (relay_session *)realloc(server->relay_sessions, capacity * sizeof(*grown));
+        if (grown == NULL) return NULL;
+        server->relay_sessions = grown;
+        server->relay_session_capacity = capacity;
+    }
+    char *path = strdup(database_path);
+    if (path == NULL) return NULL;
+    relay_session *entry = &server->relay_sessions[server->relay_session_count++];
+    memset(entry, 0, sizeof(*entry));
+    entry->database_path = path;
+    entry->session_id = session_id;
+    return entry;
+}
+
+/* Java RelayAuthorization.matches: 0/0 is TURN authentication off, where only the session counts. */
+static int relay_grant_matches(const st_storage_peer_mesh_relay_grant *grant, long long from, long long to)
+{
+    return (from <= 0 && to <= 0)
+        || (from == grant->source_client_id && to == grant->target_client_id)
+        || (from == grant->target_client_id && to == grant->source_client_id);
+}
+
+/*
+ * One SPM2 frame against its session, as Java PeerMeshService.authorizeRelayFrameForRelay does it.
+ * A grant read in the last RELAY_GRANT_TTL_MS answers from memory while the session has neither
+ * expired nor changed, and an outbound frame's bytes join the session's pending batch, so the
+ * STUN/TURN thread does not touch the database for it. Otherwise the session is read (the first
+ * frame activates a NEGOTIATING session on the relay path) and its grant kept for the next frames.
+ */
+static int authorize_relay_frame(st_stun_turn_server *server,
+                                 const char *database_path,
+                                 long long session_id,
+                                 long long from_client_id,
+                                 long long to_client_id,
+                                 long long bytes,
+                                 int account_traffic)
+{
+    int identified = from_client_id > 0 && to_client_id > 0;
+    if ((!identified && (from_client_id != 0 || to_client_id != 0))
+        || (identified && from_client_id == to_client_id)) return 0;
+    /* Read before the session is, so a change committed meanwhile leaves the new grant stale. */
+    unsigned long long version = st_storage_peer_mesh_session_version(session_id);
+    long long now_ms = monotonic_ms();
+    char now[ST_INSTANT_CAPACITY];
+    int have_now = st_instant_now(now) == 0;
+    pthread_mutex_lock(&server->relay_lock);
+    relay_session *entry = find_relay_session(server, database_path, session_id);
+    if (entry != NULL && entry->granted && entry->version == version && entry->grant_expires_ms > now_ms
+        && (entry->grant.expires_at[0] == '\0' || (have_now && strcmp(entry->grant.expires_at, now) > 0))) {
+        int allowed = relay_grant_matches(&entry->grant, from_client_id, to_client_id);
+        if (allowed && account_traffic) entry->pending_bytes = saturated_add(entry->pending_bytes, bytes);
+        pthread_mutex_unlock(&server->relay_lock);
+        return allowed;
+    }
+    pthread_mutex_unlock(&server->relay_lock);
+    st_storage_peer_mesh_relay_grant grant;
+    int allowed = st_storage_authorize_peer_mesh_relay_grant(database_path, session_id, from_client_id,
+                                                             to_client_id, &grant) == 1;
+    pthread_mutex_lock(&server->relay_lock);
+    entry = find_relay_session(server, database_path, session_id);
+    if (allowed && entry == NULL) entry = add_relay_session(server, database_path, session_id);
+    if (allowed && entry != NULL) {
+        entry->grant = grant;
+        entry->granted = 1;
+        entry->version = version;
+        entry->grant_expires_ms = now_ms + RELAY_GRANT_TTL_MS;
+        if (account_traffic) entry->pending_bytes = saturated_add(entry->pending_bytes, bytes);
+    } else if (allowed) {
+        /* No memory to count it in: a frame that cannot be counted is not relayed. */
+        allowed = 0;
+    } else if (entry != NULL) {
+        entry->granted = 0;
+    }
+    pthread_mutex_unlock(&server->relay_lock);
+    return allowed;
+}
+
+void st_stun_turn_server_flush_relay_traffic(st_stun_turn_server *server)
+{
+    if (server == NULL || !server->sync_ready) return;
+    pthread_mutex_lock(&server->flush_lock);
+    /* Take the batch, then write it without holding up the hot path. Only a flush removes
+     * entries, so the paths stay valid until the end of this one. */
+    pthread_mutex_lock(&server->relay_lock);
+    size_t pending = 0U;
+    for (size_t i = 0; i < server->relay_session_count; ++i) pending += server->relay_sessions[i].pending_bytes > 0;
+    relay_session *batch = pending == 0U ? NULL : (relay_session *)calloc(pending, sizeof(*batch));
+    size_t batch_count = 0U;
+    for (size_t i = 0; batch != NULL && i < server->relay_session_count; ++i) {
+        relay_session *entry = &server->relay_sessions[i];
+        if (entry->pending_bytes <= 0) continue;
+        batch[batch_count++] = *entry;
+        entry->pending_bytes = 0;
+    }
+    pthread_mutex_unlock(&server->relay_lock);
+    for (size_t i = 0; i < batch_count; ++i) {
+        int result = st_storage_record_peer_mesh_relay_traffic(batch[i].database_path, batch[i].session_id,
+                                                               batch[i].pending_bytes);
+        if (result < 0) {
+            fprintf(stderr, "[peer-mesh] relay traffic flush failed: session=%lld, bytes=%lld\n",
+                    batch[i].session_id, batch[i].pending_bytes);
+        }
+        pthread_mutex_lock(&server->relay_lock);
+        relay_session *entry = find_relay_session(server, batch[i].database_path, batch[i].session_id);
+        if (entry != NULL && result < 0) {
+            /* Java restoreRelayTrafficBatch: kept for the next batch. */
+            entry->pending_bytes = saturated_add(entry->pending_bytes, batch[i].pending_bytes);
+        } else if (entry != NULL && result > 0) {
+            /* Closed or gone: the next frame reads the session again. */
+            entry->granted = 0;
+            if (result == 2) entry->pending_bytes = 0;
+        }
+        pthread_mutex_unlock(&server->relay_lock);
+    }
+    free(batch);
+    /* Sessions that can no longer answer a frame and have nothing waiting are forgotten. */
+    long long now_ms = monotonic_ms();
+    pthread_mutex_lock(&server->relay_lock);
+    size_t kept = 0U;
+    for (size_t i = 0; i < server->relay_session_count; ++i) {
+        relay_session *entry = &server->relay_sessions[i];
+        if (entry->pending_bytes <= 0 && (!entry->granted || entry->grant_expires_ms <= now_ms)) {
+            free(entry->database_path);
+        } else {
+            server->relay_sessions[kept++] = *entry;
+        }
+    }
+    server->relay_session_count = kept;
+    pthread_mutex_unlock(&server->relay_lock);
+    pthread_mutex_unlock(&server->flush_lock);
+}
+
+/* Writes the pending relay bytes every flush_interval_ms until the server stops. */
+static void *relay_flush_thread(void *raw)
+{
+    st_stun_turn_server *server = (st_stun_turn_server *)raw;
+    pthread_mutex_lock(&server->relay_lock);
+    while (!server->flush_stopping) {
+        struct timespec deadline;
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
+        deadline.tv_sec += server->flush_interval_ms / 1000L;
+        deadline.tv_nsec += (server->flush_interval_ms % 1000L) * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec += 1;
+            deadline.tv_nsec -= 1000000000L;
+        }
+        int waited = 0;
+        while (!server->flush_stopping && waited != ETIMEDOUT) {
+            waited = pthread_cond_timedwait(&server->relay_wake, &server->relay_lock, &deadline);
+        }
+        if (server->flush_stopping) break;
+        pthread_mutex_unlock(&server->relay_lock);
+        st_stun_turn_server_flush_relay_traffic(server);
+        pthread_mutex_lock(&server->relay_lock);
+    }
+    pthread_mutex_unlock(&server->relay_lock);
+    return NULL;
+}
+
 /*
  * identified is whether TURN authentication is on. With it off an allocation carries no client id
  * (the credential has none), so, as in Java StunTurnServer.authorizeRelayPayload, both sides go to
  * the session check as 0 and only the session itself is checked: insisting on ids there would
  * drop every Peer Mesh datagram, probes included, and leave the relay unusable.
  */
-static int authorize_relay_payload(const uint8_t *payload,
+static int authorize_relay_payload(st_stun_turn_server *server,
+                                   const uint8_t *payload,
                                    size_t payload_len,
                                    const turn_allocation *source,
                                    const turn_allocation *target,
@@ -679,10 +907,8 @@ static int authorize_relay_payload(const uint8_t *payload,
         long long session_id = (long long)read_u64(payload + 4U);
         long long sequence = (long long)read_u64(payload + 12U);
         return session_id > 0 && sequence > 0
-            && st_storage_authorize_peer_mesh_relay(database_path, session_id,
-                                                    source_id, target_id,
-                                                    (long long)payload_len,
-                                                    account_traffic) == 1;
+            && authorize_relay_frame(server, database_path, session_id, source_id, target_id,
+                                     (long long)payload_len, account_traffic);
     }
     if (payload_len < 2U || payload_len > 2048U || payload[0] != '{'
         || payload[payload_len - 1U] != '}') return 0;
@@ -1235,7 +1461,7 @@ static void handle_send_indication(st_stun_turn_server *server,
         || decode_xor_address(&peer_attr, packet + 8U, &peer, &peer_len) != 0
         || !allocation_has_permission(allocation, &peer)) return;
     turn_allocation *target = find_allocation_by_relay(server, &peer);
-    if (!authorize_relay_payload(data.value, data.length, allocation, target, 1,
+    if (!authorize_relay_payload(server, data.value, data.length, allocation, target, 1,
                                  server->auth_required)) return;
     if (!allow_general_relay_traffic(server, allocation, data.length)) return;
     (void)sendto(allocation->relay_fd, data.value, data.length, 0,
@@ -1254,7 +1480,7 @@ static void handle_channel_data(st_stun_turn_server *server,
     turn_channel *channel = allocation == NULL ? NULL : find_channel_by_number(allocation, number);
     if (channel == NULL || 4U + data_len > len || !allocation_has_permission(allocation, &channel->peer)) return;
     turn_allocation *target = find_allocation_by_relay(server, &channel->peer);
-    if (!authorize_relay_payload(packet + 4U, data_len, allocation, target, 1,
+    if (!authorize_relay_payload(server, packet + 4U, data_len, allocation, target, 1,
                                  server->auth_required)) return;
     if (!allow_general_relay_traffic(server, allocation, data_len)) return;
     (void)sendto(allocation->relay_fd, packet + 4U, data_len, 0,
@@ -1296,7 +1522,7 @@ static void handle_relay_packet(st_stun_turn_server *server, turn_allocation *al
                                 (struct sockaddr *)&peer, &peer_len);
     if (received <= 0 || !allocation_has_permission(allocation, &peer)) return;
     turn_allocation *source = find_allocation_by_relay(server, &peer);
-    if (!authorize_relay_payload(packet, (size_t)received, source, allocation, 0,
+    if (!authorize_relay_payload(server, packet, (size_t)received, source, allocation, 0,
                                  server->auth_required)) return;
     if (!allow_general_relay_traffic(server, allocation, (size_t)received)) return;
     turn_channel *channel = find_channel_by_peer(allocation, &peer);
@@ -1417,6 +1643,59 @@ static void *stun_turn_thread(void *raw)
     return NULL;
 }
 
+static int init_relay_sync(st_stun_turn_server *server)
+{
+    pthread_condattr_t attributes;
+    if (pthread_condattr_init(&attributes) != 0) return -1;
+    int rc = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC) == 0
+        && pthread_cond_init(&server->relay_wake, &attributes) == 0 ? 0 : -1;
+    pthread_condattr_destroy(&attributes);
+    if (rc != 0) return -1;
+    if (pthread_mutex_init(&server->relay_lock, NULL) != 0) {
+        pthread_cond_destroy(&server->relay_wake);
+        return -1;
+    }
+    if (pthread_mutex_init(&server->flush_lock, NULL) != 0) {
+        pthread_mutex_destroy(&server->relay_lock);
+        pthread_cond_destroy(&server->relay_wake);
+        return -1;
+    }
+    server->sync_ready = 1;
+    return 0;
+}
+
+static void stop_relay_flusher(st_stun_turn_server *server)
+{
+    if (!server->flusher_started) return;
+    pthread_mutex_lock(&server->relay_lock);
+    server->flush_stopping = 1;
+    pthread_cond_signal(&server->relay_wake);
+    pthread_mutex_unlock(&server->relay_lock);
+    pthread_join(server->flusher, NULL);
+    server->flusher_started = 0;
+}
+
+/* Releases a server whose threads are not running (any more). */
+static void discard_server(st_stun_turn_server *server)
+{
+    for (size_t i = 0; i < server->allocation_count; ++i) {
+        if (server->allocations[i]->used) close_allocation(server->allocations[i]);
+    }
+    reap_closed_allocations(server);
+    close_stun_endpoints(server, 0);
+    for (size_t i = 0; i < server->relay_session_count; ++i) free(server->relay_sessions[i].database_path);
+    if (server->sync_ready) {
+        pthread_mutex_destroy(&server->flush_lock);
+        pthread_mutex_destroy(&server->relay_lock);
+        pthread_cond_destroy(&server->relay_wake);
+    }
+    free(server->relay_sessions);
+    free(server->allocations);
+    free(server->poll_fds);
+    free(server->poll_owners);
+    free(server);
+}
+
 int st_stun_turn_server_start(st_stun_turn_server **out_server)
 {
     if (out_server == NULL) return -1;
@@ -1424,6 +1703,14 @@ int st_stun_turn_server_start(st_stun_turn_server **out_server)
     st_stun_turn_server *server = (st_stun_turn_server *)calloc(1, sizeof(*server));
     if (server == NULL) return -1;
     server->control_fd = -1;
+    if (init_relay_sync(server) != 0) {
+        free(server);
+        return -1;
+    }
+    long long flush_interval = env_i64_value("SPECUS_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS",
+                                             RELAY_TRAFFIC_FLUSH_DEFAULT_MS);
+    server->flush_interval_ms = flush_interval <= 0 ? RELAY_TRAFFIC_FLUSH_DEFAULT_MS
+        : (flush_interval > 86400000LL ? 86400000L : (long)flush_interval);
     server->auth_required = env_bool_value("SPECUS_PEER_MESH_TURN_AUTH_REQUIRED", 1);
     server->allow_private_peers = env_bool_value("SPECUS_PEER_MESH_TURN_ALLOW_PRIVATE_PEERS", 0);
     server->allocation_ttl = env_int_alias("SPECUS_PEER_MESH_ALLOCATION_TTL_SECONDS",
@@ -1441,7 +1728,7 @@ int st_stun_turn_server_start(st_stun_turn_server **out_server)
     server->general_relay_max_bytes = env_i64_value(
         "SPECUS_PEER_MESH_GENERAL_RELAY_MAX_BYTES", 512LL * 1024LL * 1024LL);
     if (server->relay_min_port <= 0 || server->relay_max_port < server->relay_min_port) {
-        free(server);
+        discard_server(server);
         return -1;
     }
     const char *primary_bind = getenv("SPECUS_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS");
@@ -1461,14 +1748,13 @@ int st_stun_turn_server_start(st_stun_turn_server **out_server)
         && strcmp(primary_bind, alternate_bind) != 0
         && strcmp(primary_public, alternate_public) != 0;
     if (env_bool_value("SPECUS_PEER_MESH_STUN_BEHAVIOR_STRICT", 0) && !full_rfc5780) {
-        free(server);
+        discard_server(server);
         return -1;
     }
     int primary_actual = add_stun_endpoint(server, primary_bind, primary_public,
                                            configured_port, 0, 0);
     if (primary_actual <= 0) {
-        close_stun_endpoints(server, 0);
-        free(server);
+        discard_server(server);
         return -1;
     }
     server->port = primary_actual;
@@ -1480,8 +1766,7 @@ int st_stun_turn_server_start(st_stun_turn_server **out_server)
                                  configured_port, 1, 0) <= 0
             || add_stun_endpoint(server, alternate_bind, alternate_public,
                                  alternate_port, 1, 1) <= 0) {
-            close_stun_endpoints(server, 0);
-            free(server);
+            discard_server(server);
             return -1;
         }
         server->rfc5780 = 1;
@@ -1489,10 +1774,15 @@ int st_stun_turn_server_start(st_stun_turn_server **out_server)
         (void)add_stun_endpoint(server, primary_bind, primary_public,
                                 alternate_port, 0, 1);
     }
+    if (pthread_create(&server->flusher, NULL, relay_flush_thread, server) != 0) {
+        discard_server(server);
+        return -1;
+    }
+    server->flusher_started = 1;
     server->running = 1;
     if (pthread_create(&server->thread, NULL, stun_turn_thread, server) != 0) {
-        close_stun_endpoints(server, 0);
-        free(server);
+        stop_relay_flusher(server);
+        discard_server(server);
         return -1;
     }
     *out_server = server;
@@ -1510,13 +1800,8 @@ void st_stun_turn_server_stop(st_stun_turn_server *server)
     server->running = 0;
     close_stun_endpoints(server, 1);
     pthread_join(server->thread, NULL);
-    for (size_t i = 0; i < server->allocation_count; ++i) {
-        if (server->allocations[i]->used) close_allocation(server->allocations[i]);
-    }
-    reap_closed_allocations(server);
-    close_stun_endpoints(server, 0);
-    free(server->allocations);
-    free(server->poll_fds);
-    free(server->poll_owners);
-    free(server);
+    stop_relay_flusher(server);
+    /* Nothing relays any more: what is still counted is written now, not lost. */
+    st_stun_turn_server_flush_relay_traffic(server);
+    discard_server(server);
 }

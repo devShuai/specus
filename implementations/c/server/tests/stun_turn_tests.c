@@ -1224,21 +1224,28 @@ static int frame_dropped(int from_fd, const struct sockaddr_in *server, const st
     return !relayed_bytes(from_fd, server, to_relay, to_fd, frame, len, seed, 300L);
 }
 
-static int exec_sql_on(const char *path, const char *sql)
+/* Another writer holding the whole database, as a long management transaction would. */
+static sqlite3 *lock_database(const char *path)
 {
     sqlite3 *db = NULL;
-    int rc = sqlite3_open(path, &db) == SQLITE_OK
-        && sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
+    if (sqlite3_open(path, &db) == SQLITE_OK
+        && sqlite3_exec(db, "BEGIN EXCLUSIVE", NULL, NULL, NULL) == SQLITE_OK) return db;
     sqlite3_close(db);
-    return rc;
+    return NULL;
 }
 
-static int expire_session(const char *path, long long session_id)
+static void unlock_database(sqlite3 *db)
 {
-    char sql[160];
-    snprintf(sql, sizeof(sql),
-             "UPDATE peer_mesh_session SET expires_at=datetime('now','-5 seconds') WHERE id=%lld", session_id);
-    return exec_sql_on(path, sql);
+    if (db == NULL) return;
+    (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    sqlite3_close(db);
+}
+
+static long long monotonic_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000L;
 }
 
 static int session_is(const char *path, const char *tenant, long long id, const char *status,
@@ -1286,14 +1293,29 @@ static int frame_fixture_setup(frame_fixture *fixture, const char *tenant)
     return 0;
 }
 
-static int open_session(const frame_fixture *fixture, const char *token, st_storage_peer_mesh_session *session)
+static int open_session_for(const frame_fixture *fixture, const char *token, long long ttl_seconds,
+                            st_storage_peer_mesh_session *session)
 {
     uint8_t digest[ST_SHA256_LEN];
     char token_hash[ST_SHA256_HEX_LEN + 1U];
     st_sha256((const uint8_t *)token, strlen(token), digest);
     st_hex_encode(digest, sizeof(digest), token_hash);
     return st_storage_create_peer_mesh_session(fixture->path, &fixture->source, &fixture->target,
-                                               "DIRECT", token_hash, 3600, session);
+                                               "DIRECT", token_hash, ttl_seconds, session);
+}
+
+static int open_session(const frame_fixture *fixture, const char *token, st_storage_peer_mesh_session *session)
+{
+    return open_session_for(fixture, token, 3600, session);
+}
+
+/* Relay bytes reach the database in batches (Java flushRelayTraffic): write them out, then read. */
+static int counted_session_is(st_stun_turn_server *turn, const char *path, const char *tenant, long long id,
+                              const char *status, const char *path_type, long long relay_bytes,
+                              const char *label)
+{
+    st_stun_turn_server_flush_relay_traffic(turn);
+    return session_is(path, tenant, id, status, path_type, relay_bytes, label);
 }
 
 /*
@@ -1302,7 +1324,7 @@ static int open_session(const frame_fixture *fixture, const char *token, st_stor
  * relayFrameRejectsExpiredSessionAndClosesIt, relayHotPathActivatesNegotiatingSessionOnFirstFrame,
  * relayHotPathRejectsClosedSessionAndMismatchedClients), with the clients the TURN credentials name.
  */
-static int test_spm2_frames_bound_to_session(const struct sockaddr_in *server)
+static int test_spm2_frames_bound_to_session(st_stun_turn_server *turn, const struct sockaddr_in *server)
 {
     frame_fixture fixture;
     if (frame_fixture_setup(&fixture, "tenant-frames") != 0) return 1;
@@ -1327,32 +1349,36 @@ static int test_spm2_frames_bound_to_session(const struct sockaddr_in *server)
         || permit_peer(stranger_fd, server, stranger_user, stranger_key, &target_relay, 750U) != 0;
     if (failed) fprintf(stderr, "SPM2 relay allocation/permission setup failed\n");
 
-    /* The first frame of a NEGOTIATING session crosses and activates it on the relay path. */
+    /* The first frame of a NEGOTIATING session crosses and activates it on the relay path at once;
+     * its bytes are counted with the next batch. */
     if (!failed && (!frame_relayed(source_fd, server, &target_relay, target_fd, session.id, 1, 760U)
-                    || session_is(fixture.path, "tenant-frames", session.id, "ACTIVE", "RELAY", 52,
-                                  "first relayed frame") != 0)) {
+                    || session_is(fixture.path, "tenant-frames", session.id, "ACTIVE", "RELAY", -1,
+                                  "first relayed frame, before the batch") != 0
+                    || counted_session_is(turn, fixture.path, "tenant-frames", session.id, "ACTIVE", "RELAY", 52,
+                                          "first relayed frame") != 0)) {
         fprintf(stderr, "a NEGOTIATING session's first relayed frame was not admitted and counted\n");
         failed = 1;
     }
     /* An active matching session relays both ways and counts each outbound frame once. */
     if (!failed && (!frame_relayed(target_fd, server, &source_relay, source_fd, session.id, 2, 761U)
-                    || session_is(fixture.path, "tenant-frames", session.id, "ACTIVE", "RELAY", 104,
-                                  "reverse frame") != 0)) {
+                    || counted_session_is(turn, fixture.path, "tenant-frames", session.id, "ACTIVE", "RELAY", 104,
+                                          "reverse frame") != 0)) {
         fprintf(stderr, "an active session's reverse frame was not relayed and counted\n");
         failed = 1;
     }
-    /* A third client of the tenant cannot use the session: not relayed, not counted. */
+    /* A third client of the tenant cannot use the session, cached as it is: not relayed, not
+     * counted. */
     if (!failed && (!frame_dropped(stranger_fd, server, &target_relay, target_fd, session.id, 3, 762U)
-                    || session_is(fixture.path, "tenant-frames", session.id, "ACTIVE", "RELAY", 104,
-                                  "stranger frame") != 0)) {
+                    || counted_session_is(turn, fixture.path, "tenant-frames", session.id, "ACTIVE", "RELAY", 104,
+                                          "stranger frame") != 0)) {
         fprintf(stderr, "a frame from a client outside the session was relayed or counted\n");
         failed = 1;
     }
     /* Nor does its frame activate a NEGOTIATING session it is not part of. */
     if (!failed && (open_session(&fixture, "other-session-token", &other) != 0
                     || !frame_dropped(stranger_fd, server, &target_relay, target_fd, other.id, 1, 763U)
-                    || session_is(fixture.path, "tenant-frames", other.id, "NEGOTIATING", NULL, 0,
-                                  "stranger frame on a negotiating session") != 0)) {
+                    || counted_session_is(turn, fixture.path, "tenant-frames", other.id, "NEGOTIATING", NULL, 0,
+                                          "stranger frame on a negotiating session") != 0)) {
         fprintf(stderr, "a mismatched frame activated a negotiating session\n");
         failed = 1;
     }
@@ -1361,22 +1387,26 @@ static int test_spm2_frames_bound_to_session(const struct sockaddr_in *server)
         fprintf(stderr, "a frame for an unknown session was relayed\n");
         failed = 1;
     }
-    /* An expired session is refused and closed, its counters untouched. */
-    if (!failed && (open_session(&fixture, "expiring-session-token", &expiring) != 0
-                    || !frame_relayed(source_fd, server, &target_relay, target_fd, expiring.id, 1, 765U)
-                    || expire_session(fixture.path, expiring.id) != 0
-                    || !frame_dropped(source_fd, server, &target_relay, target_fd, expiring.id, 2, 766U)
-                    || session_is(fixture.path, "tenant-frames", expiring.id, "CLOSED", NULL, 52,
-                                  "frame on an expired session") != 0)) {
+    /* An expired session is refused and closed, its counters untouched: the cached grant ends with
+     * the session (Java RelayAuthorization.validAt), not with the cache. */
+    if (!failed && (open_session_for(&fixture, "expiring-session-token", 1, &expiring) != 0
+                    || !frame_relayed(source_fd, server, &target_relay, target_fd, expiring.id, 1, 765U))) {
+        fprintf(stderr, "a session about to expire did not relay\n");
+        failed = 1;
+    }
+    if (!failed) sleep_ms(1300L);
+    if (!failed && (!frame_dropped(source_fd, server, &target_relay, target_fd, expiring.id, 2, 766U)
+                    || counted_session_is(turn, fixture.path, "tenant-frames", expiring.id, "CLOSED", NULL, 52,
+                                          "frame on an expired session") != 0)) {
         fprintf(stderr, "an expired session was not refused and closed\n");
         failed = 1;
     }
-    /* A closed session relays nothing more. */
+    /* A closed session relays nothing more: closing it withdraws the cached grant at once. */
     if (!failed && (st_storage_report_peer_mesh_session(fixture.path, &fixture.source, session.id, NULL, NULL,
                                                         -1, NULL, NULL, 0, 0, 1, NULL) != 0
                     || !frame_dropped(source_fd, server, &target_relay, target_fd, session.id, 4, 767U)
-                    || session_is(fixture.path, "tenant-frames", session.id, "CLOSED", NULL, 104,
-                                  "frame on a closed session") != 0)) {
+                    || counted_session_is(turn, fixture.path, "tenant-frames", session.id, "CLOSED", NULL, 104,
+                                          "frame on a closed session") != 0)) {
         fprintf(stderr, "a closed session still relayed a frame\n");
         failed = 1;
     }
@@ -1492,8 +1522,8 @@ static int test_unidentified_relay_without_turn_auth(void)
     if (failed) fprintf(stderr, "unauthenticated TURN setup failed\n");
     if (!failed && (!frame_relayed(a, &server.address, &b_relay, b, session.id, 1, 904U)
                     || !frame_relayed(b, &server.address, &a_relay, a, session.id, 2, 905U)
-                    || session_is(fixture.path, "tenant-noauth", session.id, "ACTIVE", "RELAY", 104,
-                                  "unidentified frames") != 0)) {
+                    || counted_session_is(server.server, fixture.path, "tenant-noauth", session.id, "ACTIVE",
+                                          "RELAY", 104, "unidentified frames") != 0)) {
         fprintf(stderr, "frames of an open session were dropped with TURN authentication off\n");
         failed = 1;
     }
@@ -1515,6 +1545,187 @@ static int test_unidentified_relay_without_turn_auth(void)
     if (a >= 0) close(a);
     if (b >= 0) close(b);
     if (started) st_stun_turn_server_stop(server.server);
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(fixture.path);
+    return failed;
+}
+
+/*
+ * A frame of a session already authorized is relayed from memory (Java relayAuthorizationCache,
+ * 30 s) and its bytes are counted in memory, so another writer holding the database stalls neither
+ * the relay nor the rest of the STUN/TURN thread. Every relayed datagram used to open the database
+ * and write its bytes on that thread: behind such a lock it waited out the 5 s busy timeout, held
+ * up Binding, Allocate and the general relay meanwhile, and was dropped when the timeout ran out.
+ */
+static int test_relay_survives_database_lock(st_stun_turn_server *turn, const struct sockaddr_in *server)
+{
+    frame_fixture fixture;
+    if (frame_fixture_setup(&fixture, "tenant-lock") != 0) return 1;
+    st_storage_peer_mesh_session session;
+    struct sockaddr_in source_address, target_address, probe_address, source_relay, target_relay;
+    char source_user[192], target_user[192];
+    unsigned char source_key[16], target_key[16];
+    int source_fd = udp_socket(&source_address);
+    int target_fd = udp_socket(&target_address);
+    int probe_fd = udp_socket(&probe_address);
+    int failed = source_fd < 0 || target_fd < 0 || probe_fd < 0
+        || open_session(&fixture, "lock-session-token", &session) != 0
+        || allocate_peer_relay(source_fd, server, fixture.source.id, 1100U, source_user, source_key, &source_relay) != 0
+        || allocate_peer_relay(target_fd, server, fixture.target.id, 1110U, target_user, target_key, &target_relay) != 0
+        || permit_peer(source_fd, server, source_user, source_key, &target_relay, 1120U) != 0
+        || permit_peer(target_fd, server, target_user, target_key, &source_relay, 1130U) != 0
+        || !frame_relayed(source_fd, server, &target_relay, target_fd, session.id, 1, 1140U);
+    if (failed) fprintf(stderr, "database lock fixture setup failed\n");
+    sqlite3 *lock = failed ? NULL : lock_database(fixture.path);
+    failed = failed || lock == NULL;
+    if (!failed) {
+        long long started = monotonic_ms();
+        unsigned char frame[52];
+        size_t len = spm2_frame(frame, session.id, 2);
+        int crossed = relayed_bytes(source_fd, server, &target_relay, target_fd, frame, len, 1150U, 500L);
+        packet_builder request;
+        unsigned char response[2048];
+        start(&request, 0x0001U, 1160U);
+        set_receive_timeout(probe_fd, 500L);
+        int received = exchange(probe_fd, server, &request, response, sizeof(response));
+        long long elapsed = monotonic_ms() - started;
+        if (!crossed || received < 20 || r16(response) != 0x0101U || elapsed > 900L) {
+            fprintf(stderr, "with the database locked: frame %s, Binding %s, after %lld ms\n",
+                    crossed ? "relayed" : "not relayed", received >= 20 ? "answered" : "unanswered", elapsed);
+            failed = 1;
+        }
+    }
+    unlock_database(lock);
+    /* What was counted while the database was locked is written once it is free again. */
+    if (!failed && counted_session_is(turn, fixture.path, "tenant-lock", session.id, "ACTIVE", "RELAY", 104,
+                                      "frames relayed around a lock") != 0) failed = 1;
+    if (source_fd >= 0) close(source_fd);
+    if (target_fd >= 0) close(target_fd);
+    if (probe_fd >= 0) close(probe_fd);
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(fixture.path);
+    return failed;
+}
+
+static int wait_for_relay_bytes(const char *path, const char *tenant, long long id, long long expected,
+                                long timeout_ms)
+{
+    long long deadline = monotonic_ms() + timeout_ms;
+    st_storage_peer_mesh_session session;
+    memset(&session, 0, sizeof(session));
+    do {
+        if (st_storage_get_peer_mesh_session(path, tenant, id, &session) == 0 && session.relay_bytes == expected) {
+            return 0;
+        }
+        sleep_ms(20L);
+    } while (monotonic_ms() < deadline);
+    fprintf(stderr, "session %lld has %lld relay bytes after %ld ms, want %lld\n", id, session.relay_bytes,
+            timeout_ms, expected);
+    return -1;
+}
+
+typedef struct {
+    int source_fd;
+    int target_fd;
+    struct sockaddr_in source_relay;
+    struct sockaddr_in target_relay;
+} relay_pair;
+
+static int relay_pair_open(const frame_fixture *fixture, const turn_fixture *turn, unsigned seed, relay_pair *pair)
+{
+    struct sockaddr_in source_address, target_address;
+    char source_user[192], target_user[192];
+    unsigned char source_key[16], target_key[16];
+    pair->source_fd = udp_socket(&source_address);
+    pair->target_fd = udp_socket(&target_address);
+    return pair->source_fd < 0 || pair->target_fd < 0
+        || allocate_peer_relay(pair->source_fd, &turn->address, fixture->source.id, seed, source_user, source_key,
+                               &pair->source_relay) != 0
+        || allocate_peer_relay(pair->target_fd, &turn->address, fixture->target.id, seed + 1U, target_user,
+                               target_key, &pair->target_relay) != 0
+        || permit_peer(pair->source_fd, &turn->address, source_user, source_key, &pair->target_relay, seed + 2U) != 0
+        || permit_peer(pair->target_fd, &turn->address, target_user, target_key, &pair->source_relay, seed + 3U) != 0
+        ? -1 : 0;
+}
+
+static void relay_pair_close(relay_pair *pair)
+{
+    if (pair->source_fd >= 0) close(pair->source_fd);
+    if (pair->target_fd >= 0) close(pair->target_fd);
+    pair->source_fd = pair->target_fd = -1;
+}
+
+/*
+ * Relay bytes are written in batches every SPECUS_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS (Java
+ * flushRelayTraffic, 5 s by default), and what is still pending when the server stops is written
+ * then. A session that the management API closes stops relaying on its next frame, cached or not.
+ */
+static int test_relay_traffic_batches(void)
+{
+    frame_fixture fixture;
+    if (frame_fixture_setup(&fixture, "tenant-batches") != 0) return 1;
+    st_storage_peer_mesh_session first;
+    st_storage_peer_mesh_session second;
+    st_storage_peer_mesh_session closed;
+    relay_pair pair = {-1, -1, {0}, {0}};
+    turn_fixture turn;
+    setenv("SPECUS_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS", "200", 1);
+    int started = turn_fixture_start(&turn, 1, "55900", "55999", NULL) == 0;
+    int failed = !started || open_session(&fixture, "batch-first-token", &first) != 0
+        || open_session(&fixture, "batch-second-token", &second) != 0
+        || relay_pair_open(&fixture, &turn, 1200U, &pair) != 0;
+    if (failed) fprintf(stderr, "relay batch fixture setup failed\n");
+    /* Written by the periodic flush alone. */
+    if (!failed && (!frame_relayed(pair.source_fd, &turn.address, &pair.target_relay, pair.target_fd, first.id, 1,
+                                   1210U)
+                    || wait_for_relay_bytes(fixture.path, "tenant-batches", first.id, 52, 3000L) != 0)) {
+        fprintf(stderr, "relay bytes were not written by the periodic flush\n");
+        failed = 1;
+    }
+    /* Closed by the management API, one session and then every open one, while both are cached. */
+    if (!failed && (!frame_relayed(pair.source_fd, &turn.address, &pair.target_relay, pair.target_fd, second.id, 1,
+                                   1220U)
+                    || st_storage_close_peer_mesh_session_visible(fixture.path, first.id, "tenant-batches", "", 1,
+                                                                  &closed) != 0
+                    || !frame_dropped(pair.source_fd, &turn.address, &pair.target_relay, pair.target_fd, first.id,
+                                      2, 1221U)
+                    || !frame_relayed(pair.source_fd, &turn.address, &pair.target_relay, pair.target_fd, second.id,
+                                      2, 1222U))) {
+        fprintf(stderr, "a session closed by the management API still relayed, or its neighbour stopped\n");
+        failed = 1;
+    }
+    if (!failed) {
+        st_storage_peer_mesh_session *all = NULL;
+        size_t count = 0U;
+        failed = st_storage_close_open_peer_mesh_sessions_visible(fixture.path, "tenant-batches", "", 1, &all,
+                                                                  &count) != 0
+            || count != 1U
+            || !frame_dropped(pair.source_fd, &turn.address, &pair.target_relay, pair.target_fd, second.id, 3,
+                              1223U);
+        free(all);
+        if (failed) fprintf(stderr, "a session closed with every open one still relayed\n");
+    }
+    relay_pair_close(&pair);
+    if (started) st_stun_turn_server_stop(turn.server);
+    /* The bytes of frames relayed before a close are still counted. */
+    failed = failed || wait_for_relay_bytes(fixture.path, "tenant-batches", second.id, 104, 0L) != 0;
+
+    /* Pending when the server stops, long before the next periodic flush. */
+    st_storage_peer_mesh_session third;
+    setenv("SPECUS_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS", "600000", 1);
+    started = !failed && turn_fixture_start(&turn, 1, "55900", "55999", NULL) == 0;
+    failed = failed || !started || open_session(&fixture, "batch-third-token", &third) != 0
+        || relay_pair_open(&fixture, &turn, 1300U, &pair) != 0
+        || !frame_relayed(pair.source_fd, &turn.address, &pair.target_relay, pair.target_fd, third.id, 1, 1310U)
+        || !frame_relayed(pair.target_fd, &turn.address, &pair.source_relay, pair.source_fd, third.id, 2, 1311U)
+        || session_is(fixture.path, "tenant-batches", third.id, "ACTIVE", "RELAY", -1, "before the stop") != 0;
+    relay_pair_close(&pair);
+    if (started) st_stun_turn_server_stop(turn.server);
+    if (!failed && wait_for_relay_bytes(fixture.path, "tenant-batches", third.id, 104, 0L) != 0) {
+        fprintf(stderr, "relay bytes pending at stop were not written\n");
+        failed = 1;
+    }
+    unsetenv("SPECUS_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS");
     unsetenv("SPECUS_DATABASE_PATH");
     unlink(fixture.path);
     return failed;
@@ -1756,7 +1967,8 @@ int main(void)
     close(client2);
     close(client);
     if (peer_mesh_relay_tests(&server_address) != 0
-        || test_spm2_frames_bound_to_session(&server_address) != 0
+        || test_spm2_frames_bound_to_session(server, &server_address) != 0
+        || test_relay_survives_database_lock(server, &server_address) != 0
         || test_unknown_subject_relays_nothing(&server_address) != 0) return 1;
     st_stun_turn_server_stop(server);
 
@@ -1833,6 +2045,7 @@ int main(void)
         || test_private_peers_allowed_by_switch() != 0
         || test_expiry() != 0
         || test_unidentified_relay_without_turn_auth() != 0
+        || test_relay_traffic_batches() != 0
         || test_turn_credential_subjects() != 0) {
         fprintf(stderr, "TURN channel, refresh, nonce, peer policy or expiry tests failed\n");
         return 1;
