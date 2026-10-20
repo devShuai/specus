@@ -83,7 +83,7 @@ static void account_lifecycle(void)
 
     pair(&user, tokens);
     sql("CREATE TRIGGER abort_account_tickets BEFORE DELETE ON specus_websocket_ticket BEGIN SELECT RAISE(ABORT,'controlled ticket rollback');END");
-    CHECK(mutate("DELETE", NULL) == 404);
+    CHECK(mutate("DELETE", NULL) == 409);
     CHECK(st_storage_get_management_user_in_tenant(database, "default", "mixed", &current) == 0 && current.enabled == 1 && strcmp(current.account_key, user.account_key) == 0);
     CHECK(present(tokens[0]) == 1 && present(tokens[1]) == 1);
     sql("DROP TRIGGER abort_account_tickets"); use_pair(tokens, 101);

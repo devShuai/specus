@@ -2847,7 +2847,8 @@ static int tenant_scope_user_unchanged(const char *database_path, const char *us
 /*
  * An administrator manages the users of its own tenant only. Like Java's
  * ManagementUserService.requireMutableUserInTenant, the target is looked up inside the caller's
- * tenant, so another tenant's user answers exactly like one that does not exist (404) and its row
+ * tenant, so another tenant's user answers exactly like one that does not exist (Java's 400
+ * "用户不存在: <name>") and its row
  * is left as it was; the built-in administrator belongs to its configured tenant and is scoped the
  * same way. Credentials, TCP mappings, HTTP routes and peer services are resolved through their
  * owning client or tenant and must answer another tenant's administrator the same way.
@@ -2865,7 +2866,7 @@ static int test_tenant_scoped_admin_mutations(void)
     setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
     unsetenv("SPECUS_AUTH_TENANT_ID");
     unsetenv("SPECUS_AUTH_USERNAME");
-    const char *not_found = "{\"error\":\"user not found\"}";
+    const char *not_found = "{\"error\":\"用户不存在: dave\"}";
     const char *takeover = "{\"password\":\"taken-over\",\"role\":\"ADMIN\",\"enabled\":false}";
     int failed = st_storage_init(db_path, 0) != 0
         || connection_events_ensure_user("root-a", "tenant-a", "ADMIN") != 0
@@ -2879,13 +2880,13 @@ static int test_tenant_scoped_admin_mutations(void)
     if (!failed) {
         len = tenant_scope_call("PUT", "/api/admin/users/dave", "root-a", "tenant-a", "ADMIN", takeover,
                                 response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", not_found, "PUT of another tenant's user") != 0
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", not_found, "PUT of another tenant's user") != 0
             || tenant_scope_user_unchanged(db_path, "dave", "tenant-b", "USER", "PUT of another tenant's user") != 0;
     }
     if (!failed) {
         len = tenant_scope_call("PUT", "/api/admin/users/%20DAVE%20", "root-a", "tenant-a", "ADMIN", takeover,
                                 response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", not_found,
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", "{\"error\":\"用户不存在: DAVE\"}",
                                  "PUT of another tenant's user, other spelling") != 0
             || tenant_scope_user_unchanged(db_path, "dave", "tenant-b", "USER",
                                            "PUT of another tenant's user, other spelling") != 0;
@@ -2893,7 +2894,7 @@ static int test_tenant_scoped_admin_mutations(void)
     if (!failed) {
         len = tenant_scope_call("PUT", "/api/admin/users/root-b", "root-a", "tenant-a", "ADMIN",
                                 "{\"role\":\"USER\",\"enabled\":false}", response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", not_found,
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", "{\"error\":\"用户不存在: root-b\"}",
                                  "PUT of another tenant's administrator") != 0
             || tenant_scope_user_unchanged(db_path, "root-b", "tenant-b", "ADMIN",
                                            "PUT of another tenant's administrator") != 0;
@@ -2901,27 +2902,44 @@ static int test_tenant_scoped_admin_mutations(void)
     if (!failed) {
         len = tenant_scope_call("DELETE", "/api/admin/users/dave", "root-a", "tenant-a", "ADMIN", NULL,
                                 response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", not_found, "DELETE of another tenant's user") != 0
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", not_found, "DELETE of another tenant's user") != 0
             || tenant_scope_user_unchanged(db_path, "dave", "tenant-b", "USER", "DELETE of another tenant's user") != 0;
     }
-    /* Another tenant's user and a user nobody has are indistinguishable, byte for byte. */
+    /*
+     * Another tenant's user and a user nobody has are indistinguishable, byte for byte: the answer for
+     * "ghost" while nobody has it is the answer once tenant-b has a "ghost" (Java's message names the
+     * target, so the comparison is of one name).
+     */
     if (!failed) {
         int missing_len = tenant_scope_call("DELETE", "/api/admin/users/ghost", "root-a", "tenant-a", "ADMIN",
                                             NULL, missing, sizeof(missing));
-        len = tenant_scope_call("DELETE", "/api/admin/users/dave", "root-a", "tenant-a", "ADMIN", NULL,
-                                response, sizeof(response));
-        failed = missing_len <= 0 || len != missing_len || strcmp(response, missing) != 0;
-        if (failed) fprintf(stderr, "another tenant's user answered unlike a missing one: %s / %s\n",
-                            len > 0 ? response : "(none)", missing_len > 0 ? missing : "(none)");
-        missing_len = failed ? -1 : tenant_scope_call("PUT", "/api/admin/users/ghost", "root-a", "tenant-a",
+        failed = endpoint_expect(missing_len, missing, "HTTP/1.1 400 ", "{\"error\":\"用户不存在: ghost\"}",
+                                 "DELETE of a user nobody has") != 0
+            || connection_events_ensure_user("ghost", "tenant-b", "USER") != 0;
+        len = failed ? -1 : tenant_scope_call("DELETE", "/api/admin/users/ghost", "root-a", "tenant-a", "ADMIN",
+                                              NULL, response, sizeof(response));
+        if (!failed && (len != missing_len || strcmp(response, missing) != 0)) {
+            fprintf(stderr, "another tenant's user answered unlike a missing one: %s / %s\n",
+                    len > 0 ? response : "(none)", missing);
+            failed = 1;
+        }
+        failed = failed || tenant_scope_user_unchanged(db_path, "ghost", "tenant-b", "USER",
+                                                       "DELETE of another tenant's ghost") != 0;
+        missing_len = failed ? -1 : tenant_scope_call("PUT", "/api/admin/users/phantom", "root-a", "tenant-a",
                                                       "ADMIN", takeover, missing, sizeof(missing));
-        len = failed ? -1 : tenant_scope_call("PUT", "/api/admin/users/dave", "root-a", "tenant-a", "ADMIN",
+        failed = failed
+            || endpoint_expect(missing_len, missing, "HTTP/1.1 400 ", "{\"error\":\"用户不存在: phantom\"}",
+                               "PUT of a user nobody has") != 0
+            || connection_events_ensure_user("phantom", "tenant-b", "USER") != 0;
+        len = failed ? -1 : tenant_scope_call("PUT", "/api/admin/users/phantom", "root-a", "tenant-a", "ADMIN",
                                               takeover, response, sizeof(response));
         if (!failed && (missing_len <= 0 || len != missing_len || strcmp(response, missing) != 0)) {
             fprintf(stderr, "another tenant's user was updated unlike a missing one: %s / %s\n",
                     len > 0 ? response : "(none)", missing_len > 0 ? missing : "(none)");
             failed = 1;
         }
+        failed = failed || tenant_scope_user_unchanged(db_path, "phantom", "tenant-b", "USER",
+                                                       "PUT of another tenant's phantom") != 0;
     }
     /* Reads: there is no single-user endpoint, and the list holds the caller's tenant only. */
     if (!failed) {
@@ -2942,14 +2960,14 @@ static int test_tenant_scoped_admin_mutations(void)
     /* The built-in administrator's tenant is the default one; tenant-b is not its to manage. */
     if (!failed) {
         len = st_admin_build_response_with_body("PUT", "/api/admin/users/dave", takeover, response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", not_found,
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", not_found,
                                  "built-in admin PUT of another tenant's user") != 0
             || tenant_scope_user_unchanged(db_path, "dave", "tenant-b", "USER",
                                            "built-in admin PUT of another tenant's user") != 0;
     }
     if (!failed) {
         len = st_admin_build_response("DELETE", "/api/admin/users/dave", response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", not_found,
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", not_found,
                                  "built-in admin DELETE of another tenant's user") != 0
             || tenant_scope_user_unchanged(db_path, "dave", "tenant-b", "USER",
                                            "built-in admin DELETE of another tenant's user") != 0;
@@ -3468,10 +3486,11 @@ static int count_occurrences(const char *haystack, const char *needle)
 /*
  * ManagementUserServiceTests.createsSameLoginNameInDifferentTenantWithoutGlobalLookup and
  * ManagementUserServiceIntegrationTests.tenantsCanCreateTheSameLoginNameWithoutEnumeration. Login
- * names are unique per tenant: two tenants' administrators both create "Shared" (201, not 409),
+ * names are unique per tenant: two tenants' administrators both create "Shared" (201, no conflict),
  * each account gets a random key rather than its name, and each list shows its own tenant's only.
- * A second spelling inside one tenant is still a conflict whose answer names no other tenant, and
- * an administrator changes and deletes only its own tenant's account of that name.
+ * A second spelling inside one tenant is still a conflict (Java's 400 "用户名不可用") whose answer
+ * names no other tenant, and an administrator changes and deletes only its own tenant's account of
+ * that name.
  */
 static int test_tenants_share_login_names(void)
 {
@@ -3515,7 +3534,8 @@ static int test_tenants_share_login_names(void)
         int len = tenant_scope_call("POST", "/api/admin/users", "root-a", "tenant-a", "ADMIN",
                                     "{\"username\":\" SHARED \",\"password\":\"secret-password\"}",
                                     response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 409 ", NULL, "a second spelling inside one tenant") != 0
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", "{\"error\":\"用户名不可用\"}",
+                                 "a second spelling inside one tenant") != 0
             || contains(response, "tenant-b");
     }
     for (size_t i = 0; !failed && i < 2U; ++i) {
@@ -3645,7 +3665,9 @@ static int test_tenant_qualified_login_and_refresh(void)
         /* An account that still owns a client is not deleted (management-accounts.md 7.1). */
         int len = tenant_scope_call("DELETE", "/api/admin/users/alice", "root-a", "tenant-a", "ADMIN", NULL,
                                     response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 409 ", "\"clients\":1",
+        failed = endpoint_expect(len, response, "HTTP/1.1 409 ",
+                                 "{\"error\":\"该账号仍拥有 1 个客户端、0 个接入凭证，需先转移或删除\","
+                                 "\"clients\":1,\"credentials\":0}",
                                  "delete tenant-a's alice with a client") != 0
             || test_exec_sql(db_path, "DELETE FROM client_account WHERE client_name = 'alice-a-client';") != 0;
         len = failed ? -1 : tenant_scope_call("DELETE", "/api/admin/users/alice", "root-a", "tenant-a", "ADMIN",

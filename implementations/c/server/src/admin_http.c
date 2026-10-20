@@ -12368,6 +12368,106 @@ static int normalize_username_in_place(char *username)
 }
 
 /*
+ * Java ManagementUserService.normalizeUsername and requirePassword over a bound String: blank as
+ * Spring's StringUtils.hasText has it (Character.isWhitespace over all of Unicode) answers blank;
+ * otherwise the value is trimmed in place as String.trim does, and more than max_length UTF-16
+ * units answers too_long. NULL when the value passes.
+ */
+static const char *admin_management_text_refusal(char *value,
+                                                 size_t max_length,
+                                                 const char *blank,
+                                                 const char *too_long)
+{
+    if (value == NULL || st_unicode_java21_has_text(value, strlen(value)) == 0) {
+        return blank;
+    }
+    (void)admin_java_trim(value);
+    return admin_utf16_length(value) > max_length ? too_long : NULL;
+}
+
+/*
+ * The login name of POST, PUT and DELETE /api/admin/users as normalizeUsername takes it. C keeps a
+ * login name in 80 bytes (st_storage_management_user), so on create (stored) a longer name that
+ * Java accepts, possible only with non-ASCII characters, is refused as too long, and a name that
+ * trimming empties (control characters only, which hasText counts as text) is refused as blank:
+ * Java would create an account without a login name, which its own migrator refuses at the next
+ * start. A path name is only looked up, so such a name is simply not found there.
+ */
+static const char *admin_management_username_refusal(char *username, int stored)
+{
+    const char *refusal = admin_management_text_refusal(username, 80U, "username cannot be blank",
+                                                        "username is too long");
+    if (refusal == NULL && stored && username[0] == '\0') {
+        refusal = "username cannot be blank";
+    }
+    if (refusal == NULL && stored && strlen(username) > 80U) {
+        refusal = "username is too long";
+    }
+    return refusal;
+}
+
+/*
+ * Java String.equalsIgnoreCase, as ManagementUserService compares a login name with the built-in
+ * administrator's: code point by code point, two match when equal, when their upper-case mappings
+ * are, or when the lower-case mappings of those are (so "admın" with a dotless i is "admin").
+ * Invalid UTF-8 only matches byte for byte.
+ */
+static int admin_java_equals_ignore_case(const char *left, const char *right)
+{
+    const utf8proc_uint8_t *a = (const utf8proc_uint8_t *)left;
+    const utf8proc_uint8_t *b = (const utf8proc_uint8_t *)right;
+    utf8proc_ssize_t a_len = (utf8proc_ssize_t)strlen(left);
+    utf8proc_ssize_t b_len = (utf8proc_ssize_t)strlen(right);
+    while (a_len > 0 && b_len > 0) {
+        utf8proc_int32_t a_point = 0;
+        utf8proc_int32_t b_point = 0;
+        utf8proc_ssize_t a_width = utf8proc_iterate(a, a_len, &a_point);
+        utf8proc_ssize_t b_width = utf8proc_iterate(b, b_len, &b_point);
+        if (a_width <= 0 || b_width <= 0) {
+            return strcmp(left, right) == 0;
+        }
+        a += a_width;
+        a_len -= a_width;
+        b += b_width;
+        b_len -= b_width;
+        utf8proc_int32_t a_upper = utf8proc_toupper(a_point);
+        utf8proc_int32_t b_upper = utf8proc_toupper(b_point);
+        if (a_point != b_point && a_upper != b_upper && utf8proc_tolower(a_upper) != utf8proc_tolower(b_upper)) {
+            return 0;
+        }
+    }
+    return a_len == 0 && b_len == 0;
+}
+
+/* Java ManagementUserService's IllegalArgumentException, which GlobalExceptionHandler answers 400. */
+static int write_management_user_refusal(const char *message, char *out, size_t out_len)
+{
+    return write_bad_request_naming(message, "", out, out_len);
+}
+
+/* The audit line Java's ManagementUserService writes for a refused create, update or delete. */
+static void log_management_user_refused(const st_admin_context *context,
+                                        const char *action,
+                                        const char *target,
+                                        const char *reason)
+{
+    char safe_actor[512];
+    char safe_tenant[512];
+    char safe_target[512];
+    (void)st_admin_log_safe_reason(context->username, safe_actor, sizeof(safe_actor));
+    (void)st_admin_log_safe_reason(context->tenant_id, safe_tenant, sizeof(safe_tenant));
+    (void)st_admin_log_safe_reason(target, safe_target, sizeof(safe_target));
+    fprintf(stderr,
+            "[admin] management user %s refused: actor=%s tenant=%s target=%s reason=%s\n",
+            action,
+            safe_actor,
+            safe_tenant,
+            safe_target,
+            reason);
+    fflush(stderr);
+}
+
+/*
  * The member key bound to Java's ManagementRole as Jackson binds an enum: a string that, trimmed, is
  * the constant's name, or the constant's ordinal (ADMIN 0, USER 1) as a number or a string of
  * digits. 0 when absent or null, 1 with *role set, -2 otherwise (the name in another case, an empty
@@ -12453,26 +12553,35 @@ static int handle_management_user_create(const st_admin_context *context, const 
     (void)admin_jackson_role(body, "role", &role);
     int enabled = 1;
     (void)admin_jackson_boolean(body, "enabled", &enabled);
-    if (normalize_username_in_place(username) != 0 || password == NULL || *admin_trim(password) == '\0') {
-        free(username);
-        free(password);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"username and password are required\"}");
+    /*
+     * Java ManagementUserService.createUser, its checks in its order: the login name, the built-in
+     * administrator's name, the caller's tenant, then the password. Login names are unique per
+     * tenant: a same-named user of another tenant is no conflict, and the answer never tells whether
+     * one exists.
+     */
+    const char *refusal = admin_management_username_refusal(username, 1);
+    if (refusal == NULL && admin_java_equals_ignore_case(username, env_text("SPECUS_AUTH_USERNAME", "admin"))) {
+        refusal = "内置 admin 用户不能重复创建";
     }
-    /* Login names are unique per tenant: a same-named user of another tenant is no conflict, and the
-     * answer never tells whether one exists (Java ManagementUserService.createUser). */
     st_storage_management_user existing_user;
-    if (admin_ascii_casecmp(username, env_text("SPECUS_AUTH_USERNAME", "admin")) == 0
-        || st_storage_get_management_user_in_tenant(database_path, context->tenant_id, username,
+    if (refusal == NULL
+        && st_storage_get_management_user_in_tenant(database_path, context->tenant_id, username,
                                                     &existing_user) == 0) {
-        free(username);
-        free(password);
-        return write_response(out, out_len, 409, "Conflict", "{\"error\":\"username already exists\"}");
+        log_management_user_refused(context, "create", username, "login name taken in the caller's tenant");
+        refusal = "用户名不可用";
     }
+    if (refusal == NULL) {
+        refusal = admin_management_text_refusal(password, 120U, "password cannot be blank", "password is too long");
+    }
+    /* PasswordService.hash refuses what trimming emptied (a password of control characters). */
     char hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
-    if (st_password_hash(admin_trim(password), hash) != 0) {
+    if (refusal == NULL && st_password_hash(password, hash) != 0) {
+        refusal = "password cannot be blank";
+    }
+    if (refusal != NULL) {
         free(username);
         free(password);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"password cannot be blank\"}");
+        return write_management_user_refusal(refusal, out, out_len);
     }
     st_storage_management_user user;
     int rc = st_storage_create_management_user(database_path,
@@ -12482,8 +12591,18 @@ static int handle_management_user_create(const st_admin_context *context, const 
                                                role == NULL ? "USER" : role,
                                                enabled,
                                                &user);
+    /* Losing the name to a concurrent create is Java's unique-constraint refusal, also 用户名不可用. */
+    int taken = rc != 0
+        && st_storage_get_management_user_in_tenant(database_path, context->tenant_id, username,
+                                                    &existing_user) == 0;
+    if (taken) {
+        log_management_user_refused(context, "create", username, "login name taken in the caller's tenant");
+    }
     free(username);
     free(password);
+    if (taken) {
+        return write_management_user_refusal("用户名不可用", out, out_len);
+    }
     if (rc != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"user create failed\"}");
     }
@@ -12498,7 +12617,12 @@ static int handle_management_user_create(const st_admin_context *context, const 
     return response_len;
 }
 
-static char *admin_parse_user_path_username(const char *path)
+/*
+ * The {username} segment of /api/admin/users/{username} (before any query), or NULL when the path
+ * has none: Spring matches the pattern only with one non-empty segment, so /api/admin/users/ and
+ * /api/admin/users/a/b are no route (404) there.
+ */
+static const char *admin_user_path_segment(const char *path, size_t *len)
 {
     const char *prefix = "/api/admin/users/";
     size_t prefix_len = strlen(prefix);
@@ -12506,19 +12630,44 @@ static char *admin_parse_user_path_username(const char *path)
         return NULL;
     }
     const char *cursor = path + prefix_len;
-    const char *end = strchr(cursor, '?');
-    size_t len = end == NULL ? strlen(cursor) : (size_t)(end - cursor);
-    if (len == 0) {
+    *len = strcspn(cursor, "?");
+    return *len == 0U || memchr(cursor, '/', *len) != NULL ? NULL : cursor;
+}
+
+/*
+ * The {username} path variable as Spring binds it: percent-decoded (the request firewall leaves only
+ * an escaped '?' for this), with a '+' kept as it is, unlike a query value's.
+ */
+static char *admin_parse_user_path_username(const char *path)
+{
+    size_t len = 0U;
+    const char *segment = admin_user_path_segment(path, &len);
+    char *name = segment == NULL ? NULL : (char *)malloc(len + 1U);
+    if (name == NULL) {
         return NULL;
     }
-    return admin_url_decode(cursor, len);
+    size_t w = 0U;
+    for (size_t r = 0U; r < len; ++r) {
+        int high = 0;
+        int low = 0;
+        if (segment[r] == '%' && r + 2U < len
+            && (high = admin_hex_digit(segment[r + 1U])) >= 0 && (low = admin_hex_digit(segment[r + 2U])) >= 0) {
+            name[w++] = (char)(high * 16 + low);
+            r += 2U;
+        } else {
+            name[w++] = segment[r];
+        }
+    }
+    name[w] = '\0';
+    return name;
 }
 
 /*
  * Updates and deletes look the target up inside the caller's tenant only, like Java's
  * ManagementUserService.requireMutableUserInTenant: a user of another tenant answers exactly like
- * one that does not exist, so a tenant administrator can neither change nor probe another tenant's
- * users. The refused attempt is still logged for auditing, as Java does.
+ * one that does not exist, 400 "用户不存在: <name>" with the name as given (trimmed), so a tenant
+ * administrator can neither change nor probe another tenant's users. The refused attempt is still
+ * logged for auditing, as Java does.
  */
 static int write_management_user_not_found(const st_admin_context *context,
                                            const char *action,
@@ -12526,21 +12675,22 @@ static int write_management_user_not_found(const st_admin_context *context,
                                            char *out,
                                            size_t out_len)
 {
-    char safe_actor[512];
-    char safe_tenant[512];
-    char safe_target[512];
-    (void)st_admin_log_safe_reason(context->username, safe_actor, sizeof(safe_actor));
-    (void)st_admin_log_safe_reason(context->tenant_id, safe_tenant, sizeof(safe_tenant));
-    (void)st_admin_log_safe_reason(target, safe_target, sizeof(safe_target));
-    fprintf(stderr,
-            "[admin] management user %s refused: actor=%s tenant=%s target=%s "
-            "reason=not in the caller's tenant or missing\n",
-            action,
-            safe_actor,
-            safe_tenant,
-            safe_target);
-    fflush(stderr);
-    return write_response(out, out_len, 404, "Not Found", "{\"error\":\"user not found\"}");
+    log_management_user_refused(context, action, target, "not in the caller's tenant or missing");
+    return write_bad_request_naming("用户不存在: ", target, out, out_len);
+}
+
+/*
+ * The {username} of PUT and DELETE as Java's updateUser and deleteUser check it before looking it
+ * up: normalizeUsername, then the built-in administrator's name, refused with builtin_refusal.
+ * NULL when the name passes (trimmed in place).
+ */
+static const char *admin_management_target_refusal(char *username, const char *builtin_refusal)
+{
+    const char *refusal = admin_management_username_refusal(username, 0);
+    if (refusal == NULL && admin_java_equals_ignore_case(username, env_text("SPECUS_AUTH_USERNAME", "admin"))) {
+        refusal = builtin_refusal;
+    }
+    return refusal;
 }
 
 static int handle_management_user_update(const st_admin_context *context,
@@ -12562,13 +12712,10 @@ static int handle_management_user_update(const st_admin_context *context,
         return init_response;
     }
     char *username = admin_parse_user_path_username(path);
-    if (normalize_username_in_place(username) != 0) {
+    const char *refusal = admin_management_target_refusal(username, "内置 admin 用户只能通过配置文件修改");
+    if (refusal != NULL) {
         free(username);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"username is required\"}");
-    }
-    if (admin_ascii_casecmp(username, env_text("SPECUS_AUTH_USERNAME", "admin")) == 0) {
-        free(username);
-        return write_response(out, out_len, 409, "Conflict", "{\"error\":\"built-in admin cannot be updated\"}");
+        return write_management_user_refusal(refusal, out, out_len);
     }
     st_storage_management_user existing;
     if (st_storage_get_management_user_in_tenant(database_path, context->tenant_id, username, &existing) != 0) {
@@ -12584,11 +12731,15 @@ static int handle_management_user_update(const st_admin_context *context,
     (void)admin_jackson_boolean(body, "enabled", &enabled);
     char hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
     const char *hash_ptr = NULL;
-    if (password != NULL && *admin_trim(password) != '\0') {
-        if (st_password_hash(admin_trim(password), hash) != 0) {
+    /*
+     * Java updateUser: a password with text (StringUtils.hasText) replaces the old one trimmed, at
+     * any length; PasswordService.hash refuses what trimming emptied. A blank one changes nothing.
+     */
+    if (password != NULL && st_unicode_java21_has_text(password, strlen(password)) != 0) {
+        if (st_password_hash(admin_java_trim(password), hash) != 0) {
             free(username);
             free(password);
-                return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"password cannot be blank\"}");
+            return write_management_user_refusal("password cannot be blank", out, out_len);
         }
         hash_ptr = hash;
     }
@@ -12641,18 +12792,18 @@ static int handle_management_user_delete(const st_admin_context *context, const 
         return init_response;
     }
     char *username = admin_parse_user_path_username(path);
-    if (normalize_username_in_place(username) != 0) {
+    const char *refusal = admin_management_target_refusal(username, "内置 admin 用户不能删除");
+    if (refusal != NULL) {
         free(username);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"username is required\"}");
-    }
-    if (admin_ascii_casecmp(username, env_text("SPECUS_AUTH_USERNAME", "admin")) == 0) {
-        free(username);
-        return write_response(out, out_len, 409, "Conflict", "{\"error\":\"built-in admin cannot be deleted\"}");
+        return write_management_user_refusal(refusal, out, out_len);
     }
     /* The stored spelling of the name, which keys the account's product metrics progress row. */
     st_storage_management_user target;
-    int have_target = st_storage_get_management_user_in_tenant(database_path, context->tenant_id,
-                                                               username, &target) == 0;
+    if (st_storage_get_management_user_in_tenant(database_path, context->tenant_id, username, &target) != 0) {
+        int response_len = write_management_user_not_found(context, "delete", username, out, out_len);
+        free(username);
+        return response_len;
+    }
     st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
     st_storage_share_ids revoked = {0};
     st_storage_account_owned owned = {0};
@@ -12667,23 +12818,23 @@ static int handle_management_user_delete(const st_admin_context *context, const 
     st_storage_share_ids_free(&revoked);
     if (rc == ST_STORAGE_ACCOUNT_STILL_OWNS) {
         free(username);
-        char refusal[256];
-        snprintf(refusal, sizeof(refusal),
-                 "{\"error\":\"the account still owns %lld clients and %lld credentials: delete or transfer them "
-                 "first\",\"clients\":%lld,\"credentials\":%lld}",
+        /* Java AccountStillOwnsResourcesException, with both counts (GlobalExceptionHandler). */
+        char still_owns[256];
+        snprintf(still_owns, sizeof(still_owns),
+                 "{\"error\":\"该账号仍拥有 %lld 个客户端、%lld 个接入凭证，需先转移或删除\","
+                 "\"clients\":%lld,\"credentials\":%lld}",
                  owned.clients, owned.credentials, owned.clients, owned.credentials);
-        return write_response(out, out_len, 409, "Conflict", refusal);
+        return write_response(out, out_len, 409, "Conflict", still_owns);
     }
-    if (rc == 0 && have_target) {
+    if (rc == 0) {
         /* Committed: the identity's open management WebSockets end. */
         admin_ws_revoke_identity(target.tenant_id, target.username, "account deleted");
         (void)st_product_metrics_user_deleted(database_path, target.tenant_id, target.username);
     }
-    int response_len = rc != 0
-        ? write_management_user_not_found(context, "delete", username, out, out_len)
-        : write_response(out, out_len, 204, "No Content", "");
     free(username);
-    return response_len;
+    /* A write that fails after the lookup found the user answers as a failed update does. */
+    return rc != 0 ? write_response(out, out_len, 409, "Conflict", "{\"error\":\"user delete failed\"}")
+                   : write_response(out, out_len, 204, "No Content", "");
 }
 
 /*
@@ -13756,7 +13907,8 @@ static int st_admin_build_response_internal(const char *method,
     if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/api/admin/users")) {
         return handle_management_user_create(&context, body, out, out_len);
     }
-    if (strncmp(path, "/api/admin/users/", strlen("/api/admin/users/")) == 0) {
+    size_t user_segment_len = 0U;
+    if (admin_user_path_segment(path, &user_segment_len) != NULL) {
         if (strcmp(method, "PUT") == 0) {
             return handle_management_user_update(&context, path, body, out, out_len);
         }
