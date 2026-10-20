@@ -1577,8 +1577,9 @@ static int test_client_download_catalog_migration(void)
  * table-level unique keys that SqliteUniqueIndexMigratorTests.listsEveryTableLevelUniqueKeyOfTheMapping
  * counts (SqliteUniqueIndexMigrator.UNIQUE_KEYS): on a new database each is enforced by a full unique
  * index or table constraint on the C table and columns listed here. Where C's table or key columns
- * differ from Java's, the comment says why the key is the same. The two keys C used to lack carry
- * Java's index names, as the migrator creates them.
+ * differ from Java's, the comment says why the key is the same. The two keys C used to lack and the
+ * two traffic keys it used to put on the client name carry Java's index names, as the migrator
+ * creates them.
  */
 static int test_schema_enforces_java_unique_keys(void)
 {
@@ -1598,9 +1599,9 @@ static int test_schema_enforces_java_unique_keys(void)
         {"uq_registration_challenge_email", "specus_management_registration_challenge", "email", NULL},
         {"uk_specus_mapping_listen_port", "specus_mapping", "listen_port", "uk_specus_mapping_listen_port"},
         /*
-         * Java (client_id, route). C's routes, like its traffic counters below, name their client
-         * instead of numbering it: client_account.client_name is unique across all tenants and a
-         * rename rewrites it in these tables, so one name is one client of one tenant.
+         * Java (client_id, route). C's routes name their client instead of numbering it:
+         * client_account.client_name is unique across all tenants and a rename rewrites it here,
+         * and a deleted client's routes go with it, so one name is one client of one tenant.
          */
         {"uk_http_route_client_route", "http_route_mapping", "client_name,route", NULL},
         {"uk_peer_mesh_acl_pair", "peer_mesh_acl", "tenant_id,source_client_id,target_client_id", NULL},
@@ -1613,11 +1614,13 @@ static int test_schema_enforces_java_unique_keys(void)
         {"uk_public_transfer_access_token", "public_transfer_room_access", "token_hash", NULL},
         {"uk_public_transfer_pairing_code_hash", "public_transfer_room_pairing_code", "code_hash", NULL},
         {"uk_attachment_download_grant_token", "transfer_attachment_download_grant", "token_hash", NULL},
-        /* Java specus_traffic_usage (client_id, usage_date): C's traffic_usage, by client name. */
-        {"uk_specus_traffic_client_date", "traffic_usage", "client_name,usage_date", NULL},
-        /* Java (tenant_id, client_id, ...): the client's name fixes its tenant as well. */
+        /*
+         * Java's two traffic counters, by account: a deleted client's rows outlive it, so a name
+         * can stand for two clients of two tenants there (C keyed them by name until #35 item 45).
+         */
+        {"uk_specus_traffic_client_date", "traffic_usage", "client_id,usage_date", "uk_specus_traffic_client_date"},
         {"uk_resource_traffic_resource_date", "resource_traffic_usage",
-         "client_name,resource_type,resource_key,usage_date", NULL},
+         "tenant_id,client_id,resource_type,resource_key,usage_date", "uk_resource_traffic_resource_date"},
         /*
          * Java specus_connection_stat (tenant_id, client_name, stat_month): C's connection_stat keeps
          * the same "yyyy-MM" month in stat_date (st_storage_archive_connections), and the name fixes
@@ -2169,12 +2172,211 @@ static int test_traffic_usage_rows(void)
     return failed ? 1 : 0;
 }
 
+static long long query_count(const char *path, const char *format, long long id)
+{
+    char sql[512];
+    snprintf(sql, sizeof(sql), format, id);
+    return query_int(path, sql);
+}
+
+/*
+ * Java keys a client's traffic by its account (TrafficUsageService's upserts, by client_id), and
+ * a deleted client's rows stay. "keyed" counts 100 bytes on 2026-10-20 and is deleted; a new
+ * client of the same name in another tenant counts 50 that day: each has its own row in its own
+ * tenant, where C added the 50 to the deleted client's row, in the first tenant. "bar", renamed
+ * to the name of a deleted client that has rows on two of bar's days, keeps its rows and the
+ * deleted client keeps its own (C's UPDATE OR REPLACE deleted those), and bar's next bytes land on
+ * bar's row.
+ */
+static int test_traffic_usage_keys(void)
+{
+    char path[256];
+    scratch_db_path(path, sizeof(path), "traffic-keys");
+    st_storage_client first;
+    st_storage_client second;
+    int failed = st_storage_init(path, 0) != 0
+        || st_storage_upsert_client(path, 0, "tenant-a", "keyed", "owner", 1, 30, &first) != 0
+        || st_storage_record_traffic_usage(path, first.id, "keyed", "2026-10-20", 100, 101) != 0
+        || st_storage_record_resource_traffic_usage(path, first.id, "keyed", "HTTP_ROUTE", "http:web", 0, "web",
+                                                    "2026-10-20", 100, 101) != 0
+        || st_storage_delete_client(path, first.id) != 0
+        || st_storage_upsert_client(path, 0, "tenant-b", "keyed", "owner", 1, 30, &second) != 0
+        || second.id == first.id
+        || st_storage_record_traffic_usage(path, second.id, "keyed", "2026-10-20", 50, 51) != 0
+        || st_storage_record_resource_traffic_usage(path, second.id, "keyed", "HTTP_ROUTE", "http:web", 0, "web",
+                                                    "2026-10-20", 50, 51) != 0;
+    if (failed) {
+        fprintf(stderr, "traffic keys: setup failed\n");
+    }
+    for (int resource = 0; !failed && resource < 2; ++resource) {
+        const char *table = resource ? "resource_traffic_usage" : "traffic_usage";
+        char format[256];
+        snprintf(format, sizeof(format),
+                 "SELECT upload_bytes * 1000 + download_bytes FROM %s WHERE client_id = %%lld AND tenant_id = 'tenant-a'",
+                 table);
+        long long old_row = query_count(path, format, first.id);
+        snprintf(format, sizeof(format),
+                 "SELECT upload_bytes * 1000 + download_bytes FROM %s WHERE client_id = %%lld AND tenant_id = 'tenant-b'",
+                 table);
+        long long new_row = query_count(path, format, second.id);
+        snprintf(format, sizeof(format), "SELECT COUNT(*) FROM %s WHERE client_name = 'keyed'", table);
+        long long rows = query_int(path, format);
+        if (old_row != 100101 || new_row != 50051 || rows != 2) {
+            fprintf(stderr, "traffic keys: %s holds %lld for the deleted client in tenant-a, %lld for the new one in "
+                            "tenant-b, %lld row(s) named keyed; expected 100101, 50051 and 2\n",
+                    table, old_row, new_row, rows);
+            failed = 1;
+        }
+    }
+    st_storage_traffic_usage visible[4];
+    size_t visible_count = 0U;
+    if (!failed && (st_storage_list_traffic_usage_visible(path, 0, "tenant-b", NULL, 1, 10, visible, 4U,
+                                                          &visible_count) != 0
+                    || visible_count != 1U || visible[0].client_id != second.id || visible[0].upload_bytes != 50)) {
+        fprintf(stderr, "traffic keys: tenant-b's administrator does not see the new client's 50 bytes alone\n");
+        failed = 1;
+    }
+
+    st_storage_client gone;
+    st_storage_client bar;
+    failed = failed
+        || st_storage_upsert_client(path, 0, "tenant-a", "gone", "owner", 1, 30, &gone) != 0
+        || st_storage_record_traffic_usage(path, gone.id, "gone", "2026-10-19", 7, 7) != 0
+        || st_storage_record_traffic_usage(path, gone.id, "gone", "2026-10-20", 8, 8) != 0
+        || st_storage_record_resource_traffic_usage(path, gone.id, "gone", "TCP_SPECUS", "tcp:9100", 0, "端口 9100",
+                                                    "2026-10-19", 7, 7) != 0
+        || st_storage_delete_client(path, gone.id) != 0
+        || st_storage_upsert_client(path, 0, "tenant-a", "bar", "owner", 1, 30, &bar) != 0
+        || st_storage_record_traffic_usage(path, bar.id, "bar", "2026-10-19", 1, 1) != 0
+        || st_storage_record_traffic_usage(path, bar.id, "bar", "2026-10-20", 2, 2) != 0
+        || st_storage_record_resource_traffic_usage(path, bar.id, "bar", "TCP_SPECUS", "tcp:9100", 0, "端口 9100",
+                                                    "2026-10-19", 1, 1) != 0
+        || st_storage_upsert_client(path, bar.id, "tenant-a", "gone", "owner", 1, 30, &bar) != 0
+        || st_storage_record_traffic_usage(path, bar.id, "gone", "2026-10-20", 5, 5) != 0;
+    if (!failed) {
+        long long gone_days = query_count(path, "SELECT COUNT(*) FROM traffic_usage WHERE client_id = %lld", gone.id);
+        long long gone_sum = query_count(path, "SELECT SUM(upload_bytes) FROM traffic_usage WHERE client_id = %lld",
+                                         gone.id);
+        long long bar_sum = query_count(path, "SELECT SUM(upload_bytes) FROM traffic_usage WHERE client_id = %lld "
+                                              "AND client_name = 'gone'", bar.id);
+        long long bar_today = query_count(path, "SELECT upload_bytes FROM traffic_usage WHERE client_id = %lld "
+                                                "AND usage_date = '2026-10-20'", bar.id);
+        long long resource_rows = query_count(path, "SELECT COUNT(*) FROM resource_traffic_usage "
+                                                    "WHERE resource_key = 'tcp:9100' AND client_id = %lld", gone.id)
+            + query_count(path, "SELECT COUNT(*) FROM resource_traffic_usage WHERE resource_key = 'tcp:9100' "
+                                "AND client_id = %lld AND client_name = 'gone'", bar.id);
+        if (gone_days != 2 || gone_sum != 15 || bar_sum != 8 || bar_today != 7 || resource_rows != 2) {
+            fprintf(stderr, "traffic keys after the rename: deleted client %lld day(s) %lld bytes, renamed client "
+                            "%lld bytes (%lld today), %lld resource row(s); expected 2, 15, 8 (7), 2\n",
+                    gone_days, gone_sum, bar_sum, bar_today, resource_rows);
+            failed = 1;
+        }
+    }
+    unlink(path);
+    return failed ? 1 : 0;
+}
+
+/*
+ * Java SqliteUniqueIndexMigratorTests.mergesSplitTrafficCountersIntoTheNewestRowAndEnablesTheUpsert
+ * on a database C keyed by client name: client 7's 2026-10-01 counted under its old and its new
+ * name is summed into the newest row (30/300, the later updated_at), its other day and the rows
+ * without a client id stay, the resource table likewise (keeping the newest row's resource id and
+ * name), every id and the id sequence survive the rebuild, Java's two indexes replace the inline
+ * ones, a second start changes nothing, and a count for client 7 now adds to the merged row.
+ */
+static int test_traffic_usage_key_migration(void)
+{
+    char path[256];
+    scratch_db_path(path, sizeof(path), "traffic-key-migration");
+    int failed = exec_script(path,
+        "CREATE TABLE traffic_usage (id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER, "
+        "client_name TEXT NOT NULL, usage_date TEXT NOT NULL, upload_bytes INTEGER NOT NULL DEFAULT 0, "
+        "download_bytes INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        "UNIQUE(client_name, usage_date));"
+        "ALTER TABLE traffic_usage ADD COLUMN tenant_id TEXT;"
+        "CREATE TABLE resource_traffic_usage (id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER, "
+        "client_name TEXT NOT NULL, resource_type TEXT NOT NULL, resource_key TEXT NOT NULL, resource_id INTEGER, "
+        "resource_name TEXT, usage_date TEXT NOT NULL, upload_bytes INTEGER NOT NULL DEFAULT 0, "
+        "download_bytes INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        "UNIQUE(client_name, resource_type, resource_key, usage_date));"
+        "ALTER TABLE resource_traffic_usage ADD COLUMN tenant_id TEXT;"
+        "INSERT INTO traffic_usage(id, tenant_id, client_id, client_name, usage_date, upload_bytes, download_bytes, "
+        "updated_at) VALUES"
+        "(1, 'default', 7, 'old-name', '2026-10-01', 10, 100, '2026-10-01T10:00:00Z'),"
+        "(2, 'default', 7, 'new-name', '2026-10-01', 20, 200, '2026-10-01T09:00:00Z'),"
+        "(4, 'default', 7, 'new-name', '2026-10-02', 1, 2, '2026-10-02T08:00:00Z'),"
+        "(5, NULL, NULL, 'legacy-a', '2026-10-01', 3, 4, '2026-10-01 00:00:00'),"
+        "(6, NULL, NULL, 'legacy-b', '2026-10-01', 5, 6, '2026-10-01 00:00:00');"
+        "UPDATE sqlite_sequence SET seq = 50 WHERE name = 'traffic_usage';"
+        "INSERT INTO resource_traffic_usage(id, tenant_id, client_id, client_name, resource_type, resource_key, "
+        "resource_id, resource_name, usage_date, upload_bytes, download_bytes, updated_at) VALUES"
+        "(1, 'default', 7, 'old-name', 'TCP_SPECUS', 'tcp:9000', 3, '9000 -> a:1', '2026-10-01', 10, 100, "
+        "'2026-10-01T10:00:00Z'),"
+        "(2, 'default', 7, 'new-name', 'TCP_SPECUS', 'tcp:9000', 4, '9000 -> b:2', '2026-10-01', 20, 200, "
+        "'2026-10-01T09:00:00Z'),"
+        "(3, 'default', 7, 'new-name', 'HTTP_ROUTE', 'http:web', NULL, 'web', '2026-10-01', 1, 2, "
+        "'2026-10-01T08:00:00Z');") != 0
+        || st_storage_init(path, 0) != 0;
+    char rows[1024] = "";
+    const char *expected_rows =
+        "2:7:new-name:2026-10-01:30/300:2026-10-01T10:00:00Z|4:7:new-name:2026-10-02:1/2:2026-10-02T08:00:00Z|"
+        "5:-:legacy-a:2026-10-01:3/4:2026-10-01 00:00:00|6:-:legacy-b:2026-10-01:5/6:2026-10-01 00:00:00";
+    if (!failed) {
+        query_text(path, "SELECT group_concat(id || ':' || COALESCE(client_id, '-') || ':' || client_name || ':' || "
+                         "usage_date || ':' || upload_bytes || '/' || download_bytes || ':' || updated_at, '|') "
+                         "FROM (SELECT * FROM traffic_usage ORDER BY id)", rows, sizeof(rows));
+        failed = strcmp(rows, expected_rows) != 0;
+        if (failed) fprintf(stderr, "traffic key migration: daily rows\n%s\nexpected\n%s\n", rows, expected_rows);
+    }
+    const char *expected_resources =
+        "2:7:tcp:9000:4:9000 -> b:2:30/300:2026-10-01T10:00:00Z|3:7:http:web:-:web:1/2:2026-10-01T08:00:00Z";
+    if (!failed) {
+        query_text(path, "SELECT group_concat(id || ':' || client_id || ':' || resource_key || ':' || "
+                         "COALESCE(resource_id, '-') || ':' || resource_name || ':' || upload_bytes || '/' || "
+                         "download_bytes || ':' || updated_at, '|') FROM (SELECT * FROM resource_traffic_usage "
+                         "ORDER BY id)", rows, sizeof(rows));
+        failed = strcmp(rows, expected_resources) != 0;
+        if (failed) fprintf(stderr, "traffic key migration: resource rows\n%s\nexpected\n%s\n", rows,
+                            expected_resources);
+    }
+    if (!failed
+        && (unique_index_on(path, "traffic_usage", "client_id,usage_date", "uk_specus_traffic_client_date") != 1
+            || unique_index_on(path, "traffic_usage", "client_name,usage_date", NULL) != 0
+            || unique_index_on(path, "resource_traffic_usage", "tenant_id,client_id,resource_type,resource_key,usage_date",
+                               "uk_resource_traffic_resource_date") != 1
+            || unique_index_on(path, "resource_traffic_usage", "client_name,resource_type,resource_key,usage_date",
+                               NULL) != 0)) {
+        fprintf(stderr, "traffic key migration: the keys are not Java's\n");
+        failed = 1;
+    }
+    long counter = failed ? -1L : file_change_counter(path);
+    if (!failed && (st_storage_init(path, 0) != 0 || file_change_counter(path) != counter)) {
+        fprintf(stderr, "traffic key migration: a second start wrote to the database\n");
+        failed = 1;
+    }
+    failed = failed
+        || exec_script(path, "INSERT INTO client_account(id, tenant_id, client_name) VALUES(7, 'default', 'new-name')") != 0
+        || st_storage_record_traffic_usage(path, 7, "new-name", "2026-10-01", 5, 50) != 0
+        || st_storage_record_traffic_usage(path, 7, "new-name", "2026-10-03", 1, 1) != 0;
+    long long merged = failed ? -1 : query_int(path, "SELECT upload_bytes * 1000 + download_bytes FROM traffic_usage "
+                                                     "WHERE id = 2");
+    long long next_id = failed ? -1 : query_int(path, "SELECT id FROM traffic_usage WHERE usage_date = '2026-10-03'");
+    /* An upsert that updates still draws an AUTOINCREMENT number, so the new row is 51 or later. */
+    if (!failed && (merged != 35350 || next_id <= 50)) {
+        fprintf(stderr, "traffic key migration: the merged row holds %lld (35350 expected) and the next row got "
+                        "id %lld (above the sequence's 50 expected)\n", merged, next_id);
+        failed = 1;
+    }
+    unlink(path);
+    return failed ? 1 : 0;
+}
+
 int main(void)
 {
     if (test_client_account_id_migration() != 0) {
         return 1;
     }
-    if (test_traffic_usage_rows() != 0) {
+    if (test_traffic_usage_rows() != 0 || test_traffic_usage_keys() != 0 || test_traffic_usage_key_migration() != 0) {
         return 1;
     }
     if (test_login_name_migration_backfills_legacy_rows() != 0

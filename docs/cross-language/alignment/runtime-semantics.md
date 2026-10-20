@@ -112,7 +112,7 @@
   - 已认证的 control/data 连接上收到 `HEARTBEAT_RESPONSE` 按 Java `ConnectionRoleHandler` 与 Go 静默接受，不再按协议违规断开。
   - 已被任一侧 RST 的 TCP 流不再补发 FIN；写 public socket 失败按 Java/Go 回 `RST 9`（此前静默关闭）。
   - 单条 data 连接最多 1024 个 pending Direct HTTP 流，第 1025 个请求按 Java 答 `502 HTTP 流创建失败`（此前被当成响应头超时答 504）；请求体按 Content-Length 或 chunked 超过 16 MiB 答 `413 HTTP 请求体超过限制`，恰好 16 MiB 照常转发。
-- C server 的流量用量计数口径已按 Java `TrafficUsageService` 及其调用方对齐（issue #35 第 45 项，`traffic_usage_tests` 以真实进程覆盖）：TCP 映射上客户端写往公网的字节记上传、公网发来的记下载；Direct HTTP 与临时分享的交换不论以何种结局结束，都记已送到客户端的请求体字节和客户端发来的响应字节；路由 WebSocket 中客户端发往浏览器的 SWS2 封装（含 12 字节头）记客户端当日上传、不写资源行；资源行每次写入都取资源当时的 id 与完整名称，`updatedAt` 为带小数秒的 Instant。
+- C server 的流量用量计数口径已按 Java `TrafficUsageService` 及其调用方对齐（issue #35 第 45 项，`traffic_usage_tests` 以真实进程覆盖）：TCP 映射上客户端写往公网的字节记上传、公网发来的记下载；Direct HTTP 与临时分享的交换不论以何种结局结束，都记已送到客户端的请求体字节和客户端发来的响应字节；路由 WebSocket 中客户端发往浏览器的 SWS2 封装（含 12 字节头）记客户端当日上传、不写资源行；资源行每次写入都取资源当时的 id 与完整名称，`updatedAt` 为带小数秒的 Instant。日表与资源表按 Java 以账号做键（`client_id`，资源表另加 `tenant_id` 与资源），同一天删除后重建的同名客户端各记各的行、各在自己的租户；按客户端名做键的旧库在启动时于一个事务里重建两表，按 Java `SqliteUniqueIndexMigrator` 把同键的行求和进最新一行。
 - C server 已补可选 Elasticsearch HTTP/TCP 明细写入、查询和容量清理（`elasticsearch_traffic_tests`，对 fake ES）；未配置时继续使用 SQLite。逐 route 媒体采集已支持专用 S3-compatible/RustFS 校验、HLS/DASH/渐进式对象、multipart、Range 去重与跨对象连续区间、incomplete 稀疏回放、可选回源、tenant ticket、manifest/asset 和定时过期清理（`media_capture_tests`，对 fake S3；未接真实 RustFS）。公共 discovery 已通过 C↔C 双实例（`public_discovery_cluster_e2e`）和 C↔Java Redis（CI 中的 `java_c_discovery_interop.sh`）的 roster/名称/双向信令混部门禁；Go/.NET server 与 C 的混部没有证据。
 
 ## 阶段 4：Peer Mesh 控制面与数据面

@@ -1082,6 +1082,12 @@ int st_storage_list_connection_stats_visible(const char *path,
                                              st_storage_connection_stat *stats,
                                              size_t max_stats,
                                              size_t *stat_count);
+/*
+ * Adds bytes to a client's day as Java TrafficUsageService does: the account is found by client_id
+ * (by client_name when client_id <= 0) and gives the row its tenant, id and current name; a client
+ * that no longer exists is not counted (0). The resource variant does the same for one resource's
+ * row and stores resource_id (0 for none) and resource_name as given.
+ */
 int st_storage_record_traffic_usage(const char *path,
                                     long long client_id,
                                     const char *client_name,
