@@ -64,6 +64,7 @@
 #define ATTR_RESPONSE_ORIGIN 0x802bU
 #define ATTR_OTHER_ADDRESS 0x802cU
 #define STUN_MAX_ENDPOINTS 4U
+#define STUN_SOFTWARE "specus-standard-stun-turn"
 /* Java PeerMeshService: RELAY_AUTH_CACHE_TTL_NANOS and relay-traffic-flush-interval-ms. */
 #define RELAY_GRANT_TTL_MS 30000LL
 #define RELAY_TRAFFIC_FLUSH_DEFAULT_MS 5000L
@@ -430,72 +431,65 @@ static int builder_integrity(stun_builder *builder, const uint8_t key[16])
     return builder_attr(builder, ATTR_MESSAGE_INTEGRITY, mac, sizeof(mac));
 }
 
-static int validate_integrity(const uint8_t *packet, size_t len, char username[192])
+/*
+ * Java StunTurnServer.authenticate, in its order: NULL for a request signed with a valid credential
+ * (its username is left in username), otherwise the reason and *code of the refusal. Without this
+ * realm, a user or a nonce it is 401 unauthorized; with another nonce 438 stale-nonce, which comes
+ * with a fresh nonce so the client retries once instead of treating its credential as wrong (RFC
+ * 5389 section 10.2.2); with an unknown or expired credential 401 unauthorized, and with a wrong
+ * MESSAGE-INTEGRITY 401 bad-message-integrity.
+ */
+static const char *authentication_failure(const uint8_t *packet, size_t len, char username[192], int *code)
 {
     stun_attribute user;
     stun_attribute realm;
     stun_attribute nonce;
     stun_attribute integrity;
+    const char *current = st_turn_auth_nonce();
+    *code = 401;
     if (find_attribute(packet, len, ATTR_USERNAME, &user) != 0 || user.length == 0U || user.length >= 192U
         || find_attribute(packet, len, ATTR_REALM, &realm) != 0
-        || find_attribute(packet, len, ATTR_NONCE, &nonce) != 0
-        || find_attribute(packet, len, ATTR_MESSAGE_INTEGRITY, &integrity) != 0
-        || integrity.length != ST_SHA1_LEN
         || realm.length != strlen(st_turn_auth_realm())
         || memcmp(realm.value, st_turn_auth_realm(), realm.length) != 0
-        || nonce.length != strlen(st_turn_auth_nonce())
-        || memcmp(nonce.value, st_turn_auth_nonce(), nonce.length) != 0) return -1;
+        || find_attribute(packet, len, ATTR_NONCE, &nonce) != 0 || nonce.length == 0U) return "unauthorized";
+    if (nonce.length != strlen(current) || memcmp(nonce.value, current, nonce.length) != 0) {
+        *code = 438;
+        return "stale-nonce";
+    }
     memcpy(username, user.value, user.length);
     username[user.length] = '\0';
     uint8_t key[16];
-    if (st_turn_auth_long_term_key(username, key) != 0) return -1;
+    if (st_turn_auth_long_term_key(username, key) != 0) return "unauthorized";
+    if (find_attribute(packet, len, ATTR_MESSAGE_INTEGRITY, &integrity) != 0
+        || integrity.length != ST_SHA1_LEN) return "bad-message-integrity";
     uint8_t *copy = (uint8_t *)malloc(integrity.offset);
-    if (copy == NULL) return -1;
+    if (copy == NULL) return "bad-message-integrity";
     memcpy(copy, packet, integrity.offset);
     write_u16(copy + 2U, (uint16_t)(integrity.offset + 24U - STUN_HEADER_SIZE));
     uint8_t mac[ST_SHA1_LEN];
     st_hmac_sha1(key, sizeof(key), copy, integrity.offset, mac);
     free(copy);
-    return st_constant_time_eq(mac, integrity.value, sizeof(mac)) ? 0 : -1;
+    return st_constant_time_eq(mac, integrity.value, sizeof(mac)) ? NULL : "bad-message-integrity";
 }
 
-/*
- * RFC 5389 section 10.2.2 and Java StunTurnServer.authenticate: a request that names this realm
- * and a user but carries a nonce other than the current one gets 438 with a fresh nonce, so the
- * client retries once instead of treating its credential as wrong. Anything else stays 401.
- */
-static int request_nonce_is_stale(const uint8_t *packet, size_t len)
-{
-    stun_attribute user;
-    stun_attribute realm;
-    stun_attribute nonce;
-    const char *current = st_turn_auth_nonce();
-    return find_attribute(packet, len, ATTR_USERNAME, &user) == 0 && user.length > 0U
-        && find_attribute(packet, len, ATTR_REALM, &realm) == 0
-        && realm.length == strlen(st_turn_auth_realm())
-        && memcmp(realm.value, st_turn_auth_realm(), realm.length) == 0
-        && find_attribute(packet, len, ATTR_NONCE, &nonce) == 0 && nonce.length > 0U
-        && (nonce.length != strlen(current) || memcmp(nonce.value, current, nonce.length) != 0);
-}
-
+/* Java errorType: requests of other methods are answered as Binding errors. */
 static uint16_t stun_error_type(uint16_t request_type)
 {
     switch (request_type) {
-        case STUN_BINDING_REQUEST: return 0x0111U;
         case TURN_ALLOCATE_REQUEST: return 0x0113U;
         case TURN_REFRESH_REQUEST: return 0x0114U;
         case TURN_CREATE_PERMISSION_REQUEST: return 0x0118U;
         case TURN_CHANNEL_BIND_REQUEST: return 0x0119U;
-        default: return 0x0110U;
+        default: return 0x0111U;
     }
 }
 
-static int builder_error(stun_builder *builder,
-                         uint16_t request_type,
-                         const uint8_t transaction[12],
-                         int code,
-                         const char *reason,
-                         int add_challenge)
+/* An error answer with ERROR-CODE only, for Binding (which adds its own attributes after it). */
+static int builder_error_code(stun_builder *builder,
+                              uint16_t request_type,
+                              const uint8_t transaction[12],
+                              int code,
+                              const char *reason)
 {
     builder_start(builder, stun_error_type(request_type), transaction);
     uint8_t value[256] = {0};
@@ -504,7 +498,22 @@ static int builder_error(stun_builder *builder,
     value[2] = (uint8_t)(code / 100);
     value[3] = (uint8_t)(code % 100);
     memcpy(value + 4U, reason, reason_len);
-    if (builder_attr(builder, ATTR_ERROR_CODE, value, reason_len + 4U) != 0) return -1;
+    return builder_attr(builder, ATTR_ERROR_CODE, value, reason_len + 4U);
+}
+
+/*
+ * A TURN error answer as Java sendError builds it: ERROR-CODE with Java's (and Go's) reason
+ * phrase, SOFTWARE, and for a challenge the realm and the current nonce.
+ */
+static int builder_error(stun_builder *builder,
+                         uint16_t request_type,
+                         const uint8_t transaction[12],
+                         int code,
+                         const char *reason,
+                         int add_challenge)
+{
+    if (builder_error_code(builder, request_type, transaction, code, reason) != 0
+        || builder_attr(builder, ATTR_SOFTWARE, STUN_SOFTWARE, strlen(STUN_SOFTWARE)) != 0) return -1;
     if (add_challenge && (builder_attr(builder, ATTR_REALM, st_turn_auth_realm(), strlen(st_turn_auth_realm())) != 0
                           || builder_attr(builder, ATTR_NONCE, st_turn_auth_nonce(), strlen(st_turn_auth_nonce())) != 0)) return -1;
     return 0;
@@ -1242,8 +1251,8 @@ static int bind_channel(turn_allocation *allocation,
                         int ttl)
 {
     turn_channel *slot = find_channel_by_number(allocation, number);
-    /* RFC 5766 section 11.2: a live channel number may only be refreshed for the same peer. */
-    if (slot != NULL && !sockaddr_equal(&slot->peer, peer, 1)) return -1;
+    /* RFC 5766 section 11.2: a live channel number may only be refreshed for the same peer (-2). */
+    if (slot != NULL && !sockaddr_equal(&slot->peer, peer, 1)) return -2;
     /* Java channelBind: the peer leaves the number it was bound to before, so its data comes in
      * on the new one and the old number is free. Expired bindings give their entries back. */
     time_t now = time(NULL);
@@ -1286,13 +1295,21 @@ static int authenticate_request(st_stun_turn_server *server,
         username[0] = '\0';
         return 0;
     }
-    if (validate_integrity(packet, len, username) == 0) return 0;
-    int stale = request_nonce_is_stale(packet, len);
+    int code = 0;
+    const char *failure = authentication_failure(packet, len, username, &code);
+    if (failure == NULL) return 0;
     stun_builder error;
-    builder_error(&error, read_u16(packet), packet + 8U,
-                  stale ? 438 : 401, stale ? "Stale Nonce" : "Unauthorized", 1);
+    builder_error(&error, read_u16(packet), packet + 8U, code, failure, 1);
     send_builder(fd, &error, client, client_len);
     return -1;
+}
+
+/* Success answers carry SOFTWARE, and MESSAGE-INTEGRITY when the request was authenticated. */
+static void finish_success(st_stun_turn_server *server, stun_builder *response, const char *username)
+{
+    (void)builder_attr(response, ATTR_SOFTWARE, STUN_SOFTWARE, strlen(STUN_SOFTWARE));
+    uint8_t key[16];
+    if (server->auth_required && st_turn_auth_long_term_key(username, key) == 0) builder_integrity(response, key);
 }
 
 static void handle_binding(st_stun_turn_server *server,
@@ -1346,13 +1363,13 @@ static void handle_binding(st_stun_turn_server *server,
     }
     if (error_code != 0) {
         stun_builder error;
-        builder_error(&error, STUN_BINDING_REQUEST, packet + 8U, error_code, error_reason, 0);
+        builder_error_code(&error, STUN_BINDING_REQUEST, packet + 8U, error_code, error_reason);
         if (unknown_attribute != 0U) {
             uint8_t encoded[2];
             write_u16(encoded, unknown_attribute);
             (void)builder_attr(&error, ATTR_UNKNOWN_ATTRIBUTES, encoded, sizeof(encoded));
         }
-        (void)builder_attr(&error, ATTR_SOFTWARE, "specus-standard-stun-turn", 25U);
+        (void)builder_attr(&error, ATTR_SOFTWARE, STUN_SOFTWARE, strlen(STUN_SOFTWARE));
         (void)send_builder(received_fd, &error, &response_target, response_target_len);
         return;
     }
@@ -1365,7 +1382,7 @@ static void handle_binding(st_stun_turn_server *server,
     builder_start(&response, STUN_BINDING_SUCCESS, packet + 8U);
     (void)builder_address(&response, ATTR_MAPPED_ADDRESS, client, 0);
     (void)builder_address(&response, ATTR_XOR_MAPPED_ADDRESS, client, 1);
-    (void)builder_attr(&response, ATTR_SOFTWARE, "specus-standard-stun-turn", 25U);
+    (void)builder_attr(&response, ATTR_SOFTWARE, STUN_SOFTWARE, strlen(STUN_SOFTWARE));
     (void)builder_address(&response, ATTR_RESPONSE_ORIGIN, &response_endpoint->advertised,
                           server->rfc5780 ? 0 : 1);
     stun_server_endpoint *other = server->rfc5780
@@ -1399,7 +1416,7 @@ static void handle_allocate(st_stun_turn_server *server,
     if (find_attribute(packet, len, ATTR_REQUESTED_TRANSPORT, &transport) != 0
         || transport.length != 4U || transport.value[0] != 17U) {
         stun_builder error;
-        builder_error(&error, TURN_ALLOCATE_REQUEST, packet + 8U, 442, "Unsupported Transport", 0);
+        builder_error(&error, TURN_ALLOCATE_REQUEST, packet + 8U, 442, "unsupported-transport", 0);
         send_builder(fd, &error, client, client_len);
         return;
     }
@@ -1426,10 +1443,11 @@ static void handle_allocate(st_stun_turn_server *server,
                 client_text, rejection);
     }
     if (allocation == NULL) {
+        /* 486 names the quota that refused it, as in Java; 508 (no relay port or socket free) is
+         * C's own answer where Java fails the request without one. */
         stun_builder error;
-        builder_error(&error, TURN_ALLOCATE_REQUEST, packet + 8U,
-                      rejection != NULL ? 486 : 508,
-                      rejection != NULL ? "Allocation Quota Reached" : "Insufficient Capacity", 0);
+        builder_error(&error, TURN_ALLOCATE_REQUEST, packet + 8U, rejection != NULL ? 486 : 508,
+                      rejection != NULL ? rejection : "insufficient-capacity", 0);
         send_builder(fd, &error, client, client_len);
         return;
     }
@@ -1447,10 +1465,7 @@ static void handle_allocate(st_stun_turn_server *server,
     builder_address(&response, ATTR_XOR_RELAYED_ADDRESS, &allocation->relay, 1);
     builder_address(&response, ATTR_XOR_MAPPED_ADDRESS, client, 1);
     builder_u32(&response, ATTR_LIFETIME, (uint32_t)server->allocation_ttl);
-    if (server->auth_required) {
-        uint8_t key[16];
-        if (st_turn_auth_long_term_key(username, key) == 0) builder_integrity(&response, key);
-    }
+    finish_success(server, &response, username);
     send_builder(fd, &response, client, client_len);
 }
 
@@ -1466,7 +1481,7 @@ static void handle_refresh(st_stun_turn_server *server,
     turn_allocation *allocation = find_allocation_by_client(server, client);
     if (!allocation_matches_identity(allocation, username)) {
         stun_builder error;
-        builder_error(&error, TURN_REFRESH_REQUEST, packet + 8U, 437, "Allocation Mismatch", 0);
+        builder_error(&error, TURN_REFRESH_REQUEST, packet + 8U, 437, "allocation-mismatch", 0);
         send_builder(fd, &error, client, client_len);
         return;
     }
@@ -1476,11 +1491,12 @@ static void handle_refresh(st_stun_turn_server *server,
         lifetime = read_u32(requested.value);
         if (lifetime > (uint32_t)server->allocation_ttl) lifetime = (uint32_t)server->allocation_ttl;
     }
+    /* Java and Go answer the configured lifetime (0 for a deletion), whatever shorter one the
+     * allocation is kept for. */
     stun_builder response;
     builder_start(&response, TURN_REFRESH_SUCCESS, packet + 8U);
-    builder_u32(&response, ATTR_LIFETIME, lifetime);
-    uint8_t key[16];
-    if (server->auth_required && st_turn_auth_long_term_key(username, key) == 0) builder_integrity(&response, key);
+    builder_u32(&response, ATTR_LIFETIME, lifetime == 0U ? 0U : (uint32_t)server->allocation_ttl);
+    finish_success(server, &response, username);
     send_builder(fd, &response, client, client_len);
     if (lifetime == 0U) close_allocation(allocation);
     else allocation->expires_at = time(NULL) + lifetime;
@@ -1500,14 +1516,21 @@ static void handle_permission_or_channel(st_stun_turn_server *server,
     struct sockaddr_storage peers[TURN_MAX_PERMISSIONS];
     socklen_t peer_lens[TURN_MAX_PERMISSIONS];
     size_t peer_count = 0U;
+    int channel_bind = message_type == TURN_CHANNEL_BIND_REQUEST;
+    stun_attribute channel;
+    uint16_t number = 0U;
     int refusal = 0;
     const char *refusal_reason = NULL;
+    /* Java's order and reasons: identity, then a ChannelBind's number and peer, then the policy. */
     if (!allocation_matches_identity(allocation, username)) {
         refusal = 437;
-        refusal_reason = "Allocation Mismatch";
-    } else if (collect_peer_addresses(packet, len, peers, peer_lens, TURN_MAX_PERMISSIONS, &peer_count) != 0) {
+        refusal_reason = "allocation-mismatch";
+    } else if (collect_peer_addresses(packet, len, peers, peer_lens, TURN_MAX_PERMISSIONS, &peer_count) != 0
+               || (channel_bind && (find_attribute(packet, len, ATTR_CHANNEL_NUMBER, &channel) != 0
+                                    || channel.length != 4U || (number = read_u16(channel.value)) < 0x4000U
+                                    || number > 0x7fffU))) {
         refusal = 400;
-        refusal_reason = "Bad Request";
+        refusal_reason = channel_bind ? "bad-channel-bind" : "bad-request";
     } else if (allocation_is_general(allocation)) {
         /* Every named peer is checked before any permission is installed, as Go does: one refused
          * peer refuses the whole request instead of letting the peers before it through. */
@@ -1515,7 +1538,7 @@ static void handle_permission_or_channel(st_stun_turn_server *server,
             if (peer_address_allowed(server, &peers[i])) continue;
             log_refused_peer(message_type, client, &peers[i]);
             refusal = 403;
-            refusal_reason = "Forbidden Peer";
+            refusal_reason = "forbidden-peer-address";
         }
     }
     if (refusal != 0) {
@@ -1525,15 +1548,13 @@ static void handle_permission_or_channel(st_stun_turn_server *server,
         return;
     }
     int rc = 0;
+    const char *failure = "bad-request";
     uint16_t success_type = TURN_CREATE_PERMISSION_SUCCESS;
-    if (message_type == TURN_CHANNEL_BIND_REQUEST) {
-        stun_attribute channel;
-        uint16_t number = 0U;
-        if (find_attribute(packet, len, ATTR_CHANNEL_NUMBER, &channel) != 0 || channel.length != 4U
-            || (number = read_u16(channel.value)) < 0x4000U || number > 0x7fffU) rc = -1;
+    if (channel_bind) {
         /* The permission it installs must fit before the binding changes anything. */
-        else if (permission_slot(allocation, &peers[0]) == NULL) rc = -1;
+        if (permission_slot(allocation, &peers[0]) == NULL) rc = -1;
         else rc = bind_channel(allocation, number, &peers[0], peer_lens[0], server->channel_ttl);
+        if (rc == -2) failure = "channel-in-use";
         success_type = TURN_CHANNEL_BIND_SUCCESS;
         /* A ChannelBind binds the first peer it names; the others were only policy-checked. */
         peer_count = 1U;
@@ -1544,11 +1565,12 @@ static void handle_permission_or_channel(st_stun_turn_server *server,
     }
     stun_builder response;
     if (rc != 0) {
-        builder_error(&response, message_type, packet + 8U, 400, "Bad Request", 0);
+        /* bad-request: more live permissions or channels than an allocation holds, which Java,
+         * keeping them in maps, never refuses. */
+        builder_error(&response, message_type, packet + 8U, 400, failure, 0);
     } else {
         builder_start(&response, success_type, packet + 8U);
-        uint8_t key[16];
-        if (server->auth_required && st_turn_auth_long_term_key(username, key) == 0) builder_integrity(&response, key);
+        finish_success(server, &response, username);
     }
     send_builder(fd, &response, client, client_len);
 }
@@ -1601,13 +1623,28 @@ static void handle_control_packet(st_stun_turn_server *server,
                                   const struct sockaddr_storage *client,
                                   socklen_t client_len)
 {
+    /* Java reads ChannelData on the main port only; elsewhere it is no STUN message either. */
     if (len >= 4U && (packet[0] & 0xc0U) == 0x40U) {
-        handle_channel_data(server, packet, len, client);
+        if (fd == server->control_fd) handle_channel_data(server, packet, len, client);
         return;
     }
     if (!stun_packet_valid(packet, len)) return;
     uint16_t type = read_u16(packet);
-    if (fd != server->control_fd && type != STUN_BINDING_REQUEST) return;
+    /*
+     * Java answers a TURN message on another endpoint with 400 unsupported-endpoint and one of an
+     * unknown method with 400 unsupported-method instead of letting the client retransmit until it
+     * times out. Only requests are answered here: an answer to an indication or a response could
+     * bounce between two servers (or a spoofed server and itself) for ever.
+     */
+    int request = (type & 0x0110U) == 0U;
+    if (fd != server->control_fd && type != STUN_BINDING_REQUEST) {
+        if (request) {
+            stun_builder error;
+            builder_error(&error, type, packet + 8U, 400, "unsupported-endpoint", 0);
+            (void)send_builder(fd, &error, client, client_len);
+        }
+        return;
+    }
     switch (type) {
         case STUN_BINDING_REQUEST: handle_binding(server, fd, packet, len, client, client_len); break;
         case TURN_ALLOCATE_REQUEST: handle_allocate(server, fd, packet, len, client, client_len); break;
@@ -1616,7 +1653,13 @@ static void handle_control_packet(st_stun_turn_server *server,
         case TURN_CHANNEL_BIND_REQUEST:
             handle_permission_or_channel(server, fd, type, packet, len, client, client_len); break;
         case TURN_SEND_INDICATION: handle_send_indication(server, packet, len, client); break;
-        default: break;
+        default:
+            if (request) {
+                stun_builder error;
+                builder_error(&error, type, packet + 8U, 400, "unsupported-method", 0);
+                (void)send_builder(fd, &error, client, client_len);
+            }
+            break;
     }
 }
 

@@ -378,6 +378,27 @@ static int text_attr_equals(const unsigned char *packet, int len, unsigned type,
     return value != NULL && value_len == strlen(expected) && memcmp(value, expected, value_len) == 0;
 }
 
+static int has_software(const unsigned char *packet, int len)
+{
+    return text_attr_equals(packet, len, 0x8022U, "specus-standard-stun-turn");
+}
+
+/* An error answer with Java's (and Go's) reason phrase, and SOFTWARE like every TURN answer. */
+static int expect_reason(const unsigned char *packet, int len, unsigned type, int code, const char *reason,
+                         const char *label)
+{
+    if (expect_error(packet, len, type, code, label) != 0) return -1;
+    size_t value_len = 0U;
+    const unsigned char *value = find_attr(packet, (size_t)len, 0x0009U, &value_len);
+    int reason_matches = value != NULL && value_len == 4U + strlen(reason)
+        && memcmp(value + 4U, reason, strlen(reason)) == 0;
+    if (reason_matches && has_software(packet, len)) return 0;
+    fprintf(stderr, "%s: reason \"%.*s\"%s, want \"%s\" with SOFTWARE\n", label,
+            value == NULL || value_len < 4U ? 0 : (int)(value_len - 4U), value == NULL ? "" : (const char *)value + 4,
+            has_software(packet, len) ? "" : " without SOFTWARE", reason);
+    return -1;
+}
+
 static int lifetime_attr(const unsigned char *packet, int len)
 {
     size_t value_len = 0U;
@@ -981,6 +1002,159 @@ static int test_allocation_audit_log(void)
     return failed ? -1 : 0;
 }
 
+/* Stops the fixture's server and starts another one with the environment as it is now. */
+static int turn_fixture_restart(turn_fixture *fixture)
+{
+    st_stun_turn_server_stop(fixture->server);
+    fixture->server = NULL;
+    if (st_stun_turn_server_start(&fixture->server) != 0) {
+        fprintf(stderr, "STUN/TURN fixture restart failed\n");
+        return -1;
+    }
+    fixture->address.sin_port = htons((unsigned short)st_stun_turn_server_port(fixture->server));
+    return 0;
+}
+
+static int success_with_software(const unsigned char *packet, int len, unsigned type, const char *label)
+{
+    if (len >= 20 && r16(packet) == type && has_software(packet, len)) return 0;
+    fprintf(stderr, "%s: expected 0x%04x with SOFTWARE, got 0x%04x/%d%s\n", label, type,
+            len >= 20 ? r16(packet) : 0U, error_code(packet, len), has_software(packet, len) ? "" : " without SOFTWARE");
+    return -1;
+}
+
+/*
+ * The wire details Java and Go share: their lower-case reason phrases, SOFTWARE on every TURN
+ * answer, 400 for a TURN request on the alternate port and for an unknown method (C let them time
+ * out), ChannelData only on the main port, and a Refresh answered with the server's lifetime while
+ * the allocation keeps the shorter one asked for.
+ */
+static int test_turn_wire_details(void)
+{
+    turn_fixture fixture;
+    turn_credential general;
+    turn_credential mesh;
+    if (turn_fixture_start(&fixture, 1, "55250", "55299", NULL) != 0) return -1;
+    struct sockaddr_in reserved_primary, reserved_alternate;
+    int reserve_primary = udp_socket(&reserved_primary);
+    int reserve_alternate = udp_socket(&reserved_alternate);
+    char primary_port[16], alternate_port[16];
+    snprintf(primary_port, sizeof(primary_port), "%u", ntohs(reserved_primary.sin_port));
+    snprintf(alternate_port, sizeof(alternate_port), "%u", ntohs(reserved_alternate.sin_port));
+    if (reserve_primary >= 0) close(reserve_primary);
+    if (reserve_alternate >= 0) close(reserve_alternate);
+    setenv("SPECUS_PEER_MESH_STUN_TURN_PORT", primary_port, 1);
+    setenv("SPECUS_PEER_MESH_NAT_PROBE_ALTERNATE_PORT", alternate_port, 1);
+    setenv("SPECUS_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS", "1", 1);
+    int failed = reserve_primary < 0 || reserve_alternate < 0 || turn_fixture_restart(&fixture) != 0;
+    setenv("SPECUS_PEER_MESH_STUN_TURN_PORT", "0", 1);
+    unsetenv("SPECUS_PEER_MESH_NAT_PROBE_ALTERNATE_PORT");
+    struct sockaddr_in alternate = fixture.address;
+    alternate.sin_port = reserved_alternate.sin_port;
+    struct sockaddr_in client_address, second_address, peer_address, other_address, relay;
+    int client = udp_socket(&client_address);
+    int second = udp_socket(&second_address);
+    int peer = udp_socket(&peer_address);
+    int other = udp_socket_on("127.0.0.2", &other_address);
+    unsigned char response[2048];
+    unsigned char transport[4] = {17, 0, 0, 0};
+    packet_builder request;
+    failed = failed || client < 0 || second < 0 || peer < 0 || other < 0
+        || issue_credential("public-transfer-wire", &general) != 0 || issue_credential("pm-41", &mesh) != 0;
+    /* Authentication: 401 unauthorized, 438 stale-nonce, 401 bad-message-integrity. */
+    if (!failed) {
+        start(&request, 0x0003U, 1800U);
+        attr(&request, 0x0019U, transport, sizeof(transport));
+        int received = exchange(client, &fixture.address, &request, response, sizeof(response));
+        failed = expect_reason(response, received, 0x0113U, 401, "unauthorized", "unauthenticated Allocate") != 0;
+    }
+    if (!failed) {
+        start(&request, 0x0003U, 1801U);
+        attr(&request, 0x0019U, transport, sizeof(transport));
+        sign(&request, &general, STALE_NONCE);
+        int received = exchange(client, &fixture.address, &request, response, sizeof(response));
+        failed = expect_reason(response, received, 0x0113U, 438, "stale-nonce", "Allocate with a stale nonce") != 0;
+    }
+    if (!failed) {
+        turn_credential forged = general;
+        forged.key[3] ^= 0x5aU;
+        start(&request, 0x0003U, 1802U);
+        attr(&request, 0x0019U, transport, sizeof(transport));
+        sign(&request, &forged, st_turn_auth_nonce());
+        int received = exchange(client, &fixture.address, &request, response, sizeof(response));
+        failed = expect_reason(response, received, 0x0113U, 401, "bad-message-integrity",
+                               "Allocate with a bad integrity") != 0;
+    }
+    if (!failed) {
+        start(&request, 0x0003U, 1803U);
+        sign(&request, &general, st_turn_auth_nonce());
+        int received = exchange(client, &fixture.address, &request, response, sizeof(response));
+        failed = expect_reason(response, received, 0x0113U, 442, "unsupported-transport",
+                               "Allocate without REQUESTED-TRANSPORT") != 0;
+    }
+    int received = failed ? -1 : allocate_answer(client, &fixture, &general, 1804U, response, sizeof(response));
+    failed = failed || success_with_software(response, received, 0x0103U, "Allocate") != 0
+        || allocate(client, &fixture, &general, 1805U, &relay) != 0;
+    received = failed ? -1 : allocate_answer(second, &fixture, &general, 1806U, response, sizeof(response));
+    failed = failed || expect_reason(response, received, 0x0113U, 486, "general-relay-allocation-quota",
+                                     "general relay past its quota") != 0;
+    /* Only Binding is served on the alternate port; anything else there is refused at once. */
+    if (!failed) {
+        start(&request, 0x0003U, 1807U);
+        attr(&request, 0x0019U, transport, sizeof(transport));
+        sign(&request, &general, st_turn_auth_nonce());
+        received = exchange(second, &alternate, &request, response, sizeof(response));
+        failed = expect_reason(response, received, 0x0113U, 400, "unsupported-endpoint",
+                               "Allocate on the alternate port") != 0;
+    }
+    if (!failed) {
+        start(&request, 0x000aU, 1808U);
+        received = exchange(second, &fixture.address, &request, response, sizeof(response));
+        failed = expect_reason(response, received, 0x0111U, 400, "unsupported-method", "unknown method") != 0;
+    }
+    /* Refresh: the configured lifetime is answered, the 60 s asked for is kept. */
+    received = failed ? -1 : refresh(client, &fixture, &general, st_turn_auth_nonce(), 60, 1809U,
+                                     response, sizeof(response));
+    if (!failed && (success_with_software(response, received, 0x0104U, "Refresh") != 0
+                    || lifetime_attr(response, received) != 300)) {
+        fprintf(stderr, "Refresh asking for 60 s answered LIFETIME %d, want 300\n", lifetime_attr(response, received));
+        failed = 1;
+    }
+    received = failed ? -1 : refresh(client, &fixture, &mesh, st_turn_auth_nonce(), -1, 1810U,
+                                     response, sizeof(response));
+    failed = failed || expect_reason(response, received, 0x0114U, 437, "allocation-mismatch",
+                                     "Refresh by another identity") != 0;
+    received = failed ? -1 : create_permission(client, &fixture, &general, &peer_address, 1811U,
+                                               response, sizeof(response));
+    failed = failed || success_with_software(response, received, 0x0108U, "CreatePermission") != 0;
+    received = failed ? -1 : channel_bind(client, &fixture, &general, 0x3fffU, &peer_address, 1812U,
+                                          response, sizeof(response));
+    failed = failed || expect_reason(response, received, 0x0119U, 400, "bad-channel-bind",
+                                     "ChannelBind below 0x4000") != 0;
+    received = failed ? -1 : channel_bind(client, &fixture, &general, 0x4000U, &peer_address, 1813U,
+                                          response, sizeof(response));
+    failed = failed || success_with_software(response, received, 0x0109U, "ChannelBind") != 0;
+    received = failed ? -1 : channel_bind(client, &fixture, &general, 0x4000U, &other_address, 1814U,
+                                          response, sizeof(response));
+    failed = failed || expect_reason(response, received, 0x0119U, 400, "channel-in-use",
+                                     "ChannelBind of a number in use") != 0;
+    /* ChannelData is only read on the main port. */
+    if (!failed) {
+        unsigned char frame[16] = {0x40, 0x00, 0x00, 0x04, 'a', 'l', 't', '!'};
+        failed = sendto(client, frame, 8U, 0, (struct sockaddr *)&alternate, sizeof(alternate)) != 8
+            || !stays_silent(peer)
+            || send_channel_data(client, &fixture, 0x4000U, "main", 0U) != 0
+            || receive_exact(peer, "main", &relay, "ChannelData on the main port") != 0;
+        if (failed) fprintf(stderr, "ChannelData on the alternate port was relayed, or on the main port was not\n");
+    }
+    if (client >= 0) close(client);
+    if (second >= 0) close(second);
+    if (peer >= 0) close(peer);
+    if (other >= 0) close(other);
+    if (fixture.server != NULL) st_stun_turn_server_stop(fixture.server);
+    return failed ? -1 : 0;
+}
+
 static int test_stale_nonce(void)
 {
     turn_fixture fixture;
@@ -1066,10 +1240,11 @@ static int test_default_private_peer_refusal(void)
     for (size_t i = 0; !failed && i < sizeof(refused_ipv4_peers) / sizeof(refused_ipv4_peers[0]); ++i) {
         int received = peer_from_text(refused_ipv4_peers[i], 50000U, &peer) != 0 ? -1
             : create_permission(client, &fixture, &general, &peer, seed++, response, sizeof(response));
-        failed = expect_error(response, received, 0x0118U, 403, refused_ipv4_peers[i]) != 0;
+        failed = expect_reason(response, received, 0x0118U, 403, "forbidden-peer-address", refused_ipv4_peers[i]) != 0;
         received = failed ? -1 : channel_bind(client, &fixture, &general, 0x4000U, &peer, seed++,
                                               response, sizeof(response));
-        failed = failed || expect_error(response, received, 0x0119U, 403, refused_ipv4_peers[i]) != 0;
+        failed = failed
+            || expect_reason(response, received, 0x0119U, 403, "forbidden-peer-address", refused_ipv4_peers[i]) != 0;
     }
     for (size_t i = 0; !failed && i < sizeof(refused_ipv6_peers) / sizeof(refused_ipv6_peers[0]); ++i) {
         int received = create_permission6(client, &fixture, &general, refused_ipv6_peers[i], seed++,
@@ -2411,6 +2586,7 @@ int main(void)
         || test_refresh_and_deallocation() != 0
         || test_stale_nonce() != 0
         || test_allocation_audit_log() != 0
+        || test_turn_wire_details() != 0
         || test_default_private_peer_refusal() != 0
         || test_private_peers_allowed_by_switch() != 0
         || test_expiry() != 0
