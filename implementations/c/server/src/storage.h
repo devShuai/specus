@@ -750,6 +750,11 @@ int st_storage_upsert_client_download_link(const char *path,
                                            int display_order,
                                            int enabled,
                                            st_storage_client_download_link *out_link);
+/*
+ * Returned by the client download writes when the target already lists the version (catalog_key)
+ * or the latest slot is held: Java's DataIntegrityViolationException, nothing written.
+ */
+#define ST_STORAGE_CLIENT_DOWNLOAD_DUPLICATE (-2)
 int st_storage_upsert_client_download_link_extended(const char *path,
                                                     long long id,
                                                     const char *implementation,

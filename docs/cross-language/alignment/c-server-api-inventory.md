@@ -189,10 +189,10 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | GET | `/api/public/transfer/downloads/{token}` | 公开 | 一致 | `TransferAttachmentServiceTests` 覆盖 |
 | POST | `/api/admin/client-messages/attachments/presign-upload`、`/{attachmentId}/complete`、`/{attachmentId}/presign-download` | Bearer | 一致 | `TransferAttachmentServiceTests` 覆盖（管理端隔离） |
 | GET | `/api/admin/client-downloads` | Bearer（admin） | 一致 | `ClientDownloadLinkServiceTests` 覆盖；**本分支**修正 128 行静默截断（`management_lists_tests`） |
-| POST | `/api/admin/client-downloads` | Bearer（admin） | 一致 | 同上；共享向量 `client-download-link-validation-v1.json` 的 `createCases`（Java `ClientDownloadLinkValidationVectorTests`，C `client_package_tests`），第 9 节第 11 项 |
-| POST | `/api/admin/client-packages`（multipart） | Bearer（admin） | 一致 | `ClientPackageLifecycleTests`、`ClientPackageStorageTests` 覆盖 |
-| PUT | `/api/admin/client-downloads/{id}` | Bearer（admin） | 一致 | `ClientDownloadLinkServiceTests` 覆盖；共享向量的 `updateCases`，第 9 节第 11 项 |
-| POST | `/api/admin/client-downloads/{id}/latest` | Bearer（admin） | 一致 | 同上；`fix/c-server-client-download-messages` 起无版本答 `client download link has no version: <id>`，版本与最低版本的拒绝按 Java 逐条回原因 |
+| POST | `/api/admin/client-downloads` | Bearer（admin） | 一致 | 同上；共享向量 `client-download-link-validation-v1.json` 的 `createCases`（Java `ClientDownloadLinkValidationVectorTests`，C `client_package_tests`），第 9 节第 11 项；`fix/c-server-baseline-storage` 起同一目标已登记同一版本时按 Java 回 `400 {"error":"客户端名称已存在或数据不符合约束"}`（原为 `201` 再登记一条），`client_package_tests:test_catalogue_unique_keys` |
+| POST | `/api/admin/client-packages`（multipart） | Bearer（admin） | 一致 | `ClientPackageLifecycleTests`、`ClientPackageStorageTests` 覆盖；目标与版本已登记时回 `400 客户端名称已存在或数据不符合约束`（原为 `409 client package catalogue create failed`），`fix/c-server-baseline-storage` |
+| PUT | `/api/admin/client-downloads/{id}` | Bearer（admin） | 一致 | `ClientDownloadLinkServiceTests` 覆盖；共享向量的 `updateCases`，第 9 节第 11 项；改到同目标已登记的版本时回 `400 客户端名称已存在或数据不符合约束`（原为 `200`），`fix/c-server-baseline-storage` |
+| POST | `/api/admin/client-downloads/{id}/latest` | Bearer（admin） | 一致 | 同上；`fix/c-server-client-download-messages` 起无版本答 `client download link has no version: <id>`，版本与最低版本的拒绝按 Java 逐条回原因；写入撞上唯一键时同样回 `400 客户端名称已存在或数据不符合约束`（启动迁移已把旧行的版本归一，正常数据下碰不到） |
 | DELETE | `/api/admin/client-downloads/{id}` | Bearer（admin） | 一致 | 同上 |
 | GET | `/api/public/client-downloads` | 公开（来源限流） | 一致 | 同上 + `GitHubReleaseCatalogTests`、`ClientPackageRateLimiterTests`；**本分支**：目录超过 128 行后最新发布不再出现，`management_lists_tests` 以第 140 个版本断言 |
 | GET | `/api/public/client-version-check` | 公开（来源限流） | 一致 | 同上（第 140 个版本）；`fix/c-server-query-repeat-and-firewall` 起按 Java 依次检查三个坐标、坐标组合与 `current`，各回自己的原因（原先都是 `invalid client version target`），`client_package_tests`。允许值列表的次序 Java 取 `Set.of` 的迭代次序、每次启动都可能不同，C 与 Go、.NET 一样按声明次序列出 |

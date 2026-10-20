@@ -11772,12 +11772,16 @@ static int handle_client_download_create(const st_admin_context *context,
         return validation_response;
     }
     st_storage_client_download_link link;
-    if (st_storage_upsert_client_download_link_extended(database_path, 0,
+    int written;
+    if ((written = st_storage_upsert_client_download_link_extended(database_path, 0,
             mutation.implementation, mutation.platform, mutation.arch, mutation.display_name,
             mutation.download_url, mutation.description, mutation.display_order, mutation.enabled,
             mutation.version, mutation.sha256, mutation.file_size, mutation.is_latest,
-            mutation.changelog_url, mutation.min_supported_version, 0, NULL, NULL, &link) != 0) {
-        return write_response(out, out_len, 409, "Conflict", "{\"error\":\"client download create failed\"}");
+            mutation.changelog_url, mutation.min_supported_version, 0, NULL, NULL, &link)) != 0) {
+        /* Java: a duplicate target and version is a DataIntegrityViolationException (400). */
+        return written == ST_STORAGE_CLIENT_DOWNLOAD_DUPLICATE
+            ? write_response(out, out_len, 400, "Bad Request", "{\"error\":\"客户端名称已存在或数据不符合约束\"}")
+            : write_response(out, out_len, 409, "Conflict", "{\"error\":\"client download create failed\"}");
     }
     return build_client_download_result_response(&link, 201, "Created", out, out_len);
 }
@@ -11842,13 +11846,16 @@ static int handle_client_download_update(const st_admin_context *context,
         return validation_response;
     }
     st_storage_client_download_link link;
-    if (st_storage_upsert_client_download_link_extended(database_path, id,
+    int written;
+    if ((written = st_storage_upsert_client_download_link_extended(database_path, id,
             mutation.implementation, mutation.platform, mutation.arch, mutation.display_name,
             mutation.download_url, mutation.description, mutation.display_order, mutation.enabled,
             mutation.version, mutation.sha256, mutation.file_size, mutation.is_latest,
             mutation.changelog_url, mutation.min_supported_version, existing.hosted,
-            existing.package_path, existing.package_file_name, &link) != 0) {
-        return write_response(out, out_len, 409, "Conflict", "{\"error\":\"client download update failed\"}");
+            existing.package_path, existing.package_file_name, &link)) != 0) {
+        return written == ST_STORAGE_CLIENT_DOWNLOAD_DUPLICATE
+            ? write_response(out, out_len, 400, "Bad Request", "{\"error\":\"客户端名称已存在或数据不符合约束\"}")
+            : write_response(out, out_len, 409, "Conflict", "{\"error\":\"client download update failed\"}");
     }
     return build_client_download_result_response(&link, 200, "OK", out, out_len);
 }
@@ -11919,13 +11926,15 @@ static int handle_client_download_mark_latest(const st_admin_context *context,
                               "{\"error\":\"client package is not readable\"}");
     }
     st_storage_client_download_link updated;
-    if (st_storage_upsert_client_download_link_extended(database_path, id, existing.implementation,
+    int written;
+    if ((written = st_storage_upsert_client_download_link_extended(database_path, id, existing.implementation,
             existing.platform, existing.arch, existing.display_name, existing.download_url,
             existing.description, existing.display_order, existing.enabled, version, existing.sha256,
             existing.file_size, 1, existing.changelog_url, minimum, existing.hosted,
-            existing.package_path, existing.package_file_name, &updated) != 0) {
-        return write_response(out, out_len, 409, "Conflict",
-                              "{\"error\":\"client download latest update failed\"}");
+            existing.package_path, existing.package_file_name, &updated)) != 0) {
+        return written == ST_STORAGE_CLIENT_DOWNLOAD_DUPLICATE
+            ? write_response(out, out_len, 400, "Bad Request", "{\"error\":\"客户端名称已存在或数据不符合约束\"}")
+            : write_response(out, out_len, 409, "Conflict", "{\"error\":\"client download latest update failed\"}");
     }
     return build_client_download_result_response(&updated, 200, "OK", out, out_len);
 }
