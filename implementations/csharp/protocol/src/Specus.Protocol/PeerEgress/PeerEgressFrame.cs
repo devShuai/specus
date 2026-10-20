@@ -78,8 +78,8 @@ public static class PeerEgressFrame
 
     /// <summary>
     /// Decodes one frame as a receiver without the IPv6 data plane does, refusing an IPv6 body with
-    /// <c>EGRESS_IPV6_UNSUPPORTED</c>. The consumer reads frames this way: it does not carry IPv6
-    /// (<see cref="PeerEgressRules.ConsumerCarriesIpv6"/>).
+    /// <c>EGRESS_IPV6_UNSUPPORTED</c>. A consumer without the IPv6 data plane reads frames this way;
+    /// one with it reads them as <see cref="Parse(ReadOnlySpan{byte}, bool)"/> with the flag set.
     /// </summary>
     public static Decoded Parse(ReadOnlySpan<byte> payload) => Parse(payload, ipv6: false);
 

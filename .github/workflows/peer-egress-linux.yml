@@ -19,7 +19,9 @@ on:
       - 'implementations/go/client/internal/client/peer_egress_bind*'
       - 'implementations/go/client/internal/client/peer_device_linux*'
       - 'implementations/csharp/client/src/Specus.Client/PeerMesh/PeerVirtualDevice.cs'
-      - 'implementations/csharp/client/tests/Specus.Client.Tests/LinuxTunDeviceTests.cs'
+      - 'implementations/csharp/client/src/Specus.Client/PeerMesh/LinuxPeerEgressRouteCommander.cs'
+      - 'implementations/csharp/client/src/Specus.Client/PeerMesh/PeerEgressRouteCommands.cs'
+      - 'implementations/csharp/client/tests/Specus.Client.Tests/LinuxTunDevice*'
   push:
     branches: [main]
     paths:
@@ -29,7 +31,9 @@ on:
       - 'implementations/go/client/internal/client/peer_egress_bind*'
       - 'implementations/go/client/internal/client/peer_device_linux*'
       - 'implementations/csharp/client/src/Specus.Client/PeerMesh/PeerVirtualDevice.cs'
-      - 'implementations/csharp/client/tests/Specus.Client.Tests/LinuxTunDeviceTests.cs'
+      - 'implementations/csharp/client/src/Specus.Client/PeerMesh/LinuxPeerEgressRouteCommander.cs'
+      - 'implementations/csharp/client/src/Specus.Client/PeerMesh/PeerEgressRouteCommands.cs'
+      - 'implementations/csharp/client/tests/Specus.Client.Tests/LinuxTunDevice*'
   workflow_dispatch:
 
 permissions:
@@ -82,18 +86,28 @@ jobs:
       # The .NET TUN device the same way: built as the runner user, run as root in a namespace of
       # its own, and searched for by name afterwards. Loopback comes up first because the test host
       # talks to its runner over it; the test itself refuses a namespace whose main table is not
-      # empty.
-      - name: Replace a real .NET TUN device under the same name
+      # empty. The IPv6 data plane's device and route tests run in the same class, one at a time:
+      # one of them turns IPv6 off for new interfaces while it runs.
+      - name: Replace a real .NET TUN device under the same name, and give it its IPv6 address
         run: |
           set -o pipefail
           project=implementations/csharp/client/tests/Specus.Client.Tests/Specus.Client.Tests.csproj
           dotnet build "$project" -c Release -v quiet
           sudo -n unshare -n env SPECUS_ROUTE_MUTATION_TEST=1 DOTNET_NOLOGO=1               DOTNET_CLI_HOME="$RUNNER_TEMP/dotnet-home" DOTNET_ROOT="$DOTNET_ROOT"               NUGET_PACKAGES="$HOME/.nuget/packages"               sh -c 'ip link set lo up && exec "$0" test "$1" -c Release --no-build                 --filter FullyQualifiedName~LinuxTunDeviceTests --logger "console;verbosity=normal"'               "$(command -v dotnet)" "$project" | tee "$RUNNER_TEMP/dotnet-tun.log"
-          name=Specus.Client.Tests.LinuxTunDeviceTests.ADeviceReplacedUnderTheSameNameStartsEveryTime
-          if ! grep -q "Passed $name" "$RUNNER_TEMP/dotnet-tun.log"; then
-            echo "$name did not run against a real interface"
-            exit 1
-          fi
+          for test in ADeviceReplacedUnderTheSameNameStartsEveryTime \
+              ATunTakesItsDerivedIpv6Address \
+              ATunWithoutIpv6ReportsNoIpv6DataPlane \
+              ATunOfAConsumerSwitchedOffIsGivenNoIpv6Address \
+              TheCommanderInstallsAnIpv6BypassUnderItsOwnTunnelRoute \
+              TheCommanderRefusesAnIpv6BypassOnlyABlackholeWouldCarry \
+              TheInstallerRepairsIpv6RoutesTheTableLost \
+              TheCommanderReportsSomebodyElsesIpv6Route; do
+            name=Specus.Client.Tests.LinuxTunDeviceTests.$test
+            if ! grep -q "Passed $name" "$RUNNER_TEMP/dotnet-tun.log"; then
+              echo "$name did not run against a real interface"
+              exit 1
+            fi
+          done
 
       # The namespace is gone with the process, so nothing can be left in the runner's own table.
       # Checked anyway: a test that wrote to the wrong namespace would show up here.

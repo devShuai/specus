@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using Specus.Client.Cli;
 using Specus.Client.Configuration;
+using Specus.Client.PeerMesh;
 using Specus.Protocol.PeerEgress;
 
 namespace Specus.Client.Tests;
@@ -200,6 +201,33 @@ public sealed class EgressTestPreviewTests : IDisposable
         Assert.Equal("address", data["kind"]);
     }
 
+    /// <summary>
+    /// An IPv6 address previews by the IPv6 rules, where this client carries IPv6, in the same lines;
+    /// at a peerMeshMtu below 1280 no IPv6 rule is in force and the address stays local.
+    /// </summary>
+    [Fact]
+    public void AnIpv6AddressIsPreviewedByTheIpv6Rules()
+    {
+        var rules = new List<PeerEgressRule> { Rule("203.0.113.0/24", "egress", 7), Rule("2001:db8::/32", "egress", 42) };
+        var config = new SpecusClientConfig { PeerEgressEnabled = true, PeerEgressRules = rules, PeerMeshMtu = 1280 };
+        var (lines, data) = Preview(config, "2001:DB8::9");
+        List<string> want = ["Preview for 2001:DB8::9 from the configuration (no connection is made; --connect PORT tests one)",
+            "  takeover: on", "  rule: [1] 2001:db8::/32 egress 42", "  result: through egress 42"];
+        if (EgressEdit.RuleCode(config, rules[1]) is not null)
+        {
+            // A platform without the IPv6 data plane: the rule is not in force.
+            want = [want[0], "  takeover: on", "  rule: none", "  result: not covered by any rule; stays local (direct)"];
+        }
+        Assert.Equal(want, lines);
+        Assert.Equal("address", data["kind"]);
+        Assert.Equal(PeerEgressIpv6Plane.PlatformCarriesIpv6, EgressEdit.RuleCode(config, rules[1]) is null);
+
+        config.PeerMeshMtu = 1200;
+        (lines, _) = Preview(config, "2001:db8::9");
+        Assert.Equal("  rule: none", lines[2]);
+        Assert.Equal(PeerEgressCodes.RuleIpv6Unsupported, EgressEdit.RuleCode(config, rules[1]));
+    }
+
     [Theory]
     [InlineData("203.0.113.9", null)]
     [InlineData("example.com", null)]
@@ -217,7 +245,15 @@ public sealed class EgressTestPreviewTests : IDisposable
     [InlineData("", "ADDRESS must be an IPv4 address.")]
     [InlineData("300.1.1.1", "ADDRESS must be an IPv4 address.")]
     [InlineData("203.0.113.0/24", "ADDRESS must be an IPv4 address.")]
-    [InlineData("2001:db8::1", "ADDRESS must be an IPv4 address.")]
+    // An IPv6 address is previewed as an address, written as a rule's match is; a zone, brackets, a
+    // dotted tail or a prefix are not one.
+    [InlineData("2001:db8::1", null)]
+    [InlineData("2001:DB8:0::1", null)]
+    [InlineData("fe80::1%eth0", "ADDRESS must be an IPv4 address.")]
+    [InlineData("[2001:db8::1]", "ADDRESS must be an IPv4 address.")]
+    [InlineData("::ffff:192.0.2.1", "ADDRESS must be an IPv4 address.")]
+    [InlineData("2001:db8::/32", "ADDRESS must be an IPv4 address.")]
+    [InlineData("example.com:443", "ADDRESS must be an IPv4 address.")]
     [InlineData("1.2.3.4.", "ADDRESS must be an IPv4 address.")]
     public void OnlyAnAddressOrANameARuleCanMatchIsPreviewed(string address, string? problem)
     {

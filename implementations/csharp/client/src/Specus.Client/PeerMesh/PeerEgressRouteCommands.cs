@@ -119,6 +119,19 @@ internal static class PeerEgressRouteCommands
     /// <summary>Reads the main table, for a bypass hop <c>ip route get</c> could not give.</summary>
     public static string[] ShowMainTableArgs() => ["-4", "route", "show", "table", "main"];
 
+    /// <summary>Reads the IPv6 main table (protocol/spec/peer-egress.md, IPv6 数据面).</summary>
+    public static string[] ShowMainTableArgs6() => ["-6", "route", "show", "table", "main"];
+
+    /// <summary>
+    /// The arguments to <c>ip</c> for a route command on a prefix or address of either family:
+    /// <c>route ...</c> for IPv4, exactly as it always was, and <c>-6 route ...</c> for IPv6. Argv
+    /// entries, so nothing here is ever seen by a shell.
+    /// </summary>
+    public static string[] RouteArgs(string target, params string[] arguments) =>
+        target.Contains(':', StringComparison.Ordinal)
+            ? ["-6", "route", .. arguments]
+            : ["route", .. arguments];
+
     private static readonly HashSet<string> LeadsNowhere = ["blackhole", "unreachable", "prohibit", "throw"];
     private static readonly HashSet<string> NotForwarding = ["local", "broadcast", "anycast", "multicast", "nat"];
 
@@ -134,8 +147,22 @@ internal static class PeerEgressRouteCommands
     ///
     /// <para>Shared vector: <c>protocol/test-vectors/peer-egress-socket-binding-v1.json</c>, linux.</para>
     /// </remarks>
-    public static List<PeerEgressBindRoute> ParseRouteTable(string? output)
+    public static List<PeerEgressBindRoute> ParseRouteTable(string? output) => ParseRouteTable(output, ipv6: false);
+
+    /// <summary>
+    /// Reads <c>ip -6 route show table main</c> the same way: the layout is the same, the destinations
+    /// and gateways are IPv6, and each reader is only ever given its own family's table. A gateway is
+    /// usually link-local; it is kept as written, since <c>ip -6 route add ... via fe80::1 dev eth0</c>
+    /// names the interface that scopes it. The prefix is written the way this feature writes its own,
+    /// so a row for a route it installed compares equal to the journal's entry.
+    /// </summary>
+    public static List<PeerEgressBindRoute> ParseRouteTable6(string? output) => ParseRouteTable(output, ipv6: true);
+
+    private static List<PeerEgressBindRoute> ParseRouteTable(string? output, bool ipv6)
     {
+        bool GatewayOk(string text) => ipv6
+            ? Ipv6Cidr.TryParseAddress(text, out var six) && !new Ipv6Cidr(MappedNetwork, 96).Contains(six)
+            : Ipv4Cidr.TryParseAddress(text, out _);
         var routes = new List<PeerEgressBindRoute>();
         var pending = -1;
         var deviceless = new List<int>();
@@ -155,7 +182,7 @@ internal static class PeerEgressRouteCommands
                     var device = "";
                     for (var index = 1; index + 1 < fields.Length; index++)
                     {
-                        if (fields[index] == "via" && Ipv4Cidr.TryParseAddress(fields[index + 1], out _))
+                        if (fields[index] == "via" && GatewayOk(fields[index + 1]))
                         {
                             gateway = fields[index + 1];
                         }
@@ -175,7 +202,7 @@ internal static class PeerEgressRouteCommands
             }
             var nowhere = LeadsNowhere.Contains(fields[0]);
             var start = nowhere ? 1 : 0;
-            if (start >= fields.Length || PrefixOf(fields[start]) is not { } prefix)
+            if (start >= fields.Length || (ipv6 ? PrefixOf6(fields[start]) : PrefixOf(fields[start])) is not { } prefix)
             {
                 continue;
             }
@@ -194,7 +221,7 @@ internal static class PeerEgressRouteCommands
                 }
                 switch (fields[index])
                 {
-                    case "via" when Ipv4Cidr.TryParseAddress(fields[index + 1], out _):
+                    case "via" when GatewayOk(fields[index + 1]):
                         gatewayAddress = fields[index + 1];
                         break;
                     case "dev":
@@ -225,6 +252,34 @@ internal static class PeerEgressRouteCommands
             }
         }
         return routes;
+    }
+
+    /// <summary><c>::ffff:0:0</c>, where no route's gateway lies.</summary>
+    private static readonly UInt128 MappedNetwork = (UInt128)0xFFFF << 32;
+
+    /// <summary>
+    /// Reads an IPv6 destination of <c>ip -6 route</c>: "default" is <c>::/0</c>, a bare address a
+    /// /128, and the address is masked by the length.
+    /// </summary>
+    private static string? PrefixOf6(string text)
+    {
+        if (text == "default")
+        {
+            return "::/0";
+        }
+        var slash = text.IndexOf('/');
+        if (!Ipv6Cidr.TryParseAddress(slash < 0 ? text : text[..slash], out var address))
+        {
+            return null;
+        }
+        var length = Ipv6Cidr.MaxPrefix;
+        if (slash >= 0 && (!int.TryParse(text[(slash + 1)..], NumberStyles.None, CultureInfo.InvariantCulture, out length)
+            || length > Ipv6Cidr.MaxPrefix))
+        {
+            return null;
+        }
+        var mask = length == 0 ? UInt128.Zero : UInt128.MaxValue << (Ipv6Cidr.MaxPrefix - length);
+        return new Ipv6Cidr(address & mask, length).ToString();
     }
 
     private static string? PrefixOf(string text)

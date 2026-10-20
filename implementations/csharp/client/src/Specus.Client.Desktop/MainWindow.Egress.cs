@@ -37,6 +37,7 @@ public partial class MainWindow
         [PeerEgressCodes.RuleMissingTarget] = "没有指定出口设备",
         [PeerEgressCodes.RuleDomainUnsupported] = "域名规则需要二期的 DNS 接管，目前不支持",
         [PeerEgressCodes.RuleIpv6Unsupported] = "本机还不能承载 IPv6 流量，IPv6 规则暂不生效",
+        [PeerEgressCodes.RuleEgressNoIpv6] = "指向的出口设备在线，但不承载 IPv6 流量",
         [PeerEgressCodes.RulePortUnsupported] = "消费端规则不支持端口字段",
         [PeerEgressCodes.RuleDisabled] = "规则已停用",
         [PeerEgressCodes.ConsumerDisabled] = "系统接管未开启",
@@ -301,7 +302,7 @@ public partial class MainWindow
         // The local page's words for the same refusals.
         EgressTestResultText.Text = problem == EgressEdit.NameProblem
             ? "这个名字不是域名规则能匹配的写法：标签只能用 a-z、0-9 和 -，国际化域名写成 punycode（xn--）。"
-            : "请填写一个 IPv4 地址或域名。";
+            : "请填写一个 IPv4 或 IPv6 地址，或域名。";
         return null;
     }
 
@@ -370,7 +371,7 @@ public partial class MainWindow
         if (!EgressEdit.IsAddress(address))
         {
             // Connecting to a name would test what this device resolves it to, not where the egress would go.
-            EgressTestResultText.Text = "连通测试只接受 IPv4 地址：名字会在本机解析，不代表出口那边的解析结果。";
+            EgressTestResultText.Text = "连通测试只接受 IP 地址：名字会在本机解析，不代表出口那边的解析结果。";
             return;
         }
         if (!int.TryParse(EgressTestPortBox.Text.Trim(), out var port) || port is < 1 or > 65535)
@@ -378,7 +379,7 @@ public partial class MainWindow
             EgressTestResultText.Text = "请填写 1–65535 之间的端口。";
             return;
         }
-        var target = address + ":" + port;
+        var target = address.Contains(':') ? "[" + address + "]:" + port : address + ":" + port;
         EgressConnectButton.IsEnabled = false;
         EgressTestResultText.Text = "正在连接 " + target + "…";
         var watch = Stopwatch.StartNew();
@@ -567,7 +568,9 @@ public partial class MainWindow
             {
                 EgressIssues.Add(new EgressIssueRow("拦截计数",
                     "被丢弃、没有放行的包，按原因分别计数：rule 为阻断规则，unsupported-protocol 为不承载的协议（如 ICMP），egress-unavailable 为出口不可用，"
-                    + "egress-not-offered 为出口未提供给本机，egress-unsupported 为出口客户端不支持出口，rejected- 开头为出口拒绝。", blocked));
+                    + "egress-not-offered 为出口未提供给本机，egress-unsupported 为出口客户端不支持出口，rejected- 开头为出口拒绝；"
+                    + "IPv6 另有 egress-no-ipv6（出口不承载 IPv6）、ipv6-source-not-mesh（源不是本机的 IPv6 推出地址）、"
+                    + "ipv6-mesh-unsupported（发往其他设备的 IPv6 推出地址，设备之间只走 IPv4）、ipv6-path-mtu（到出口的路径 MTU 低于 1280）。", blocked));
             }
         }
         EgressProblemsText.Text = problems > 0 ? problems + " 个问题" : "正常";

@@ -116,6 +116,19 @@ internal interface IPeerEgressMeshHost
     string DeviceStatus => "absent";
 
     /// <summary>
+    /// Whether this platform and <c>peerMeshMtu</c> allow the IPv6 data plane
+    /// (<see cref="PeerEgressIpv6Plane.ConsumerCarriesIpv6"/>). False by default, so a host built only to
+    /// drive the plane is the IPv4 consumer it always was; the device must still carry IPv6.
+    /// </summary>
+    bool PlatformCarriesIpv6 => false;
+
+    /// <summary>
+    /// Whether the virtual device carries IPv6: up with its derived address assigned
+    /// (<see cref="IPeerVirtualDeviceIpv6"/>), and why not when it does not.
+    /// </summary>
+    (bool Ready, string Reason) DeviceIpv6 => (false, "the virtual device carries no IPv6");
+
+    /// <summary>
     /// The hosts the tunnel's transport talks to, as URLs, host:port pairs or bare hosts: the
     /// control connection, the login server, STUN and TURN, the relay. Resolved by the plane, so a
     /// hostname is fine here.
@@ -235,6 +248,9 @@ internal sealed class PeerEgressMesh(
     private string _errorLogged = "";
     private string _bypassFailedLogged = "";
     private bool _deviceWaitLogged;
+
+    /// <summary>The last reason logged for IPv6 rules being out of force. Under the plan lock.</summary>
+    private string _ipv6Logged = "";
 
     /// <summary>The last check of the table against the plan, and whether it left a reinstall undone.</summary>
     private long _repairAtMillis;
@@ -492,7 +508,13 @@ internal sealed class PeerEgressMesh(
             _consumer ??= new PeerEgressConsumer(
                 (peerId, frame) => host.CanReach(peerId) && _queue.TryAdd((peerId, frame)),
                 packet => _deviceQueue.TryAdd(packet),
-                logger);
+                logger)
+            {
+                // The effective MTU of the session to an egress, the SPMTU2 answer the IPv4 path clamps
+                // to, for the IPv6 data plane's path check. Whether this device carries IPv6 is given
+                // with every configuration, since it depends on the device as well as the platform.
+                PathMtu = host.PathMtuForPeer,
+            };
             return _consumer;
         }
     }
@@ -571,7 +593,10 @@ internal sealed class PeerEgressMesh(
         {
             return false;
         }
-        if (outcome is not (PeerEgressConsumerOutcome.Forwarded or PeerEgressConsumerOutcome.DnsQuery))
+        // Nor is the system's own IPv6 chatter on the TUN -- neighbour discovery, multicast reports --
+        // which arrives on its own schedule and is no one's traffic.
+        if (outcome is not (PeerEgressConsumerOutcome.Forwarded or PeerEgressConsumerOutcome.DnsQuery
+            or PeerEgressConsumerOutcome.Ignored))
         {
             // Logged without the destination: a per-destination record of what a user was blocked
             // from reaching is their own browsing history.
@@ -647,8 +672,9 @@ internal sealed class PeerEgressMesh(
             return;
         }
         logger?.LogInformation(
-            "[peer-egress-consumer] egress catalog applied revision={Revision} domainTargetCapable=[{Capable}] listed=[{Listed}] egressVersion=[{Versions}]",
-            _catalog.Revision, string.Join(",", _catalog.CapableIds()), string.Join(",", _catalog.ListedIds()),
+            "[peer-egress-consumer] egress catalog applied revision={Revision} domainTargetCapable=[{Capable}] ipv6PacketCapable=[{Ipv6}] listed=[{Listed}] egressVersion=[{Versions}]",
+            _catalog.Revision, string.Join(",", _catalog.CapableIds()), string.Join(",", _catalog.Ipv6CapableIds()),
+            string.Join(",", _catalog.ListedIds()),
             string.Join(",", _catalog.EgressVersions().Select(entry => entry.Key + ":" + entry.Value)));
         HandCatalogToConsumer();
     }
@@ -880,6 +906,9 @@ internal sealed class PeerEgressMesh(
         // unaccounted for by the mesh path.
         var (_, pool) = DecidePhaseTwo(meshCidr);
         var responder = pool is null ? null : DnsResponderFor(rules, meshCidr, pool);
+        // Whether the device carries IPv6, read once for this whole reconcile: the consumer, the plan
+        // and the bypass list all act on the same answer.
+        var (carriesIpv6, ipv6Reason) = Ipv6State();
         // Consumer callbacks may reach the mesh. Do not wait for their lock while
         // holding _planLock, which mesh shutdown needs when withdrawing routes.
         // A consumer still holding the pool is reconfigured even with no rules: phase two stopping
@@ -887,7 +916,7 @@ internal sealed class PeerEgressMesh(
         // away from it and purge the flows into the pool, or it would go on steering by names.
         var purge = rules.Count == 0 && pool is null && _consumerPool is null
             ? new Dictionary<long, IReadOnlyList<string>>()
-            : ConfigureConsumer(rules, meshCidr, pool, responder, nowMs);
+            : ConfigureConsumer(rules, meshCidr, pool, responder, carriesIpv6, nowMs);
         List<PeerEgressDnsUpstream> upstreams;
         lock (_planLock)
         {
@@ -898,7 +927,11 @@ internal sealed class PeerEgressMesh(
                     return;
                 }
             }
-            ReconcileLocked(rules, pool?.Cidr, nowMs);
+            if (rules.Count > 0)
+            {
+                LogIpv6State(carriesIpv6, ipv6Reason, rules);
+            }
+            ReconcileLocked(rules, pool?.Cidr, carriesIpv6, nowMs);
             // After the routes: whether the pool's route went in decides whether the system's DNS
             // can be pointed at the responder at all.
             TakeOverDnsLocked(pool, meshCidr, nowMs);
@@ -983,8 +1016,58 @@ internal sealed class PeerEgressMesh(
         }
     }
 
+    /// <summary>
+    /// Whether this device has the IPv6 data plane now, and why not when it has none.
+    /// </summary>
+    /// <remarks>
+    /// The platform and <c>peerMeshMtu</c> have to allow it, and then the TUN has to be up and actually
+    /// carry its derived IPv6 address. A device whose address could not be assigned -- a host with IPv6
+    /// disabled, say -- has no IPv6 data plane: its IPv6 rules report
+    /// <c>EGRESS_RULE_IPV6_UNSUPPORTED</c> and nothing IPv6 is planned, so the IPv6 route installs that
+    /// would fail cannot roll the IPv4 routes back with them. A device that is not up, or a noop one,
+    /// carries no IPv6 either. The answer is read on every reconcile, so a TUN recreated with its
+    /// address enables the data plane on the next one.
+    /// </remarks>
+    internal (bool Carries, string Reason) Ipv6State()
+    {
+        if (!host.PlatformCarriesIpv6)
+        {
+            return (false, "this platform or peerMeshMtu has no IPv6 data plane");
+        }
+        if (!host.DeviceReady)
+        {
+            return (false, "the virtual device is " + host.DeviceStatus);
+        }
+        var (ready, reason) = host.DeviceIpv6;
+        return (ready, ready ? string.Empty : reason);
+    }
+
+    /// <summary>
+    /// Says once per distinct reason why IPv6 rules are not in force, when the platform would have
+    /// carried them -- the device is what is missing. Called under the plan lock.
+    /// </summary>
+    private void LogIpv6State(bool carries, string reason, IReadOnlyList<PeerEgressRule> rules)
+    {
+        var withIpv6 = rules.Any(rule => PeerEgressRules.IsIpv6Match(rule.Match));
+        var logged = !carries && host.PlatformCarriesIpv6 && withIpv6 ? reason : string.Empty;
+        if (string.Equals(logged, _ipv6Logged, StringComparison.Ordinal))
+        {
+            return;
+        }
+        _ipv6Logged = logged;
+        if (logged.Length > 0)
+        {
+            logger?.LogWarning("[peer-egress-consumer] IPv6 rules not in force ({Code}): {Reason}; IPv4 rules are unaffected",
+                PeerEgressCodes.RuleIpv6Unsupported, logged);
+        }
+        else if (carries && withIpv6)
+        {
+            logger?.LogInformation("[peer-egress-consumer] the virtual device carries IPv6; IPv6 rules are in force");
+        }
+    }
+
     private void ReconcileLocked(
-        IReadOnlyList<PeerEgressRule> rules, Ipv4Cidr? fakeIpPool, long nowMs)
+        IReadOnlyList<PeerEgressRule> rules, Ipv4Cidr? fakeIpPool, bool carriesIpv6, long nowMs)
     {
         var meshCidr = MeshCidrOrDefault();
 
@@ -996,7 +1079,8 @@ internal sealed class PeerEgressMesh(
         if (host.DeviceReady)
         {
             _deviceWaitLogged = false;
-            var plan = PeerEgressRoutePlanner.Plan(rules, BypassAddresses(nowMs), meshCidr, fakeIpPool);
+            var plan = PeerEgressRoutePlanner.Plan(rules, BypassAddresses(nowMs, carriesIpv6), meshCidr, fakeIpPool,
+                carriesIpv6);
             LogRefusals(plan.Refused);
             desired = plan.Routes;
         }
@@ -1139,12 +1223,15 @@ internal sealed class PeerEgressMesh(
     /// </remarks>
     private IReadOnlyDictionary<long, IReadOnlyList<string>> ConfigureConsumer(
         IReadOnlyList<PeerEgressRule> rules, string meshCidr, PeerEgressFakeIpPool? fakeIpPool,
-        PeerEgressDnsResponder? responder, long nowMs)
+        PeerEgressDnsResponder? responder, bool carriesIpv6, long nowMs)
     {
         var virtualIp = host.VirtualIp?.Trim() ?? string.Empty;
         // Phase two starting or stopping changes which rules are in force, so it is part of what
-        // makes a configuration distinct.
-        var key = meshCidr + "|" + virtualIp + "|" + (fakeIpPool?.Cidr.ToString() ?? "-") + "|" + string.Join("|",
+        // makes a configuration distinct. So does the IPv6 data plane: a device that stops carrying
+        // IPv6 takes the IPv6 rules out of force and closes their flows, and one that starts carrying
+        // it puts them back.
+        var key = meshCidr + "|" + virtualIp + "|" + (fakeIpPool?.Cidr.ToString() ?? "-") + "|"
+            + (carriesIpv6 ? "ipv6" : "ipv4") + "|" + string.Join("|",
             rules.Select(rule => $"{rule.Match} {rule.Action} {rule.EgressClientId} {rule.Port}"));
         var consumerRole = EnsureConsumer();
         lock (consumerRole)
@@ -1161,7 +1248,7 @@ internal sealed class PeerEgressMesh(
             // consumer's lock, as ApplyEgressCatalog reads it, so the newest catalogue wins.
             var purge = Merge(
                 consumerRole.SetCatalog(_catalog.Snapshot(), nowMs),
-                consumerRole.Configure(rules, meshCidr, virtualIp, nowMs, fakeIpPool));
+                consumerRole.Configure(rules, meshCidr, virtualIp, nowMs, fakeIpPool, carriesIpv6));
             return purge;
         }
     }
@@ -1289,9 +1376,10 @@ internal sealed class PeerEgressMesh(
     /// resolved, and every peer's own endpoint. Without them a rule broad enough to cover one would
     /// route the tunnel's transport into the tunnel.
     /// </summary>
-    private List<string> BypassAddresses(long nowMs)
+    private List<string> BypassAddresses(long nowMs, bool carriesIpv6)
     {
-        var resolution = _bypass.Resolve(host.BypassHosts(), nowMs);
+        var hosts = host.BypassHosts();
+        var resolution = _bypass.Resolve(hosts, nowMs);
         var failed = string.Join(",", resolution.Failed);
         if (!string.Equals(failed, _bypassFailedLogged, StringComparison.Ordinal))
         {
@@ -1306,6 +1394,12 @@ internal sealed class PeerEgressMesh(
             }
         }
         var addresses = new List<string>(resolution.Addresses);
+        if (carriesIpv6)
+        {
+            // The IPv6 answers too, only once this device routes IPv6 at all; the plan pins one only
+            // when an IPv6 rule covers it.
+            addresses.AddRange(_bypass.Resolve6(hosts, nowMs));
+        }
         addresses.AddRange(host.PeerEndpointAddresses());
         return addresses;
     }

@@ -1093,8 +1093,8 @@ internal sealed class PeerEgressRuntime
     /// <summary>
     /// Whether this egress accepts IPv6 packets in SPEG1 type=1 frames, and so announces
     /// <c>ipv6PacketCapable</c> (protocol/spec/peer-egress.md, IPv6 数据面). The consumer side is
-    /// separate: <see cref="PeerEgressRules.ConsumerCarriesIpv6"/> says whether this device sends IPv6
-    /// to an egress, and stays false until the consumer data plane exists.
+    /// separate: <see cref="PeerEgressIpv6Plane.ConsumerCarriesIpv6"/> and the TUN's derived address
+    /// say whether this device sends IPv6 to an egress.
     /// </summary>
     internal const bool Ipv6PacketCapable = true;
 

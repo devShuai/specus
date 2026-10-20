@@ -97,6 +97,15 @@ internal sealed class WindowsPeerEgressRouteCommander(string? tun) : IPeerEgress
     private string _table = "";
     private long _tableAt;
 
+    /// <summary>The same for the IPv6 table, which a separate query reads.</summary>
+    private string _table6 = "";
+    private long _table6At;
+
+    /// <summary>Visible for tests: whether each table has been read.</summary>
+    internal bool TableRead => _table.Length > 0;
+
+    internal bool Table6Read => _table6.Length > 0;
+
     /// <summary>
     /// Where each bypass address goes, resolved before any tunnel route exists.
     /// </summary>
@@ -111,6 +120,25 @@ internal sealed class WindowsPeerEgressRouteCommander(string? tun) : IPeerEgress
 
     public PeerEgressRouteConflictCheck Conflict(PeerEgressRoute route)
     {
+        if (PeerEgressRoutePlanner.IsIpv6(route))
+        {
+            if (_table6.Length == 0 || Stopwatch.GetElapsedTime(_table6At) > TableCacheLifetime)
+            {
+                try
+                {
+                    _table6 = Run(PeerEgressWindowsRouteCommands.ShowAllRoutesScript6());
+                }
+                catch (Exception)
+                {
+                    return PeerEgressRouteConflictCheck.None;
+                }
+                _table6At = Stopwatch.GetTimestamp();
+            }
+            var existing6 = PeerEgressWindowsRouteCommands.ConflictFromTable6(_table6, route.Cidr);
+            return existing6.Present
+                ? new PeerEgressRouteConflictCheck(true, existing6.Description)
+                : PeerEgressRouteConflictCheck.None;
+        }
         if (_table.Length == 0
             || Stopwatch.GetElapsedTime(_tableAt) > TableCacheLifetime)
         {
@@ -139,7 +167,7 @@ internal sealed class WindowsPeerEgressRouteCommander(string? tun) : IPeerEgress
         // Checked before anything is run: an argument the script builder would refuse must
         // not cost a process first, and on this platform that refusal is what keeps a prefix
         // from becoming a second command.
-        if (!PeerEgressWindowsRouteCommands.ValidPrefix(route.Cidr))
+        if (!ValidPrefix(route))
         {
             throw new ArgumentException(
                 $"refusing to build a route command from this argument: {route.Cidr}",
@@ -154,19 +182,29 @@ internal sealed class WindowsPeerEgressRouteCommander(string? tun) : IPeerEgress
         {
             throw new InvalidOperationException("no TUN interface to route into");
         }
-        Apply(
-            PeerEgressWindowsRouteCommands.InstallRouteScript(route.Cidr, TunnelIndex(), null),
-            $"install {route.Cidr}");
+        Apply(InstallRouteScript(route, TunnelIndex(), null), $"install {route.Cidr}");
     }
+
+    /// <summary>The prefix check of the route's family.</summary>
+    private static bool ValidPrefix(PeerEgressRoute route) => PeerEgressRoutePlanner.IsIpv6(route)
+        ? PeerEgressWindowsRouteCommands.ValidPrefix6(route.Cidr)
+        : PeerEgressWindowsRouteCommands.ValidPrefix(route.Cidr);
+
+    /// <summary>The install builder of the route's family.</summary>
+    private static string InstallRouteScript(PeerEgressRoute route, int interfaceIndex, string? gateway) =>
+        PeerEgressRoutePlanner.IsIpv6(route)
+            ? PeerEgressWindowsRouteCommands.InstallRouteScript6(route.Cidr, interfaceIndex, gateway)
+            : PeerEgressWindowsRouteCommands.InstallRouteScript(route.Cidr, interfaceIndex, gateway);
 
     private void InstallBypass(PeerEgressRoute route)
     {
-        var address = route.Cidr.EndsWith("/32", StringComparison.Ordinal)
-            ? route.Cidr[..^3]
-            : route.Cidr;
+        var address = PeerEgressRoutePlanner.BypassAddress(route.Cidr);
+        var ipv6 = PeerEgressRoutePlanner.IsIpv6(route);
         if (!_hops.TryGetValue(address, out var hop))
         {
-            var output = Run(PeerEgressWindowsRouteCommands.FindRoutesScript([address]));
+            var output = Run(ipv6
+                ? PeerEgressWindowsRouteCommands.FindRoutesScript6([address])
+                : PeerEgressWindowsRouteCommands.FindRoutesScript([address]));
             var resolved = PeerEgressWindowsRouteCommands.ParseRouteFind(output);
             if (resolved is null)
             {
@@ -180,7 +218,8 @@ internal sealed class WindowsPeerEgressRouteCommander(string? tun) : IPeerEgress
                 // back out of PowerShell intact. The native table, read with the tunnel left out,
                 // says where it went before.
                 var fallback = PeerEgressSocketBinding.BypassHopFromTable(address,
-                    _tunIndex.ToString(CultureInfo.InvariantCulture), PeerEgressSocketBinder.Windows.Routes);
+                    _tunIndex.ToString(CultureInfo.InvariantCulture),
+                    ipv6 ? PeerEgressSocketBinder.Windows.Routes6 : PeerEgressSocketBinder.Windows.Routes);
                 if (!int.TryParse(fallback.Interface, NumberStyles.None, CultureInfo.InvariantCulture, out var index))
                 {
                     throw new InvalidOperationException(
@@ -190,10 +229,7 @@ internal sealed class WindowsPeerEgressRouteCommander(string? tun) : IPeerEgress
             }
             _hops[address] = hop;
         }
-        Apply(
-            PeerEgressWindowsRouteCommands.InstallRouteScript(
-                route.Cidr, hop.InterfaceIndex, hop.Gateway),
-            $"install bypass {route.Cidr}");
+        Apply(InstallRouteScript(route, hop.InterfaceIndex, hop.Gateway), $"install bypass {route.Cidr}");
     }
 
     /// <summary>
@@ -207,16 +243,26 @@ internal sealed class WindowsPeerEgressRouteCommander(string? tun) : IPeerEgress
             index.ToString(CultureInfo.InvariantCulture));
     }
 
+    /// <summary>Reads the native IPv6 forwarding table, with the tunnel as its index.</summary>
+    public PeerEgressRouteTable Table6()
+    {
+        var index = TunnelIndex();
+        return new PeerEgressRouteTable(PeerEgressSocketBinder.Windows.Routes6(),
+            index.ToString(CultureInfo.InvariantCulture));
+    }
+
     public void Remove(PeerEgressRoute route)
     {
-        _hops.Remove(route.Cidr.EndsWith("/32", StringComparison.Ordinal) ? route.Cidr[..^3] : route.Cidr);
-        if (!PeerEgressWindowsRouteCommands.ValidPrefix(route.Cidr))
+        _hops.Remove(PeerEgressRoutePlanner.BypassAddress(route.Cidr));
+        if (!ValidPrefix(route))
         {
             throw new ArgumentException(
                 $"refusing to build a route command from this argument: {route.Cidr}",
                 nameof(route));
         }
-        Apply(PeerEgressWindowsRouteCommands.RemoveRouteScript(route.Cidr), $"remove {route.Cidr}");
+        Apply(PeerEgressRoutePlanner.IsIpv6(route)
+            ? PeerEgressWindowsRouteCommands.RemoveRouteScript6(route.Cidr)
+            : PeerEgressWindowsRouteCommands.RemoveRouteScript(route.Cidr), $"remove {route.Cidr}");
     }
 
     /// <summary>Resolves the TUN adapter's interface index, once.</summary>
@@ -283,7 +329,7 @@ internal sealed class WindowsPeerEgressRouteCommander(string? tun) : IPeerEgress
     /// <para>Exit codes are not consulted unless stdout is empty. A script that failed exits 1
     /// after describing itself on stdout, and that description is what the caller needs.</para>
     /// </remarks>
-    private static string Run(string script)
+    internal static string Run(string script)
     {
         var start = new ProcessStartInfo("powershell.exe")
         {

@@ -177,10 +177,18 @@ public class LayoutTests
                     }
                     testAddress.Text = "example.com";
                     Click("EgressConnectButton");
-                    Assert.StartsWith("连通测试只接受 IPv4 地址", testResult.Text);
+                    Assert.StartsWith("连通测试只接受 IP 地址", testResult.Text);
                     testAddress.Text = "203.0.113.9";
                     Click("EgressPreviewButton");
                     Assert.StartsWith("203.0.113.9：命中规则 #0，系统接管未开启", testResult.Text);
+                    // An IPv6 address is previewed as an address; a zoned one is not an address a rule
+                    // can match.
+                    testAddress.Text = "2001:db8::9";
+                    Click("EgressPreviewButton");
+                    Assert.StartsWith("2001:db8::9：", testResult.Text);
+                    testAddress.Text = "fe80::1%3";
+                    Click("EgressPreviewButton");
+                    Assert.Equal("请填写一个 IPv4 或 IPv6 地址，或域名。", testResult.Text);
 
                     // An edit goes through the plan the commands use: a domain is refused with its
                     // reason, an address range is added and saved.

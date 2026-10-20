@@ -130,6 +130,12 @@ public readonly record struct Ipv6Cidr(UInt128 Network, int PrefixLength)
     public bool Contains(UInt128 address) => (address & MaskFor(PrefixLength)) == Network;
 
     /// <summary>
+    /// Whether two prefixes share an address, which for prefixes is the same as one containing the
+    /// other's network.
+    /// </summary>
+    public bool Overlaps(Ipv6Cidr other) => Contains(other.Network) || other.Contains(Network);
+
+    /// <summary>
     /// Whether the prefix lies in <c>::ffff:0:0/96</c>, where IPv4 destinations are spelled in IPv6
     /// APIs. No packet carries one, so a consumer rule there would never match anything.
     /// </summary>

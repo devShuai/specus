@@ -372,6 +372,24 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             }
         }
 
+        public bool PlatformCarriesIpv6 => PeerEgressIpv6Plane.ConsumerCarriesIpv6(owner._config.PeerMeshMtu);
+
+        public (bool Ready, string Reason) DeviceIpv6
+        {
+            get
+            {
+                IPeerVirtualDevice? device;
+                lock (owner._sync)
+                {
+                    device = owner._device;
+                }
+                // Asked outside the mesh's lock: the device keeps its answer under its own.
+                return device is IPeerVirtualDeviceIpv6 ipv6
+                    ? ipv6.Ipv6Ready()
+                    : (false, "the virtual device carries no IPv6");
+            }
+        }
+
         public IReadOnlyList<string?> BypassHosts()
         {
             PeerMeshConfig? mesh;

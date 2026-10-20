@@ -121,25 +121,27 @@ public static class PeerEgressRules
     /// runs; without it the pool is an ordinary range an address rule is free to cover.
     /// </remarks>
     public static string? Validate(PeerEgressRule rule, string? meshCidr, Ipv4Cidr? fakeIpPool) =>
-        Validate(rule, meshCidr, fakeIpPool, ConsumerCarriesIpv6);
-
-    /// <summary>
-    /// Whether this consumer has an IPv6 data plane: IPv6 packets read from the TUN, IPv6 routes
-    /// installed into it, and IPv6 carried to the egress. It does not yet, so a well-formed IPv6 rule
-    /// is refused with <c>EGRESS_RULE_IPV6_UNSUPPORTED</c>: installing nothing for it and reporting it
-    /// in force would send its destinations straight out of the local interface.
-    /// </summary>
-    /// <remarks>
-    /// The rule is still read and checked in full first, so a mistake in it is reported as one, and
-    /// how IPv6 rules match is pinned by the vector's <c>ipv6</c> section, which the tests run with
-    /// this set.
-    /// </remarks>
-    public const bool ConsumerCarriesIpv6 = false;
+        Validate(rule, meshCidr, fakeIpPool, carriesIpv6: false);
 
     /// <summary>
     /// As <see cref="Validate(PeerEgressRule, string?, Ipv4Cidr?)"/>, with the consumer's IPv6 data
-    /// plane stated.
+    /// plane stated: whether IPv6 packets are read from the TUN, IPv6 routes installed into it and
+    /// IPv6 carried to the egress (protocol/spec/peer-egress.md, IPv6 数据面).
     /// </summary>
+    /// <remarks>
+    /// The entry points without <paramref name="carriesIpv6"/> judge a consumer without the data
+    /// plane, as every consumer was before it existed. Whether a device has one depends on its
+    /// platform, its <c>peerMeshMtu</c> and whether its TUN took its derived IPv6 address, none of
+    /// which this library knows, so every path that acts on rules -- the offline check, the route
+    /// plan, the data plane, the status -- states it.
+    ///
+    /// <para>Without the data plane a well-formed IPv6 rule is refused last with
+    /// <c>EGRESS_RULE_IPV6_UNSUPPORTED</c>: installing nothing for it and reporting it in force would
+    /// send its destinations straight out of the local interface. With it, the prefix every device's
+    /// IPv6 address lies in is to IPv6 what the Peer Mesh network is to IPv4, so a rule overlapping it
+    /// is refused with <c>EGRESS_RULE_MESH_OVERLAP</c> at the same place in the order as the IPv4
+    /// check.</para>
+    /// </remarks>
     public static string? Validate(PeerEgressRule rule, string? meshCidr, Ipv4Cidr? fakeIpPool, bool carriesIpv6)
     {
         // Ahead of anything about the rule's content: a switched-off rule is the user's choice, and
@@ -166,6 +168,12 @@ public static class PeerEgressRules
             if (prefix.PrefixLength == 0)
             {
                 return PeerEgressCodes.RuleDefaultRoute;
+            }
+            if (carriesIpv6 && prefix.Overlaps(PeerEgressMeshAddress.PrefixCidr))
+            {
+                // Device-to-device traffic stays IPv4, and a rule over the derived prefix would capture
+                // the addresses replies are checked against.
+                return PeerEgressCodes.RuleMeshOverlap;
             }
             // Last: everything about the rule is right, and what is missing is this device's ability
             // to carry IPv6 at all.
@@ -252,7 +260,7 @@ public static class PeerEgressRules
     /// </remarks>
     public static PeerEgressRuleMatch Match(
         IReadOnlyList<PeerEgressRule> rules, string? destination, string? meshCidr,
-        Ipv4Cidr? fakeIpPool = null) => Match(rules, destination, meshCidr, fakeIpPool, ConsumerCarriesIpv6);
+        Ipv4Cidr? fakeIpPool = null) => Match(rules, destination, meshCidr, fakeIpPool, carriesIpv6: false);
 
     /// <summary>
     /// As above, with the consumer's IPv6 data plane stated.
@@ -426,21 +434,44 @@ public static class PeerEgressRules
     /// <c>egress-unavailable</c>, not a refused rule.
     /// </remarks>
     public static string? RuleStatus(PeerEgressRule rule, string? meshCidr, Ipv4Cidr? fakeIpPool,
-        Func<long, bool> online, Func<long, bool> domainTargetCapable)
+        Func<long, bool> online, Func<long, bool> domainTargetCapable) =>
+        RuleStatus(rule, meshCidr, fakeIpPool, online, domainTargetCapable, carriesIpv6: false, _ => false);
+
+    /// <summary>
+    /// As above, with the consumer's IPv6 data plane stated and which egresses the catalogue says take
+    /// IPv6 packets (vector <c>ruleValidation</c> of peer-egress-ipv6-v1.json).
+    /// </summary>
+    /// <remarks>
+    /// An IPv6 rule to an online egress that does not announce <c>ipv6PacketCapable</c> is
+    /// <c>EGRESS_RULE_EGRESS_NO_IPV6</c>, by the same rule as <c>EGRESS_RULE_EGRESS_NO_DOMAIN</c>: the
+    /// capability only counts for an egress that is online. Like that code it is about the egress at
+    /// this moment, not about the rule, so it is never a validation code: the rule's route stays
+    /// installed and its destinations are blocked as <c>egress-no-ipv6</c> rather than falling through
+    /// to a shorter rule or out of the local interface.
+    /// </remarks>
+    public static string? RuleStatus(PeerEgressRule rule, string? meshCidr, Ipv4Cidr? fakeIpPool,
+        Func<long, bool> online, Func<long, bool> domainTargetCapable, bool carriesIpv6,
+        Func<long, bool> ipv6PacketCapable)
     {
-        if (Validate(rule, meshCidr, fakeIpPool) is { } code)
+        if (Validate(rule, meshCidr, fakeIpPool, carriesIpv6) is { } code)
         {
             return code;
         }
-        if (IsDomainMatch(rule.Match)
-            && (rule.Action?.Trim() ?? string.Empty) == ActionEgress
-            && rule.EgressClientId is { } egress
-            && online(egress) && !domainTargetCapable(egress))
+        var egressRule = (rule.Action?.Trim() ?? string.Empty) == ActionEgress && rule.EgressClientId is not null;
+        var egress = rule.EgressClientId ?? 0;
+        if (IsDomainMatch(rule.Match) && egressRule && online(egress) && !domainTargetCapable(egress))
         {
             return PeerEgressCodes.RuleEgressNoDomain;
         }
+        if (IsIpv6Match(rule.Match) && egressRule && online(egress) && !ipv6PacketCapable(egress))
+        {
+            return PeerEgressCodes.RuleEgressNoIpv6;
+        }
         return null;
     }
+
+    /// <summary>Whether a rule's match is written as IPv6, which a colon settles.</summary>
+    public static bool IsIpv6Match(string? match) => match?.Trim().Contains(':', StringComparison.Ordinal) == true;
 
     private static bool LooksLikeDomain(string match)
     {

@@ -44,13 +44,16 @@ internal static class ConfigDiagnostics
             effective.PeerEgressFakeIpCidr, Specus.Protocol.PeerEgress.PeerEgressRules.DefaultMeshCidr);
         if (phaseTwo.Code is { } poolCode)
             warning($"peerEgressFakeIpCidr is not usable: {poolCode}; domain rules are not in force");
+        // An IPv6 rule is in force where this device has the IPv6 data plane: its platform and its
+        // peerMeshMtu. Whether the TUN takes its address is found at startup, and said there.
+        var carriesIpv6 = Specus.Client.PeerMesh.PeerEgressIpv6Plane.ConsumerCarriesIpv6(effective.PeerMeshMtu);
         for (var index = 0; index < rules.Count; index++)
         {
             var rule = rules[index];
             var code = rule is null
                 ? Specus.Protocol.PeerEgress.PeerEgressCodes.RuleMalformed
                 : Specus.Protocol.PeerEgress.PeerEgressRules.Validate(rule,
-                    Specus.Protocol.PeerEgress.PeerEgressRules.DefaultMeshCidr, phaseTwo.RunningPool);
+                    Specus.Protocol.PeerEgress.PeerEgressRules.DefaultMeshCidr, phaseTwo.RunningPool, carriesIpv6);
             if (code is not null && code != Specus.Protocol.PeerEgress.PeerEgressCodes.RuleDisabled)
                 warning($"peerEgressRules[{index}] is not in force: {code}");
         }

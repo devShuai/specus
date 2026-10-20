@@ -9,14 +9,21 @@ namespace Specus.Protocol.PeerEgress;
 /// can be used: an older server does not send the field, and a value that is not a non-negative
 /// integer cannot be read as saying anything.
 /// </param>
-public readonly record struct PeerEgressCatalogListing(bool DomainTargetCapable, long? EgressVersion);
+/// <param name="Ipv6PacketCapable">
+/// Whether the egress takes IPv6 packets in SPEG1 type=1 frames (protocol/spec/peer-egress.md, IPv6
+/// 数据面). A server older than the field sends none, which reads as false: an IPv6 packet sent to an
+/// egress that cannot read it is refused there with <c>EGRESS_IPV6_UNSUPPORTED</c>, so the consumer
+/// blocks it and says so instead.
+/// </param>
+public readonly record struct PeerEgressCatalogListing(bool DomainTargetCapable, long? EgressVersion,
+    bool Ipv6PacketCapable = false);
 
 /// <summary>
 /// The <c>egress-catalog</c> push, as a consumer reads it: which egress devices it lists, the
 /// <c>egressVersion</c> each one's online session announced, and which resolve names.
 /// </summary>
 /// <remarks>
-/// Only those three are read. Nothing else in the catalogue changes what a consumer does today --
+/// Only those four are read, the fourth being <c>ipv6PacketCapable</c>. Nothing else in the catalogue changes what a consumer does today --
 /// whether an egress is reachable comes from Peer Mesh's own view of the peer, not from the
 /// catalogue's <c>online</c> -- and a field that is decoded but unused is one more thing for the
 /// three clients to disagree about. Being listed and the version are what tell an egress that is not
@@ -107,7 +114,10 @@ public sealed record PeerEgressCatalogMessage(long Revision, IReadOnlyDictionary
                     var version = entry.TryGetProperty("egressVersion", out var announced)
                         ? NonNegativeInteger(announced)
                         : null;
-                    listed[clientId] = new PeerEgressCatalogListing(capable, version);
+                    // Read like domainTargetCapable: only a JSON true says the egress takes IPv6.
+                    var packets = entry.TryGetProperty("ipv6PacketCapable", out var ipv6)
+                        && ipv6.ValueKind == JsonValueKind.True;
+                    listed[clientId] = new PeerEgressCatalogListing(capable, version, packets);
                 }
             }
             return new PeerEgressCatalogMessage(revision, listed);
