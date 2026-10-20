@@ -12,12 +12,12 @@
 #include <limits.h>
 #include <netinet/in.h>
 #include <openssl/rand.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -25,7 +25,6 @@
 #define STUN_COOKIE 0x2112a442U
 #define STUN_HEADER_SIZE 20U
 #define STUN_MAX_PACKET 65535U
-#define TURN_MAX_ALLOCATIONS 256U
 #define TURN_MAX_PERMISSIONS 32U
 #define TURN_MAX_CHANNELS 32U
 
@@ -120,7 +119,18 @@ struct st_stun_turn_server {
     int general_relay_max_allocations_per_address;
     long long general_relay_max_bytes;
     pthread_t thread;
-    turn_allocation allocations[TURN_MAX_ALLOCATIONS];
+    /*
+     * Every allocation, without a fixed limit (Java keeps them in an unbounded map: the relay
+     * port range and the descriptor limit bound them). Each is allocated on its own, so pointers
+     * to it survive the table growing; one closed during a poll pass is freed after that pass.
+     */
+    turn_allocation **allocations;
+    size_t allocation_count;
+    size_t allocation_capacity;
+    /* The poll set of one pass and the allocation each relay entry belongs to (NULL: endpoint). */
+    struct pollfd *poll_fds;
+    turn_allocation **poll_owners;
+    size_t poll_capacity;
 };
 
 typedef struct {
@@ -541,9 +551,10 @@ static turn_allocation *find_allocation_by_client(st_stun_turn_server *server,
                                                    const struct sockaddr_storage *client)
 {
     time_t now = time(NULL);
-    for (size_t i = 0; i < TURN_MAX_ALLOCATIONS; ++i) {
-        if (server->allocations[i].used && server->allocations[i].expires_at > now
-            && sockaddr_equal(&server->allocations[i].client, client, 1)) return &server->allocations[i];
+    for (size_t i = 0; i < server->allocation_count; ++i) {
+        turn_allocation *allocation = server->allocations[i];
+        if (allocation->used && allocation->expires_at > now
+            && sockaddr_equal(&allocation->client, client, 1)) return allocation;
     }
     return NULL;
 }
@@ -552,9 +563,10 @@ static turn_allocation *find_allocation_by_relay(st_stun_turn_server *server,
                                                   const struct sockaddr_storage *relay)
 {
     time_t now = time(NULL);
-    for (size_t i = 0; i < TURN_MAX_ALLOCATIONS; ++i) {
-        if (server->allocations[i].used && server->allocations[i].expires_at > now
-            && sockaddr_equal(&server->allocations[i].relay, relay, 1)) return &server->allocations[i];
+    for (size_t i = 0; i < server->allocation_count; ++i) {
+        turn_allocation *allocation = server->allocations[i];
+        if (allocation->used && allocation->expires_at > now
+            && sockaddr_equal(&allocation->relay, relay, 1)) return allocation;
     }
     return NULL;
 }
@@ -601,8 +613,8 @@ static int general_relay_quota_allows(st_stun_turn_server *server,
     if (server->general_relay_max_allocations <= 0) return 0;
     int total = 0;
     int same_address = 0;
-    for (size_t i = 0; i < TURN_MAX_ALLOCATIONS; ++i) {
-        turn_allocation *candidate = &server->allocations[i];
+    for (size_t i = 0; i < server->allocation_count; ++i) {
+        turn_allocation *candidate = server->allocations[i];
         if (!candidate->used || candidate == exclude || !allocation_is_general(candidate)) continue;
         ++total;
         if (sockaddr_equal(&candidate->client, client, 0)) ++same_address;
@@ -801,14 +813,15 @@ static turn_allocation *create_allocation(st_stun_turn_server *server,
                                            socklen_t client_len,
                                            const char *username)
 {
-    turn_allocation *slot = NULL;
-    for (size_t i = 0; i < TURN_MAX_ALLOCATIONS; ++i) {
-        if (!server->allocations[i].used) {
-            slot = &server->allocations[i];
-            break;
-        }
+    if (server->allocation_count == server->allocation_capacity) {
+        size_t capacity = server->allocation_capacity == 0U ? 16U : server->allocation_capacity * 2U;
+        if (capacity > SIZE_MAX / sizeof(*server->allocations)) return NULL;
+        turn_allocation **grown = (turn_allocation **)realloc(server->allocations,
+                                                              capacity * sizeof(*grown));
+        if (grown == NULL) return NULL;
+        server->allocations = grown;
+        server->allocation_capacity = capacity;
     }
-    if (slot == NULL) return NULL;
     const char *bind_address = getenv("SPECUS_PEER_MESH_BIND_ADDRESS");
     if (bind_address == NULL || *bind_address == '\0') bind_address = "0.0.0.0";
     int relay_fd = -1;
@@ -824,7 +837,12 @@ static turn_allocation *create_allocation(st_stun_turn_server *server,
         }
     }
     if (relay_fd < 0) return NULL;
-    memset(slot, 0, sizeof(*slot));
+    turn_allocation *slot = (turn_allocation *)calloc(1, sizeof(*slot));
+    if (slot == NULL) {
+        close(relay_fd);
+        return NULL;
+    }
+    server->allocations[server->allocation_count++] = slot;
     slot->used = 1;
     slot->relay_fd = relay_fd;
     slot->client = *client;
@@ -1298,55 +1316,97 @@ static void handle_relay_packet(st_stun_turn_server *server, turn_allocation *al
 static void expire_allocations(st_stun_turn_server *server)
 {
     time_t now = time(NULL);
-    for (size_t i = 0; i < TURN_MAX_ALLOCATIONS; ++i) {
-        if (server->allocations[i].used && server->allocations[i].expires_at <= now) {
-            close_allocation(&server->allocations[i]);
+    for (size_t i = 0; i < server->allocation_count; ++i) {
+        if (server->allocations[i]->used && server->allocations[i]->expires_at <= now) {
+            close_allocation(server->allocations[i]);
         }
     }
 }
 
+/* Frees the allocations closed during the pass that just ended; nothing points at them any more. */
+static void reap_closed_allocations(st_stun_turn_server *server)
+{
+    size_t kept = 0U;
+    for (size_t i = 0; i < server->allocation_count; ++i) {
+        if (server->allocations[i]->used) server->allocations[kept++] = server->allocations[i];
+        else free(server->allocations[i]);
+    }
+    server->allocation_count = kept;
+}
+
+static int reserve_poll_set(st_stun_turn_server *server, size_t needed)
+{
+    if (needed <= server->poll_capacity) return 0;
+    size_t capacity = server->poll_capacity == 0U ? 32U : server->poll_capacity;
+    while (capacity < needed) {
+        if (capacity > SIZE_MAX / 2U / sizeof(*server->poll_owners)) return -1;
+        capacity *= 2U;
+    }
+    struct pollfd *fds = (struct pollfd *)realloc(server->poll_fds, capacity * sizeof(*fds));
+    if (fds == NULL) return -1;
+    server->poll_fds = fds;
+    turn_allocation **owners = (turn_allocation **)realloc(server->poll_owners, capacity * sizeof(*owners));
+    if (owners == NULL) return -1;
+    server->poll_owners = owners;
+    server->poll_capacity = capacity;
+    return 0;
+}
+
+/*
+ * One thread serves every endpoint and relay socket. poll, not select: a process with many
+ * connections hands out socket numbers at and past FD_SETSIZE (the systemd unit allows 1048576
+ * descriptors), which an fd_set cannot hold. As before, each ready socket gives up one datagram
+ * per pass, endpoints first.
+ */
 static void *stun_turn_thread(void *raw)
 {
     st_stun_turn_server *server = (st_stun_turn_server *)raw;
     while (server->running) {
-        fd_set read_fds;
-        FD_ZERO(&read_fds);
-        int max_fd = -1;
+        if (reserve_poll_set(server, server->endpoint_count + server->allocation_count) != 0) {
+            fprintf(stderr, "[peer-mesh] STUN/TURN poll set allocation failed\n");
+            struct timespec pause = {0, 100000000L};
+            nanosleep(&pause, NULL);
+            continue;
+        }
+        nfds_t count = 0U;
         for (size_t i = 0; i < server->endpoint_count; ++i) {
-            int fd = server->endpoints[i].fd;
-            if (fd >= 0) {
-                FD_SET(fd, &read_fds);
-                if (fd > max_fd) max_fd = fd;
-            }
+            if (server->endpoints[i].fd < 0) continue;
+            server->poll_fds[count] = (struct pollfd){server->endpoints[i].fd, POLLIN, 0};
+            server->poll_owners[count++] = NULL;
         }
-        for (size_t i = 0; i < TURN_MAX_ALLOCATIONS; ++i) {
-            if (server->allocations[i].used) {
-                FD_SET(server->allocations[i].relay_fd, &read_fds);
-                if (server->allocations[i].relay_fd > max_fd) max_fd = server->allocations[i].relay_fd;
-            }
+        nfds_t endpoint_entries = count;
+        for (size_t i = 0; i < server->allocation_count; ++i) {
+            turn_allocation *allocation = server->allocations[i];
+            if (!allocation->used) continue;
+            server->poll_fds[count] = (struct pollfd){allocation->relay_fd, POLLIN, 0};
+            server->poll_owners[count++] = allocation;
         }
-        struct timeval timeout = {1, 0};
-        int ready = select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
-        if (ready < 0 && errno != EINTR) break;
-        for (size_t which = 0; which < server->endpoint_count; ++which) {
-            int fd = server->endpoints[which].fd;
-            if (fd >= 0 && FD_ISSET(fd, &read_fds)) {
-                uint8_t packet[STUN_MAX_PACKET];
-                struct sockaddr_storage client;
-                socklen_t client_len = sizeof(client);
-                ssize_t received = recvfrom(fd, packet, sizeof(packet), 0,
-                                            (struct sockaddr *)&client, &client_len);
-                if (received > 0) handle_control_packet(server, fd, packet, (size_t)received,
-                                                        &client, client_len);
-            }
+        int ready = poll(server->poll_fds, count, 1000);
+        if (ready < 0 && errno != EINTR) {
+            fprintf(stderr, "[peer-mesh] STUN/TURN poll failed: %s\n", strerror(errno));
+            struct timespec pause = {0, 100000000L};
+            nanosleep(&pause, NULL);
         }
-        for (size_t i = 0; i < TURN_MAX_ALLOCATIONS; ++i) {
-            if (server->allocations[i].used
-                && FD_ISSET(server->allocations[i].relay_fd, &read_fds)) {
-                handle_relay_packet(server, &server->allocations[i]);
-            }
+        for (nfds_t k = 0; ready > 0 && k < endpoint_entries; ++k) {
+            if ((server->poll_fds[k].revents & (POLLIN | POLLERR | POLLHUP)) == 0) continue;
+            int fd = server->poll_fds[k].fd;
+            uint8_t packet[STUN_MAX_PACKET];
+            struct sockaddr_storage client;
+            socklen_t client_len = sizeof(client);
+            ssize_t received = recvfrom(fd, packet, sizeof(packet), 0,
+                                        (struct sockaddr *)&client, &client_len);
+            if (received > 0) handle_control_packet(server, fd, packet, (size_t)received,
+                                                    &client, client_len);
+        }
+        for (nfds_t k = endpoint_entries; ready > 0 && k < count; ++k) {
+            turn_allocation *allocation = server->poll_owners[k];
+            /* Closed earlier in this pass (its number may even belong to a new relay by now). */
+            if ((server->poll_fds[k].revents & (POLLIN | POLLERR | POLLHUP)) == 0
+                || !allocation->used || allocation->relay_fd != server->poll_fds[k].fd) continue;
+            handle_relay_packet(server, allocation);
         }
         expire_allocations(server);
+        reap_closed_allocations(server);
     }
     return NULL;
 }
@@ -1379,7 +1439,6 @@ int st_stun_turn_server_start(st_stun_turn_server **out_server)
         return -1;
     }
     server->next_relay_port = server->relay_min_port;
-    for (size_t i = 0; i < TURN_MAX_ALLOCATIONS; ++i) server->allocations[i].relay_fd = -1;
     const char *primary_bind = getenv("SPECUS_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS");
     int primary_explicit = primary_bind != NULL && *primary_bind != '\0';
     if (!primary_explicit) primary_bind = getenv("SPECUS_PEER_MESH_BIND_ADDRESS");
@@ -1446,9 +1505,13 @@ void st_stun_turn_server_stop(st_stun_turn_server *server)
     server->running = 0;
     close_stun_endpoints(server, 1);
     pthread_join(server->thread, NULL);
-    for (size_t i = 0; i < TURN_MAX_ALLOCATIONS; ++i) {
-        if (server->allocations[i].used) close_allocation(&server->allocations[i]);
+    for (size_t i = 0; i < server->allocation_count; ++i) {
+        if (server->allocations[i]->used) close_allocation(server->allocations[i]);
     }
+    reap_closed_allocations(server);
     close_stun_endpoints(server, 0);
+    free(server->allocations);
+    free(server->poll_fds);
+    free(server->poll_owners);
     free(server);
 }
