@@ -7758,6 +7758,117 @@ int st_storage_record_traffic_usage(const char *path,
     return rc;
 }
 
+static char *storage_dup_text(const char *text);
+
+/*
+ * Java resolveResource for one of the account's resource keys: the mapping on the port or the
+ * route of that name, with Java's name for it; no resource is id 0 and "端口 <port>" or the bare
+ * route. *resource_name is the caller's to free.
+ */
+static int resolve_traffic_resource(sqlite3 *db,
+                                    const traffic_usage_account *account,
+                                    const char *resource_key,
+                                    const char **resource_type,
+                                    long long *resource_id,
+                                    char **resource_name)
+{
+    *resource_id = 0;
+    *resource_name = NULL;
+    int http = strncmp(resource_key, "http:", 5U) == 0;
+    const char *route = resource_key + 5;
+    long port = strncmp(resource_key, "tcp:", 4U) == 0 ? strtol(resource_key + 4, NULL, 10) : 0L;
+    *resource_type = http ? "HTTP_ROUTE" : "TCP_SPECUS";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            http ? "SELECT id, route || ' -> ' || target_base_url FROM http_route_mapping "
+                   "WHERE client_name = ?1 AND route = ?2 ORDER BY id LIMIT 1"
+                 : "SELECT id, listen_port || ' -> ' || target_address || ':' || target_port FROM specus_mapping "
+                   "WHERE client_name = ?1 AND listen_port = ?2 ORDER BY id LIMIT 1",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, account->client_name, -1, SQLITE_TRANSIENT);
+    if (http) {
+        sqlite3_bind_text(stmt, 2, route, -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_int64(stmt, 2, port);
+    }
+    int step = sqlite3_step(stmt);
+    int rc = step == SQLITE_ROW || step == SQLITE_DONE ? 0 : -1;
+    if (step == SQLITE_ROW) {
+        *resource_id = sqlite3_column_int64(stmt, 0);
+        *resource_name = storage_dup_text((const char *)sqlite3_column_text(stmt, 1));
+    } else if (step == SQLITE_DONE && http) {
+        *resource_name = storage_dup_text(route);
+    } else if (step == SQLITE_DONE) {
+        char name[32];
+        snprintf(name, sizeof(name), "端口 %ld", port);
+        *resource_name = storage_dup_text(name);
+    }
+    sqlite3_finalize(stmt);
+    return rc == 0 && *resource_name == NULL ? -1 : rc;
+}
+
+int st_storage_flush_traffic_usage(const char *path, const st_storage_traffic_delta *deltas, size_t delta_count)
+{
+    if (delta_count == 0U) {
+        return 0;
+    }
+    /* One instant for the whole flush; its UTC date is the day the bytes go to, as in Java. */
+    char now[ST_INSTANT_CAPACITY];
+    char updated_at[ST_INSTANT_CAPACITY];
+    char usage_date[11];
+    if (st_instant_now(now) != 0 || st_instant_public(now, updated_at, sizeof(updated_at)) != 0) {
+        return -1;
+    }
+    memcpy(usage_date, now, 10U);
+    usage_date[10] = '\0';
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    int rc = exec_sql(db, "BEGIN IMMEDIATE");
+    int began = rc == 0;
+    for (size_t i = 0U; rc == 0 && i < delta_count; ++i) {
+        const st_storage_traffic_delta *delta = &deltas[i];
+        if (delta->client_name == NULL || (delta->upload_bytes <= 0 && delta->download_bytes <= 0)) {
+            continue;
+        }
+        traffic_usage_account account;
+        int found = find_traffic_usage_account(db, 0, delta->client_name, &account);
+        if (found <= 0) {
+            /* Gone (renamed or deleted): Java findClientByName finds nothing and drops the bytes. */
+            rc = found;
+            continue;
+        }
+        if (delta->resource_key == NULL || *delta->resource_key == '\0') {
+            rc = upsert_traffic_usage_on_db(db, &account, usage_date, delta->upload_bytes, delta->download_bytes,
+                                            updated_at);
+            continue;
+        }
+        const char *resource_type = NULL;
+        long long resource_id = 0;
+        char *resource_name = NULL;
+        rc = resolve_traffic_resource(db, &account, delta->resource_key, &resource_type, &resource_id,
+                                      &resource_name);
+        if (rc == 0) {
+            rc = upsert_resource_traffic_usage_on_db(db, &account, resource_type, delta->resource_key, resource_id,
+                                                     resource_name, usage_date, delta->upload_bytes,
+                                                     delta->download_bytes, updated_at);
+        }
+        free(resource_name);
+    }
+    if (rc == 0) {
+        rc = exec_sql(db, "COMMIT");
+    }
+    if (rc != 0 && began) {
+        (void)exec_sql(db, "ROLLBACK");
+    }
+    sqlite3_close(db);
+    return rc == 0 ? 0 : -1;
+}
+
 int st_storage_list_traffic_usage(const char *path,
                                   long long client_id,
                                   int limit,

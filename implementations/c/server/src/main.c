@@ -18,6 +18,7 @@
 #include "stun_turn.h"
 #include "tls_transport.h"
 #include "traffic_capture.h"
+#include "traffic_usage.h"
 #include "workbench.h"
 
 #include <arpa/inet.h>
@@ -955,16 +956,6 @@ static int64_t now_ms(void)
     return (int64_t)tv.tv_sec * 1000LL + (int64_t)tv.tv_usec / 1000LL;
 }
 
-static int current_utc_date(char out[11])
-{
-    time_t now = time(NULL);
-    struct tm utc;
-    if (gmtime_r(&now, &utc) == NULL) {
-        return -1;
-    }
-    return strftime(out, 11U, "%Y-%m-%d", &utc) == 10U ? 0 : -1;
-}
-
 static int current_utc_timestamp(char out[64])
 {
     time_t now = time(NULL);
@@ -1183,50 +1174,16 @@ static void build_tcp_resource_name(const tcp_mapping *mapping, int port, char o
     }
 }
 
-/* Java TrafficUsageService.recordTcpUpload/recordTcpDownload: port 0 counts the client's day only. */
+/*
+ * Java TrafficUsageService.recordTcpUpload/recordTcpDownload: added in memory, port 0 to the
+ * client's day only; the periodic flush finds the account and the mapping (traffic_usage.h).
+ */
 static void record_tcp_traffic(specus_session *session, int port, long long upload_bytes, long long download_bytes)
 {
-    if (session == NULL
-        || session->config.database_path[0] == '\0'
-        || (upload_bytes <= 0 && download_bytes <= 0)) {
+    if (session == NULL || session->config.database_path[0] == '\0') {
         return;
     }
-    char usage_date[11];
-    if (current_utc_date(usage_date) != 0) {
-        return;
-    }
-    const char *database_path = session->config.database_path;
-    const char *client_name = session->config.client_name;
-    long long client_id = session->config.client_id;
-    st_storage_record_traffic_usage(database_path, client_id, client_name, usage_date, upload_bytes, download_bytes);
-    if (port <= 0) {
-        return;
-    }
-
-    tcp_mapping mapping_copy;
-    const tcp_mapping *mapping = NULL;
-    pthread_mutex_lock(&session->map_lock);
-    const tcp_mapping *configured = find_tcp_mapping_by_port(&session->config, port);
-    if (configured != NULL) {
-        mapping_copy = *configured;
-        mapping = &mapping_copy;
-    }
-    pthread_mutex_unlock(&session->map_lock);
-    char resource_key[64];
-    char resource_name[512];
-    snprintf(resource_key, sizeof(resource_key), "tcp:%d", port);
-    long long resource_id = mapping == NULL ? 0 : mapping->id;
-    build_tcp_resource_name(mapping, port, resource_name);
-    st_storage_record_resource_traffic_usage(database_path,
-                                             client_id,
-                                             client_name,
-                                             "TCP_SPECUS",
-                                             resource_key,
-                                             resource_id,
-                                             resource_name,
-                                             usage_date,
-                                             upload_bytes,
-                                             download_bytes);
+    st_traffic_usage_record_tcp(session->config.client_name, port, upload_bytes, download_bytes);
 }
 
 static void record_tcp_frame(specus_session *session,
@@ -5636,6 +5593,13 @@ int main(void)
         st_public_discovery_shutdown();
         return 1;
     }
+    /* Traffic usage counted in memory is written every SPECUS_TRAFFIC_FLUSH_INTERVAL_MS (Java). */
+    if (st_traffic_usage_start(config.database_path) != 0) {
+        fprintf(stderr, "traffic usage flush failed to start\n");
+        config_release_routes(&config);
+        st_public_discovery_shutdown();
+        return 1;
+    }
     st_stun_turn_server *stun_turn_server = NULL;
     if (env_bool("SPECUS_PEER_MESH_ENABLED", 0)) {
         if (st_stun_turn_server_start(&stun_turn_server) != 0) {
@@ -5863,9 +5827,10 @@ int main(void)
                    unfinished, swept);
         }
     }
-    /* What the channels captured last is written out before the process ends (Java's
-     * TrafficInspectionService flushBeforeShutdown). */
+    /* What the channels captured and counted last is written out before the process ends (Java's
+     * TrafficInspectionService and TrafficUsageService flushBeforeShutdown). */
     st_elasticsearch_traffic_shutdown();
+    st_traffic_usage_stop();
     shutdown_wake_close(shutdown_pipe);
     peer_mesh_maintenance_stop();
     st_admin_set_nat_control_handler(NULL, NULL);

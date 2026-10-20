@@ -50,6 +50,7 @@ add_library(specus_c_core
     src/stun_turn.c
     src/tls_transport.c
     src/traffic_capture.c
+    src/traffic_usage.c
     src/turn_auth.c
     src/upstream_browser_headers.c
     src/unicode_java21.c

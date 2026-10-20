@@ -1094,6 +1094,22 @@ int st_storage_record_traffic_usage(const char *path,
                                     const char *usage_date,
                                     long long upload_bytes,
                                     long long download_bytes);
+/* Bytes counted in memory for a client's day (resource_key "") or one resource of it. */
+typedef struct {
+    const char *client_name;
+    const char *resource_key; /* "", "tcp:<listenPort>" or "http:<route>" */
+    long long upload_bytes;
+    long long download_bytes;
+} st_storage_traffic_delta;
+
+/*
+ * Java TrafficUsageService.flush: writes the counts in one transaction, on the UTC date and with
+ * the instant of the call. Each client is found by name (Java findClientByName), so the bytes of
+ * a client deleted or renamed since are dropped; a resource row takes the resource's current id
+ * and name (resolveResource: the mapping on that port or the route of that name, "端口 <port>" or
+ * the bare route when there is none). 0 once committed, -1 when nothing was written.
+ */
+int st_storage_flush_traffic_usage(const char *path, const st_storage_traffic_delta *deltas, size_t delta_count);
 int st_storage_list_traffic_usage(const char *path,
                                   long long client_id,
                                   int limit,

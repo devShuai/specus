@@ -167,6 +167,7 @@ Additional runtime knobs:
 | `SPECUS_CLIENT_PACKAGE_GITHUB_RELEASE_FALLBACK_ENABLED` | `true` | Merges validated official GitHub latest-release assets for targets without any configured row. |
 | `SPECUS_CONNECTION_DETAIL_RETENTION_DAYS` | `60` | Connection detail older than this many UTC days is rolled into monthly totals and deleted; `0` or less turns the archive off. |
 | `SPECUS_CONNECTION_ARCHIVE_INTERVAL_MS` | `3600000` | Delay between archive runs; the first run comes one interval after start. |
+| `SPECUS_TRAFFIC_FLUSH_INTERVAL_MS` | `5000` | Delay between writes of the traffic usage counted in memory, from the end of one write to the next (Java `specus.traffic.flush-interval-ms`). |
 | `SPECUS_AUTH_REGISTRATION_ENABLED` | `false` | Enables `/auth/register`; optional SMTP verification and Turnstile use the `SPECUS_AUTH_EMAIL_*`, `SPECUS_AUTH_SMTP_*`, and `SPECUS_AUTH_TURNSTILE_*` groups. |
 | `SPECUS_OIDC_CLIENT_ID` | unset | OIDC browser client id. Non-blank marks OIDC as configured in `/oidc-config`; without it `/oidc/token` answers `503`. ID tokens must list it in `aud`, and `azp` must equal it when present or when `aud` has several entries. |
 | `SPECUS_OIDC_ISSUER` | `https://certus.devshuai.com` | Exact `iss` required of ID tokens and of identity-provider bearer tokens. Set but blank refuses every token, as Java does. |
@@ -421,9 +422,16 @@ from the background archive (Java `ConnectionArchiveService`): every
 UTC days is added to its client's `yyyy-MM` row and deleted in the same transaction.
 `GET /api/admin/traffic` and `GET /api/admin/traffic/resources` follow the Java summary view
 shapes for daily client traffic and per-resource traffic. When `SPECUS_DATABASE_PATH` is set, the
-C server records successful TCP specus bytes as `TCP_SPECUS` resources with keys such as
-`tcp:18080`, and successful Direct HTTP body bytes as `HTTP_ROUTE` resources with keys such as
-`http:api`.
+C server counts traffic as Java's `TrafficUsageService` does: TCP mapping bytes (client to public
+as upload, public to client as download) on the client's day and as `TCP_SPECUS` resources keyed
+`tcp:18080`; the request body bytes that reached the client and the response bytes it sent of
+every Direct HTTP or share exchange, whatever its outcome, as `HTTP_ROUTE` resources keyed
+`http:api`; and the client's route WebSocket envelopes as its upload, without a resource row. The
+counts are kept in memory and written in one transaction every `SPECUS_TRAFFIC_FLUSH_INTERVAL_MS`,
+before `GET /api/admin/clients`, `/api/admin/clients/{id}`, `/api/admin/overview` and the two
+usage lists with `flush=true`, and at shutdown; a flush that fails keeps them for the next one.
+The rows are keyed by client account (`client_id`, and `tenant_id` for resources), as Java keys
+them.
 
 SQLite traffic detail capture runs only when `SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED=true` (default
 `false`, as Java's `specus.traffic.capture-detail-enabled`) and the corresponding TCP mapping or

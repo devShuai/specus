@@ -25,6 +25,7 @@ CONNECTIVITY_LIFETIME_TESTS := $(BUILD_DIR)/specus_c_connectivity_lifetime_tests
 CONNECTIVITY_SETTER_TESTS := $(BUILD_DIR)/specus_c_connectivity_setter_tests
 CORE_OBJS += $(BUILD_DIR)/instant.o $(BUILD_DIR)/instant_storage.o $(BUILD_DIR)/java_uri.o
 CORE_OBJS += $(BUILD_DIR)/websocket_ticket.o
+CORE_OBJS += $(BUILD_DIR)/traffic_usage.o
 INSTANT_TESTS := $(BUILD_DIR)/specus_c_instant_tests
 INSTANT_MIGRATION_TESTS := $(BUILD_DIR)/specus_c_instant_migration_tests
 CONNECTION_TIME_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_connection_time_reference_tests

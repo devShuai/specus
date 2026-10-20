@@ -10,7 +10,9 @@
  *   - every client-to-browser SWS2 envelope of a route WebSocket, header included and valid or
  *     not, is the client's upload; the browser's direction is not counted and no resource row is
  *     written;
- *   - an HTTP route's row is named "route -> targetBaseUrl" in full.
+ *   - an HTTP route's row is named "route -> targetBaseUrl" in full;
+ *   - the counts are kept in memory and written where Java flushes them: periodically, before
+ *     the reads that ask for it, and at shutdown; a flush that fails keeps them for the next.
  *
  * The values are read the way an operator reads them, through /api/admin/traffic and
  * /api/admin/traffic/resources with flush=true.
@@ -21,6 +23,7 @@
 #include "nat_stream_tests.c"
 #undef main
 #include "admin_http.h"
+#include "traffic_usage.h"
 
 typedef struct {
     int found;
@@ -139,22 +142,21 @@ static int expect_usage(const test_server *server, long long client_id, const ch
 /* TCP                                                                                           */
 
 /*
- * The public peer sends 3000 bytes and the client answers 700: Java (and Go and .NET) count 700
- * as upload and 3000 as download, on the client's day and on tcp:<port>, whose row names the
- * mapping. C had the two the other way round.
+ * One public TCP stream on the client's port: the public peer sends public_bytes, the client
+ * answers client_bytes, and the client resets the stream once both have arrived.
  */
-static int check_tcp_direction(test_server *server, client_pair *pair)
+static int relay_tcp(client_pair *pair, size_t public_bytes, size_t client_bytes)
 {
-    CHECK(admin_login(server) == 0, "admin login");
     int public_fd = -1;
     uint32_t stream_id = 0U;
+    uint8_t buffer[4096];
+    CHECK(public_bytes <= sizeof(buffer) && client_bytes <= sizeof(buffer), "relay sizes");
     CHECK(open_public_stream_id(pair->data, pair->public_port, &public_fd, &stream_id) == 0, "public OPEN");
-    uint8_t buffer[3000];
-    memset(buffer, 'p', sizeof(buffer));
-    CHECK(send_all(public_fd, buffer, sizeof(buffer)) == 0, "public send");
+    memset(buffer, 'p', public_bytes);
+    CHECK(send_all(public_fd, buffer, public_bytes) == 0, "public send");
     size_t received = 0U;
     long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
-    while (received < sizeof(buffer)) {
+    while (received < public_bytes) {
         st_nat_message message;
         CHECK(next_nat_frame(pair->data, deadline, &message) == 1, "public bytes reached the client: %zu", received);
         if (message.stream_id == stream_id && message.type == ST_NAT_DATA) {
@@ -162,11 +164,26 @@ static int check_tcp_direction(test_server *server, client_pair *pair)
         }
         st_nat_message_free(&message);
     }
-    CHECK(received == sizeof(buffer), "the client got %zu bytes", received);
-    memset(buffer, 'c', 700U);
-    CHECK(send_nat(pair->data, ST_NAT_DATA, 0U, stream_id, 0U, NULL, buffer, 700U) == 0, "client DATA");
-    CHECK(recv_exact(public_fd, buffer, 700U, monotonic_ms() + IO_TIMEOUT_MS) == 1, "client bytes reached the public peer");
+    CHECK(received == public_bytes, "the client got %zu bytes", received);
+    memset(buffer, 'c', client_bytes);
+    CHECK(send_nat(pair->data, ST_NAT_DATA, 0U, stream_id, 0U, NULL, buffer, client_bytes) == 0, "client DATA");
+    CHECK(recv_exact(public_fd, buffer, client_bytes, monotonic_ms() + IO_TIMEOUT_MS) == 1,
+          "client bytes reached the public peer");
+    CHECK(send_nat(pair->data, ST_NAT_RST, 0U, stream_id, 0U, NULL, NULL, 0U) == 0, "RST");
+    CHECK(drain_until_eof(public_fd, IO_TIMEOUT_MS) == 0, "public peer closed");
+    close_fd(&public_fd);
+    return 0;
+}
 
+/*
+ * The public peer sends 3000 bytes and the client answers 700: Java (and Go and .NET) count 700
+ * as upload and 3000 as download, on the client's day and on tcp:<port>, whose row names the
+ * mapping. C had the two the other way round.
+ */
+static int check_tcp_direction(test_server *server, client_pair *pair)
+{
+    CHECK(admin_login(server) == 0, "admin login");
+    CHECK(relay_tcp(pair, 3000U, 700U) == 0, "relay");
     char key[32];
     snprintf(key, sizeof(key), "tcp:%d", pair->public_port);
     usage_row row;
@@ -178,9 +195,6 @@ static int check_tcp_direction(test_server *server, client_pair *pair)
     snprintf(name, sizeof(name), "%d -> 127.0.0.1:9", pair->public_port);
     CHECK(row.resource_id > 0 && strcmp(row.resource_name, name) == 0, "mapping row %lld %s, expected %s",
           row.resource_id, row.resource_name, name);
-    CHECK(send_nat(pair->data, ST_NAT_RST, 0U, stream_id, 0U, NULL, NULL, 0U) == 0, "RST");
-    CHECK(drain_until_eof(public_fd, IO_TIMEOUT_MS) == 0, "public peer closed");
-    close_fd(&public_fd);
     return 0;
 }
 
@@ -518,6 +532,195 @@ static int check_websocket_upload(test_server *server, client_pair *pair)
     return 0;
 }
 
+/* ------------------------------------------------------------------------------------------- */
+/* When the counts are written                                                                   */
+
+/* "<upload>/<download>" of the client's day as stored, "-1/-1" when there is no row. */
+static int stored_day(const char *db_path, long long client_id, char *out, size_t out_len)
+{
+    return db_scalar(db_path,
+                     "SELECT COALESCE(SUM(upload_bytes), -1) || '/' || COALESCE(SUM(download_bytes), -1) "
+                     "FROM traffic_usage WHERE client_id = ?",
+                     NULL, client_id, out, out_len);
+}
+
+/* GETs path as the administrator until the stored day reads expected: each such GET flushes. */
+static int expect_flushed_by(const test_server *server, long long client_id, const char *path, const char *expected)
+{
+    char stored[64] = "";
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    for (;;) {
+        int status = 0;
+        char *body = NULL;
+        int rc = http_request(server->admin_port, "GET", path, NULL, admin_token, &status, &body);
+        free(body);
+        CHECK(rc == 0 && status == 200, "GET %s answered %d", path, status);
+        CHECK(stored_day(server->db_path, client_id, stored, sizeof(stored)) == 0, "stored day");
+        if (strcmp(stored, expected) == 0) {
+            return 0;
+        }
+        CHECK(monotonic_ms() < deadline, "GET %s left the day at %s, expected %s", path, stored, expected);
+        sleep_ms(50);
+    }
+}
+
+/*
+ * With an hour between periodic flushes, the counts reach the database only where Java's
+ * TrafficUsageService flushes them: not on each chunk (C wrote two rows per chunk), not on a read
+ * of /api/admin/traffic without flush, but on one with flush=true, on GET /api/admin/overview,
+ * /api/admin/clients and /api/admin/clients/{id}, and at shutdown.
+ */
+static int check_flush_points(test_server *server, client_pair *pair)
+{
+    CHECK(admin_login(server) == 0, "admin login");
+    long long id = pair->runtime.client_id;
+    char stored[64] = "";
+    char path[128];
+    CHECK(relay_tcp(pair, 3000U, 700U) == 0, "relay");
+    sleep_ms(300);
+    CHECK(stored_day(server->db_path, id, stored, sizeof(stored)) == 0 && strcmp(stored, "-1/-1") == 0,
+          "the bytes must stay in memory until a flush, the day already reads %s", stored);
+    snprintf(path, sizeof(path), "/api/admin/traffic?clientId=%lld", id);
+    int status = 0;
+    char *body = NULL;
+    CHECK(http_request(server->admin_port, "GET", path, NULL, admin_token, &status, &body) == 0 && status == 200
+              && body != NULL && strcmp(body, "[]") == 0,
+          "a read without flush=true must not flush: %s", body == NULL ? "" : body);
+    free(body);
+    snprintf(path, sizeof(path), "/api/admin/traffic?clientId=%lld&flush=true", id);
+    CHECK(expect_flushed_by(server, id, path, "700/3000") == 0, "flush=true");
+
+    CHECK(relay_tcp(pair, 1000U, 100U) == 0, "relay");
+    CHECK(expect_flushed_by(server, id, "/api/admin/overview", "800/4000") == 0, "overview");
+    char *overview = NULL;
+    CHECK(http_request(server->admin_port, "GET", "/api/admin/overview", NULL, admin_token, &status, &overview) == 0
+              && status == 200 && overview != NULL && strstr(overview, "\"uploadBytes\":800,\"downloadBytes\":4000") != NULL,
+          "the overview counts the flushed bytes: %s", overview == NULL ? "" : overview);
+    free(overview);
+    CHECK(relay_tcp(pair, 500U, 50U) == 0, "relay");
+    CHECK(expect_flushed_by(server, id, "/api/admin/clients", "850/4500") == 0, "client list");
+    CHECK(relay_tcp(pair, 20U, 2U) == 0, "relay");
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld", id);
+    CHECK(expect_flushed_by(server, id, path, "852/4520") == 0, "client detail");
+
+    CHECK(relay_tcp(pair, 7U, 3U) == 0, "relay");
+    sleep_ms(300);
+    CHECK(stored_day(server->db_path, id, stored, sizeof(stored)) == 0 && strcmp(stored, "852/4520") == 0,
+          "nothing asked for a flush, the day reads %s", stored);
+    CHECK(server_stop(server, 20000) == 0, "server stop");
+    CHECK(stored_day(server->db_path, id, stored, sizeof(stored)) == 0 && strcmp(stored, "855/4527") == 0,
+          "the shutdown must flush what was still counted, the day reads %s", stored);
+    return 0;
+}
+
+/* With SPECUS_TRAFFIC_FLUSH_INTERVAL_MS=200 the counts reach the database on their own. */
+static int check_periodic_flush(test_server *server, client_pair *pair)
+{
+    CHECK(relay_tcp(pair, 3000U, 700U) == 0, "relay");
+    char stored[64] = "";
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    while (stored_day(server->db_path, pair->runtime.client_id, stored, sizeof(stored)) == 0
+           && strcmp(stored, "700/3000") != 0 && monotonic_ms() < deadline) {
+        sleep_ms(50);
+    }
+    CHECK(strcmp(stored, "700/3000") == 0, "the periodic flush did not write the day: %s", stored);
+    return 0;
+}
+
+static long long db_number(const char *db_path, const char *sql)
+{
+    char text[64];
+    return db_scalar(db_path, sql, NULL, 0, text, sizeof(text)) == 0 && text[0] != '\0' ? atoll(text) : -1;
+}
+
+/*
+ * In this process, without a server: counts stay in memory until a flush; a flush that cannot
+ * write (a database that cannot be opened) keeps them, and the next one writes them with what was
+ * counted since, as Java adds a failed flush's bytes back to its counters. A client that does not
+ * exist is dropped. Resource rows take the resource as the flush finds it: the mapping and the
+ * route by id and full name, then "端口 9300" and no id once the mapping is gone.
+ */
+static int test_failed_flush_keeps_counts(void)
+{
+    char dir[] = "/tmp/specus-c-traffic-flush-XXXXXX";
+    CHECK(mkdtemp(dir) != NULL, "scratch directory");
+    char path[128];
+    char missing[160];
+    snprintf(path, sizeof(path), "%s/usage.db", dir);
+    snprintf(missing, sizeof(missing), "%s/missing/usage.db", dir);
+    st_storage_client client;
+    st_storage_mapping mapping;
+    st_storage_http_route route;
+    int failed = st_storage_init(path, 0) != 0
+        || st_storage_upsert_client(path, 0, "tenant-flush", "flush-client", "owner", 1, 30, &client) != 0
+        || st_storage_create_mapping_for_client(path, client.id, 9300, "10.0.0.5", 22, 1, 0, &mapping) != 0
+        || st_storage_create_http_route_for_client(path, client.id, "web", "http://10.0.0.6:8080/app", 1, 0, 0, 0, 0,
+                                                   0, NULL, NULL, &route) != 0;
+    if (!failed) {
+        st_traffic_usage_record_tcp("flush-client", 9300, 10, 20);
+        st_traffic_usage_record_http("flush-client", "web", 1, 2);
+        st_traffic_usage_record_tcp("no-such-client", 9300, 5, 5);
+        failed = db_number(path, "SELECT COUNT(*) FROM traffic_usage") != 0
+            || db_number(path, "SELECT COUNT(*) FROM resource_traffic_usage") != 0;
+        if (failed) fprintf(stderr, "counts were written before a flush\n");
+    }
+    if (!failed && st_traffic_usage_flush(missing) != -1) {
+        fprintf(stderr, "a flush into a database that cannot be opened did not fail\n");
+        failed = 1;
+    }
+    st_traffic_usage_record_tcp("flush-client", 9300, 100, 200);
+    if (!failed && st_traffic_usage_flush(path) != 0) {
+        fprintf(stderr, "the flush after the failed one failed\n");
+        failed = 1;
+    }
+    char expected[512];
+    char text[512];
+    if (!failed) {
+        snprintf(expected, sizeof(expected),
+                 "day 111/222|HTTP_ROUTE http:web %lld web -> http://10.0.0.6:8080/app 1/2|"
+                 "TCP_SPECUS tcp:9300 %lld 9300 -> 10.0.0.5:22 110/220",
+                 route.id, mapping.id);
+        failed = db_scalar(path,
+                           "SELECT (SELECT 'day ' || upload_bytes || '/' || download_bytes FROM traffic_usage) || '|' || "
+                           "(SELECT group_concat(row, '|') FROM (SELECT resource_type || ' ' || resource_key || ' ' || "
+                           "COALESCE(resource_id, '-') || ' ' || resource_name || ' ' || upload_bytes || '/' || "
+                           "download_bytes AS row FROM resource_traffic_usage ORDER BY resource_type))",
+                           NULL, 0, text, sizeof(text)) != 0
+            || strcmp(text, expected) != 0
+            || db_number(path, "SELECT COUNT(*) FROM traffic_usage") != 1;
+        if (failed) fprintf(stderr, "flushed rows\n%s\nexpected\n%s\n", text, expected);
+    }
+    if (!failed && (st_traffic_usage_flush(path) != 0
+                    || db_number(path, "SELECT upload_bytes FROM traffic_usage") != 111)) {
+        fprintf(stderr, "a flush with nothing counted changed the day\n");
+        failed = 1;
+    }
+    if (!failed) {
+        st_traffic_usage_record_tcp("flush-client", 9300, 1, 1);
+        failed = st_storage_delete_mapping_by_id(path, mapping.id) != 0 || st_traffic_usage_flush(path) != 0
+            || db_scalar(path, "SELECT COALESCE(resource_id, '-') || ' ' || resource_name || ' ' || upload_bytes "
+                               "FROM resource_traffic_usage WHERE resource_key = 'tcp:9300'",
+                         NULL, 0, text, sizeof(text)) != 0
+            || strcmp(text, "- 端口 9300 111") != 0;
+        if (failed) fprintf(stderr, "the row of a deleted mapping reads %s\n", text);
+    }
+    unlink(path);
+    char journal[160];
+    snprintf(journal, sizeof(journal), "%s-journal", path);
+    unlink(journal);
+    rmdir(dir);
+    printf("%s a failed flush keeps its counts for the next one\n", failed ? "FAIL" : "ok  ");
+    return failed;
+}
+
+static const char *const hour_between_flushes[] = {
+    "SPECUS_CONTROL_READ_IDLE_SECONDS=900", "SPECUS_TRAFFIC_FLUSH_INTERVAL_MS=3600000", NULL
+};
+
+static const char *const quick_flushes[] = {
+    "SPECUS_CONTROL_READ_IDLE_SECONDS=900", "SPECUS_TRAFFIC_FLUSH_INTERVAL_MS=200", NULL
+};
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -526,11 +729,15 @@ int main(int argc, char **argv)
     }
     server_binary = argv[1];
     signal(SIGPIPE, SIG_IGN);
-    int failures = 0;
+    int failures = test_failed_flush_keeps_counts();
     failures += run_check("TCP traffic: client to public is upload, public to client download", check_tcp_direction);
     failures += run_check("HTTP traffic counted on every outcome once the stream is open", check_http_outcomes);
     failures += run_scenario("HTTP route row named route -> target in full", check_http_resource_name, long_idle);
     failures += run_check("WebSocket envelopes from the client are its upload", check_websocket_upload);
+    current_check = check_flush_points;
+    failures += run_scenario("counts are written where Java flushes them", run_current_check, hour_between_flushes);
+    current_check = check_periodic_flush;
+    failures += run_scenario("counts are written by the periodic flush", run_current_check, quick_flushes);
     if (failures != 0) {
         fprintf(stderr, "%d traffic usage check(s) failed\n", failures);
         return 1;

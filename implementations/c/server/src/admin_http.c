@@ -29,6 +29,7 @@
 #include "storage.h"
 #include "tls_transport.h"
 #include "traffic_capture.h"
+#include "traffic_usage.h"
 #include "turn_auth.h"
 #include "unicode_java21.h"
 #include "upstream_browser_headers.h"
@@ -3620,6 +3621,8 @@ static int admin_count_connections(const char *database_path,
                                                count);
 }
 
+static int admin_flush_traffic_usage(char *out, size_t out_len, int *answer);
+
 /*
  * GET /api/admin/overview as Java OverviewService: the caller's clients (an administrator's whole
  * tenant), how many are online, their traffic, the successful and failed logins of the tenant (of
@@ -3628,6 +3631,10 @@ static int admin_count_connections(const char *database_path,
  */
 static int build_overview_response(const st_admin_context *context, char *out, size_t out_len)
 {
+    int answer = 0;
+    if (admin_flush_traffic_usage(out, out_len, &answer) != 0) {
+        return answer;
+    }
     size_t mapping_count = 0;
     if (load_visible_tcp_mapping_count(context, &mapping_count) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"overview response failed\"}");
@@ -3727,16 +3734,6 @@ static const char *admin_database_path(void)
     return path != NULL && *path != '\0' ? path : NULL;
 }
 
-static int admin_current_utc_date(char out[11])
-{
-    time_t now = time(NULL);
-    struct tm utc;
-    if (gmtime_r(&now, &utc) == NULL) {
-        return -1;
-    }
-    return strftime(out, 11U, "%Y-%m-%d", &utc) == 10U ? 0 : -1;
-}
-
 static int admin_current_utc_timestamp(char out[64])
 {
     time_t now = time(NULL);
@@ -3754,61 +3751,34 @@ static long long admin_now_ms(void)
     return (long long)tv.tv_sec * 1000LL + (long long)tv.tv_usec / 1000LL;
 }
 
+/*
+ * Java recordHttpUpload/recordHttpDownload: added in memory; the next flush finds the account
+ * (it only has to exist, enabled or not) and names the row "route -> targetBaseUrl" in full.
+ */
 static void record_direct_http_traffic(const char *client_name,
                                        const char *route,
                                        long long upload_bytes,
                                        long long download_bytes)
 {
-    if (client_name == NULL
-        || route == NULL
-        || (upload_bytes <= 0 && download_bytes <= 0)) {
+    if (client_name == NULL || route == NULL || admin_database_path() == NULL) {
         return;
     }
-    const char *database_path = admin_database_path();
-    if (database_path == NULL) {
-        return;
-    }
-    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
-        return;
-    }
-    /* Java findClientByName: the account only has to exist, enabled or not. */
-    st_storage_client client;
-    if (st_storage_get_client_by_name(database_path, client_name, &client) != 0) {
-        return;
-    }
-    char usage_date[11];
-    if (admin_current_utc_date(usage_date) != 0) {
-        return;
-    }
-    st_storage_record_traffic_usage(database_path,
-                                    client.id,
-                                    client.client_name,
-                                    usage_date,
-                                    upload_bytes,
-                                    download_bytes);
+    st_traffic_usage_record_http(client_name, route, upload_bytes, download_bytes);
+}
 
-    st_storage_http_route http_route;
-    long long resource_id = 0;
-    /* Java's whole "route -> targetBaseUrl": both fields fit, so nothing is cut. */
-    char resource_name[sizeof(http_route.route) + sizeof(" -> ") + sizeof(http_route.target_base_url)];
-    if (st_storage_get_http_route_by_client_route(database_path, client_name, route, &http_route) == 0) {
-        resource_id = http_route.id;
-        snprintf(resource_name, sizeof(resource_name), "%s -> %s", http_route.route, http_route.target_base_url);
-    } else {
-        snprintf(resource_name, sizeof(resource_name), "%s", route);
+/*
+ * Java TrafficUsageService.flush ahead of the reads that ask for it: ClientResource's list and
+ * detail, OverviewResource and TrafficResource with flush=true. A flush that fails keeps the
+ * counts for the next one; Java's throws, so the read answers 500 here as well.
+ */
+static int admin_flush_traffic_usage(char *out, size_t out_len, int *answer)
+{
+    const char *database_path = admin_database_path();
+    if (database_path == NULL || st_traffic_usage_flush(database_path) == 0) {
+        return 0;
     }
-    char resource_key[192];
-    snprintf(resource_key, sizeof(resource_key), "http:%s", route);
-    st_storage_record_resource_traffic_usage(database_path,
-                                             client.id,
-                                             client.client_name,
-                                             "HTTP_ROUTE",
-                                             resource_key,
-                                             resource_id,
-                                             resource_name,
-                                             usage_date,
-                                             upload_bytes,
-                                             download_bytes);
+    *answer = write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"traffic usage flush failed\"}");
+    return -1;
 }
 
 /*
@@ -5116,6 +5086,10 @@ static int admin_load_tenant_client(const char *database_path,
 
 static int build_clients_response(const st_admin_context *context, char *out, size_t out_len)
 {
+    int answer = 0;
+    if (admin_flush_traffic_usage(out, out_len, &answer) != 0) {
+        return answer;
+    }
     st_admin_string_builder builder = {0};
     int rc = admin_sb_append(&builder, "[");
     const char *database_path = admin_database_path();
@@ -5228,6 +5202,10 @@ static int build_client_detail_response(const st_admin_context *context,
                                         char *out,
                                         size_t out_len)
 {
+    int answer = 0;
+    if (admin_flush_traffic_usage(out, out_len, &answer) != 0) {
+        return answer;
+    }
     const char *database_path = admin_database_path();
     st_storage_client client;
     if (database_path == NULL
@@ -7877,6 +7855,11 @@ static int admin_traffic_usage_params(const st_admin_context *context,
     int limit_param = admin_query_number_param(path, "limit", INT_MIN, INT_MAX, &requested_limit);
     if (client_filter < 0 || limit_param < 0) {
         *answer = write_spring_bad_request(out, out_len);
+        return -1;
+    }
+    /* flush=true writes what was counted in memory first, before the visibility check, as Java. */
+    int flush = 0;
+    if (admin_query_bool(path, "flush", &flush) == 0 && flush && admin_flush_traffic_usage(out, out_len, answer) != 0) {
         return -1;
     }
     *limit = requested_limit < 1 ? 1 : (requested_limit > 500 ? 500 : (int)requested_limit);
