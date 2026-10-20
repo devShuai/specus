@@ -18,7 +18,8 @@ import (
 // (protocol/spec/peer-egress.md, 能力不支持): an egress the catalogue leaves out, or one whose client
 // announced no peer egress, would take a flow and drop it without a word, so its destinations are
 // blocked and the reason said instead. domainTargetCapable says whether a domain rule sent to it is
-// in force. Availability still comes from the mesh's own view of which peers are online, not from
+// in force, and ipv6PacketCapable whether an IPv6 rule sent to it is (protocol/spec/peer-egress.md,
+// IPv6 数据面). Availability still comes from the mesh's own view of which peers are online, not from
 // the catalogue's online field.
 //
 // The decoding rules are protocol/spec/peer-egress-dns.md's 能力协商 and the catalog cases of
@@ -32,6 +33,10 @@ const peerControlTypeEgressCatalog = "egress-catalog"
 // egressCatalogListing is what an accepted catalogue said about one egress it lists.
 type egressCatalogListing struct {
 	DomainTargetCapable bool
+	// IPv6PacketCapable says the egress takes IPv6 packets in SPEG1 type=1 frames. A server older
+	// than the field sends none, which reads as false: an IPv6 packet sent to an egress that cannot
+	// read it is refused there with EGRESS_IPV6_UNSUPPORTED, so it is blocked here and said instead.
+	IPv6PacketCapable bool
 	// Version is the egressVersion the egress's online session announced, when VersionKnown. A
 	// server older than the field sends none, and that reads as unknown rather than as 0: 0 says the
 	// egress's client announced no peer egress, which blocks, and an older server must block nothing.
@@ -115,6 +120,7 @@ func (r *egressCatalogReader) read(payload []byte) bool {
 		// send, and reading them as yes would send names to an egress that may not take them.
 		listing := egressCatalogListing{
 			DomainTargetCapable: bytes.Equal(bytes.TrimSpace(entry["domainTargetCapable"]), []byte("true")),
+			IPv6PacketCapable:   bytes.Equal(bytes.TrimSpace(entry["ipv6PacketCapable"]), []byte("true")),
 		}
 		// Only a non-negative integer is a version. Anything else reads as no field at all, which is
 		// what an older server sends, so a server that got the type wrong blocks nothing.
@@ -149,6 +155,17 @@ func (r *egressCatalogReader) capableIDs() []int64 {
 	ids := make([]int64, 0, len(r.listed))
 	for id, listing := range r.listed {
 		if listing.DomainTargetCapable {
+			ids = append(ids, id)
+		}
+	}
+	return sortEgressIDs(ids)
+}
+
+// ipv6CapableIDs lists the egresses that take IPv6 packets, in order.
+func (r *egressCatalogReader) ipv6CapableIDs() []int64 {
+	ids := make([]int64, 0, len(r.listed))
+	for id, listing := range r.listed {
+		if listing.IPv6PacketCapable {
 			ids = append(ids, id)
 		}
 	}
