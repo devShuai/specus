@@ -5,6 +5,7 @@
 #include "crypto.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <hiredis/hiredis.h>
 #include <pthread.h>
 #include <signal.h>
@@ -23,6 +24,8 @@ typedef struct {
     pthread_mutex_t lock;
     pthread_cond_t cond;
     int received;
+    unsigned long handled;
+    int block;
     uint8_t kind;
     char target[ST_PUBLIC_CLUSTER_EVENT_ID_BYTES + 1U];
     char payload[256];
@@ -35,10 +38,11 @@ static event_capture capture = {
     .cond = PTHREAD_COND_INITIALIZER
 };
 
+/* Records the event; while capture.block is set the handler stays inside, as a slow consumer. */
 static void capture_event(const st_public_cluster_event *event, void *context)
 {
     (void)context;
-    if (event == NULL || event->kind == ST_PUBLIC_CLUSTER_EVENT_UNAVAILABLE) return;
+    if (event == NULL) return;
     pthread_mutex_lock(&capture.lock);
     capture.kind = event->kind;
     snprintf(capture.target, sizeof(capture.target), "%s", event->target_peer_id);
@@ -47,7 +51,9 @@ static void capture_event(const st_public_cluster_event *event, void *context)
     if (length > 0U) memcpy(capture.payload, event->payload, length);
     capture.payload[length] = '\0';
     capture.received = 1;
+    ++capture.handled;
     pthread_cond_broadcast(&capture.cond);
+    while (capture.block) pthread_cond_wait(&capture.cond, &capture.lock);
     pthread_mutex_unlock(&capture.lock);
 }
 
@@ -87,6 +93,29 @@ static redisReply *fixture_command(const char *format, ...)
     va_end(arguments);
     redisFree(redis);
     return reply;
+}
+
+/* How often Redis has run one command so far (INFO commandstats). */
+static long long command_calls(const char *command)
+{
+    redisReply *reply = fixture_command("INFO commandstats");
+    if (reply == NULL || (reply->type != REDIS_REPLY_STRING && reply->type != REDIS_REPLY_VERB)) {
+        freeReplyObject(reply);
+        return -1;
+    }
+    char needle[64];
+    snprintf(needle, sizeof(needle), "cmdstat_%s:calls=", command);
+    const char *found = strstr(reply->str, needle);
+    long long calls = found == NULL ? 0 : strtoll(found + strlen(needle), NULL, 10);
+    freeReplyObject(reply);
+    return calls;
+}
+
+static st_public_coordination_status status_now(void)
+{
+    st_public_coordination_status status;
+    st_public_coordination_status_get(&status);
+    return status;
 }
 
 static int wait_for_event(void)
@@ -253,6 +282,281 @@ static int test_unidentifiable_addresses(void)
         (void)st_public_coordination_unregister(&first, &revision);
         (void)st_public_coordination_unregister(&second, &revision);
         (void)st_public_coordination_unregister(&mate, &revision);
+    }
+    return 0;
+}
+
+/*
+ * Java findPeer walks the merged scope with one SMEMBERS and one MGET per group, without cleanup or
+ * revision reads; roster() reads the presences with one MGET per group instead of a GET per member.
+ */
+static int test_lookup_costs(void)
+{
+    static const char *const ids[] = {"cost-a", "cost-b", "cost-c", "cost-d"};
+    static const char *const names[] = {"Cost A", "Cost B", "Cost C", "Cost D"};
+    st_public_cluster_participant peers[4];
+    uint64_t revision = 0U;
+    for (size_t i = 0U; i < 4U; ++i) {
+        if (participant(&peers[i], ids[i], names[i], "cost-room", "room:cost", "203.0.113.90") != 0
+            || st_public_coordination_register(&peers[i], 10, &revision) != 0) {
+            fprintf(stderr, "lookup cost participant %s\n", ids[i]);
+            return 1;
+        }
+    }
+    long long get_before = command_calls("get");
+    long long eval_before = command_calls("eval");
+    long long mget_before = command_calls("mget");
+    st_public_cluster_participant found_peer;
+    int found = 0;
+    if (st_public_coordination_find_peer(&peers[0], "cost-d", &found_peer, &found) != 0 || !found) {
+        fprintf(stderr, "lookup cost target not found\n");
+        return 1;
+    }
+    long long get_lookup = command_calls("get");
+    long long eval_lookup = command_calls("eval");
+    long long mget_lookup = command_calls("mget");
+    if (get_lookup != get_before || eval_lookup != eval_before || mget_lookup != mget_before + 1) {
+        fprintf(stderr, "findPeer cost: %lld GET, %lld EVAL, %lld MGET (expected 0, 0, 1)\n",
+                get_lookup - get_before, eval_lookup - eval_before, mget_lookup - mget_before);
+        return 1;
+    }
+    st_public_cluster_roster roster = {0};
+    if (st_public_coordination_roster(&peers[0], &roster) != 0 || roster.count != 4U) {
+        fprintf(stderr, "lookup cost roster\n");
+        return 1;
+    }
+    st_public_coordination_roster_free(&roster);
+    long long get_roster = command_calls("get") - get_lookup;
+    long long eval_roster = command_calls("eval") - eval_lookup;
+    long long mget_roster = command_calls("mget") - mget_lookup;
+    /*
+     * One cleanup script (its two revision GETs count too), four revision reads around one stable
+     * pass and one MGET for the one group; no GET per member.
+     */
+    if (get_roster != 6 || eval_roster != 1 || mget_roster != 1) {
+        fprintf(stderr, "roster cost: %lld GET, %lld EVAL, %lld MGET (expected 6, 1, 1)\n",
+                get_roster, eval_roster, mget_roster);
+        return 1;
+    }
+    for (size_t i = 0U; i < 4U; ++i) (void)st_public_coordination_unregister(&peers[i], &revision);
+    return 0;
+}
+
+/* Java command(): an error reply fails that call only; the connection stays and the next call works. */
+static int test_error_reply_fails_only_the_call(void)
+{
+    static const char bucket_and_identity[] = "wrongtype\0probe";
+    uint8_t digest[ST_SHA256_LEN];
+    char hex[ST_SHA256_LEN * 2U + 1U];
+    st_sha256((const uint8_t *)bucket_and_identity, sizeof(bucket_and_identity) - 1U, digest);
+    st_hex_encode(digest, sizeof(digest), hex);
+    char key[256];
+    snprintf(key, sizeof(key), "%s:rate:%s", getenv("SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX"), hex);
+    /* A set where the rate script expects a counter: INCR answers WRONGTYPE. */
+    redisReply *seeded = fixture_command("SADD %s member", key);
+    int seeded_ok = seeded != NULL && seeded->type == REDIS_REPLY_INTEGER;
+    freeReplyObject(seeded);
+    st_public_coordination_status before = status_now();
+    int allowed = 1;
+    if (!seeded_ok || st_public_coordination_allow_rate("wrongtype", "probe", 5, 30, &allowed) != -1) {
+        fprintf(stderr, "a WRONGTYPE reply did not fail the rate call\n");
+        return 1;
+    }
+    st_public_coordination_status after = status_now();
+    if (!after.command_connected || after.command_reconnects != before.command_reconnects
+        || !st_public_coordination_available()
+        || st_public_coordination_allow_rate("after-error", "probe", 5, 30, &allowed) != 0 || !allowed) {
+        fprintf(stderr, "an error reply affected more than its own call\n");
+        return 1;
+    }
+    freeReplyObject(fixture_command("DEL %s", key));
+    return 0;
+}
+
+/* A timed-out command fails alone; the next command reconnects instead of the instance giving up. */
+static int test_timeout_fails_only_the_call(void)
+{
+    st_public_coordination_status before = status_now();
+    redisReply *paused = fixture_command("CLIENT PAUSE %d", 700);
+    int paused_ok = paused != NULL && paused->type == REDIS_REPLY_STATUS;
+    freeReplyObject(paused);
+    long long started = now_ms();
+    int available = 0;
+    int timed_out = st_public_coordination_name_available("Pause Probe", "", &available) == -1;
+    long long elapsed = now_ms() - started;
+    if (!paused_ok || !timed_out || elapsed > 600) {
+        fprintf(stderr, "a paused Redis did not time the command out (%lld ms)\n", elapsed);
+        return 1;
+    }
+    sleep_ms(900 - (long)elapsed);
+    st_public_coordination_status after = status_now();
+    if (st_public_coordination_name_available("Pause Probe", "", &available) != 0 || !available
+        || status_now().command_reconnects <= before.command_reconnects
+        || !after.subscriber_connected || after.subscriber_reconnects != before.subscriber_reconnects) {
+        fprintf(stderr, "the command after a timeout did not reconnect, or the timeout reached Pub/Sub\n");
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * Java's event executor: a blocked handler leaves at most 4096 events queued and drops the rest,
+ * while the subscription keeps reading.
+ */
+static int test_event_queue_is_bounded(void)
+{
+    static const char text[] = "{\"type\":\"queue\"}";
+    st_public_cluster_participant source;
+    if (participant(&source, "queue-source", "Queue Source", "queue-room", "room:queue", "203.0.113.91") != 0) {
+        return 1;
+    }
+    st_public_coordination_status before = status_now();
+    pthread_mutex_lock(&capture.lock);
+    capture.handled = 0U;
+    capture.block = 1;
+    pthread_mutex_unlock(&capture.lock);
+    if (st_public_coordination_publish_text(source.group_id, "", source.lease_id, 0,
+                                            (const uint8_t *)text, strlen(text)) != 0) return 1;
+    long long deadline = now_ms() + 3000;
+    for (;;) {
+        pthread_mutex_lock(&capture.lock);
+        unsigned long handled = capture.handled;
+        pthread_mutex_unlock(&capture.lock);
+        if (handled == 1U) break;
+        if (now_ms() > deadline) {
+            fprintf(stderr, "the first queued event never reached the handler\n");
+            return 1;
+        }
+        sleep_ms(5);
+    }
+    const unsigned long extra = 64U;
+    for (unsigned long i = 0U; i < ST_PUBLIC_CLUSTER_EVENT_QUEUE_LIMIT + extra; ++i) {
+        if (st_public_coordination_publish_text(source.group_id, "", source.lease_id, 0,
+                                                (const uint8_t *)text, strlen(text)) != 0) {
+            fprintf(stderr, "publish %lu failed\n", i);
+            return 1;
+        }
+    }
+    st_public_coordination_status full;
+    deadline = now_ms() + 5000;
+    do {
+        full = status_now();
+        if (full.events_dropped - before.events_dropped >= extra) break;
+        sleep_ms(10);
+    } while (now_ms() < deadline);
+    if (full.events_queued != ST_PUBLIC_CLUSTER_EVENT_QUEUE_LIMIT
+        || full.events_dropped - before.events_dropped != extra || !full.subscriber_connected) {
+        fprintf(stderr, "queue: %zu queued, %lu dropped, subscriber %d\n", full.events_queued,
+                full.events_dropped - before.events_dropped, full.subscriber_connected);
+        return 1;
+    }
+    pthread_mutex_lock(&capture.lock);
+    capture.block = 0;
+    pthread_cond_broadcast(&capture.cond);
+    pthread_mutex_unlock(&capture.lock);
+    deadline = now_ms() + 5000;
+    unsigned long handled = 0U;
+    while (now_ms() < deadline) {
+        pthread_mutex_lock(&capture.lock);
+        handled = capture.handled;
+        pthread_mutex_unlock(&capture.lock);
+        if (handled >= 1U + ST_PUBLIC_CLUSTER_EVENT_QUEUE_LIMIT) break;
+        sleep_ms(10);
+    }
+    sleep_ms(200);
+    pthread_mutex_lock(&capture.lock);
+    handled = capture.handled;
+    pthread_mutex_unlock(&capture.lock);
+    if (handled != 1U + ST_PUBLIC_CLUSTER_EVENT_QUEUE_LIMIT) {
+        fprintf(stderr, "handled %lu events, expected %u\n", handled, 1U + ST_PUBLIC_CLUSTER_EVENT_QUEUE_LIMIT);
+        return 1;
+    }
+    return 0;
+}
+
+/* The fixture's own redis-server, started again on the same port after SHUTDOWN. */
+static pid_t restarted_redis = -1;
+
+/* posix_spawn rather than fork: this process already runs the coordination threads. */
+static pid_t start_redis(void)
+{
+    char port[16];
+    snprintf(port, sizeof(port), "%d", fixture_port());
+    const char *dir = getenv("SPECUS_TEST_REDIS_DIR");
+    char *const argv[] = {"redis-server", "--bind", "127.0.0.1", "--port", port,
+                          "--protected-mode", "yes", "--save", "", "--appendonly", "no",
+                          "--dir", (char *)(dir == NULL ? "/tmp" : dir), NULL};
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) return -1;
+    (void)posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+    (void)posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    pid_t child = -1;
+    int rc = posix_spawnp(&child, "redis-server", &actions, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    return rc == 0 ? child : -1;
+}
+
+/*
+ * Lettuce reconnects on its own: while Redis is down the operations fail, and once it is back the
+ * commands work again and the Pub/Sub subscription is re-established, without a process restart.
+ */
+static int test_reconnect_after_restart(void)
+{
+    st_public_coordination_status before = status_now();
+    freeReplyObject(fixture_command("SHUTDOWN NOSAVE"));
+    long long deadline = now_ms() + 3000;
+    while (status_now().subscriber_connected && now_ms() < deadline) sleep_ms(10);
+    int allowed = 0;
+    static const char text[] = "{\"type\":\"restart\"}";
+    st_public_cluster_participant source;
+    if (participant(&source, "restart-source", "Restart Source", "restart-room", "room:restart", "203.0.113.92") != 0
+        || status_now().subscriber_connected
+        || st_public_coordination_allow_rate("restart", "probe", 5, 30, &allowed) != -1
+        || st_public_coordination_publish_text(source.group_id, "", source.lease_id, 0,
+                                               (const uint8_t *)text, strlen(text)) != -1) {
+        fprintf(stderr, "operations did not fail while Redis was down\n");
+        return 1;
+    }
+    restarted_redis = start_redis();
+    deadline = now_ms() + 5000;
+    int up = 0;
+    while (!up && now_ms() < deadline) {
+        redisReply *pong = fixture_command("PING");
+        up = pong != NULL && pong->type == REDIS_REPLY_STATUS;
+        freeReplyObject(pong);
+        if (!up) sleep_ms(20);
+    }
+    if (restarted_redis < 0 || !up) {
+        fprintf(stderr, "the fixture could not restart redis-server\n");
+        return 1;
+    }
+    deadline = now_ms() + 10000;
+    int recovered = 0;
+    while (!recovered && now_ms() < deadline) {
+        recovered = st_public_coordination_allow_rate("restart", "probe", 5, 30, &allowed) == 0 && allowed;
+        if (!recovered) sleep_ms(50);
+    }
+    while (recovered && !status_now().subscriber_connected && now_ms() < deadline) sleep_ms(20);
+    if (!recovered || !status_now().subscriber_connected) {
+        fprintf(stderr, "coordination did not recover after Redis came back\n");
+        return 1;
+    }
+    pthread_mutex_lock(&capture.lock);
+    capture.received = 0;
+    pthread_mutex_unlock(&capture.lock);
+    if (st_public_coordination_publish_text(source.group_id, "restart-target", source.lease_id, 0,
+                                            (const uint8_t *)text, strlen(text)) != 0
+        || wait_for_event() != 0 || strcmp(capture.target, "restart-target") != 0
+        || strcmp(capture.payload, text) != 0) {
+        fprintf(stderr, "the Pub/Sub subscription was not re-established\n");
+        return 1;
+    }
+    st_public_coordination_status after = status_now();
+    if (after.subscriber_reconnects <= before.subscriber_reconnects
+        || after.command_reconnects <= before.command_reconnects
+        || after.publisher_reconnects <= before.publisher_reconnects || !st_public_coordination_available()) {
+        fprintf(stderr, "reconnect counters did not move\n");
+        return 1;
     }
     return 0;
 }
@@ -489,7 +793,7 @@ int main(int argc, char **argv)
     }
     struct timespec idle = {.tv_sec = 0, .tv_nsec = 250000000L};
     (void)nanosleep(&idle, NULL);
-    if (!st_public_coordination_available()) {
+    if (!st_public_coordination_available() || status_now().subscriber_reconnects != 0U) {
         fprintf(stderr, "idle Pub/Sub connection incorrectly used the command timeout\n");
         return 1;
     }
@@ -601,8 +905,17 @@ int main(int argc, char **argv)
     (void)st_public_coordination_unregister(&p3, &revision);
     (void)st_public_coordination_unregister(&unicode_name, &revision);
     if (test_merged_roster_and_revision() != 0 || test_unidentifiable_addresses() != 0) return 1;
-    int failed = test_spring_binding() != 0;
+    int failed = test_lookup_costs() != 0
+        || test_error_reply_fails_only_the_call() != 0
+        || test_timeout_fails_only_the_call() != 0
+        || test_event_queue_is_bounded() != 0
+        || test_spring_binding() != 0
+        || test_reconnect_after_restart() != 0;
     st_public_coordination_shutdown();
+    if (restarted_redis > 0) {
+        (void)kill(restarted_redis, SIGTERM);
+        (void)waitpid(restarted_redis, NULL, 0);
+    }
     if (failed) return 1;
     puts("public coordination tests passed");
     return 0;

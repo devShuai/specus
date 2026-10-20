@@ -91,9 +91,9 @@ int st_public_discovery_initialize(void)
 {
     pthread_mutex_lock(&public_discovery_init_lock);
     if (public_discovery_initialized) {
-        int result = !st_public_coordination_enabled() || st_public_coordination_available() ? 0 : -1;
+        /* A later Redis failure is not terminal: each operation fails alone and reconnects. */
         pthread_mutex_unlock(&public_discovery_init_lock);
-        return result;
+        return 0;
     }
     if (st_public_coordination_enabled()) {
         if (st_public_coordination_initialize(public_cluster_event_handler, NULL) != 0) {
@@ -1062,13 +1062,6 @@ static void public_cluster_event_handler(const st_public_cluster_event *event, v
         st_admin_handle_cluster_event(event);
         return;
     }
-    if (event->kind == ST_PUBLIC_CLUSTER_EVENT_UNAVAILABLE) {
-        pthread_mutex_lock(&public_peer_lock);
-        for (st_public_peer *peer = public_peers; peer != NULL; peer = peer->next)
-            (void)shutdown(peer->fd, SHUT_RDWR);
-        pthread_mutex_unlock(&public_peer_lock);
-        return;
-    }
     if (event->kind == ST_PUBLIC_CLUSTER_EVENT_ROSTER) {
         pthread_mutex_lock(&public_peer_lock);
         size_t count = 0U;
@@ -1087,19 +1080,37 @@ static void public_cluster_event_handler(const st_public_cluster_event *event, v
             }
         }
         pthread_mutex_unlock(&public_peer_lock);
-        for (size_t i = 0U; i < copied; ++i) {
-            st_public_cluster_roster roster = {0};
-            if (st_public_coordination_roster(&recipients[i], &roster) != 0) break;
-            char *text = public_build_cluster_roster_text(&recipients[i], &roster);
-            st_public_coordination_roster_free(&roster);
-            if (text != NULL) {
-                pthread_mutex_lock(&public_peer_lock);
-                st_public_peer *peer = public_find_cluster_peer_locked(recipients[i].lease_id);
-                if (peer != NULL) (void)public_peer_send_text(peer, text);
-                pthread_mutex_unlock(&public_peer_lock);
-                free(text);
+        /*
+         * Java emitRoster: one Redis snapshot per (groupId, netId) of the recipients in this event,
+         * each recipient's view built from it; a failed read discards the rest of the event.
+         */
+        st_public_cluster_roster *snapshots = copied == 0U ? NULL
+            : (st_public_cluster_roster *)calloc(copied, sizeof(*snapshots));
+        size_t *snapshot_of = copied == 0U ? NULL : (size_t *)calloc(copied, sizeof(*snapshot_of));
+        size_t snapshot_count = 0U;
+        for (size_t i = 0U; snapshots != NULL && snapshot_of != NULL && i < copied; ++i) {
+            size_t found = SIZE_MAX;
+            for (size_t j = 0U; j < i && found == SIZE_MAX; ++j) {
+                if (strcmp(recipients[j].group_id, recipients[i].group_id) == 0
+                    && strcmp(recipients[j].net_id, recipients[i].net_id) == 0) found = snapshot_of[j];
             }
+            if (found == SIZE_MAX) {
+                if (st_public_coordination_roster(&recipients[i], &snapshots[snapshot_count]) != 0) break;
+                found = snapshot_count++;
+            }
+            snapshot_of[i] = found;
+            char *text = public_build_cluster_roster_text(&recipients[i], &snapshots[found]);
+            if (text == NULL) continue;
+            pthread_mutex_lock(&public_peer_lock);
+            st_public_peer *peer = public_find_cluster_peer_locked(recipients[i].lease_id);
+            if (peer != NULL) (void)public_peer_send_text(peer, text);
+            pthread_mutex_unlock(&public_peer_lock);
+            free(text);
         }
+        for (size_t i = 0U; snapshots != NULL && i < snapshot_count; ++i)
+            st_public_coordination_roster_free(&snapshots[i]);
+        free(snapshots);
+        free(snapshot_of);
         free(recipients);
         return;
     }
@@ -1315,12 +1326,90 @@ static int public_allow_message(st_public_peer *peer)
     return 1;
 }
 
-static void public_drop_cluster_lease(const char *lease_id)
+/*
+ * Java dropLocal(session, SERVER_ERROR): forgets the connection at once (so it is neither
+ * unregistered nor announced when it ends), closes it with 1011 and ends it. lease_id NULL drops
+ * every local connection, hidden ones included.
+ */
+static void public_drop_peers(const char *lease_id)
 {
     pthread_mutex_lock(&public_peer_lock);
-    st_public_peer *peer = public_find_cluster_peer_locked(lease_id);
-    if (peer != NULL) (void)shutdown(peer->fd, SHUT_RDWR);
+    st_public_peer **cursor = &public_peers;
+    while (*cursor != NULL) {
+        st_public_peer *peer = *cursor;
+        if (lease_id != NULL && strcmp(peer->cluster.lease_id, lease_id) != 0) {
+            cursor = &peer->next;
+            continue;
+        }
+        *cursor = peer->next;
+        public_peer_close(peer, 1011U);
+        (void)shutdown(peer->fd, SHUT_RDWR);
+        if (lease_id != NULL) break;
+    }
     pthread_mutex_unlock(&public_peer_lock);
+}
+
+/* Appends value unless an equal string is already among the first count entries. */
+static int public_unique_add(const char **values, size_t *count, const char *value)
+{
+    for (size_t i = 0U; i < *count; ++i)
+        if (strcmp(values[i], value) == 0) return 0;
+    values[(*count)++] = value;
+    return 1;
+}
+
+/*
+ * Java refreshClusterPresence: renew every visible local lease (a lost lease drops that socket
+ * with 1011), then sweep each distinct (group, net) once and publish one roster per distinct net.
+ * Any Redis failure in the cycle drops every local discovery socket with 1011.
+ */
+static void public_refresh_cluster_presence(void)
+{
+    pthread_mutex_lock(&public_peer_lock);
+    size_t count = 0U;
+    for (st_public_peer *peer = public_peers; peer != NULL; peer = peer->next)
+        if (peer->discoverable) ++count;
+    st_public_cluster_participant *participants = count == 0U ? NULL
+        : (st_public_cluster_participant *)calloc(count, sizeof(*participants));
+    size_t copied = 0U;
+    if (participants != NULL) {
+        for (st_public_peer *peer = public_peers; peer != NULL && copied < count; peer = peer->next)
+            if (peer->discoverable) participants[copied++] = peer->cluster;
+    }
+    pthread_mutex_unlock(&public_peer_lock);
+    if (copied == 0U) {
+        free(participants);
+        return;
+    }
+    const st_public_cluster_participant **group_nets =
+        (const st_public_cluster_participant **)calloc(copied, sizeof(*group_nets));
+    const char **nets = (const char **)calloc(copied, sizeof(*nets));
+    size_t group_net_count = 0U;
+    size_t net_count = 0U;
+    int failed = group_nets == NULL || nets == NULL;
+    for (size_t i = 0U; !failed && i < copied; ++i) {
+        int distinct = 1;
+        for (size_t j = 0U; j < group_net_count && distinct; ++j) {
+            distinct = strcmp(group_nets[j]->group_id, participants[i].group_id) != 0
+                || strcmp(group_nets[j]->net_id, participants[i].net_id) != 0;
+        }
+        if (distinct) group_nets[group_net_count++] = &participants[i];
+        (void)public_unique_add(nets, &net_count, participants[i].net_id);
+        int refreshed = st_public_coordination_refresh(&participants[i]);
+        if (refreshed < 0) failed = 1;
+        else if (refreshed > 0) public_drop_peers(participants[i].lease_id);
+    }
+    for (size_t i = 0U; !failed && i < group_net_count; ++i)
+        failed = st_public_coordination_sweep(group_nets[i]->group_id, group_nets[i]->net_id) != 0;
+    for (size_t i = 0U; !failed && i < net_count; ++i)
+        failed = st_public_coordination_publish_roster(nets[i], 0U) != 0;
+    if (failed) {
+        fprintf(stderr, "[public-transfer] Redis coordination unavailable; closing local discovery sockets\n");
+        public_drop_peers(NULL);
+    }
+    free((void *)group_nets);
+    free((void *)nets);
+    free(participants);
 }
 
 static void *public_cluster_refresh_thread(void *unused)
@@ -1346,31 +1435,7 @@ static void *public_cluster_refresh_thread(void *unused)
         int stopping = public_refresh_stop;
         pthread_mutex_unlock(&public_discovery_init_lock);
         if (stopping) break;
-
-        pthread_mutex_lock(&public_peer_lock);
-        size_t count = 0U;
-        for (st_public_peer *peer = public_peers; peer != NULL; peer = peer->next)
-            if (peer->discoverable) ++count;
-        st_public_cluster_participant *participants = count == 0U ? NULL
-            : (st_public_cluster_participant *)calloc(count, sizeof(*participants));
-        size_t copied = 0U;
-        if (participants != NULL) {
-            for (st_public_peer *peer = public_peers; peer != NULL && copied < count; peer = peer->next)
-                if (peer->discoverable) participants[copied++] = peer->cluster;
-        }
-        pthread_mutex_unlock(&public_peer_lock);
-        for (size_t i = 0U; i < copied; ++i) {
-            int refreshed = st_public_coordination_refresh(&participants[i]);
-            if (refreshed < 0) break;
-            if (refreshed > 0) {
-                public_drop_cluster_lease(participants[i].lease_id);
-                continue;
-            }
-            if (st_public_coordination_sweep(&participants[i]) != 0
-                || st_public_coordination_publish_roster(participants[i].net_id, 0U) != 0)
-                break;
-        }
-        free(participants);
+        public_refresh_cluster_presence();
     }
     return NULL;
 }

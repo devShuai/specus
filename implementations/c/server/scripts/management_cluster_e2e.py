@@ -190,9 +190,12 @@ class Fixture:
         self.processes = []
         self.binary = str(Path(binary).resolve())
         self.redis_port = free_port()
-        self.spawn("redis", ["redis-server", "--bind", "127.0.0.1", "--port", str(self.redis_port),
-                              "--protected-mode", "yes", "--save", "", "--appendonly", "no",
-                              "--dir", str(self.directory)])
+        self.start_redis("redis")
+
+    def start_redis(self, name):
+        self.spawn(name, ["redis-server", "--bind", "127.0.0.1", "--port", str(self.redis_port),
+                          "--protected-mode", "yes", "--save", "", "--appendonly", "no",
+                          "--dir", str(self.directory)])
         for _ in range(100):
             try:
                 with socket.create_connection(("127.0.0.1", self.redis_port), timeout=0.2) as channel:
@@ -203,6 +206,11 @@ class Fixture:
                 time.sleep(0.05)
         else:
             raise AssertionError("private Redis did not start")
+
+    def subscribers(self):
+        with contextlib.closing(socket.create_connection(("127.0.0.1", self.redis_port), timeout=3)) as channel:
+            resp_command(channel, "PUBSUB", "NUMSUB", PREFIX + ":events")
+            return resp_read(channel)[1]
 
     def spawn(self, name, command, env=None):
         log = self.stack.enter_context((self.directory / (name + ".log")).open("wb"))
@@ -446,6 +454,20 @@ def check(binary):
         local_bob.revoked("account disabled")
         bob_ws.alive()  # Documented missed Pub/Sub delivery, not fake remote success.
         print("ok Redis failure preserves local event fallback and committed local revocation", flush=True)
+
+        # Lettuce reconnects on its own: with Redis back on the same port every instance subscribes
+        # again and publishes again, so a committed revocation crosses instances without a restart.
+        fixture.start_redis("redis-restarted")
+        deadline = time.monotonic() + 15
+        while fixture.subscribers() < 3:
+            assert time.monotonic() < deadline, "the three C instances did not subscribe again"
+            time.sleep(0.05)
+        request(one, "PUT", "/api/admin/users/bob", {"enabled": True}, admin_token)
+        remote_bob = fixture.ws(two, login(two, "bob"))
+        request(one, "PUT", "/api/admin/users/bob", {"enabled": False}, admin_token)
+        remote_bob.revoked("account disabled")
+        admin_ws[1].alive()
+        print("ok after Redis returns, revocations cross instances again without a restart", flush=True)
 
 
 def check_interop(binary, java_jar, java_executable):

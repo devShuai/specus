@@ -14,6 +14,8 @@ cleanup() {
   if [[ -n "${SERVER_ONE_PID:-}" ]]; then kill "$SERVER_ONE_PID" 2>/dev/null || true; fi
   if [[ -n "${SERVER_TWO_PID:-}" ]]; then kill "$SERVER_TWO_PID" 2>/dev/null || true; fi
   if [[ -n "${REDIS_PID:-}" ]]; then kill "$REDIS_PID" 2>/dev/null || true; fi
+  # The recovery check restarts redis-server on the same port; stop whichever instance is left.
+  redis-cli -h 127.0.0.1 -p "$REDIS_PORT" shutdown nosave >/dev/null 2>&1 || true
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
@@ -162,6 +164,34 @@ class WebSocket:
                 raise EOFError(f"websocket closed: {payload!r}")
         raise TimeoutError("matching websocket JSON was not received")
 
+    def close_code(self, timeout=5):
+        """The status code of the server's close frame; None when the stream ends without one."""
+        deadline = time.time() + timeout
+        try:
+            while time.time() < deadline:
+                self.sock.settimeout(max(0.1, deadline - time.time()))
+                opcode, payload = self.receive()
+                if opcode == 8:
+                    return struct.unpack("!H", payload[:2])[0] if len(payload) >= 2 else None
+        except (EOFError, OSError):
+            return None
+        raise TimeoutError("the websocket was not closed")
+
+    def count_rosters(self, seconds):
+        deadline = time.time() + seconds
+        count = 0
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return count
+            self.sock.settimeout(remaining)
+            try:
+                opcode, payload = self.receive()
+            except socket.timeout:
+                return count
+            if opcode == 1 and json.loads(payload).get("type") == "roster":
+                count += 1
+
 def server_environment(admin_port, **settings):
     environment = {key: value for key, value in os.environ.items() if not key.startswith("SPECUS_")}
     environment.update(SPECUS_ENV="dev", SPECUS_DB_SEED_DEMO_CLIENT="false",
@@ -261,6 +291,9 @@ target = b"peer-b"
 relay = b"STWR" + bytes((2, 0)) + struct.pack("!HHI", len(target), 0, len(app)) + target + app
 one.send(2, relay)
 opcode, binary = two.receive()
+# The 200 ms presence refresh keeps publishing rosters; skip any that arrive first.
+while opcode == 1 and json.loads(binary).get("type") == "roster":
+    opcode, binary = two.receive()
 if opcode != 2 or binary[:4] != b"STWR":
     raise RuntimeError("cross-instance binary relay was not delivered")
 target_len, source_len, app_len = struct.unpack("!HHI", binary[6:14])
@@ -308,6 +341,23 @@ for websocket in (one, two):
         if "peer-hidden" in {peer["peerId"] for peer in value["peers"]}:
             raise RuntimeError(f"a hidden peer was listed in a visible peer's roster: {value}")
 
+# Java refreshClusterPresence publishes one roster per distinct net and cycle on each instance,
+# however many visible peers that instance holds there. Every peer here shares the loopback net:
+# instance one holds peer-a and three more, instance two holds peer-b and peer-c, so each 200 ms
+# cycle brings peer-a two rosters (a roster per visible peer would be six).
+extras = []
+for index in range(3):
+    extra = WebSocket(ADMIN_ONE, issue_ticket(ADMIN_ONE, f"peer-x{index}", f"Extra {index}"))
+    extra.json_until(lambda value: value.get("type") == "hello")
+    extras.append(extra)
+one.count_rosters(0.6)
+rosters = one.count_rosters(2.0)
+if rosters > 30:
+    raise RuntimeError(f"{rosters} rosters in ten refresh cycles; one per net and instance was expected")
+print(f"rosters in ten refresh cycles: {rosters}")
+for extra in extras:
+    extra.sock.close()
+
 # The pairing-code redemption window (two per source in this run) lives in Redis, so the two
 # instances share it: the third and fourth attempts are refused whichever instance they reach.
 # These servers have no SPECUS_DATABASE_PATH, so an admitted attempt finds no room storage (503);
@@ -320,23 +370,39 @@ if statuses != [503, 503, 429, 429]:
 
 subprocess.run(["redis-cli", "-h", "127.0.0.1", "-p", str(REDIS_PORT),
                 "shutdown", "nosave"], check=True, stdout=subprocess.DEVNULL)
-deadline = time.time() + 5
-closed = 0
-for websocket in (one, two):
-    websocket.sock.settimeout(max(0.1, deadline - time.time()))
-    try:
-        while time.time() < deadline:
-            opcode, _ = websocket.receive()
-            if opcode == 8:
-                closed += 1
-                break
-    except (EOFError, OSError, socket.timeout):
-        closed += 1
-if closed != 2:
-    raise RuntimeError("Redis outage did not fail closed across both instances")
+# Java dropLocal: the refresh cycle that meets the outage closes every local socket with 1011.
+for name, websocket in (("one", one), ("two", two)):
+    code = websocket.close_code(5)
+    if code != 1011:
+        raise RuntimeError(f"Redis outage closed instance {name}'s socket with {code}, not 1011")
 status, refused = request(ADMIN_TWO, "POST", "/api/public/transfer/rooms/pairing-codes/redeem", redeem)
 if status != 429:
     raise RuntimeError(f"pairing-code redemption did not fail closed without Redis: {status} {refused}")
+
+# Redis returns on the same port, empty: both instances recover without a restart, as Lettuce
+# reconnects and subscribes again.
+subprocess.Popen(["redis-server", "--bind", "127.0.0.1", "--port", str(REDIS_PORT), "--protected-mode", "yes",
+                  "--save", "", "--appendonly", "no", "--dir", TMP_DIR],
+                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+wait_ready()
+statuses = [request(port, "POST", "/api/public/transfer/rooms/pairing-codes/redeem", redeem)[0]
+            for port in (ADMIN_ONE, ADMIN_TWO)]
+if statuses != [503, 503]:
+    raise RuntimeError(f"pairing-code redemption did not recover with Redis: {statuses}")
+back_one = WebSocket(ADMIN_ONE, issue_ticket(ADMIN_ONE, "peer-back-1", "Back One"))
+back_two = WebSocket(ADMIN_TWO, issue_ticket(ADMIN_TWO, "peer-back-2", "Back Two"))
+back_one.json_until(lambda value: value.get("type") == "hello")
+back_two.json_until(lambda value: value.get("type") == "hello")
+# Each instance hears the other's presence again only through its renewed subscription.
+back_one.json_until(lambda value: value.get("type") == "roster"
+                    and "peer-back-2" in {peer["peerId"] for peer in value["peers"]}, timeout=15)
+back_two.json_until(lambda value: value.get("type") == "roster"
+                    and "peer-back-1" in {peer["peerId"] for peer in value["peers"]}, timeout=15)
+back_one.send(1, json.dumps({"type": "signal", "targetPeerId": "peer-back-2",
+                             "payload": {"after": "restart"}}, separators=(",", ":")).encode())
+message = back_two.json_until(lambda value: value.get("type") == "signal")
+if message.get("sourcePeerId") != "peer-back-1" or message.get("payload") != {"after": "restart"}:
+    raise RuntimeError(f"cross-instance signal after the restart: {message}")
 
 print("two-process Redis public discovery E2E passed")
 PY

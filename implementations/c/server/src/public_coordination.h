@@ -40,9 +40,32 @@ enum {
     ST_PUBLIC_CLUSTER_EVENT_TEXT = 2,
     ST_PUBLIC_CLUSTER_EVENT_BINARY = 3,
     ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT = 4,
-    ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT_REVOCATION = 5,
-    ST_PUBLIC_CLUSTER_EVENT_UNAVAILABLE = 255
+    ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT_REVOCATION = 5
 };
+
+/*
+ * Java's single "public-transfer-cluster-events" executor: decoded events wait in a bounded queue
+ * and one dispatcher thread hands them to the handler, so a slow handler never stalls the Redis
+ * subscription. A full queue drops the event (Java logs and discards). C also bounds the queued
+ * payload bytes, which Java does not.
+ */
+#define ST_PUBLIC_CLUSTER_EVENT_QUEUE_LIMIT 4096U
+#define ST_PUBLIC_CLUSTER_EVENT_QUEUE_MAX_BYTES (64U * 1024U * 1024U)
+
+/* Lettuce's default reconnect delay: 2^(attempt-1) ms after each failed attempt, at most 30 s. */
+#define ST_PUBLIC_CLUSTER_RECONNECT_MAX_DELAY_MS 30000L
+
+typedef struct {
+    int initialized;
+    int command_connected;
+    int publisher_connected;
+    int subscriber_connected;
+    unsigned long command_reconnects;
+    unsigned long publisher_reconnects;
+    unsigned long subscriber_reconnects;
+    unsigned long events_dropped;
+    size_t events_queued;
+} st_public_coordination_status;
 
 typedef struct {
     uint8_t kind;
@@ -69,9 +92,17 @@ int st_public_coordination_enabled(void);
  * must be a boolean and the lease, refresh and timeout values must be numbers. 0 or -1 (logged).
  */
 int st_public_coordination_validate_config(void);
+/*
+ * Startup connects the command, publish and subscribe connections (PING and SUBSCRIBE must
+ * succeed, as Java requires). Afterwards a lost connection is re-established in the background
+ * (Pub/Sub, with SUBSCRIBE replayed) or by the next command, with Lettuce's exponential delay;
+ * while a connection is down its operations fail without affecting the others.
+ */
 int st_public_coordination_initialize(st_public_cluster_event_handler handler, void *context);
 void st_public_coordination_shutdown(void);
+/* 1 after a successful initialize while the command and subscribe connections are both up. */
 int st_public_coordination_available(void);
+void st_public_coordination_status_get(st_public_coordination_status *status);
 long st_public_coordination_refresh_interval_ms(void);
 
 int st_public_coordination_prepare_participant(st_public_cluster_participant *participant);
@@ -80,10 +111,12 @@ int st_public_coordination_prepare_participant(st_public_cluster_participant *pa
 int st_public_coordination_register(const st_public_cluster_participant *participant,
                                     int room_limit,
                                     uint64_t *revision);
+/* 0 refreshed, 1 lease lost (the presence or name is no longer this lease's), -1 Redis failure. */
 int st_public_coordination_refresh(const st_public_cluster_participant *participant);
 int st_public_coordination_unregister(const st_public_cluster_participant *participant,
                                       uint64_t *revision);
-int st_public_coordination_sweep(const st_public_cluster_participant *participant);
+/* Java sweep(groupId, netId): prunes expired members and publishes both rosters when any left. */
+int st_public_coordination_sweep(const char *group_id, const char *net_id);
 
 int st_public_coordination_roster(const st_public_cluster_participant *recipient,
                                   st_public_cluster_roster *roster);
