@@ -29,16 +29,20 @@ import (
 // drops, or one to an egress that is not there, has no session to ask about. None of these drops is
 // answered: they are not an egress being unavailable but traffic this data plane cannot carry.
 func (c *egressConsumer) handleOutbound6(packet []byte, now time.Time) egressConsumerOutcome {
-	if !c.carriesIPv6 || len(packet) < ipv6HeaderLen {
-		// Without the data plane no IPv6 rule is in force, so nothing can claim the packet.
+	if len(packet) < ipv6HeaderLen {
 		return egressOutcomeNotMine
 	}
 	source, destination := [16]byte(packet[8:24]), [16]byte(packet[24:40])
+	c.mu.Lock()
+	if !c.carriesIPv6 {
+		// Without the data plane no IPv6 rule is in force, so nothing can claim the packet.
+		c.mu.Unlock()
+		return egressOutcomeNotMine
+	}
 	if egressIPv6LinkLocal(source) || egressIPv6Multicast(destination) {
+		c.mu.Unlock()
 		return egressOutcomeIgnored
 	}
-
-	c.mu.Lock()
 	if !c.hasVirtual6 || source != c.virtualIP6 {
 		c.recordBlockedLocked("ipv6-source-not-mesh")
 		c.mu.Unlock()

@@ -38,6 +38,8 @@ type darwinUtunDevice struct {
 	// address6 is the derived IPv6 address the device is given, "" when it is given none
 	// (peerDeviceAddress6).
 	address6 string
+	// ipv6 says whether the address was assigned, under mu: what IPv6Ready answers.
+	ipv6 peerDeviceIPv6State
 
 	mu     sync.Mutex
 	fd     int
@@ -189,6 +191,7 @@ func (device *darwinUtunDevice) WritePacket(packet []byte) error {
 
 func (device *darwinUtunDevice) Close() error {
 	device.SyncPeerRoutes(nil)
+	device.setIPv6(false, "the utun is closed")
 	device.mu.Lock()
 	fd := device.fd
 	device.fd = -1
@@ -264,15 +267,21 @@ func (device *darwinUtunDevice) configure() error {
 // stays up, for the reason the Linux device gives.
 func (device *darwinUtunDevice) configureIPv6() {
 	if device.address6 == "" {
+		device.setIPv6(false, peerDeviceIPv6NotAsked)
 		return
 	}
 	args, err := macosAssignAddress6Args(device.name, device.address6)
 	if err == nil {
 		err = runDarwinCommand(args...)
 	}
-	if err != nil && device.logger != nil {
-		device.logger.Printf("Peer Mesh utun IPv6 address not assigned; IPv6 rules cannot carry traffic: %v", err)
+	if err != nil {
+		device.setIPv6(false, "the utun's IPv6 address could not be assigned: "+err.Error())
+		if device.logger != nil {
+			device.logger.Printf("Peer Mesh utun IPv6 address not assigned; IPv6 rules are not in force: %v", err)
+		}
+		return
 	}
+	device.setIPv6(true, "")
 }
 
 func (device *darwinUtunDevice) requestedUnit() uint32 {
@@ -349,4 +358,18 @@ func runDarwinCommand(args ...string) error {
 		return fmt.Errorf("%s failed: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+// IPv6Ready reports whether the device carries IPv6: up with its derived address assigned. A device
+// whose address could not be assigned has no IPv6 data plane, and its IPv4 one is unaffected.
+func (device *darwinUtunDevice) IPv6Ready() (bool, string) {
+	device.mu.Lock()
+	defer device.mu.Unlock()
+	return device.ipv6.ready, device.ipv6.reason
+}
+
+func (device *darwinUtunDevice) setIPv6(ready bool, reason string) {
+	device.mu.Lock()
+	device.ipv6 = peerDeviceIPv6State{ready: ready, reason: reason}
+	device.mu.Unlock()
 }

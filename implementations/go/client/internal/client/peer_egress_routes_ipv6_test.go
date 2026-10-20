@@ -1,8 +1,10 @@
 package client
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"log"
 	"net"
 	"os"
 	"reflect"
@@ -203,6 +205,7 @@ func TestMeshReconcilesIPv6Routes(t *testing.T) {
 		egressRule{Match: "203.0.113.0/24", Action: egressActionEgress, EgressClientID: 2})
 	carries := true
 	harness.mesh.egressIPv6 = &carries
+	harness.mesh.device.(*fakePeerVirtualDevice).ipv6 = true
 	harness.mesh.config.ServerBaseURL = "https://[2001:db8:1::443]:8443"
 	harness.tick(0)
 	if !contains(harness.commander.installLog, "2001:db8:1::/48") ||
@@ -225,6 +228,7 @@ func TestMeshReconcilesIPv6Routes(t *testing.T) {
 		egressRule{Match: "2001:db8:1::/48", Action: egressActionEgress, EgressClientID: 2})
 	notCarried := false
 	off.mesh.egressIPv6 = &notCarried
+	off.mesh.device.(*fakePeerVirtualDevice).ipv6 = true
 	off.mesh.config.ServerBaseURL = "https://[2001:db8:1::443]:8443"
 	off.tick(0)
 	if len(off.commander.installLog) != 0 {
@@ -242,6 +246,7 @@ func TestMeshStatusNamesTheIPv6Refusals(t *testing.T) {
 	harness := newReconcileHarness(t, egressRule{Match: "2001:db8:1::/48", Action: egressActionEgress, EgressClientID: 2})
 	carries := true
 	harness.mesh.egressIPv6 = &carries
+	harness.mesh.device.(*fakePeerVirtualDevice).ipv6 = true
 	harness.tick(0)
 	harness.mesh.mu.Lock()
 	consumer := harness.mesh.egressConsumer
@@ -562,5 +567,106 @@ func TestEgressBypassResolverResolvesIPv6Apart(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Errorf("the name was looked up %d times for both families", calls)
+	}
+}
+
+// A device whose derived IPv6 address could not be assigned has no IPv6 data plane: its IPv6 rules
+// report EGRESS_RULE_IPV6_UNSUPPORTED, nothing IPv6 is planned, and the IPv4 routes are installed and
+// stay installed -- an IPv6 install that would fail cannot roll them back. Said once in the log. When
+// the device carries IPv6 again the next reconcile puts the IPv6 rules in force, and when it stops the
+// IPv6 routes go and the IPv4 ones stay.
+func TestMeshWithoutTheTunsIPv6AddressKeepsIPv4AndRefusesIPv6(t *testing.T) {
+	harness := newReconcileHarness(t,
+		egressRule{Match: "203.0.113.0/24", Action: egressActionEgress, EgressClientID: 2},
+		egressRule{Match: "2001:db8:1::/48", Action: egressActionEgress, EgressClientID: 2})
+	var logs bytes.Buffer
+	harness.mesh.logger = log.New(&logs, "", 0)
+	platform := true
+	harness.mesh.egressIPv6 = &platform
+	device := harness.mesh.device.(*fakePeerVirtualDevice)
+	device.ipv6, device.ipv6Reason = false, "the TUN's IPv6 address could not be assigned: RTNETLINK answers: Permission denied"
+	harness.mesh.config.ServerBaseURL = "https://[2001:db8:1::443]:8443"
+	// Were an IPv6 route attempted it would fail, and the failure would take the IPv4 route with it.
+	harness.commander.installErr["2001:db8:1::/48"] = errors.New("ip -6 route add failed: IPv6 is disabled")
+
+	harness.tick(0)
+	harness.tick(egressRouteRetryInterval)
+	if !contains(harness.commander.installLog, "203.0.113.0/24") {
+		t.Fatalf("the IPv4 route was not installed: %v", harness.commander.installLog)
+	}
+	for _, cidr := range harness.commander.installLog {
+		if strings.Contains(cidr, ":") {
+			t.Errorf("an IPv6 route was attempted without the address: %s", cidr)
+		}
+	}
+	if _, present := harness.commander.table["203.0.113.0/24"]; !present {
+		t.Error("the IPv4 route did not stay installed")
+	}
+	section := mapSection(t, harness.mesh.egressStatusJSON(), "consumer")
+	rules := section["rules"].([]map[string]any)
+	if rules[0]["inForce"] != true || rules[1]["inForce"] != false || rules[1]["code"] != egressCodeRuleIPv6Unsupported {
+		t.Errorf("rules = %v", rules)
+	}
+	if routeError, present := section["routeError"]; present || section["rolledBack"] != false {
+		t.Errorf("routeError = %v rolledBack = %v", routeError, section["rolledBack"])
+	}
+	for _, route := range section["routes"].([]map[string]any) {
+		if strings.Contains(route["cidr"].(string), ":") {
+			t.Errorf("an IPv6 route in the status: %v", route)
+		}
+	}
+	if count := strings.Count(logs.String(), "IPv6 rules not in force"); count != 1 ||
+		!strings.Contains(logs.String(), "Permission denied") {
+		t.Errorf("the reason was logged %d times: %s", count, logs.String())
+	}
+	harness.mesh.mu.Lock()
+	consumer := harness.mesh.egressConsumer
+	harness.mesh.mu.Unlock()
+	local, _ := egressDeviceAddress6("100.96.0.1")
+	remote, _ := parseEgressAddress6("2001:db8:1::5")
+	if outcome := consumer.handleOutbound(buildTCPSegment(tcpSegment{IPv6: true, SourceIP6: local, DestinationIP6: remote,
+		SourcePort: 40000, DestinationPort: 443, Flags: tcpFlagSYN, Window: 65535}), flowEpoch); outcome != egressOutcomeNotMine {
+		t.Errorf("an IPv6 packet was claimed without the data plane: %s", outcome)
+	}
+
+	// The device recreated with its address: the next reconcile puts the IPv6 rule in force.
+	delete(harness.commander.installErr, "2001:db8:1::/48")
+	device.ipv6, device.ipv6Reason = true, ""
+	harness.tick(time.Second)
+	if _, present := harness.commander.table["2001:db8:1::/48"]; !present {
+		t.Errorf("the IPv6 route was not installed once the device carried IPv6: %v", harness.commander.installLog)
+	}
+	if !contains(harness.commander.installLog, "2001:db8:1::443/128") {
+		t.Errorf("the IPv6 bypass was not installed: %v", harness.commander.installLog)
+	}
+	rules = mapSection(t, harness.mesh.egressStatusJSON(), "consumer")["rules"].([]map[string]any)
+	if rules[1]["code"] == egressCodeRuleIPv6Unsupported {
+		t.Errorf("the IPv6 rule is still refused: %v", rules[1])
+	}
+
+	// And losing it again takes the IPv6 routes out, the IPv4 one staying.
+	device.ipv6, device.ipv6Reason = false, "the TUN is closed"
+	harness.tick(time.Second)
+	if _, present := harness.commander.table["2001:db8:1::/48"]; present {
+		t.Error("the IPv6 route stayed after the device stopped carrying IPv6")
+	}
+	if _, present := harness.commander.table["203.0.113.0/24"]; !present {
+		t.Error("the IPv4 route went with the IPv6 one")
+	}
+}
+
+// The noop device carries no IPv6, whatever the platform says.
+func TestMeshNoopDeviceCarriesNoIPv6(t *testing.T) {
+	mesh := newConsumerMeshHarness(t)
+	platform := true
+	mesh.egressIPv6 = &platform
+	if carries, reason := mesh.egressIPv6State(&noopPeerVirtualDevice{status: "NOOP"}); carries || reason == "" {
+		t.Errorf("noop: %v %q", carries, reason)
+	}
+	if carries, _ := mesh.egressIPv6State(&fakePeerVirtualDevice{status: "UP", ipv6: true}); !carries {
+		t.Error("a device carrying IPv6 was refused")
+	}
+	if carries, _ := mesh.egressIPv6State(&fakePeerVirtualDevice{status: "ERROR", ipv6: true}); carries {
+		t.Error("a device that is not up carried IPv6")
 	}
 }

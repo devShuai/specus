@@ -106,9 +106,9 @@ type egressConsumer struct {
 	// virtualIP is this node's mesh address, which every reply must be addressed to.
 	virtualIP string
 
-	// The IPv6 data plane (protocol/spec/peer-egress.md, IPv6 数据面). carriesIPv6 is fixed when the
-	// consumer is built (egressConsumerCarriesIPv6); without it every IPv6 packet is left alone, as
-	// before the data plane existed. virtualIP6 is the address derived from virtualIP, the only
+	// The IPv6 data plane (protocol/spec/peer-egress.md, IPv6 数据面). carriesIPv6 is whether the
+	// device carries IPv6 now, given with each configuration (egressIPv6State); without it every
+	// IPv6 packet is left alone, as before the data plane existed. virtualIP6 is the address derived from virtualIP, the only
 	// source an IPv6 packet may leave with and the only destination a reply may come back to.
 	// capable6 is which egresses the catalogue says take IPv6 packets, and pathMTU the effective MTU
 	// of the session to an egress, asked with no consumer lock held.
@@ -210,6 +210,17 @@ func (c *egressConsumer) configure(rules []egressRule, meshCIDR string, virtualI
 // they go only with the pool itself.
 func (c *egressConsumer) configureIn(rules []egressRule, meshCIDR, virtualIP, fakeIPCIDR string, now time.Time) map[int64][]string {
 	c.mu.Lock()
+	carries := c.carriesIPv6
+	c.mu.Unlock()
+	return c.configureFor(rules, meshCIDR, virtualIP, fakeIPCIDR, carries, now)
+}
+
+// configureFor is configureIn with the IPv6 data plane stated: whether the device carries IPv6 now.
+// Turned off, every IPv6 flow is closed like any flow whose rule stopped applying.
+func (c *egressConsumer) configureFor(rules []egressRule, meshCIDR, virtualIP, fakeIPCIDR string, carriesIPv6 bool,
+	now time.Time) map[int64][]string {
+	c.mu.Lock()
+	c.carriesIPv6 = carriesIPv6
 	c.rules = append([]egressRule(nil), rules...)
 	if trimmed := strings.TrimSpace(meshCIDR); trimmed != "" {
 		c.meshCIDR = trimmed
@@ -701,7 +712,10 @@ func (c *egressConsumer) handleInbound(frame []byte, fromEgress int64, now time.
 	}
 	// A consumer with the IPv6 data plane reads an IPv6 body; one without leaves it, refused, to the
 	// egress role, as before.
-	parsed, code := parsePeerEgressFrameFor(frame, c.carriesIPv6)
+	c.mu.Lock()
+	carriesIPv6 := c.carriesIPv6
+	c.mu.Unlock()
+	parsed, code := parsePeerEgressFrameFor(frame, carriesIPv6)
 	if code != "" {
 		// A frame nobody can read is not claimed. The egress runtime refuses it with its own
 		// code, which is the one an operator needs, and counting it here as well would report

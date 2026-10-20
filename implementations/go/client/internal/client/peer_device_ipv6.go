@@ -10,6 +10,22 @@ package client
 // No build tag: the command builders are the part worth testing everywhere, and only the device
 // files that run them are platform-specific.
 
+// peerVirtualDeviceIPv6 is a device that can say whether it carries IPv6: whether it is up with its
+// derived address assigned, and why not when it is not. A device that does not implement it -- the
+// noop device -- carries no IPv6.
+type peerVirtualDeviceIPv6 interface {
+	IPv6Ready() (bool, string)
+}
+
+// peerDeviceIPv6State is what a device keeps for IPv6Ready, guarded by the device's own lock.
+type peerDeviceIPv6State struct {
+	ready  bool
+	reason string
+}
+
+// peerDeviceIPv6NotAsked is the reason a device given no derived address carries no IPv6.
+const peerDeviceIPv6NotAsked = "the consumer is off or peerMeshMtu is below 1280, so the TUN was given no IPv6 address"
+
 // peerDeviceAddress6 is the derived IPv6 address the TUN is given, or false when it is given none:
 // the consumer is switched off, or this device has no IPv6 data plane (its platform, or a
 // peerMeshMtu below 1280). Assigned only for the consumer -- an address on the TUN serves nothing

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -179,6 +180,9 @@ func TestLinuxTunDeviceTakesItsDerivedIPv6Address(t *testing.T) {
 		_ = device.Close()
 	}()
 
+	if ready, reason := device.(peerVirtualDeviceIPv6).IPv6Ready(); !ready {
+		t.Fatalf("the device does not report carrying IPv6: %s", reason)
+	}
 	derived, _ := egressDeviceAddress6(virtual)
 	address := formatEgressAddress6(derived)
 	if shown := linuxRouteOutput(t, "-6", "address", "show", "dev", device.Name()); !strings.Contains(shown, address+"/128") {
@@ -218,5 +222,43 @@ func TestLinuxTunDeviceTakesItsDerivedIPv6Address(t *testing.T) {
 		case <-deadline:
 			t.Fatalf("no IPv6 packet to %s came out of the device; status=%s err=%s", destination, device.Status(), device.Error())
 		}
+	}
+}
+
+// On a TUN where IPv6 is disabled the address cannot be assigned: the device stays up for IPv4 and
+// reports no IPv6 data plane, with the kernel's reason.
+func TestLinuxTunDeviceWithoutIPv6ReportsNoIPv6DataPlane(t *testing.T) {
+	linuxMutationNamespace6(t)
+	if !egressPlatformCarriesIPv6 {
+		t.Skip("this build has no IPv6 data plane")
+	}
+	const sysctl = "/proc/sys/net/ipv6/conf/default/disable_ipv6"
+	if err := os.WriteFile(sysctl, []byte("1"), 0o644); err != nil {
+		t.Skipf("cannot disable IPv6 for new interfaces here: %v", err)
+	}
+	defer func() { _ = os.WriteFile(sysctl, []byte("0"), 0o644) }()
+
+	device := newPlatformPeerVirtualDevice(
+		Config{PeerMeshTunName: "specustest6x", PeerMeshMTU: 1280, PeerMeshDevice: "auto", PeerEgressEnabled: true},
+		PeerMeshConfig{VirtualIP: "100.96.0.44", CIDR: "100.96.0.0/11"},
+		log.New(testLogWriter{t}, "", 0),
+	)
+	stop := make(chan struct{})
+	if err := device.Start(stop, func([]byte) {}); err != nil {
+		t.Fatalf("the device did not come up for IPv4: %v", err)
+	}
+	defer func() {
+		close(stop)
+		_ = device.Close()
+	}()
+	if status := device.Status(); status != "UP" {
+		t.Errorf("status = %s (%s)", status, device.Error())
+	}
+	ready, reason := device.(peerVirtualDeviceIPv6).IPv6Ready()
+	if ready || !strings.Contains(reason, "could not be assigned") {
+		t.Errorf("IPv6Ready = %v %q", ready, reason)
+	}
+	if shown := linuxRouteOutput(t, "-4", "address", "show", "dev", device.Name()); !strings.Contains(shown, "100.96.0.44/32") {
+		t.Errorf("the IPv4 address is missing: %q", shown)
 	}
 }

@@ -200,9 +200,8 @@ func (mesh *peerMeshClient) ensureEgressConsumer() *egressConsumer {
 	consumer := newEgressConsumer(mesh.logger,
 		func(egress int64, frame []byte) error { return mesh.sendEgressFrameToPeer(egress, frame) },
 		func(packet []byte) error { return mesh.writeEgressPacketToDevice(packet) })
-	// Whether this device carries IPv6 is fixed by its platform and its configured MTU, so it is
-	// settled once, here, and every decision the consumer makes reads the same answer.
-	consumer.carriesIPv6 = mesh.egressCarriesIPv6()
+	// Whether this device carries IPv6 is given with every configuration (configureEgressConsumer),
+	// since it depends on the device as well as on the platform.
 	consumer.pathMTU = mesh.egressPathMTU
 	// A catalogue that arrived before the consumer was built still says which egresses it lists and
 	// which resolve names; nothing else will repeat it until the server has a reason to. The consumer
@@ -393,12 +392,69 @@ func (mesh *peerMeshClient) currentEgressPhaseTwo() egressPhaseTwo {
 	return egressPhaseTwo{CIDR: cidr, Code: code}
 }
 
-// egressCarriesIPv6 is whether this device has the IPv6 data plane (egressConsumerCarriesIPv6).
-func (mesh *peerMeshClient) egressCarriesIPv6() bool {
+// egressIPv6State is whether this device has the IPv6 data plane now, and why not when it has none.
+//
+// The platform and peerMeshMtu have to allow it (egressConsumerCarriesIPv6), and then the TUN has to
+// be up and actually carry its derived IPv6 address. A device whose address could not be assigned --
+// a host with IPv6 disabled, say -- has no IPv6 data plane: its IPv6 rules report
+// EGRESS_RULE_IPV6_UNSUPPORTED and nothing IPv6 is planned, so the IPv6 route installs that would
+// fail cannot roll the IPv4 routes back with them. A device that is not up, or a noop one, carries
+// no IPv6 either. The answer is read on every reconcile, so a TUN recreated with its address enables
+// the data plane on the next one.
+func (mesh *peerMeshClient) egressIPv6State(device peerVirtualDevice) (bool, string) {
 	if mesh.egressIPv6 != nil {
-		return *mesh.egressIPv6
+		// Tests: stands in for the platform and the MTU; the device still has to carry IPv6.
+		if !*mesh.egressIPv6 {
+			return false, "this platform or peerMeshMtu has no IPv6 data plane"
+		}
+	} else if !egressConsumerCarriesIPv6(mesh.config.PeerMeshMTU) {
+		return false, "this platform or peerMeshMtu has no IPv6 data plane"
 	}
-	return egressConsumerCarriesIPv6(mesh.config.PeerMeshMTU)
+	if !egressDeviceReady(device) {
+		return false, "the virtual device is " + egressDeviceStatus(device)
+	}
+	capable, ok := device.(peerVirtualDeviceIPv6)
+	if !ok {
+		return false, "the virtual device carries no IPv6"
+	}
+	return capable.IPv6Ready()
+}
+
+// egressCarriesIPv6 is egressIPv6State's answer for the current device.
+func (mesh *peerMeshClient) egressCarriesIPv6() bool {
+	mesh.mu.Lock()
+	device := mesh.device
+	mesh.mu.Unlock()
+	carries, _ := mesh.egressIPv6State(device)
+	return carries
+}
+
+// logEgressIPv6State says once per distinct reason why IPv6 rules are not in force, when the
+// platform would have carried them -- the device is what is missing.
+func (mesh *peerMeshClient) logEgressIPv6State(carries bool, reason string, rules []egressRule) {
+	logged := ""
+	if !carries && egressConsumerCarriesIPv6(mesh.config.PeerMeshMTU) && egressRulesHaveIPv6(rules) {
+		logged = reason
+	}
+	if logged == mesh.egressIPv6Logged {
+		return
+	}
+	mesh.egressIPv6Logged = logged
+	if logged != "" {
+		mesh.logger.Printf("[peer-egress-consumer] IPv6 rules not in force (%s): %s; IPv4 rules are unaffected",
+			egressCodeRuleIPv6Unsupported, logged)
+	} else if carries && egressRulesHaveIPv6(rules) {
+		mesh.logger.Printf("[peer-egress-consumer] the virtual device carries IPv6; IPv6 rules are in force")
+	}
+}
+
+func egressRulesHaveIPv6(rules []egressRule) bool {
+	for _, rule := range rules {
+		if egressRuleIsIPv6(rule.Match) {
+			return true
+		}
+	}
+	return false
 }
 
 // egressPathMTU is the effective MTU of the session to an egress, the SPMTU2 answer the IPv4 path
@@ -578,8 +634,14 @@ func (mesh *peerMeshClient) reconcileEgressRoutesAt(now time.Time) {
 	mesh.mu.Lock()
 	built := mesh.egressConsumer != nil
 	mesh.mu.Unlock()
+	// Whether the device carries IPv6, read once for this whole reconcile: the consumer, the plan and
+	// the bypass list all act on the same answer.
+	carriesIPv6, ipv6Reason := mesh.egressIPv6State(device)
+	if len(rules) > 0 {
+		mesh.logEgressIPv6State(carriesIPv6, ipv6Reason, rules)
+	}
 	if len(rules) > 0 || phase.Active || built {
-		mesh.configureEgressConsumer(rules, meshCIDR, runtime.PeerMesh.VirtualIP, phase.pool(), now)
+		mesh.configureEgressConsumer(rules, meshCIDR, runtime.PeerMesh.VirtualIP, phase.pool(), carriesIPv6, now)
 	}
 
 	// Without a device there is nothing to route into. A rule's route pointed at an interface
@@ -588,9 +650,9 @@ func (mesh *peerMeshClient) reconcileEgressRoutesAt(now time.Time) {
 	var desired []egressRoute
 	if egressDeviceReady(device) {
 		mesh.egressDeviceWaitLogged = false
-		bypass := mesh.egressBypassAddresses(now)
+		bypass := mesh.egressBypassAddresses(now, carriesIPv6)
 		var refused []egressRuleSetError
-		desired, refused = planEgressRoutesFor(rules, bypass, meshCIDR, phase.pool(), mesh.egressCarriesIPv6())
+		desired, refused = planEgressRoutesFor(rules, bypass, meshCIDR, phase.pool(), carriesIPv6)
 		mesh.logEgressRefusals(refused)
 	} else if (len(rules) > 0 || phase.Active) && !mesh.egressDeviceWaitLogged {
 		mesh.egressDeviceWaitLogged = true
@@ -738,14 +800,18 @@ func mergeEgressConflicts(existing, more []egressRouteConflict) []egressRouteCon
 // Reconfiguring purges the flows the new rules no longer cover, and with the same rules that is
 // every flow being re-examined for nothing on every tick; with a change of virtual IP it is what
 // has to happen.
-func (mesh *peerMeshClient) configureEgressConsumer(rules []egressRule, meshCIDR, virtualIP, fakeIPPool string, now time.Time) {
-	key := fmt.Sprintf("%s|%s|%s|%+v", meshCIDR, strings.TrimSpace(virtualIP), fakeIPPool, rules)
+//
+// The IPv6 data plane is part of the configuration: a device that stops carrying IPv6 takes the IPv6
+// rules out of force and closes their flows, and one that starts carrying it puts them back.
+func (mesh *peerMeshClient) configureEgressConsumer(rules []egressRule, meshCIDR, virtualIP, fakeIPPool string,
+	carriesIPv6 bool, now time.Time) {
+	key := fmt.Sprintf("%s|%s|%s|%v|%+v", meshCIDR, strings.TrimSpace(virtualIP), fakeIPPool, carriesIPv6, rules)
 	if key == mesh.egressConsumerKey {
 		return
 	}
 	mesh.egressConsumerKey = key
 	consumer := mesh.ensureEgressConsumer()
-	mesh.deliverEgressPurges(consumer.configureIn(rules, meshCIDR, virtualIP, fakeIPPool, now))
+	mesh.deliverEgressPurges(consumer.configureFor(rules, meshCIDR, virtualIP, fakeIPPool, carriesIPv6, now))
 }
 
 // logEgressRefusals reports the rules that were thrown out, once per distinct set. The rules do not
@@ -839,7 +905,7 @@ func egressRouteJournalPath() string {
 // connection, the server the client logs in to, STUN and TURN, the relay, and every peer's own
 // endpoint. Without them a rule broad enough to cover one would route the tunnel's transport into
 // the tunnel. Called under egressPlanMu with no mesh lock held; hostnames are resolved here.
-func (mesh *peerMeshClient) egressBypassAddresses(now time.Time) []string {
+func (mesh *peerMeshClient) egressBypassAddresses(now time.Time, carriesIPv6 bool) []string {
 	mesh.mu.Lock()
 	runtime := mesh.runtime
 	conn := mesh.conn
@@ -878,7 +944,7 @@ func (mesh *peerMeshClient) egressBypassAddresses(now time.Time) []string {
 			mesh.logger.Printf("[peer-egress-consumer] bypass host %s did not resolve; a rule covering it would capture it", host)
 		}
 	}
-	if mesh.egressCarriesIPv6() {
+	if carriesIPv6 {
 		// The IPv6 answers too, only once this device routes IPv6 at all; the plan pins one only
 		// when an IPv6 rule covers it.
 		resolved = append(resolved, mesh.egressBypass.resolve6(hosts, now)...)

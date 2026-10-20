@@ -14,11 +14,16 @@ import (
 // due. What these cases pin is the wiring around that: what the plan is fed, when the installer is
 // asked to act, and what happens to the routes when the device is not there.
 
-// fakePeerVirtualDevice stands in for a TUN that came up, or one that did not.
+// fakePeerVirtualDevice stands in for a TUN that came up, or one that did not, and that carries
+// IPv6 or does not (ipv6, and why not in ipv6Reason).
 type fakePeerVirtualDevice struct {
-	name   string
-	status string
+	name       string
+	status     string
+	ipv6       bool
+	ipv6Reason string
 }
+
+func (d *fakePeerVirtualDevice) IPv6Ready() (bool, string) { return d.ipv6, d.ipv6Reason }
 
 func (d *fakePeerVirtualDevice) Name() string                                  { return d.name }
 func (d *fakePeerVirtualDevice) Start(_ <-chan struct{}, _ func([]byte)) error { return nil }

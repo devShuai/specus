@@ -33,6 +33,8 @@ type windowsWintunDevice struct {
 	// address6 is the derived IPv6 address the device is given, "" when it is given none
 	// (peerDeviceAddress6).
 	address6 string
+	// ipv6 says whether the address was assigned, under mu: what IPv6Ready answers.
+	ipv6 peerDeviceIPv6State
 
 	mu      sync.Mutex
 	dll     *syscall.LazyDLL
@@ -191,6 +193,7 @@ func (device *windowsWintunDevice) WritePacket(packet []byte) error {
 
 func (device *windowsWintunDevice) Close() error {
 	device.SyncPeerRoutes(nil)
+	device.setIPv6(false, "the adapter is closed")
 	device.mu.Lock()
 	api := device.api
 	session := device.session
@@ -275,6 +278,7 @@ func (device *windowsWintunDevice) configure() error {
 // stays up, for the reason the Linux device gives.
 func (device *windowsWintunDevice) configureIPv6() {
 	if device.address6 == "" {
+		device.setIPv6(false, peerDeviceIPv6NotAsked)
 		return
 	}
 	err := func() error {
@@ -302,9 +306,14 @@ func (device *windowsWintunDevice) configureIPv6() {
 		}
 		return nil
 	}()
-	if err != nil && device.logger != nil {
-		device.logger.Printf("Peer Mesh Wintun IPv6 address not assigned; IPv6 rules cannot carry traffic: %v", err)
+	if err != nil {
+		device.setIPv6(false, "the adapter's IPv6 address could not be assigned: "+err.Error())
+		if device.logger != nil {
+			device.logger.Printf("Peer Mesh Wintun IPv6 address not assigned; IPv6 rules are not in force: %v", err)
+		}
+		return
 	}
+	device.setIPv6(true, "")
 }
 
 func (device *windowsWintunDevice) setStatus(status, errText string) {
@@ -438,4 +447,18 @@ func runWindowsCommand(args ...string) error {
 		return fmt.Errorf("%s failed: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+// IPv6Ready reports whether the device carries IPv6: up with its derived address assigned. A device
+// whose address could not be assigned has no IPv6 data plane, and its IPv4 one is unaffected.
+func (device *windowsWintunDevice) IPv6Ready() (bool, string) {
+	device.mu.Lock()
+	defer device.mu.Unlock()
+	return device.ipv6.ready, device.ipv6.reason
+}
+
+func (device *windowsWintunDevice) setIPv6(ready bool, reason string) {
+	device.mu.Lock()
+	device.ipv6 = peerDeviceIPv6State{ready: ready, reason: reason}
+	device.mu.Unlock()
 }
