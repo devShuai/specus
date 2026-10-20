@@ -1734,6 +1734,8 @@ int st_storage_init(const char *path, int seed_demo_client)
          * Service workbench: one row per (identity, list, reference), nothing but the reference
          * and an epoch-millisecond time. No foreign keys, like every other table: the deletions
          * of routes, mappings, Peer services, clients and accounts remove their rows themselves.
+         * idx_mwi_identity repeats the key's leading (tenant_id, username) and is not one of the
+         * indexes the spec asks for; it is here because Java's entity declares it.
          */
         rc = exec_sql(db,
             "CREATE TABLE IF NOT EXISTS management_workbench_item ("
@@ -1745,6 +1747,7 @@ int st_storage_init(const char *path, int seed_demo_client)
             "at_ms INTEGER NOT NULL,"
             "PRIMARY KEY(tenant_id, username, list, kind, object_id)"
             ");"
+            "CREATE INDEX IF NOT EXISTS idx_mwi_identity ON management_workbench_item(tenant_id, username);"
             "CREATE INDEX IF NOT EXISTS idx_mwi_object ON management_workbench_item(tenant_id, kind, object_id);"
             "CREATE INDEX IF NOT EXISTS idx_mwi_list_at ON management_workbench_item(list, at_ms);");
     }

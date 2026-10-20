@@ -4,19 +4,25 @@
  * Service workbench (protocol/spec/service-workbench.md): the shared vector replayed through the
  * real admin request handling (routing, the shared authentication layer that re-reads the account,
  * the handler and SQLite), plus HTTP-level isolation checks and the cascades of the existing
- * delete endpoints.
+ * delete endpoints. What depends on the listener itself (the request firewall that decodes the
+ * path before it is routed, the request body as sent) goes over real HTTP to an in-process listener.
  */
 
 #include "admin_http.h"
 #include "json.h"
 #include "security.h"
+#include "server_harness.h"
 #include "storage.h"
 #include "workbench.h"
 
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <netinet/in.h>
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #ifndef ST_WORKBENCH_VECTOR_FILE
@@ -546,9 +552,11 @@ static int replay_event(wb_scenario *scenario, const char *step, const char *nam
         const char *prefix = strcmp(kind, "http-route") == 0 ? "/api/admin/http-routes/"
             : strcmp(kind, "tcp-mapping") == 0 ? "/api/admin/specus-mappings/" : "/api/admin/peer-mesh/services/";
         snprintf(path, sizeof(path), "%s%lld", prefix, id);
+        /* What each endpoint answers as Java does: a route or mapping 204, a Peer service 200 (void). */
+        int expected = strcmp(kind, "peer-service") == 0 ? 200 : 204;
         if (object == NULL || operator_bearer(object->tenant_id, bearer, sizeof(bearer)) != 0
             || call("DELETE", path, bearer, NULL, buffer, sizeof(buffer), &response) != 0
-            || response.status != 204) {
+            || response.status != expected) {
             fprintf(stderr, "delete-object %s %lld failed: %.200s\n", kind, id, buffer);
             return -1;
         }
@@ -872,6 +880,12 @@ static int test_workbench_vector(void)
     free(vector);
     printf("workbench vector: replayed %zu/%zu scenarios, %zu/%zu steps\n",
            scenarios_replayed, scenario_count, steps_replayed, step_total);
+    /* The vector's size is pinned as Java's WorkbenchVectorTests pins it. */
+    if (scenario_count != 15U || step_total != 150U) {
+        fprintf(stderr, "workbench vector holds %zu scenarios and %zu steps, expected 15 and 150\n",
+                scenario_count, step_total);
+        failed = 1;
+    }
     if (failed || scenarios_replayed != scenario_count || steps_replayed != step_total) {
         fprintf(stderr, "workbench vector replay incomplete\n");
         return 1;
@@ -937,26 +951,34 @@ static int test_workbench_http_isolation(void)
         return 1;
     }
     int failures = 0;
-    /* No session: the shared layer answers 401 before the path is looked at. */
+    /*
+     * No session (WorkbenchResourceTests.everyOperationNeedsASession): each of the seven operations
+     * is a 401 without a token and with a forged one, before the path is looked at.
+     */
     const char *const unauthenticated[][2] = {
         {"GET", "/api/admin/workbench"},
         {"PUT", "/api/admin/workbench/favorites/http-route/1"},
-        {"PUT", "/api/admin/workbench/favorites/bad/042"},
+        {"DELETE", "/api/admin/workbench/favorites/http-route/1"},
+        {"DELETE", "/api/admin/workbench/favorites"},
+        {"POST", "/api/admin/workbench/recents/http-route/1"},
+        {"DELETE", "/api/admin/workbench/recents/http-route/1"},
         {"DELETE", "/api/admin/workbench/recents"},
+        {"PUT", "/api/admin/workbench/favorites/bad/042"},
     };
     for (size_t i = 0; i < sizeof(unauthenticated) / sizeof(unauthenticated[0]); ++i) {
+        char label[160];
+        snprintf(label, sizeof(label), "unauthenticated %s %s", unauthenticated[i][0], unauthenticated[i][1]);
         failures += call(unauthenticated[i][0], unauthenticated[i][1], NULL, NULL, buffer, sizeof(buffer), &response) != 0
-            || expect_response("unauthenticated", &response, 401, NULL);
+            || expect_response(label, &response, 401, NULL);
+        snprintf(label, sizeof(label), "forged token %s %s", unauthenticated[i][0], unauthenticated[i][1]);
+        failures += call(unauthenticated[i][0], unauthenticated[i][1], "Bearer not-a-token", NULL, buffer,
+                         sizeof(buffer), &response) != 0
+            || expect_response(label, &response, 401, NULL);
     }
-    failures += call("GET", "/api/admin/workbench", "Bearer not-a-token", NULL, buffer, sizeof(buffer), &response) != 0
-        || expect_response("invalid token", &response, 401, NULL);
-    /* 042 is not 42: the id is checked on the raw path text, and 400 carries the header too. */
+    /* 042 is not 42: the id is checked on the path segment's text, and 400 carries the header too. */
     failures += call("PUT", "/api/admin/workbench/favorites/http-route/042", alice, NULL, buffer, sizeof(buffer),
                      &response) != 0
         || expect_response("leading zero", &response, 400, "WORKBENCH_REQUEST_INVALID");
-    failures += call("POST", "/api/admin/workbench/recents/http-route/%31", alice, NULL, buffer, sizeof(buffer),
-                     &response) != 0
-        || expect_response("percent-encoded id", &response, 400, "WORKBENCH_REQUEST_INVALID");
     failures += call("PUT", "/api/admin/workbench/favorites/http-route/77", alice, NULL, buffer, sizeof(buffer),
                      &response) != 0
         || expect_response("missing target", &response, 404, "WORKBENCH_TARGET_NOT_FOUND");
@@ -990,12 +1012,16 @@ static int test_workbench_http_isolation(void)
     /* The built-in administrator is the identity (default tenant, configured name). */
     failures += call("GET", "/api/admin/workbench", builtin, NULL, buffer, sizeof(buffer), &response) != 0
         || expect_document("built-in admin", &response, "[]", "[]");
-    /* A disabled account is refused by the shared layer and writes nothing; disabling deletes nothing. */
-    st_storage_management_user user;
-    failures += st_storage_update_management_user(test_db_path, "t1", "alice", NULL, NULL, 0, &user) != 0;
+    /*
+     * A disabled account is refused by the shared layer and writes nothing; disabling deletes nothing.
+     * The account is disabled and enabled again through the account endpoint, by the administrator.
+     */
+    failures += call("PUT", "/api/admin/users/alice", root, "{\"enabled\":false}", buffer, sizeof(buffer),
+                     &response) != 0 || response.status != 200;
     failures += call("DELETE", "/api/admin/workbench/favorites", alice, NULL, buffer, sizeof(buffer), &response) != 0
         || expect_response("disabled account", &response, 403, NULL);
-    failures += st_storage_update_management_user(test_db_path, "t1", "alice", NULL, NULL, 1, &user) != 0;
+    failures += call("PUT", "/api/admin/users/alice", root, "{\"enabled\":true}", buffer, sizeof(buffer),
+                     &response) != 0 || response.status != 200;
     failures += query_i64("SELECT COUNT(*) FROM management_workbench_item WHERE username = ?", "alice") != 2;
     /* 429 carries Retry-After and the private header; the limiter key is the identity. */
     st_workbench_rate_limit_reset();
@@ -1017,6 +1043,13 @@ static int test_workbench_http_isolation(void)
     failures += exec_sql("ALTER TABLE management_workbench_item RENAME TO management_workbench_item_down") != 0;
     failures += call("GET", "/api/admin/workbench", alice, NULL, buffer, sizeof(buffer), &response) != 0
         || expect_response("store down read", &response, 503, "WORKBENCH_UNAVAILABLE");
+    /* A store that cannot be read never looks like empty lists: the refusal has no favorites member. */
+    char *unavailable_favorites = st_json_get_top_level_raw(response.body, "favorites");
+    if (unavailable_favorites != NULL) {
+        fprintf(stderr, "store down read carries favorites: %s\n", response.body);
+        ++failures;
+    }
+    free(unavailable_favorites);
     failures += call("PUT", "/api/admin/workbench/favorites/http-route/77", alice, NULL, buffer, sizeof(buffer),
                      &response) != 0
         || expect_response("store down before visibility", &response, 503, "WORKBENCH_UNAVAILABLE");
@@ -1222,6 +1255,727 @@ static int test_workbench_cascades(void)
     return failures == 0 ? 0 : 1;
 }
 
+/* ---- WorkbenchResourceTests and WorkbenchCascadeTests, check by check ---------------------- */
+
+/* The vector's baseTime, 2026-10-06T00:00:00Z: Java's WorkbenchHttpTestSupport.BASE_TIME. */
+#define WB_BASE_MS 1791244800000LL
+
+static int insert_row(const char *tenant_id, const char *username, const char *list, const char *kind,
+                      long long id, long long at_ms)
+{
+    const char *texts[] = {tenant_id, username, list, kind};
+    long long ints[] = {id, at_ms};
+    return exec_bound("INSERT INTO management_workbench_item(tenant_id, username, list, kind, object_id, at_ms) "
+                      "VALUES(?,?,?,?,?,?)", "ttttii", texts, ints);
+}
+
+/* The number of entries under key in a document; -1 when it is not an array. */
+static long long list_size(const char *body, const char *key)
+{
+    char **items = NULL;
+    size_t count = 0U;
+    if (vec_array(body, key, &items, &count) != 0) {
+        return -1;
+    }
+    st_json_free_string_array(items, count);
+    return (long long)count;
+}
+
+/* method path as bearer answers 200; reports the answer otherwise. */
+static int expect_ok(const char *method, const char *path, const char *bearer)
+{
+    static char buffer[WB_RESPONSE_BYTES];
+    wb_response response;
+    if (call(method, path, bearer, NULL, buffer, sizeof(buffer), &response) != 0 || response.status != 200) {
+        fprintf(stderr, "%s %s: expected 200, got %.300s\n", method, path, buffer);
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * WorkbenchResourceTests.readingNeverWrites: with the clock at 40 days an expired recent and the
+ * recents over the bound of 20 are left out of the answer, and only a write deletes them: the
+ * stored rows are exactly the same afterwards.
+ */
+static int test_workbench_reading_never_writes(void)
+{
+    static char buffer[WB_RESPONSE_BYTES];
+    static wb_row before[WB_MAX_ROWS];
+    static wb_row after[WB_MAX_ROWS];
+    const long long day_ms = 24LL * 3600LL * 1000LL;
+    wb_response response;
+    char alice[2400];
+    if (open_fresh_database() != 0
+        || st_storage_create_management_user(test_db_path, "alice", "t1", "unused", "USER", 1, NULL) != 0
+        || issue_bearer("alice", "t1", alice, sizeof(alice)) != 0) {
+        return 1;
+    }
+    test_clock_ms = WB_BASE_MS + 40LL * day_ms;
+    int failures = insert_row("t1", "alice", "recent", "http-route", 1, WB_BASE_MS) != 0;
+    for (long long id = 10; id < 32; ++id) {
+        failures += insert_row("t1", "alice", "recent", "http-route", id, WB_BASE_MS + 39LL * day_ms + id) != 0;
+    }
+    size_t before_count = 0U;
+    size_t after_count = 0U;
+    failures += dump_rows(WB_BASE_MS, before, WB_MAX_ROWS, &before_count) != 0 || before_count != 23U;
+    failures += call("GET", "/api/admin/workbench", alice, NULL, buffer, sizeof(buffer), &response) != 0
+        || expect_response("read over the bound", &response, 200, NULL);
+    long long recents = list_size(response.body, "recents");
+    if (recents != 20) {
+        fprintf(stderr, "read over the bound: expected 20 recents, got %lld: %s\n", recents, response.body);
+        ++failures;
+    }
+    failures += dump_rows(WB_BASE_MS, after, WB_MAX_ROWS, &after_count) != 0;
+    if (!rows_equal(before, before_count, after, after_count)) {
+        fprintf(stderr, "reading changed the stored rows\n");
+        print_rows("before", before, before_count);
+        print_rows("after", after, after_count);
+        ++failures;
+    }
+    return failures == 0 ? 0 : 1;
+}
+
+/* The stored SQL of a schema object, in lower case with each run of whitespace one space. */
+static int schema_sql(const char *type, const char *name, char *out, size_t out_len)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    out[0] = '\0';
+    if (sqlite3_open(test_db_path, &db) == SQLITE_OK
+        && sqlite3_prepare_v2(db, "SELECT sql FROM sqlite_master WHERE type = ? AND name = ?", -1, &stmt,
+                              NULL) == SQLITE_OK
+        && sqlite3_bind_text(stmt, 1, type, -1, SQLITE_TRANSIENT) == SQLITE_OK
+        && sqlite3_bind_text(stmt, 2, name, -1, SQLITE_TRANSIENT) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_text(stmt, 0) != NULL) {
+        size_t used = 0U;
+        int space = 0;
+        for (const unsigned char *p = sqlite3_column_text(stmt, 0); *p != '\0' && used + 2U < out_len; ++p) {
+            if (isspace(*p)) {
+                space = 1;
+                continue;
+            }
+            if (space && used > 0U) {
+                out[used++] = ' ';
+            }
+            space = 0;
+            out[used++] = (char)tolower(*p);
+        }
+        out[used] = '\0';
+        rc = 0;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    if (rc != 0) {
+        fprintf(stderr, "no %s named %s in sqlite_master\n", type, name);
+    }
+    return rc;
+}
+
+/*
+ * WorkbenchResourceTests.oneRowPerReferenceAndIndexesForIdentityCascadeAndSweep: the primary key is
+ * the reference within the identity's list, and the identity, cascade and sweep indexes exist.
+ */
+static int test_workbench_schema(void)
+{
+    static const char *const key_columns[] = {"tenant_id", "username", "list", "kind", "object_id"};
+    static const char *const indexes[][2] = {
+        {"idx_mwi_identity", "(tenant_id, username)"},
+        {"idx_mwi_object", "(tenant_id, kind, object_id)"},
+        {"idx_mwi_list_at", "(list, at_ms)"},
+    };
+    char sql[1024];
+    if (open_fresh_database() != 0 || schema_sql("table", "management_workbench_item", sql, sizeof(sql)) != 0) {
+        return 1;
+    }
+    int failures = 0;
+    /* The column list of "primary key (...)", compared as a set. */
+    const char *key = strstr(sql, "primary key");
+    char columns[256] = "";
+    if (key != NULL) {
+        key += strlen("primary key");
+        key += *key == ' ';
+        size_t len = *key == '(' ? strcspn(key + 1, ")") : 0U;
+        if (len > 0U && len < sizeof(columns) && key[1 + len] == ')') {
+            memcpy(columns, key + 1, len);
+            columns[len] = '\0';
+        }
+    }
+    size_t found = 0U;
+    size_t listed = columns[0] == '\0' ? 0U : 1U;
+    for (const char *p = columns; *p != '\0'; ++p) {
+        listed += *p == ',';
+    }
+    for (size_t i = 0; i < sizeof(key_columns) / sizeof(key_columns[0]); ++i) {
+        for (char *column = columns; *column != '\0';) {
+            column += *column == ' ';
+            size_t len = strcspn(column, ",");
+            found += len == strlen(key_columns[i]) && strncmp(column, key_columns[i], len) == 0;
+            column += len + (column[len] == ',');
+        }
+    }
+    if (listed != 5U || found != 5U) {
+        fprintf(stderr, "primary key is not (tenant_id, username, list, kind, object_id): %s\n", sql);
+        ++failures;
+    }
+    for (size_t i = 0; i < sizeof(indexes) / sizeof(indexes[0]); ++i) {
+        if (schema_sql("index", indexes[i][0], sql, sizeof(sql)) != 0 || strstr(sql, indexes[i][1]) == NULL) {
+            fprintf(stderr, "index %s is not on %s: %s\n", indexes[i][0], indexes[i][1], sql);
+            ++failures;
+        }
+    }
+    return failures == 0 ? 0 : 1;
+}
+
+typedef struct {
+    char alice[2400];
+    char bob[2400];
+    char root[2400];
+} wb_cascade_tokens;
+
+/*
+ * WorkbenchCascadeTests' fixture: two clients (alice's and bob's) with one object of each kind, and
+ * alice, bob and root (an administrator) referencing them -- 18 rows, all written at 1000.
+ */
+static int cascade_fixture(wb_scenario *scenario, wb_cascade_tokens *tokens)
+{
+    static const char *const kinds[] = {"http-route", "tcp-mapping", "peer-service"};
+    memset(scenario, 0, sizeof(*scenario));
+    scenario->next_listen_port = 24000;
+    if (open_fresh_database() != 0
+        || st_storage_create_management_user(test_db_path, "alice", "t1", "unused", "USER", 1, NULL) != 0
+        || st_storage_create_management_user(test_db_path, "bob", "t1", "unused", "USER", 1, NULL) != 0
+        || st_storage_create_management_user(test_db_path, "root", "t1", "unused", "ADMIN", 1, NULL) != 0
+        || issue_bearer("alice", "t1", tokens->alice, sizeof(tokens->alice)) != 0
+        || issue_bearer("bob", "t1", tokens->bob, sizeof(tokens->bob)) != 0
+        || issue_bearer("root", "t1", tokens->root, sizeof(tokens->root)) != 0) {
+        return -1;
+    }
+    for (int i = 0; i < 3; ++i) {
+        if (create_object(scenario, kinds[i], 11 + i, "t1", "alice") != 0
+            || create_object(scenario, kinds[i], 21 + i, "t1", "bob") != 0) {
+            return -1;
+        }
+    }
+    test_clock_ms = WB_BASE_MS + 1000LL;
+    int failures = 0;
+    char favorite[128];
+    char recent[128];
+    for (int i = 0; i < 3; ++i) {
+        snprintf(favorite, sizeof(favorite), "/api/admin/workbench/favorites/%s/%d", kinds[i], 11 + i);
+        snprintf(recent, sizeof(recent), "/api/admin/workbench/recents/%s/%d", kinds[i], 11 + i);
+        failures += expect_ok("PUT", favorite, tokens->alice) + expect_ok("POST", recent, tokens->alice)
+            + expect_ok("PUT", favorite, tokens->root) + expect_ok("POST", recent, tokens->root);
+    }
+    for (int i = 0; i < 3; ++i) {
+        snprintf(favorite, sizeof(favorite), "/api/admin/workbench/favorites/%s/%d", kinds[i], 21 + i);
+        failures += expect_ok("PUT", favorite, tokens->bob) + expect_ok("PUT", favorite, tokens->root);
+    }
+    if (failures != 0 || query_i64("SELECT COUNT(*) FROM management_workbench_item", NULL) != 18) {
+        fprintf(stderr, "workbench cascade fixture failed\n");
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * WorkbenchCascadeTests.deletingARouteRemovesEveryReferenceToIt, deletingAMappingRemovesEveryReferenceToIt
+ * and deletingAPeerServiceRemovesEveryReferenceToIt, each from a fresh fixture through the existing
+ * delete endpoint: every identity's references to the object go and nothing else; a route id
+ * handed out again starts without references.
+ */
+static int test_workbench_object_deletions(void)
+{
+    static char buffer[WB_RESPONSE_BYTES];
+    static wb_scenario scenario;
+    static wb_cascade_tokens tokens;
+    static const struct {
+        const char *path;
+        const char *kind;
+        long long id;
+        int as_root;
+        int status;
+        long long rows_left;
+    } cases[] = {
+        {"/api/admin/http-routes/11", "http-route", 11, 1, 204, 14},
+        {"/api/admin/specus-mappings/12", "tcp-mapping", 12, 0, 204, 14},
+        {"/api/admin/peer-mesh/services/23", "peer-service", 23, 1, 200, 16},
+    };
+    wb_response response;
+    int failures = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        if (cascade_fixture(&scenario, &tokens) != 0) {
+            return 1;
+        }
+        int failed = call("DELETE", cases[i].path, cases[i].as_root ? tokens.root : tokens.alice, NULL, buffer,
+                          sizeof(buffer), &response) != 0 || response.status != cases[i].status
+            || count_rows(cases[i].kind, cases[i].id) != 0
+            || query_i64("SELECT COUNT(*) FROM management_workbench_item", NULL) != cases[i].rows_left;
+        if (!failed && strcmp(cases[i].kind, "http-route") == 0) {
+            /* An id handed out again starts without references. */
+            char *favorites = NULL;
+            failed = create_object(&scenario, "http-route", 11, "t1", "alice") != 0
+                || call("GET", "/api/admin/workbench", tokens.alice, NULL, buffer, sizeof(buffer), &response) != 0
+                || response.status != 200
+                || (favorites = st_json_get_top_level_raw(response.body, "favorites")) == NULL
+                || strstr(favorites, "{\"kind\":\"http-route\",\"id\":11,") != NULL;
+            free(favorites);
+        }
+        if (failed) {
+            fprintf(stderr, "DELETE %s did not cascade as expected: %.300s\n", cases[i].path, buffer);
+        }
+        failures += failed;
+    }
+    return failures == 0 ? 0 : 1;
+}
+
+/*
+ * WorkbenchCascadeTests.deletingAnAccountRemovesItsRowsAndTheSameNameStartsEmpty: an account that
+ * still owns a client is not deleted (409); once its client belongs to root it is (204) and only
+ * its rows go; its old token neither reads nor writes; the same name created again starts empty.
+ */
+static int test_workbench_account_deletion(void)
+{
+    static char buffer[WB_RESPONSE_BYTES];
+    static wb_scenario scenario;
+    static wb_cascade_tokens tokens;
+    static wb_row rows[WB_MAX_ROWS];
+    wb_response response;
+    if (cascade_fixture(&scenario, &tokens) != 0) {
+        return 1;
+    }
+    int failures = call("DELETE", "/api/admin/users/alice", tokens.root, NULL, buffer, sizeof(buffer), &response) != 0
+        || response.status != 409;
+    failures += exec_sql("UPDATE client_account SET owner_username = 'root' WHERE client_name = 'wb-t1-alice'") != 0;
+    failures += call("DELETE", "/api/admin/users/alice", tokens.root, NULL, buffer, sizeof(buffer), &response) != 0
+        || response.status != 204;
+    size_t count = 0U;
+    failures += dump_rows(WB_BASE_MS, rows, WB_MAX_ROWS, &count) != 0;
+    for (size_t i = 0; i < count; ++i) {
+        failures += strcmp(rows[i].username, "bob") != 0 && strcmp(rows[i].username, "root") != 0;
+    }
+    failures += count != 12U;
+    failures += call("POST", "/api/admin/workbench/recents/http-route/11", tokens.alice, NULL, buffer, sizeof(buffer),
+                     &response) != 0 || response.status != 403;
+    failures += query_i64("SELECT COUNT(*) FROM management_workbench_item", NULL) != 12;
+    char recreated[2400];
+    failures += call("POST", "/api/admin/users", tokens.root,
+                     "{\"username\":\"alice\",\"password\":\"wb-password-1\",\"role\":\"USER\",\"enabled\":true}",
+                     buffer, sizeof(buffer), &response) != 0 || response.status != 201;
+    failures += issue_bearer("alice", "t1", recreated, sizeof(recreated)) != 0
+        || call("GET", "/api/admin/workbench", recreated, NULL, buffer, sizeof(buffer), &response) != 0
+        || expect_document("recreated account", &response, "[]", "[]");
+    if (failures != 0) {
+        print_rows("after the account deletion", rows, count);
+        fprintf(stderr, "account deletion failed (%d): %.300s\n", failures, buffer);
+    }
+    return failures == 0 ? 0 : 1;
+}
+
+static int always_visible(const void *ctx, const st_storage_client *client)
+{
+    (void)ctx;
+    (void)client;
+    return 1;
+}
+
+/*
+ * WorkbenchConcurrentWriteTests.aRowWrittenMeanwhileByAnotherInstanceIsKeptNotAConflict, on the
+ * store write itself: a favourite added again keeps its first addedAt, a recent keeps the later of
+ * the two times whichever write came last. C is one process on SQLite and writes in a BEGIN
+ * IMMEDIATE transaction, so these are the writes of two instances in sequence.
+ */
+static int test_workbench_rows_written_meanwhile(void)
+{
+    static wb_scenario scenario;
+    static wb_row rows[WB_MAX_ROWS];
+    static const struct {
+        st_storage_workbench_write_op op;
+        long long at_ms;
+    } writes[] = {
+        {ST_STORAGE_WORKBENCH_ADD_FAVORITE, 100},
+        {ST_STORAGE_WORKBENCH_ADD_FAVORITE, 200},
+        {ST_STORAGE_WORKBENCH_RECORD_VISIT, 300},
+        {ST_STORAGE_WORKBENCH_RECORD_VISIT, 250},
+        {ST_STORAGE_WORKBENCH_RECORD_VISIT, 400},
+    };
+    memset(&scenario, 0, sizeof(scenario));
+    scenario.next_listen_port = 28000;
+    if (open_fresh_database() != 0 || create_object(&scenario, "http-route", 11, "t1", "alice") != 0) {
+        return 1;
+    }
+    int failures = 0;
+    for (size_t i = 0; i < sizeof(writes) / sizeof(writes[0]); ++i) {
+        st_storage_workbench_write_request request = {
+            .op = writes[i].op,
+            .tenant_id = "t1",
+            .username = "alice",
+            .kind = "http-route",
+            .object_id = 11,
+            .now_ms = WB_BASE_MS + writes[i].at_ms,
+            .visible = always_visible,
+            .visible_ctx = NULL
+        };
+        st_storage_workbench_document doc;
+        memset(&doc, 0, sizeof(doc));
+        failures += st_storage_workbench_write(test_db_path, &request, &doc) != 0;
+        st_storage_workbench_document_free(&doc);
+    }
+    const wb_row expected[] = {
+        {"t1", "alice", "favorite", "http-route", 11, 100},
+        {"t1", "alice", "recent", "http-route", 11, 400},
+    };
+    size_t count = 0U;
+    failures += dump_rows(WB_BASE_MS, rows, WB_MAX_ROWS, &count) != 0;
+    if (failures != 0 || !rows_equal(expected, 2U, rows, count)) {
+        print_rows("expected", expected, 2U);
+        print_rows("stored", rows, count);
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * WorkbenchCascadeTests.deletingAClientRemovesTheReferencesToEverythingItCarries: the client's
+ * routes go with it and the workbench forgets everything it carried; the deleted route cannot be
+ * added back; its Peer service row stays, so the administrator, who still sees it in the Peer
+ * service list, may add it while its former owner may not.
+ */
+static int test_workbench_client_deletion(void)
+{
+    static char buffer[WB_RESPONSE_BYTES];
+    static wb_scenario scenario;
+    static wb_cascade_tokens tokens;
+    static wb_row rows[WB_MAX_ROWS];
+    wb_response response;
+    if (cascade_fixture(&scenario, &tokens) != 0) {
+        return 1;
+    }
+    char path[128];
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld",
+             query_i64("SELECT rowid FROM client_account WHERE client_name = ?", "wb-t1-alice"));
+    int failures = call("DELETE", path, tokens.root, NULL, buffer, sizeof(buffer), &response) != 0
+        || response.status != 204;
+    if (failures != 0) {
+        fprintf(stderr, "client deletion: expected 204, got %.300s\n", buffer);
+        return 1;
+    }
+    if (query_i64("SELECT COUNT(*) FROM http_route_mapping WHERE id = 11", NULL) != 0) {
+        fprintf(stderr, "client deletion left its route 11\n");
+        ++failures;
+    }
+    size_t count = 0U;
+    failures += dump_rows(WB_BASE_MS, rows, WB_MAX_ROWS, &count) != 0;
+    for (size_t i = 0; i < count; ++i) {
+        failures += rows[i].id != 21 && rows[i].id != 22 && rows[i].id != 23;
+    }
+    if (count != 6U) {
+        print_rows("after the client deletion", rows, count);
+        ++failures;
+    }
+    failures += call("PUT", "/api/admin/workbench/favorites/http-route/11", tokens.root, NULL, buffer,
+                     sizeof(buffer), &response) != 0
+        || expect_response("deleted route", &response, 404, "WORKBENCH_TARGET_NOT_FOUND");
+    failures += expect_ok("PUT", "/api/admin/workbench/favorites/peer-service/13", tokens.root);
+    failures += expect_ok("POST", "/api/admin/workbench/recents/peer-service/13", tokens.root);
+    failures += call("PUT", "/api/admin/workbench/favorites/peer-service/13", tokens.alice, NULL, buffer,
+                     sizeof(buffer), &response) != 0
+        || expect_response("former owner of an orphaned Peer service", &response, 404, "WORKBENCH_TARGET_NOT_FOUND");
+    if (failures != 0) {
+        fprintf(stderr, "client deletion follow-ups failed (%d)\n", failures);
+    }
+    return failures == 0 ? 0 : 1;
+}
+
+/*
+ * WorkbenchCascadeTests.disablingAnAccountDeletesNothing: the administrator disables alice through
+ * the account endpoint, her token is refused while she is disabled and no row goes; enabled again,
+ * her favourites are exactly what they were.
+ */
+static int test_workbench_disabling_deletes_nothing(void)
+{
+    static char buffer[WB_RESPONSE_BYTES];
+    static wb_scenario scenario;
+    static wb_cascade_tokens tokens;
+    static wb_row before[WB_MAX_ROWS];
+    static wb_row after[WB_MAX_ROWS];
+    wb_response response;
+    if (cascade_fixture(&scenario, &tokens) != 0) {
+        return 1;
+    }
+    size_t before_count = 0U;
+    size_t after_count = 0U;
+    int failures = dump_rows(WB_BASE_MS, before, WB_MAX_ROWS, &before_count) != 0;
+    failures += call("PUT", "/api/admin/users/alice", tokens.root, "{\"enabled\":false}", buffer, sizeof(buffer),
+                     &response) != 0 || response.status != 200;
+    failures += call("GET", "/api/admin/workbench", tokens.alice, NULL, buffer, sizeof(buffer), &response) != 0
+        || expect_response("disabled account", &response, 403, NULL);
+    failures += dump_rows(WB_BASE_MS, after, WB_MAX_ROWS, &after_count) != 0;
+    if (after_count != 18U || !rows_equal(before, before_count, after, after_count)) {
+        print_rows("before disabling", before, before_count);
+        print_rows("while disabled", after, after_count);
+        ++failures;
+    }
+    failures += call("PUT", "/api/admin/users/alice", tokens.root, "{\"enabled\":true}", buffer, sizeof(buffer),
+                     &response) != 0 || response.status != 200;
+    failures += call("GET", "/api/admin/workbench", tokens.alice, NULL, buffer, sizeof(buffer), &response) != 0
+        || expect_document("enabled again", &response,
+                           "[{\"kind\":\"http-route\",\"id\":11,\"addedAt\":\"2026-10-06T00:00:01.000Z\"},"
+                           "{\"kind\":\"tcp-mapping\",\"id\":12,\"addedAt\":\"2026-10-06T00:00:01.000Z\"},"
+                           "{\"kind\":\"peer-service\",\"id\":13,\"addedAt\":\"2026-10-06T00:00:01.000Z\"}]",
+                           "[{\"kind\":\"http-route\",\"id\":11,\"visitedAt\":\"2026-10-06T00:00:01.000Z\"},"
+                           "{\"kind\":\"tcp-mapping\",\"id\":12,\"visitedAt\":\"2026-10-06T00:00:01.000Z\"},"
+                           "{\"kind\":\"peer-service\",\"id\":13,\"visitedAt\":\"2026-10-06T00:00:01.000Z\"}]");
+    if (failures != 0) {
+        fprintf(stderr, "disabling an account failed (%d): %.300s\n", failures, buffer);
+    }
+    return failures == 0 ? 0 : 1;
+}
+
+/*
+ * WorkbenchResourceTests.anAdministratorReadsAndClearsOnlyTheirOwnLists: whatever the query or the
+ * body names, an administrator reads and clears their own lists, never alice's.
+ */
+static int test_workbench_administrator_own_lists(void)
+{
+    static char buffer[WB_RESPONSE_BYTES];
+    static wb_scenario scenario;
+    static wb_row rows[WB_MAX_ROWS];
+    static const char *const queries[] = {"", "?username=alice", "?tenantId=t1&username=alice", "?user=alice"};
+    static const char *const naming = "{\"tenantId\":\"t1\",\"username\":\"alice\"}";
+    wb_response response;
+    char alice[2400];
+    char root[2400];
+    memset(&scenario, 0, sizeof(scenario));
+    scenario.next_listen_port = 25000;
+    if (open_fresh_database() != 0
+        || st_storage_create_management_user(test_db_path, "alice", "t1", "unused", "USER", 1, NULL) != 0
+        || st_storage_create_management_user(test_db_path, "root", "t1", "unused", "ADMIN", 1, NULL) != 0
+        || create_object(&scenario, "http-route", 1, "t1", "alice") != 0
+        || create_object(&scenario, "tcp-mapping", 2, "t1", "alice") != 0
+        || issue_bearer("alice", "t1", alice, sizeof(alice)) != 0
+        || issue_bearer("root", "t1", root, sizeof(root)) != 0) {
+        return 1;
+    }
+    test_clock_ms = WB_BASE_MS + 1000LL;
+    int failures = expect_ok("PUT", "/api/admin/workbench/favorites/http-route/1", alice)
+        + expect_ok("POST", "/api/admin/workbench/recents/tcp-mapping/2", alice);
+    test_clock_ms = WB_BASE_MS + 2000LL;
+    failures += expect_ok("PUT", "/api/admin/workbench/favorites/tcp-mapping/2", root);
+    for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); ++i) {
+        char path[128];
+        char label[160];
+        snprintf(path, sizeof(path), "/api/admin/workbench%s", queries[i]);
+        snprintf(label, sizeof(label), "administrator GET %s", path);
+        failures += call("GET", path, root, NULL, buffer, sizeof(buffer), &response) != 0
+            || expect_document(label, &response,
+                               "[{\"kind\":\"tcp-mapping\",\"id\":2,\"addedAt\":\"2026-10-06T00:00:02.000Z\"}]", "[]");
+    }
+    failures += call("DELETE", "/api/admin/workbench/favorites?username=alice", root, naming, buffer, sizeof(buffer),
+                     &response) != 0 || response.status != 200;
+    failures += call("DELETE", "/api/admin/workbench/recents?username=alice", root, naming, buffer, sizeof(buffer),
+                     &response) != 0 || response.status != 200;
+    failures += call("DELETE", "/api/admin/workbench/favorites/http-route/1?username=alice", root, naming, buffer,
+                     sizeof(buffer), &response) != 0 || response.status != 200;
+    failures += call("GET", "/api/admin/workbench", alice, NULL, buffer, sizeof(buffer), &response) != 0
+        || expect_document("alice's lists untouched", &response,
+                           "[{\"kind\":\"http-route\",\"id\":1,\"addedAt\":\"2026-10-06T00:00:01.000Z\"}]",
+                           "[{\"kind\":\"tcp-mapping\",\"id\":2,\"visitedAt\":\"2026-10-06T00:00:01.000Z\"}]");
+    failures += call("GET", "/api/admin/workbench", root, NULL, buffer, sizeof(buffer), &response) != 0
+        || expect_document("administrator's own lists cleared", &response, "[]", "[]");
+    size_t count = 0U;
+    failures += dump_rows(WB_BASE_MS, rows, WB_MAX_ROWS, &count) != 0;
+    for (size_t i = 0; i < count; ++i) {
+        failures += strcmp(rows[i].username, "alice") != 0;
+    }
+    if (count != 2U) {
+        print_rows("after the administrator's clearing", rows, count);
+        ++failures;
+    }
+    if (failures != 0) {
+        fprintf(stderr, "administrator own lists failed (%d)\n", failures);
+    }
+    return failures == 0 ? 0 : 1;
+}
+
+/* ---- Over the listener: the request firewall and the body as sent -------------------------- */
+
+static st_admin_server listener;
+static int listener_port = 0;
+
+static int start_listener(void)
+{
+    if (listener_port != 0) {
+        return 0;
+    }
+    memset(&listener, 0, sizeof(listener));
+    listener.fd = -1;
+    struct sockaddr_in address;
+    socklen_t address_len = sizeof(address);
+    if (st_admin_server_start(&listener, 0, "") != 0
+        || getsockname(listener.fd, (struct sockaddr *)&address, &address_len) != 0) {
+        fprintf(stderr, "workbench test listener could not start\n");
+        return -1;
+    }
+    listener_port = ntohs(address.sin_port);
+    return 0;
+}
+
+/* One request over real HTTP; bearer as issue_bearer writes it ("Bearer <token>"). */
+static int listener_call(const char *method, const char *path, const char *bearer, const char *body, int *status,
+                         char **answer)
+{
+    const char *token = bearer == NULL ? NULL : bearer + strlen("Bearer ");
+    if (http_request(listener_port, method, path, body, token, status, answer) != 0) {
+        fprintf(stderr, "%s %s: no answer from the listener\n", method, path);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * WorkbenchResourceTests.theRequestBodyIsNeverRead, over real HTTP: a body naming another
+ * reference, other times and another user changes nothing, a body that is no JSON is no error,
+ * and both times are the server clock's.
+ */
+static int test_workbench_body_never_read(void)
+{
+    static wb_scenario scenario;
+    static wb_row rows[WB_MAX_ROWS];
+    char alice[2400];
+    memset(&scenario, 0, sizeof(scenario));
+    scenario.next_listen_port = 26000;
+    if (open_fresh_database() != 0 || start_listener() != 0
+        || st_storage_create_management_user(test_db_path, "alice", "t1", "unused", "USER", 1, NULL) != 0
+        || create_object(&scenario, "http-route", 7, "t1", "alice") != 0
+        || issue_bearer("alice", "t1", alice, sizeof(alice)) != 0) {
+        return 1;
+    }
+    test_clock_ms = WB_BASE_MS + 5000LL;
+    const char *body = "{\"kind\":\"tcp-mapping\",\"id\":99,\"addedAt\":\"2020-01-01T00:00:00.000Z\","
+                       "\"visitedAt\":\"2020-01-01T00:00:00.000Z\",\"username\":\"bob\"}";
+    int status = 0;
+    char *answer = NULL;
+    int failures = listener_call("PUT", "/api/admin/workbench/favorites/http-route/7", alice, body, &status,
+                                 &answer) != 0 || status != 200;
+    if (status != 200) {
+        fprintf(stderr, "PUT with a body: expected 200, got %d %s\n", status, answer == NULL ? "" : answer);
+    }
+    free(answer);
+    answer = NULL;
+    failures += listener_call("POST", "/api/admin/workbench/recents/http-route/7", alice, "not json at all", &status,
+                              &answer) != 0 || status != 200;
+    if (status != 200) {
+        fprintf(stderr, "POST with no JSON: expected 200, got %d %s\n", status, answer == NULL ? "" : answer);
+    }
+    free(answer);
+    const wb_row expected[] = {
+        {"t1", "alice", "favorite", "http-route", 7, 5000},
+        {"t1", "alice", "recent", "http-route", 7, 5000},
+    };
+    size_t count = 0U;
+    failures += dump_rows(WB_BASE_MS, rows, WB_MAX_ROWS, &count) != 0;
+    if (!rows_equal(expected, 2U, rows, count)) {
+        print_rows("expected", expected, 2U);
+        print_rows("stored", rows, count);
+        ++failures;
+    }
+    return failures == 0 ? 0 : 1;
+}
+
+/*
+ * WorkbenchResourceTests.idsAreValidatedAsTheRawPathSegment, over real HTTP: the listener decodes
+ * the path before it is routed, as Spring hands the controller the decoded segment, so "%2B42"
+ * arrives as "+42" -- which a Long binding would read as 42 -- and is refused like every other
+ * spelling but the canonical one. Nothing is written for any of them.
+ */
+static int test_workbench_ids_as_path_segments(void)
+{
+    static wb_scenario scenario;
+    static const char *const ids[] = {"042", "0042", "%2B42", "%2042", "42%20", "42.0", "4%2C2", "0x2A", "42L"};
+    static const char *const others[][2] = {
+        {"Http-Route", "42"},
+        {"http-route", "9007199254740992"},
+        {"http-route", "99999999999999999999"},
+    };
+    static const char *const requests[][2] = {
+        {"PUT", "favorites"},
+        {"DELETE", "favorites"},
+        {"POST", "recents"},
+        {"DELETE", "recents"},
+    };
+    char alice[2400];
+    memset(&scenario, 0, sizeof(scenario));
+    scenario.next_listen_port = 27000;
+    if (open_fresh_database() != 0 || start_listener() != 0
+        || st_storage_create_management_user(test_db_path, "alice", "t1", "unused", "USER", 1, NULL) != 0
+        || create_object(&scenario, "http-route", 42, "t1", "alice") != 0
+        || issue_bearer("alice", "t1", alice, sizeof(alice)) != 0) {
+        return 1;
+    }
+    test_clock_ms = WB_BASE_MS;
+    const size_t id_count = sizeof(ids) / sizeof(ids[0]);
+    const size_t other_count = sizeof(others) / sizeof(others[0]);
+    int failures = 0;
+    for (size_t pass = 0; pass < 2U; ++pass) {
+        /* Every spelling across the four operations; then, once 42 is a favourite, the others again. */
+        for (size_t i = pass == 0U ? 0U : id_count; i < id_count + other_count; ++i) {
+            const char *kind = i < id_count ? "http-route" : others[i - id_count][0];
+            const char *id = i < id_count ? ids[i] : others[i - id_count][1];
+            for (size_t r = 0; r < sizeof(requests) / sizeof(requests[0]); ++r) {
+                char path[160];
+                snprintf(path, sizeof(path), "/api/admin/workbench/%s/%s/%s", requests[r][1], kind, id);
+                int status = 0;
+                char *answer = NULL;
+                char *code = NULL;
+                int failed = listener_call(requests[r][0], path, alice, NULL, &status, &answer) != 0 || status != 400
+                    || answer == NULL || (code = body_code(answer)) == NULL
+                    || strcmp(code, "WORKBENCH_REQUEST_INVALID") != 0;
+                if (failed) {
+                    fprintf(stderr, "%s %s: expected 400 WORKBENCH_REQUEST_INVALID, got %d %s\n", requests[r][0], path,
+                            status, answer == NULL ? "" : answer);
+                }
+                failures += failed;
+                free(code);
+                free(answer);
+            }
+        }
+        if (pass == 0U) {
+            if (query_i64("SELECT COUNT(*) FROM management_workbench_item", NULL) != 0) {
+                fprintf(stderr, "a refused id wrote a row\n");
+                ++failures;
+            }
+            int status = 0;
+            char *answer = NULL;
+            failures += listener_call("PUT", "/api/admin/workbench/favorites/http-route/42", alice, NULL, &status,
+                                      &answer) != 0 || status != 200;
+            if (status != 200) {
+                fprintf(stderr, "PUT favourite 42: expected 200, got %d %s\n", status, answer == NULL ? "" : answer);
+            }
+            free(answer);
+        }
+    }
+    /*
+     * A segment that decodes to the canonical spelling is that id: Java answers 200 to
+     * "/favorites/http-route/%34%32" (measured with a temporary probe on its HTTP stack).
+     */
+    int status = 0;
+    char *answer = NULL;
+    failures += listener_call("POST", "/api/admin/workbench/recents/http-route/%34%32", alice, NULL, &status,
+                              &answer) != 0 || status != 200;
+    if (status != 200) {
+        fprintf(stderr, "POST recent %%34%%32: expected 200, got %d %s\n", status, answer == NULL ? "" : answer);
+    }
+    free(answer);
+    if (query_i64("SELECT COUNT(*) FROM management_workbench_item WHERE object_id = 42", NULL) != 2
+        || query_i64("SELECT COUNT(*) FROM management_workbench_item", NULL) != 2) {
+        fprintf(stderr, "a refused id changed the rows\n");
+        ++failures;
+    }
+    return failures == 0 ? 0 : 1;
+}
+
 int main(void)
 {
     setenv("SPECUS_AUTH_JWT_SECRET", "c-workbench-test-secret", 1);
@@ -1236,6 +1990,17 @@ int main(void)
     failures += test_workbench_kind_order();
     failures += test_workbench_rate_limit_key_bound();
     failures += test_workbench_cascades();
+    failures += test_workbench_reading_never_writes();
+    failures += test_workbench_schema();
+    failures += test_workbench_object_deletions();
+    failures += test_workbench_client_deletion();
+    failures += test_workbench_account_deletion();
+    failures += test_workbench_disabling_deletes_nothing();
+    failures += test_workbench_rows_written_meanwhile();
+    failures += test_workbench_administrator_own_lists();
+    /* Last: the listener reads SPECUS_DATABASE_PATH while it serves. */
+    failures += test_workbench_body_never_read();
+    failures += test_workbench_ids_as_path_segments();
     st_workbench_set_clock(NULL);
     if (test_db_path[0] != '\0') {
         unlink(test_db_path);
