@@ -808,6 +808,191 @@ static int test_query_parameters(void)
     return failed;
 }
 
+/*
+ * A parameter given more than once, as the Java server answers it (measured over real HTTP): a
+ * String gets the values comma-joined; a number or boolean converts the first value alone, and when
+ * that fails the property editor gets them all joined and names them in its message. Names are
+ * percent-decoded, and a name without '=' is an empty value.
+ */
+static int test_repeated_query_parameters(void)
+{
+    static const struct {
+        const char *path;
+        int status;
+        const char *answer; /* NULL: anything */
+    } cases[] = {
+        {"/api/admin/specus-mappings?clientId=a&clientId=1", 400, "{\"error\":\"For input string: \\\"a,1\\\"\"}"},
+        {"/api/admin/specus-mappings?clientId=%20&clientId=%20", 400, "{\"error\":\"For input string: \\\",\\\"\"}"},
+        {"/api/admin/specus-mappings?clientId=1%2C2", 400, "{\"error\":\"For input string: \\\"1,2\\\"\"}"},
+        {"/api/admin/specus-mappings?%63lientId=x", 400, "{\"error\":\"For input string: \\\"x\\\"\"}"},
+        {"/api/admin/specus-mappings?clientId=&clientId=", 200, NULL},
+        {"/api/admin/specus-mappings?clientId=&clientId=5", 200, NULL},
+        {"/api/admin/specus-mappings?clientId", 200, NULL},
+        {"/api/admin/specus-mappings?clientId&clientId=3", 200, NULL},
+        {"/api/admin/specus-mappings?clientId=1&&clientId=2", 200, NULL},
+        {"/api/admin/connections?page=&page=", 400, "{\"error\":\"For input string: \\\",\\\"\"}"},
+        {"/api/admin/connections?page=0&page=x", 200, "\"page\":0"},
+        {"/api/admin/connections?page=x&page=0", 400, "{\"error\":\"For input string: \\\"x,0\\\"\"}"},
+        {"/api/admin/connections?success=true&success=false", 200, NULL},
+        {"/api/admin/connections?success=&success=", 200, NULL},
+        {"/api/admin/connections?success=maybe&success=true", 400, "{\"error\":\"Invalid boolean value [maybe,true]\"}"},
+        {"/api/admin/traffic?flush=&flush=", 400, "{\"error\":\"Invalid boolean value [,]\"}"},
+        {"/api/admin/traffic?flush=true&flush=true", 200, NULL},
+        {"/api/admin/clients/name-availability?clientName=a&clientName=b", 200, "\"clientName\":\"a,b\""},
+        {"/api/admin/clients/name-availability?clientName=crud-a&clientName=", 200, "\"clientName\":\"crud-a,\""},
+        {"/api/admin/clients/name-availability?clientName", 400, "{\"error\":\"clientName cannot be blank\"}"},
+        /* Java names the allowed values in an order that changes between JVMs; see client_package_tests. */
+        {"/api/public/client-version-check?implementation=go&implementation=java&platform=linux&arch=x64"
+         "&current=1.0.0", 400, "{\"error\":\"implementation must be one of [java go csharp android]\"}"},
+    };
+    int failed = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]) && !failed; ++i) {
+        failed = expect("GET", cases[i].path, NULL, admin_token, cases[i].status, NULL) != 0
+            || (cases[i].answer != NULL
+                && (cases[i].answer[0] == '{' ? strcmp(last_body, cases[i].answer) != 0
+                                              : strstr(last_body, cases[i].answer) == NULL));
+        if (failed) fprintf(stderr, "FAIL GET %s: expected %d %s, got %d %s\n", cases[i].path, cases[i].status,
+                            cases[i].answer == NULL ? "" : cases[i].answer, last_status,
+                            last_body == NULL ? "" : last_body);
+    }
+    /* The first value that converts is the one the list filters by. */
+    char path[200];
+    char owner_a[64];
+    char owner_b[64];
+    snprintf(owner_a, sizeof(owner_a), "\"clientId\":%lld,", client_a);
+    snprintf(owner_b, sizeof(owner_b), "\"clientId\":%lld,", client_b);
+    snprintf(path, sizeof(path), "/api/admin/specus-mappings?clientId=%lld&clientId=%lld", client_a, client_b);
+    failed = failed || expect("GET", path, NULL, admin_token, 200, owner_a) != 0 || strstr(last_body, owner_b) != NULL;
+    snprintf(path, sizeof(path), "/api/admin/specus-mappings?clientId=%lld&clientId=x", client_b);
+    failed = failed || expect("GET", path, NULL, admin_token, 200, owner_b) != 0 || strstr(last_body, owner_a) != NULL;
+    printf("%s repeated request parameters bind as Spring binds them\n", failed ? "FAIL" : "ok  ");
+    return failed;
+}
+
+/* ---- request firewall ---------------------------------------------------------------------- */
+
+/* The status the listener answers request (a whole request head) with; -1 when there is none. */
+static int raw_status(const char *request)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons((uint16_t)port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    char answer[512] = "";
+    size_t used = 0U;
+    if (fd >= 0 && connect(fd, (struct sockaddr *)&address, sizeof(address)) == 0
+        && send(fd, request, strlen(request), 0) == (ssize_t)strlen(request)) {
+        ssize_t got = 0;
+        while (used < sizeof(answer) - 1U && (got = recv(fd, answer + used, sizeof(answer) - 1U - used, 0)) > 0) {
+            used += (size_t)got;
+        }
+    }
+    if (fd >= 0) close(fd);
+    answer[used] = '\0';
+    int status = -1;
+    return sscanf(answer, "HTTP/1.1 %d", &status) == 1 ? status : -1;
+}
+
+/*
+ * What the Java server refuses before any handler and before authentication, measured over real
+ * HTTP: Tomcat's request-line, decoding and header checks and Spring Security's StrictHttpFirewall
+ * are a 400 for an administrator and an anonymous caller alike. What they let through is decoded
+ * before it is routed. The C server used to route the raw path, so "//api/admin/clients" was a 404
+ * for an administrator and a 401 for anyone else, and "/api/admin/cli%65nts" was a 404.
+ */
+static int test_request_firewall(void)
+{
+    static const char *const refused[] = {
+        "//api/admin/clients", "/api/admin//clients", "/api/admin/clients//", "/api/admin/./clients",
+        "/api/admin/../admin/clients", "/api/admin/clients/.", "/api/admin/clients/..", "/api/admin/clients/./1",
+        "/api/admin/clients;x", "/api/admin/clients%3Bx", "/api/admin/clients%3bx", "/;/api/admin/clients",
+        "/api/admin/clients/1%3B", "/api/admin/%2e/clients", "/api/admin/%2E%2E/admin/clients",
+        "/api/admin/clients/%2e", "/api/admin/clients%25", "/api/admin/clients%0a", "/api/admin/clients%0d",
+        "/api/admin/clients%E2%80%A8", "/api/admin/clients%E2%80%A9", "/api/admin/clients\\",
+        "/api/admin/clients%5C", "/api/admin/clients%5c", "/api/admin/clients%2F1", "/api/admin/cli%2Fents",
+        "/api/admin/clients/1%2F", "/api/admin/clients%00", "/api/admin/clients\xc3\xa4", "/api/admin/clients\x7f",
+        "/api/admin/clients%FF", "/api/admin/clients%", "/api/admin/clients%zz", "/api/admin/clients%2",
+        "/api/admin/clients?x=1#y", "*", "api/admin/clients", "http://localhost/api/admin/clients", "//health",
+        /* Of the printable ASCII characters Tomcat refuses ";<>[\]^`{|} in the path and "<>[\]^`| in the query. */
+        "/api/admin/clients/1[", "/api/admin/clients/1]", "/api/admin/clients{", "/api/admin/clients}",
+        "/api/admin/clients^", "/api/admin/clients`", "/api/admin/clients|", "/api/admin/clients\"",
+        "/api/admin/clients<", "/api/admin/clients?x=[", "/api/admin/clients?x=]", "/api/admin/clients?x=|",
+        "/api/admin/clients?x=\\", "/api/admin/clients?x=^", "/api/admin/clients?x=`", "/api/admin/clients?x=\"",
+        "/api/admin/clients?x=>",
+    };
+    int failed = 0;
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]) && !failed; ++i) {
+        failed = expect("GET", refused[i], NULL, admin_token, 400, NULL) != 0
+            || strcmp(last_body, "{\"error\":\"Bad Request\"}") != 0
+            || expect("GET", refused[i], NULL, NULL, 400, "{\"error\":\"Bad Request\"}") != 0;
+        if (failed) fprintf(stderr, "FAIL GET %s: expected 400, got %d %s\n", refused[i], last_status,
+                            last_body == NULL ? "" : last_body);
+    }
+    /* Let through and decoded: the same answers as the plain spelling. */
+    char path[200];
+    snprintf(path, sizeof(path), "/api/admin/cl%%69ents/%lld", client_a);
+    failed = failed
+        || expect("GET", "/api/admin/cli%65nts", NULL, admin_token, 200, "\"clientName\":\"crud-a\"") != 0
+        || expect("GET", "/api/admin/cli%65nts", NULL, NULL, 401, NULL) != 0
+        || expect("GET", path, NULL, admin_token, 200, "\"clientName\":\"crud-a\"") != 0
+        || expect("GET", "/api/admin/clients?a=1;b=2", NULL, admin_token, 200, "\"clientName\":\"crud-a\"") != 0
+        || expect("GET", "/api/admin/clients?x={}&y=%&z=?/", NULL, admin_token, 200, "\"clientName\":\"crud-a\"") != 0
+        || expect("GET", "/api/admin/clients/%3F", NULL, admin_token, 400,
+                  "{\"error\":\"For input string: \\\"?\\\"\"}") != 0
+        || expect("GET", "/api/admin/clients%3F", NULL, admin_token, 404, NULL) != 0
+        || expect("GET", "/api/admin/clients/..x", NULL, admin_token, 400,
+                  "{\"error\":\"For input string: \\\"..x\\\"\"}") != 0
+        || expect("GET", "/api/admin/clients/.x", NULL, admin_token, 400,
+                  "{\"error\":\"For input string: \\\".x\\\"\"}") != 0
+        || expect("POST", "/auth//login", "{\"username\":\"crud-root\",\"password\":\"crud-root-password-2026\"}",
+                  NULL, 400, "{\"error\":\"Bad Request\"}") != 0;
+    /* The login route decoded: the same answer as the plain spelling (here Turnstile's refusal). */
+    char plain[256] = "";
+    failed = failed
+        || expect("POST", "/auth/login", "{\"username\":\"crud-root\",\"password\":\"crud-root-password-2026\"}",
+                  NULL, 400, NULL) != 0;
+    if (!failed) snprintf(plain, sizeof(plain), "%s", last_body);
+    failed = failed
+        || expect("POST", "/auth/l%6fgin", "{\"username\":\"crud-root\",\"password\":\"crud-root-password-2026\"}",
+                  NULL, 400, NULL) != 0
+        || strcmp(last_body, plain) != 0 || strcmp(plain, "{\"error\":\"Bad Request\"}") == 0;
+    static const char *const unmatched[] = {
+        "/api/admin/clients%20", "/api/admin/clients%09", "/api/admin/clients%7F", "/api/admin/clients%C3%A4",
+        "/api/admin/clients+", "/api/admin/.clients", "/api/admin/clients/",
+    };
+    for (size_t i = 0; i < sizeof(unmatched) / sizeof(unmatched[0]) && !failed; ++i) {
+        failed = expect("GET", unmatched[i], NULL, admin_token, 404, NULL) != 0
+            || expect("GET", unmatched[i], NULL, NULL, 401, NULL) != 0;
+    }
+    /* Methods: StrictHttpFirewall's seven, spelled exactly; Tomcat's own answers to TRACE and CONNECT. */
+    failed = failed
+        || expect("get", "/api/admin/clients", NULL, admin_token, 400, "{\"error\":\"Bad Request\"}") != 0
+        || expect("FOO", "/api/admin/clients", NULL, admin_token, 400, "{\"error\":\"Bad Request\"}") != 0
+        || expect("FOO", "/api/admin/clients", NULL, NULL, 400, "{\"error\":\"Bad Request\"}") != 0
+        || expect("TRACE", "/api/admin/clients", NULL, admin_token, 405, NULL) != 0
+        || expect("CONNECT", "/api/admin/clients", NULL, admin_token, 501, NULL) != 0;
+    /* Header lines: a name that is no token or a value with a control character. */
+    char request[1400];
+    snprintf(request, sizeof(request), "GET /api/admin/clients HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+             "X-Probe: a\x01" "b\r\nConnection: close\r\n\r\n", admin_token);
+    int status = raw_status(request);
+    snprintf(request, sizeof(request), "GET /api/admin/clients HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+             "X-Pr\xc3\xa4" "be: ab\r\nConnection: close\r\n\r\n", admin_token);
+    int name_status = raw_status(request);
+    snprintf(request, sizeof(request), "GET /api/admin/clients HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+             "X-Probe: \xc3\xa4\r\nConnection: close\r\n\r\n", admin_token);
+    int text_status = raw_status(request);
+    if (!failed && (status != 400 || name_status != 400 || text_status != 200)) {
+        fprintf(stderr, "FAIL header lines: control %d, name %d, non-ASCII value %d\n", status, name_status,
+                text_status);
+        failed = 1;
+    }
+    printf("%s the request firewall refuses what Java's does, before authentication\n", failed ? "FAIL" : "ok  ");
+    return failed;
+}
+
 /* ---- management user request body --------------------------------------------------------- */
 
 /*
@@ -1139,6 +1324,8 @@ int main(void)
         failed = test_path_variables() != 0 || failed;
         failed = test_user_mutation_binding() != 0 || failed;
         failed = test_query_parameters() != 0 || failed;
+        failed = test_repeated_query_parameters() != 0 || failed;
+        failed = test_request_firewall() != 0 || failed;
         failed = test_database_initialize() != 0 || failed;
     }
     free(last_body);

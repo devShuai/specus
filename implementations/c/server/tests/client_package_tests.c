@@ -913,6 +913,42 @@ static int test_catalogue_mutations(void)
     CHECK(version_check("implementation=android&platform=windows&arch=any&current=1.0.0", NULL) == 400
               && contains(response_body(), "platform=android"),
           "a version check for dead coordinates: %s", response);
+    /*
+     * checkVersion refuses the coordinates in turn, then the current version, each with its own
+     * reason; the C server used to answer every one of them "invalid client version target".
+     */
+    static const struct {
+        const char *query;
+        const char *answer;
+    } refused_targets[] = {
+        {"implementation=rust&platform=beos&arch=mips&current=x",
+         "{\"error\":\"implementation must be one of [java go csharp android]\"}"},
+        {"implementation=GO&platform=beos&arch=mips&current=x",
+         "{\"error\":\"platform must be one of [windows linux macos android any]\"}"},
+        {"implementation=go&platform=linux&arch=mips&current=x", "{\"error\":\"arch must be one of [x64 arm64 any]\"}"},
+        {"implementation=go&platform=android&arch=any&current=x",
+         "{\"error\":\"platform=android is reserved for android/any packages\"}"},
+        {"implementation=go&platform=linux&arch=x64&current=1.0",
+         "{\"error\":\"current must be a valid SemVer 2.0 version\"}"},
+        {"implementation=go&platform=linux&arch=x64&current=",
+         "{\"error\":\"current must be a valid SemVer 2.0 version\"}"},
+        {"implementation=go&platform=linux&arch=x64&current=1.0.0-01",
+         "{\"error\":\"current contains a numeric pre-release identifier with a leading zero\"}"},
+        /* Only one "v" is dropped, so the pattern refuses this before the leading-zero rule sees it. */
+        {"implementation=go&platform=linux&arch=x64&current=vv1.0.0-01",
+         "{\"error\":\"current must be a valid SemVer 2.0 version\"}"},
+        {"implementation=go&platform=linux&arch=x64&current=1.0.0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+         "{\"error\":\"current is too long (max 32)\"}"},
+        {"implementation=go&platform=linux&arch=x64&current=1.0.0-%E4%B8%AD%E4%B8%AD%E4%B8%AD%E4%B8%AD%E4%B8%AD%E4%B8%AD"
+         "%E4%B8%AD%E4%B8%AD%E4%B8%AD", "{\"error\":\"current must be a valid SemVer 2.0 version\"}"},
+    };
+    for (size_t i = 0; i < sizeof(refused_targets) / sizeof(refused_targets[0]); ++i) {
+        CHECK(version_check(refused_targets[i].query, NULL) == 400
+                  && strcmp(response_body(), refused_targets[i].answer) == 0,
+              "version check %s: %s", refused_targets[i].query, response);
+    }
+    CHECK(version_check("implementation=go&platform=linux&arch=x64&current=%20v1.0.0%20", NULL) == 200,
+          "a trimmed current version with its v: %s", response);
 
     /* createAndUpdateRejectDisabledLatestBeforeChangingLatestSlot */
     CHECK(admin_call("POST", "/api/admin/client-downloads",
