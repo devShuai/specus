@@ -695,37 +695,61 @@ static int allocation_matches_identity(const turn_allocation *allocation, const 
 }
 
 static void close_allocation(turn_allocation *allocation);
+static void format_endpoint(const struct sockaddr_storage *address, char *out, size_t out_len);
 
-static int general_relay_quota_allows(st_stun_turn_server *server,
-                                      const struct sockaddr_storage *client,
-                                      const turn_allocation *exclude)
+/* General relay allocations other than exclude, and how many of them come from client's address. */
+static int count_general_relays(st_stun_turn_server *server,
+                                const struct sockaddr_storage *client,
+                                const turn_allocation *exclude,
+                                int *same_address)
 {
-    if (server->general_relay_max_allocations <= 0) return 0;
     int total = 0;
-    int same_address = 0;
+    *same_address = 0;
     for (size_t i = 0; i < server->allocation_count; ++i) {
         turn_allocation *candidate = server->allocations[i];
         if (!candidate->used || candidate == exclude || !allocation_is_general(candidate)) continue;
         ++total;
-        if (sockaddr_equal(&candidate->client, client, 0)) ++same_address;
+        if (client != NULL && sockaddr_equal(&candidate->client, client, 0)) ++*same_address;
     }
-    return total < server->general_relay_max_allocations
-        && (server->general_relay_max_allocations_per_address <= 0
-            || same_address < server->general_relay_max_allocations_per_address);
+    return total;
 }
 
+/*
+ * Java generalRelayQuotaRejection: NULL when a general relay allocation is admitted, otherwise the
+ * reason, which the audit line and the 486 carry. exclude is the allocation of the same endpoint
+ * that this one replaces, so a client re-allocating is not refused for the room it holds itself.
+ */
+static const char *general_relay_quota_rejection(st_stun_turn_server *server,
+                                                 const struct sockaddr_storage *client,
+                                                 const turn_allocation *exclude)
+{
+    if (server->general_relay_max_allocations <= 0) return "general-relay-disabled";
+    int same_address = 0;
+    if (count_general_relays(server, client, exclude, &same_address) >= server->general_relay_max_allocations) {
+        return "general-relay-allocation-quota";
+    }
+    if (server->general_relay_max_allocations_per_address > 0
+        && same_address >= server->general_relay_max_allocations_per_address) return "general-relay-address-quota";
+    return NULL;
+}
+
+/*
+ * Java allowGeneralRelayTraffic: a general relay allocation that has relayed more than its byte
+ * quota in both directions is closed (not throttled), with an audit line written once, as it closes.
+ */
 static int allow_general_relay_traffic(st_stun_turn_server *server,
                                        turn_allocation *allocation,
                                        size_t bytes)
 {
     if (!allocation_is_general(allocation)) return 1;
-    if (bytes > ULLONG_MAX - allocation->relayed_bytes) {
-        close_allocation(allocation);
-        return 0;
-    }
-    allocation->relayed_bytes += bytes;
-    if (server->general_relay_max_bytes > 0
-        && allocation->relayed_bytes > (unsigned long long)server->general_relay_max_bytes) {
+    int overflow = bytes > ULLONG_MAX - allocation->relayed_bytes;
+    allocation->relayed_bytes = overflow ? ULLONG_MAX : allocation->relayed_bytes + bytes;
+    if (overflow || (server->general_relay_max_bytes > 0
+                     && allocation->relayed_bytes > (unsigned long long)server->general_relay_max_bytes)) {
+        char client[INET6_ADDRSTRLEN + 16];
+        format_endpoint(&allocation->client, client, sizeof(client));
+        fprintf(stderr, "[peer-mesh][audit] general TURN byte quota exhausted, closing allocation: "
+                "client=%s, bytes=%llu\n", client, allocation->relayed_bytes);
         close_allocation(allocation);
         return 0;
     }
@@ -1138,6 +1162,13 @@ static turn_allocation *create_allocation(st_stun_turn_server *server,
         relay->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     }
     slot->relay_len = sizeof(*relay);
+    /* Java createAllocation logs every allocation at info. */
+    char client_text[INET6_ADDRSTRLEN + 16];
+    char relay_text[INET6_ADDRSTRLEN + 16];
+    format_endpoint(client, client_text, sizeof(client_text));
+    format_endpoint(&slot->relay, relay_text, sizeof(relay_text));
+    printf("[peer-mesh] TURN allocation created: client=%s, relay=%s\n", client_text, relay_text);
+    fflush(stdout);
     return slot;
 }
 
@@ -1373,29 +1404,42 @@ static void handle_allocate(st_stun_turn_server *server,
         return;
     }
     turn_allocation *allocation = find_allocation_by_client(server, client);
-    int quota_rejected = 0;
+    const char *rejection = NULL;
     int general_relay = username_is_general(username);
-    if (allocation != NULL && !allocation_matches_identity(allocation, username)) {
-        if (general_relay && !general_relay_quota_allows(server, client, allocation)) {
-            quota_rejected = 1;
+    int created = 0;
+    if (allocation == NULL || !allocation_matches_identity(allocation, username)) {
+        /* A new allocation, or one replacing this endpoint's allocation of another identity. */
+        if (general_relay) rejection = general_relay_quota_rejection(server, client, allocation);
+        if (rejection == NULL) {
+            if (allocation != NULL) close_allocation(allocation);
+            allocation = create_allocation(server, client, client_len, username);
+            created = allocation != NULL;
+        } else {
             allocation = NULL;
         }
-        else {
-            close_allocation(allocation);
-            allocation = create_allocation(server, client, client_len, username);
-        }
-    } else if (allocation == NULL) {
-        if (!general_relay || general_relay_quota_allows(server, client, NULL))
-            allocation = create_allocation(server, client, client_len, username);
-        else quota_rejected = 1;
+    }
+    char client_text[INET6_ADDRSTRLEN + 16];
+    format_endpoint(client, client_text, sizeof(client_text));
+    if (rejection != NULL) {
+        /* Java: the general relay follows the public ICE configuration, so a refusal must be traceable. */
+        fprintf(stderr, "[peer-mesh][audit] general TURN allocation rejected: client=%s, reason=%s\n",
+                client_text, rejection);
     }
     if (allocation == NULL) {
         stun_builder error;
         builder_error(&error, TURN_ALLOCATE_REQUEST, packet + 8U,
-                      quota_rejected ? 486 : 508,
-                      quota_rejected ? "Allocation Quota Reached" : "Insufficient Capacity", 0);
+                      rejection != NULL ? 486 : 508,
+                      rejection != NULL ? "Allocation Quota Reached" : "Insufficient Capacity", 0);
         send_builder(fd, &error, client, client_len);
         return;
+    }
+    if (created && general_relay) {
+        int same_address = 0;
+        char relay_text[INET6_ADDRSTRLEN + 16];
+        format_endpoint(&allocation->relay, relay_text, sizeof(relay_text));
+        printf("[peer-mesh][audit] general TURN allocation created: client=%s, relay=%s, active=%d\n",
+               client_text, relay_text, count_general_relays(server, NULL, NULL, &same_address));
+        fflush(stdout);
     }
     allocation->expires_at = time(NULL) + server->allocation_ttl;
     stun_builder response;

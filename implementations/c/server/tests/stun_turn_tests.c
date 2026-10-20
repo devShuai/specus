@@ -507,6 +507,18 @@ static int allocate(int fd,
     return 0;
 }
 
+/* An Allocate whose answer, success or error, is left in response. */
+static int allocate_answer(int fd, const turn_fixture *fixture, const turn_credential *credential, unsigned seed,
+                           unsigned char *response, size_t response_size)
+{
+    packet_builder request;
+    unsigned char transport[4] = {17, 0, 0, 0};
+    start(&request, 0x0003U, seed);
+    attr(&request, 0x0019U, transport, sizeof(transport));
+    sign(&request, credential, st_turn_auth_nonce());
+    return exchange(fd, &fixture->address, &request, response, response_size);
+}
+
 static int create_permission(int fd,
                              const turn_fixture *fixture,
                              const turn_credential *credential,
@@ -824,6 +836,148 @@ static int test_refresh_and_deallocation(void)
     close(peer);
     close(client);
     st_stun_turn_server_stop(fixture.server);
+    return failed ? -1 : 0;
+}
+
+/* What the server writes to stdout and stderr in between, the STUN/TURN thread included. */
+typedef struct {
+    int saved_out;
+    int saved_err;
+    char path[64];
+} output_capture;
+
+static int capture_start(output_capture *capture)
+{
+    snprintf(capture->path, sizeof(capture->path), "/tmp/specus_c_stun_turn_log.XXXXXX");
+    int fd = mkstemp(capture->path);
+    fflush(stdout);
+    fflush(stderr);
+    capture->saved_out = dup(STDOUT_FILENO);
+    capture->saved_err = dup(STDERR_FILENO);
+    int failed = fd < 0 || capture->saved_out < 0 || capture->saved_err < 0
+        || dup2(fd, STDOUT_FILENO) < 0 || dup2(fd, STDERR_FILENO) < 0;
+    if (fd >= 0) close(fd);
+    return failed ? -1 : 0;
+}
+
+/* Restores stdout and stderr and returns what was written meanwhile (to free), NULL on failure. */
+static char *capture_stop(output_capture *capture)
+{
+    fflush(stdout);
+    fflush(stderr);
+    if (capture->saved_out >= 0) dup2(capture->saved_out, STDOUT_FILENO);
+    if (capture->saved_err >= 0) dup2(capture->saved_err, STDERR_FILENO);
+    if (capture->saved_out >= 0) close(capture->saved_out);
+    if (capture->saved_err >= 0) close(capture->saved_err);
+    FILE *file = fopen(capture->path, "rb");
+    char *text = NULL;
+    if (file != NULL) {
+        text = (char *)calloc(1, 65536U);
+        if (text != NULL && fread(text, 1, 65535U, file) == 0U && ferror(file)) {
+            free(text);
+            text = NULL;
+        }
+        fclose(file);
+    }
+    unlink(capture->path);
+    return text;
+}
+
+static int log_has(const char *log, const char *line, const char *label)
+{
+    if (log != NULL && strstr(log, line) != NULL) return 0;
+    fprintf(stderr, "%s: no log line \"%s\"\n", label, line);
+    return -1;
+}
+
+static void endpoint_text(const struct sockaddr_in *address, char *out, size_t out_len)
+{
+    char host[INET_ADDRSTRLEN] = "?";
+    (void)inet_ntop(AF_INET, &address->sin_addr, host, sizeof(host));
+    snprintf(out, out_len, "%s:%u", host, ntohs(address->sin_port));
+}
+
+/*
+ * The audit lines Java StunTurnServer writes for allocations (and Go likewise): every allocation
+ * created, a general relay allocation created with the number now active, refused by its quota
+ * with the reason, and closed once its byte quota is spent. C wrote none of them.
+ */
+static int test_allocation_audit_log(void)
+{
+    turn_fixture fixture;
+    turn_credential general;
+    turn_credential mesh;
+    if (turn_fixture_start(&fixture, 1, "55250", "55299", NULL) != 0) return -1;
+    st_stun_turn_server_stop(fixture.server);
+    setenv("SPECUS_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS", "1", 1);
+    setenv("SPECUS_PEER_MESH_GENERAL_RELAY_MAX_BYTES", "64", 1);
+    fixture.server = NULL;
+    int started = st_stun_turn_server_start(&fixture.server) == 0;
+    unsetenv("SPECUS_PEER_MESH_GENERAL_RELAY_MAX_BYTES");
+    if (started) fixture.address.sin_port = htons((unsigned short)st_stun_turn_server_port(fixture.server));
+    struct sockaddr_in first_address, second_address, mesh_address, peer_address, relay, mesh_relay;
+    int first = udp_socket(&first_address);
+    int second = udp_socket(&second_address);
+    int mesh_client = udp_socket(&mesh_address);
+    int peer = udp_socket(&peer_address);
+    unsigned char response[2048];
+    output_capture capture;
+    int failed = !started || first < 0 || second < 0 || mesh_client < 0 || peer < 0
+        || issue_credential("public-transfer-audit", &general) != 0 || issue_credential("pm-31", &mesh) != 0
+        || capture_start(&capture) != 0;
+    int captured = !failed;
+    failed = failed || allocate(first, &fixture, &general, 1700U, &relay) != 0
+        || allocate(mesh_client, &fixture, &mesh, 1701U, &mesh_relay) != 0;
+    int received = failed ? -1 : allocate_answer(second, &fixture, &general, 1702U, response, sizeof(response));
+    failed = failed || expect_error(response, received, 0x0113U, 486, "general relay past its quota") != 0;
+    received = failed ? -1 : create_permission(first, &fixture, &general, &peer_address, 1703U,
+                                               response, sizeof(response));
+    failed = failed || received < 20 || r16(response) != 0x0108U
+        || send_indication(first, &fixture, &peer_address, "forty-bytes-of-payload-padding-the-quota", 1704U) != 0
+        || receive_exact(peer, "forty-bytes-of-payload-padding-the-quota", &relay, "first datagram") != 0
+        || send_indication(first, &fixture, &peer_address, "forty-bytes-of-payload-padding-the-quota", 1705U) != 0
+        || !stays_silent(peer);
+    /* The allocation is gone once the line has been written. */
+    received = failed ? -1 : refresh(first, &fixture, &general, st_turn_auth_nonce(), -1, 1706U,
+                                     response, sizeof(response));
+    failed = failed || expect_error(response, received, 0x0114U, 437, "allocation past its byte quota") != 0;
+    char *log = captured ? capture_stop(&capture) : NULL;
+    if (captured && log == NULL) failed = 1;
+    char first_text[32], second_text[32], mesh_text[32], relay_text[32], mesh_relay_text[32], line[256];
+    endpoint_text(&first_address, first_text, sizeof(first_text));
+    endpoint_text(&second_address, second_text, sizeof(second_text));
+    endpoint_text(&mesh_address, mesh_text, sizeof(mesh_text));
+    endpoint_text(&relay, relay_text, sizeof(relay_text));
+    endpoint_text(&mesh_relay, mesh_relay_text, sizeof(mesh_relay_text));
+    if (!failed) {
+        snprintf(line, sizeof(line), "[peer-mesh] TURN allocation created: client=%s, relay=%s\n",
+                 first_text, relay_text);
+        failed = log_has(log, line, "general allocation") != 0;
+        snprintf(line, sizeof(line), "[peer-mesh][audit] general TURN allocation created: client=%s, relay=%s, "
+                 "active=1\n", first_text, relay_text);
+        failed = log_has(log, line, "general allocation audit") != 0 || failed;
+        snprintf(line, sizeof(line), "[peer-mesh] TURN allocation created: client=%s, relay=%s\n",
+                 mesh_text, mesh_relay_text);
+        failed = log_has(log, line, "Peer Mesh allocation") != 0 || failed;
+        snprintf(line, sizeof(line), "[peer-mesh][audit] general TURN allocation rejected: client=%s, "
+                 "reason=general-relay-allocation-quota\n", second_text);
+        failed = log_has(log, line, "quota rejection") != 0 || failed;
+        snprintf(line, sizeof(line), "[peer-mesh][audit] general TURN byte quota exhausted, closing allocation: "
+                 "client=%s, bytes=80\n", first_text);
+        failed = log_has(log, line, "byte quota") != 0 || failed;
+        /* A Peer Mesh allocation is no general relay. */
+        snprintf(line, sizeof(line), "general TURN allocation created: client=%s", mesh_text);
+        if (strstr(log, line) != NULL) {
+            fprintf(stderr, "a Peer Mesh allocation was audited as a general relay\n");
+            failed = 1;
+        }
+    }
+    free(log);
+    if (first >= 0) close(first);
+    if (second >= 0) close(second);
+    if (mesh_client >= 0) close(mesh_client);
+    if (peer >= 0) close(peer);
+    if (started) st_stun_turn_server_stop(fixture.server);
     return failed ? -1 : 0;
 }
 
@@ -2256,6 +2410,7 @@ int main(void)
     if (test_channel_bind_and_channel_data() != 0
         || test_refresh_and_deallocation() != 0
         || test_stale_nonce() != 0
+        || test_allocation_audit_log() != 0
         || test_default_private_peer_refusal() != 0
         || test_private_peers_allowed_by_switch() != 0
         || test_expiry() != 0
