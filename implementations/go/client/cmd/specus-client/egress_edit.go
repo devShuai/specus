@@ -319,8 +319,9 @@ const (
 // device, and whatever it connected to says nothing about what the egress resolves it to.
 const egressConnectNameRefusal = "--connect needs an IPv4 address: a name would be resolved here, not by the egress."
 
-// egressTarget reads what egress test was given: an IPv4 address, or a name a domain rule could
-// match, normalized the way rules compare names. problem says why it cannot be previewed, or is ""
+// egressTarget reads what egress test was given: an IPv4 or IPv6 address, or a name a domain rule
+// could match, normalized the way rules compare names. Anything else is still told it must be an IPv4
+// address, the wording the three clients and the CLI matrix share. problem says why it cannot be previewed, or is ""
 // when it can.
 func egressTarget(address string) (kind, target, problem string) {
 	valid, domain := client.ValidEgressAddress(address)

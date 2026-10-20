@@ -142,10 +142,14 @@ func EgressCodeExplanation(code string) string {
 }
 
 // ValidEgressAddress reports whether a destination is one the address rules can decide: a plain IPv4
-// address. Something that reads as a name is told apart, for EgressPreviewName to judge.
+// address, or an IPv6 one written as a rule's match is (no zone, no brackets, no dotted tail).
+// Something that reads as a name is told apart, for EgressPreviewName to judge.
 func ValidEgressAddress(destination string) (ok bool, domain bool) {
 	value := strings.TrimSpace(destination)
 	if _, parsed := parseEgressRuleMatch(value); parsed && !strings.Contains(value, "/") {
+		return true, false
+	}
+	if _, parsed := parseEgressAddress6(value); parsed {
 		return true, false
 	}
 	return false, looksLikeEgressDomainRule(value) && !strings.Contains(value, ":")
