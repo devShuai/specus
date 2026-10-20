@@ -500,7 +500,7 @@ target_link_libraries(specus_c_stun_turn_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_stun_turn_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME stun_turn_tests COMMAND specus_c_stun_turn_tests)
 
-add_executable(specus_c_workbench_tests tests/workbench_tests.c)
+add_executable(specus_c_workbench_tests tests/workbench_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_workbench_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_workbench_tests PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_definitions(specus_c_workbench_tests PRIVATE

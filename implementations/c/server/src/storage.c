@@ -1607,6 +1607,7 @@ int st_storage_init(const char *path, int seed_demo_client)
             "at_ms INTEGER NOT NULL,"
             "PRIMARY KEY(tenant_id, username, list, kind, object_id)"
             ");"
+            "CREATE INDEX IF NOT EXISTS idx_mwi_identity ON management_workbench_item(tenant_id, username);"
             "CREATE INDEX IF NOT EXISTS idx_mwi_object ON management_workbench_item(tenant_id, kind, object_id);"
             "CREATE INDEX IF NOT EXISTS idx_mwi_list_at ON management_workbench_item(list, at_ms);");
     }
