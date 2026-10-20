@@ -109,6 +109,31 @@ st_security_baseline_result st_security_baseline_validate(const char *environmen
     return ST_SECURITY_BASELINE_OK;
 }
 
+int st_security_baseline_message(st_security_baseline_result result,
+                                 st_deployment_environment environment,
+                                 char *out,
+                                 size_t out_len)
+{
+    /* Java prints the DeploymentEnvironment constant's name. */
+    const char *name = environment == ST_DEPLOYMENT_DEV ? "DEV" : environment == ST_DEPLOYMENT_TEST ? "TEST" : "PROD";
+    int written;
+    if (out == NULL || out_len == 0U) {
+        return -1;
+    }
+    if (result == ST_SECURITY_BASELINE_KNOWN_DEFAULT_PASSWORD) {
+        written = snprintf(out, out_len,
+                           "specus.auth.password 使用了已知默认口令，禁止在 %s 环境启动；"
+                           "请设置 SPECUS_AUTH_PASSWORD 或置空以关闭密码登录", name);
+    } else if (result == ST_SECURITY_BASELINE_KNOWN_DEFAULT_JWT_SECRET) {
+        written = snprintf(out, out_len,
+                           "specus.auth.jwt-secret 使用了公开占位值，禁止在 %s 环境启动；"
+                           "请设置随机 SPECUS_AUTH_JWT_SECRET 或置空以使用临时密钥", name);
+    } else {
+        return -1;
+    }
+    return written < 0 || (size_t)written >= out_len ? -1 : 0;
+}
+
 int st_security_baseline_validate_current(void)
 {
     const char *environment = getenv("SPECUS_ENV");
@@ -130,32 +155,28 @@ int st_security_baseline_validate_current(void)
     if (st_object_storage_validate_current() != 0) {
         return -1;
     }
+    char message[256];
     if (deployment != ST_DEPLOYMENT_PROD) {
-        if (weak_password) {
-            fprintf(stderr,
-                    "[security-baseline] warning: known default SPECUS_AUTH_PASSWORD is allowed only "
-                    "because SPECUS_ENV is dev/test\n");
+        if (weak_password
+            && st_security_baseline_message(ST_SECURITY_BASELINE_KNOWN_DEFAULT_PASSWORD, deployment, message,
+                                            sizeof(message)) == 0) {
+            fprintf(stderr, "[security-baseline] %s\n", message);
         }
-        if (weak_jwt_secret) {
-            fprintf(stderr,
-                    "[security-baseline] warning: published SPECUS_AUTH_JWT_SECRET placeholder is allowed only "
-                    "because SPECUS_ENV is dev/test\n");
+        if (weak_jwt_secret
+            && st_security_baseline_message(ST_SECURITY_BASELINE_KNOWN_DEFAULT_JWT_SECRET, deployment, message,
+                                            sizeof(message)) == 0) {
+            fprintf(stderr, "[security-baseline] %s\n", message);
         }
     }
     st_security_baseline_result result = st_security_baseline_validate(environment,
                                                                       password_login_enabled,
                                                                       password,
                                                                       jwt_secret);
-    if (result == ST_SECURITY_BASELINE_KNOWN_DEFAULT_PASSWORD) {
-        fprintf(stderr,
-                "security baseline rejected known default SPECUS_AUTH_PASSWORD in production; "
-                "set a strong password or leave it blank to disable built-in password login\n");
-        return -1;
-    }
-    if (result == ST_SECURITY_BASELINE_KNOWN_DEFAULT_JWT_SECRET) {
-        fprintf(stderr,
-                "security baseline rejected the published SPECUS_AUTH_JWT_SECRET placeholder in production; "
-                "set a random secret or leave it blank to use an ephemeral key\n");
+    if (result != ST_SECURITY_BASELINE_OK) {
+        /* Java throws IllegalStateException with this message and the context never starts. */
+        if (st_security_baseline_message(result, deployment, message, sizeof(message)) == 0) {
+            fprintf(stderr, "security baseline rejected startup: %s\n", message);
+        }
         return -1;
     }
     if (deployment == ST_DEPLOYMENT_PROD

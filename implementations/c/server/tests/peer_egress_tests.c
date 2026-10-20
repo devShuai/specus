@@ -114,6 +114,15 @@ static int run_ipv6_packet_announcement_vector(void)
     }
     st_json_free_string_array(cases, count);
     free(root);
+    /* Java ClientAuthServiceEgressLoginTests.ipv6PacketAndTargetSupportAreStoredIndependently. */
+    static const char packets_only[] = "{\"version\":1,\"egressCapable\":true,\"ipv6PacketCapable\":true}";
+    static const char targets_only[] = "{\"version\":1,\"egressCapable\":true,\"ipv6TargetCapable\":true}";
+    if (st_egress_declares_ipv6_packets(packets_only, 1) != 1 || st_egress_declares_ipv6_targets(packets_only, 1) != 0
+        || st_egress_declares_ipv6_packets(targets_only, 1) != 0
+        || st_egress_declares_ipv6_targets(targets_only, 1) != 1) {
+        fprintf(stderr, "IPv6 packet and target support are not read independently\n");
+        failures++;
+    }
     return failures;
 }
 
@@ -1015,6 +1024,19 @@ static int run_management_edges(void)
         "[\"10.0.0.0/8\"]",
         "[{\"cidr\":\"10.0.0.0 /8\"}]",
         "[{\"cidr\":\"10.0.0.0/8\"}",
+        /* Java PeerEgressResourceTests.portBoundsThatAreNotJsonIntegersAreRefused. */
+        "[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[\"tcp\"],\"portRanges\":[[443.5,443]]}]",
+        "[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[\"tcp\"],\"portRanges\":[[1e2,443]]}]",
+        "[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[\"tcp\"],\"portRanges\":[[true,1]]}]",
+        "[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[\"tcp\"],\"portRanges\":[[null,443]]}]",
+        "[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[\"tcp\"],\"portRanges\":[[4294967296,4294967296]]}]",
+        /* Java PeerEgressServiceTests.destinationRuleEdgesOutsideTheSharedVectorAreRefused. */
+        "[null]",
+        "[{\"cidr\":\"\\u000010.0.0.0/8\",\"protocols\":[\"tcp\"],\"portRanges\":[[443,443]]}]",
+        "[{\"cidr\":\"10.0.0.0/8\\u0007\",\"protocols\":[\"tcp\"],\"portRanges\":[[443,443]]}]",
+        "[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[\"tcp\",null],\"portRanges\":[[443,443]]}]",
+        "[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[\"tcp\"],\"portRanges\":[null]}]",
+        "[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[\"tcp\"],\"portRanges\":[[443,null]]}]",
     };
     int failures = 0;
     for (size_t i = 0U; i < sizeof(refused) / sizeof(refused[0]); i++) {
@@ -1035,6 +1057,9 @@ static int run_management_edges(void)
          "[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[],\"portRanges\":[]}]"},
         {"  [ { \"cidr\" : \"10.0.0.0/8\" , \"protocols\" : [ \"UDP\" ] , \"portRanges\" : [ [ -0 , 53 ] ] } ]  ",
          "[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[\"udp\"],\"portRanges\":[[0,53]]}]"},
+        /* Whitespace other than an ASCII space is still only spelling (PeerEgressServiceTests). */
+        {"[{\"cidr\":\"\\t10.0.0.0/8\\n\",\"protocols\":[\" UDP\"]}]",
+         "[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[\"udp\"],\"portRanges\":[]}]"},
     };
     for (size_t i = 0U; i < sizeof(accepted) / sizeof(accepted[0]); i++) {
         char *got = NULL;

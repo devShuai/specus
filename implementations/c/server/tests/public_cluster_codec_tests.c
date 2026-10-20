@@ -323,6 +323,28 @@ static int test_identifiers(const char *root)
     int bound = tenant != NULL && expected_group != NULL && strcmp(management_group, expected_group) == 0;
     free(tenant); free(expected_group); free(management);
     CHECK(bound, "management group is not derived from the shared tenant vector");
+
+    /* managementRevocationMatchesCanonicalVectorAndTenantBinding: group and payload name one tenant. */
+    char *revocation = st_json_get_top_level_raw(root, "canonicalManagementRevocation");
+    char *fields[4] = {NULL, NULL, NULL, NULL};
+    static const char *const names[3] = {"tenantId", "username", "reason"};
+    char *payload = revocation == NULL ? NULL : st_json_get_top_level_string(revocation, "payloadUtf8");
+    expected_group = revocation == NULL ? NULL : st_json_get_top_level_string(revocation, "groupId");
+    fields[3] = revocation == NULL ? NULL : st_json_get_top_level_string(revocation, "tenantId");
+    st_public_coordination_management_group(fields[3] == NULL ? "" : fields[3], management_group);
+    bound = fields[3] != NULL && expected_group != NULL && strcmp(management_group, expected_group) == 0;
+    int payload_bound = payload != NULL && revocation != NULL;
+    for (size_t i = 0U; payload_bound && i < 3U; ++i) {
+        char *want = st_json_get_top_level_string(revocation, names[i]);
+        fields[i] = st_json_get_top_level_string(payload, names[i]);
+        payload_bound = want != NULL && fields[i] != NULL && strcmp(want, fields[i]) == 0;
+        free(want);
+    }
+    for (size_t i = 0U; i < 4U; ++i) free(fields[i]);
+    free(payload); free(expected_group); free(revocation);
+    CHECK(bound, "revocation group is not the management group of the vector tenant");
+    CHECK(payload_bound, "revocation payload tenantId/username/reason differ from the vector");
+
     st_public_coordination_management_group(" \tdefault\r\n", management_group);
     CHECK(strcmp(management_group, "37a8eec1ce19687d132fe29051dca629d164e2c4958ba141d5f4133a33f0688f") == 0,
           "management group does not use Java trim");

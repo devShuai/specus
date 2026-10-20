@@ -340,6 +340,26 @@ def check(binary):
         foreign_ws.alive()
         print("ok real connection event reaches both instances exactly once; owner and tenant filtered", flush=True)
 
+        # ConnectionEventsWebSocketHandlerTests tenant binding: a kind-4 frame is delivered only when its
+        # group is the management group of the payload's own tenant, in either direction of a mismatch.
+        foreign_admin_ws = fixture.ws(foreign, foreign_admin)
+        default_group, foreign_group = (hashlib.sha256(t.encode()).hexdigest() for t in ("default", "tenant-b"))
+        connection = {"id": 4242, "clientId": runtime["clientId"], "clientName": runtime["clientName"],
+                      "connectedAt": "2026-10-13T00:00:00Z", "success": True}
+        for payload_tenant, group in (("default", foreign_group), ("tenant-b", default_group)):
+            fixture.publish(frame(4, {"tenantId": payload_tenant, "type": "created", "connection": connection},
+                                  group=group))
+            for websocket in admin_ws + alice_ws + [bob_ws, foreign_ws, foreign_admin_ws]:
+                websocket.alive()
+        fixture.publish(frame(4, {"tenantId": "default", "type": "created", "connection": connection},
+                              group=default_group))
+        for websocket in admin_ws + alice_ws:
+            event = websocket.read_json()
+            assert event["tenantId"] == "default" and event["connection"]["id"] == 4242, event
+        for websocket in admin_ws + alice_ws + [bob_ws, foreign_ws, foreign_admin_ws]:
+            websocket.alive()
+        print("ok management frames bound to another tenant's group reach no admin socket", flush=True)
+
         observer = fixture.redis()
         resp_command(observer, "SUBSCRIBE", PREFIX + ":events")
         assert resp_read(observer)[0] == b"subscribe"
