@@ -15,7 +15,8 @@ import java.util.TreeSet;
  * online session announced decide whether a flow to an egress a rule names can go at all
  * ({@code protocol/spec/peer-egress.md}, "能力不支持"): an online egress the catalogue does not list,
  * or one that announced no peer egress, would only drop what it is sent. {@code domainTargetCapable}
- * decides whether a domain rule pointed at it is in force (phase two). Whether an egress is online
+ * decides whether a domain rule pointed at it is in force (phase two), and {@code ipv6PacketCapable}
+ * whether an IPv6 rule pointed at it is ({@code protocol/spec/peer-egress.md}, IPv6 数据面). Whether an egress is online
  * is the mesh's own peer state, not the catalogue's {@code online}, and nothing else in an entry
  * changes what a consumer does today. See {@code protocol/spec/peer-egress-dns.md} ("consumer reads
  * the catalogue"); shared vector: the {@code catalog} section of
@@ -26,9 +27,14 @@ import java.util.TreeSet;
  * @param listed              every egress with an entry that has a usable {@code clientId}
  * @param egressVersions      the listed egresses whose entry carries a usable {@code egressVersion},
  *                            and that version; a listed egress missing here carries none
+ * @param ipv6PacketCapable   the egresses whose entry says JSON {@code true} for
+ *                            {@code ipv6PacketCapable}, and only those: an egress that takes IPv6
+ *                            packets in SPEG1. A server older than the field sends none, which reads
+ *                            as no -- an IPv6 packet sent to an egress that cannot read it is refused
+ *                            there, so it is blocked here and said instead.
  */
 public record PeerEgressCatalogMessage(long revision, Set<Long> domainTargetCapable, Set<Long> listed,
-        Map<Long, Long> egressVersions) {
+        Map<Long, Long> egressVersions, Set<Long> ipv6PacketCapable) {
 
     public static final String TYPE = "egress-catalog";
 
@@ -42,7 +48,7 @@ public record PeerEgressCatalogMessage(long revision, Set<Long> domainTargetCapa
      * <p>Inside the list an entry without a usable {@code clientId} is skipped rather than refusing
      * the message, and only a JSON {@code true} counts as capable: the string {@code "true"} or the
      * number {@code 1} is a server bug, and reading it as yes would put domain rules in force for an
-     * egress that never said it resolves names. Unknown keys are ignored, so a server that adds a
+     * egress that never said it resolves names. {@code ipv6PacketCapable} is read the same way. Unknown keys are ignored, so a server that adds a
      * field does not stop every older client from reading the catalogue.
      *
      * <p>{@code egressVersion} counts only as a non-negative JSON integer; anything else reads as
@@ -74,6 +80,7 @@ public record PeerEgressCatalogMessage(long revision, Set<Long> domainTargetCapa
         // A later entry for the same egress replaces an earlier one, as a map built from the list
         // in order would; that includes taking away a version the earlier entry carried.
         Map<Long, Boolean> capable = new TreeMap<>();
+        Map<Long, Boolean> capable6 = new TreeMap<>();
         Map<Long, Long> versions = new TreeMap<>();
         for (JsonNode entry : egresses) {
             if (!entry.isObject() || !positiveInteger(entry.path("clientId"))) {
@@ -82,6 +89,8 @@ public record PeerEgressCatalogMessage(long revision, Set<Long> domainTargetCapa
             long id = entry.path("clientId").longValue();
             JsonNode flag = entry.path("domainTargetCapable");
             capable.put(id, flag.isBoolean() && flag.booleanValue());
+            JsonNode packets = entry.path("ipv6PacketCapable");
+            capable6.put(id, packets.isBoolean() && packets.booleanValue());
             Long version = egressVersion(entry.path("egressVersion"));
             if (version == null) {
                 versions.remove(id);
@@ -95,8 +104,15 @@ public record PeerEgressCatalogMessage(long revision, Set<Long> domainTargetCapa
                 ids.add(id);
             }
         });
+        Set<Long> ids6 = new TreeSet<>();
+        capable6.forEach((id, able) -> {
+            if (able) {
+                ids6.add(id);
+            }
+        });
         return new PeerEgressCatalogMessage(revision.longValue(), Collections.unmodifiableSet(ids),
-                Collections.unmodifiableSet(new TreeSet<>(capable.keySet())), Collections.unmodifiableMap(versions));
+                Collections.unmodifiableSet(new TreeSet<>(capable.keySet())), Collections.unmodifiableMap(versions),
+                Collections.unmodifiableSet(ids6));
     }
 
     /** A JSON integer above zero: not a string, not a boolean, not a fraction, and fits a long. */

@@ -119,4 +119,23 @@ class PeerEgressCatalogTests {
         assertEquals(PeerEgressCatalog.Standing.UNKNOWN, catalog.snapshot().standing(2L));
         assertEquals("none", catalog.state(EPOCH + 3 * wait));
     }
+
+    /**
+     * ipv6PacketCapable in egress-catalog (protocol/spec/peer-egress.md, IPv6 数据面, 能力): read like
+     * domainTargetCapable, so only a JSON true says an egress takes IPv6 packets.
+     */
+    @Test
+    void readsIpv6PacketCapableOnlyAsJsonTrue() {
+        PeerEgressCatalog catalog = new PeerEgressCatalog();
+        catalog.newSession(EPOCH);
+        assertTrue(catalog.read("{\"type\":\"egress-catalog\",\"revision\":1,\"egresses\":["
+                + "{\"clientId\":2,\"ipv6PacketCapable\":true},{\"clientId\":3,\"ipv6PacketCapable\":\"true\"},"
+                + "{\"clientId\":4,\"ipv6PacketCapable\":1},{\"clientId\":5},{\"clientId\":6,\"ipv6TargetCapable\":true}]}"));
+        assertEquals(List.of(2L), catalog.ipv6CapableIds());
+        assertEquals(java.util.Set.of(2L), catalog.snapshot().ipv6Capable());
+        assertEquals(List.of(2L, 3L, 4L, 5L, 6L), catalog.listedIds());
+        // The next catalogue replaces it whole: an egress it no longer says takes IPv6 packets does not.
+        assertTrue(catalog.read("{\"type\":\"egress-catalog\",\"revision\":2,\"egresses\":[{\"clientId\":2}]}"));
+        assertTrue(catalog.ipv6CapableIds().isEmpty());
+    }
 }
