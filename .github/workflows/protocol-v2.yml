@@ -252,7 +252,7 @@ jobs:
           path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'postgres-results/postgres-bootstrap.trx'
           counters = ET.parse(path).getroot().find('.//{*}Counters')
           assert counters is not None, 'missing actual PostgreSQL test counters'
-          for key, expected in [('total', 15), ('executed', 15), ('passed', 15), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 16), ('executed', 16), ('passed', 16), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           print('Verified all fifteen real PostgreSQL cases executed and passed; zero skipped.')
           PY
@@ -278,7 +278,7 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual MySQL test counters'
-          for key, expected in [('total', 10), ('executed', 10), ('passed', 10), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 11), ('executed', 11), ('passed', 11), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           print('Verified all ten real MySQL schema cases executed and passed; zero skipped.')
           PY
@@ -303,7 +303,7 @@ jobs:
           path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'mariadb-results/mariadb-compatibility.trx'
           counters = ET.parse(path).getroot().find('.//{*}Counters')
           assert counters is not None, 'missing actual MariaDB test counters'
-          for key, expected in [('total', 15), ('executed', 15), ('passed', 15), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 16), ('executed', 16), ('passed', 16), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           print('Verified all fifteen real MariaDB cases executed and passed; zero skipped.')
           PY
