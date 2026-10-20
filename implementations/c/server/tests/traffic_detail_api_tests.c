@@ -169,11 +169,13 @@ typedef struct {
     const char *stored_body_type;
     const char *request_headers;
     const char *response_body;
+    const char *request_body; /* text/plain; none when left out */
 } exchange_spec;
 
 static int record_exchange(const exchange_spec *spec)
 {
     size_t response_len = spec->response_body == NULL ? 0U : strlen(spec->response_body);
+    size_t request_len = spec->request_body == NULL ? 0U : strlen(spec->request_body);
     st_storage_http_exchange_record record = {
         .tenant_id = spec->tenant,
         .client_id = spec->client_id,
@@ -196,6 +198,8 @@ static int record_exchange(const exchange_spec *spec)
         .response_body_type = spec->stored_body_type,
         .request_headers = spec->request_headers == NULL ? "Accept: */*" : spec->request_headers,
         .response_headers = "Server: test",
+        .request_body = (const uint8_t *)spec->request_body,
+        .request_body_len = request_len,
         .response_body = (const uint8_t *)spec->response_body,
         .response_body_len = response_len,
         .captured_at = "2026-10-07T01:02:03Z"
@@ -249,16 +253,16 @@ static int test_elasticsearch_search(void)
     exchange_spec specs[] = {
         /* A JSON response whose stored type says otherwise: found for json by its Content-Type. */
         {"t-es", owned_id, "es-owned", "api", "GET", "/v1/items", 200, NULL, "192.0.2.10",
-         "application/json; charset=utf-8", "binary", NULL, "{\"a\":1}"},
+         "application/json; charset=utf-8", "binary", NULL, "{\"a\":1}", NULL},
         {"t-es", owned_id, "es-owned", "files", "POST", "/upload/report", 404, "upstream timed out", "10.0.0.7",
-         "text/html", NULL, "X-Trace: Alpha-42", "<p>hello world</p>"},
+         "text/html", NULL, "X-Trace: Alpha-42", "<p>hello world</p>", "lookup Gamma-7 report"},
         {"t-es", other_id, "es-other-client", "api", "GET", "/v1/other", 500, NULL, "192.0.2.11",
-         "text/plain", NULL, NULL, "boom"},
+         "text/plain", NULL, NULL, "boom", NULL},
         /* An empty body; its client is deleted below. */
         {"t-es", gone_id, "es-gone", "legacy", "DELETE", "/old", 204, NULL, "192.0.2.12",
-         NULL, NULL, NULL, NULL},
+         NULL, NULL, NULL, NULL, NULL},
         {"t-foreign", foreign_id, "es-foreign-client", "api", "GET", "/v1/foreign", 202, NULL, "192.0.2.13",
-         "application/json", NULL, NULL, "{}"},
+         "application/json", NULL, NULL, "{}", NULL},
     };
     for (size_t i = 0; i < sizeof(specs) / sizeof(specs[0]); ++i) {
         CHECK(record_exchange(&specs[i]) == 0, "record exchange %zu", i);
@@ -319,6 +323,14 @@ static int test_elasticsearch_search(void)
           "field=all reads headers");
     CHECK(expect_exchanges(admin_token, "/api/admin/traffic/http-exchanges?field=responseBody&q=hello", 1, "404") == 0,
           "field=responseBody");
+    CHECK(expect_exchanges(admin_token, "/api/admin/traffic/http-exchanges?field=requestBody&q=gamma", 1, "404") == 0,
+          "field=requestBody");
+    CHECK(expect_exchanges(admin_token, "/api/admin/traffic/http-exchanges?field=requestBody&q=hello", 0, "") == 0,
+          "field=requestBody leaves the response preview out");
+    CHECK(expect_exchanges(admin_token, "/api/admin/traffic/http-exchanges?field=responseBody&q=gamma", 0, "") == 0,
+          "field=responseBody leaves the request preview out");
+    CHECK(expect_exchanges(admin_token, "/api/admin/traffic/http-exchanges?field=all&q=gamma", 1, "404") == 0,
+          "field=all reads the request preview");
     CHECK(expect_exchanges(admin_token, "/api/admin/traffic/http-exchanges?field=path&q=items", 1, "200") == 0,
           "field=path");
 
@@ -594,7 +606,7 @@ static int test_sqlite_stream_and_pages(void)
     for (int i = 0; i < 120; ++i) {
         exchange_spec spec = {"t-sql", client_id, "sql-client", "bulk", "GET", "/bulk/page/listing", 200 + (i % 2),
                               NULL, NULL, i == 0 ? "application/json" : "text/plain", i == 0 ? "binary" : NULL,
-                              NULL, "payload"};
+                              NULL, "payload", NULL};
         CHECK(record_exchange(&spec) == 0, "exchange %d", i);
     }
     CHECK(api_get(listener_port, "/api/admin/traffic/http-exchanges?size=120", token, &body) == 200
@@ -684,14 +696,15 @@ static int test_sqlite_search(void)
     CHECK(owned > 0 && other > 0 && gone > 0 && foreign_client > 0, "sqlite search clients");
     exchange_spec specs[] = {
         {"t-sqls", owned, "sqls-owned", "api", "GET", "/v1/items", 200, NULL, "192.0.2.10",
-         "application/json; charset=utf-8", "binary", NULL, "{\"a\":1}"},
+         "application/json; charset=utf-8", "binary", NULL, "{\"a\":1}", NULL},
         {"t-sqls", owned, "sqls-owned", "files", "POST", "/upload/report", 404, "upstream timed out", "10.0.0.7",
-         "text/html", NULL, "X-Trace: Alpha-42", "<p>hello world</p>"},
+         "text/html", NULL, "X-Trace: Alpha-42", "<p>hello world</p>", "lookup Gamma-7 report"},
         {"t-sqls", other, "sqls-other-client", "api", "GET", "/v1/other", 500, NULL, "192.0.2.11",
-         "text/plain", NULL, NULL, "boom"},
-        {"t-sqls", gone, "sqls-gone", "legacy", "DELETE", "/old", 204, NULL, "192.0.2.12", NULL, NULL, NULL, NULL},
+         "text/plain", NULL, NULL, "boom", NULL},
+        {"t-sqls", gone, "sqls-gone", "legacy", "DELETE", "/old", 204, NULL, "192.0.2.12", NULL, NULL, NULL, NULL,
+         NULL},
         {"t-sqls-foreign", foreign_client, "sqls-foreign-client", "api", "GET", "/v1/foreign", 202, NULL,
-         "192.0.2.13", "application/json", NULL, NULL, "{}"},
+         "192.0.2.13", "application/json", NULL, NULL, "{}", NULL},
     };
     for (size_t i = 0; i < sizeof(specs) / sizeof(specs[0]); ++i) {
         CHECK(record_exchange(&specs[i]) == 0, "sqlite exchange %zu", i);
@@ -727,6 +740,11 @@ static int test_sqlite_search(void)
         {"field=headers&q=alpha", 0, "", "an unknown field code is the summary, which leaves headers out"},
         {"field=all&q=alpha", 1, "404", "field=all reads headers"},
         {"field=responseBody&q=HELLO", 1, "404", "field=responseBody reads the preview, case-insensitively"},
+        {"field=requestBody&q=GAMMA", 1, "404", "field=requestBody reads the request preview, case-insensitively"},
+        {"field=REQUEST_BODY&q=gamma-7", 1, "404", "the constant name works too"},
+        {"field=requestBody&q=hello", 0, "", "field=requestBody leaves the response preview out"},
+        {"field=responseBody&q=gamma", 0, "", "field=responseBody leaves the request preview out"},
+        {"field=all&q=GAMMA", 1, "404", "field=all reads the request preview"},
         {"field=body&q=hello", 0, "", "body is no field code: the summary"},
         {"field=path&q=items", 1, "200", "field=path"},
         {"field=contentType&q=HTML", 1, "404", "field=contentType"},

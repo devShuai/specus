@@ -331,6 +331,13 @@ static long long iso_seconds(const char *text)
     return days_from_civil(y, mo, d) * 86400LL + h * 3600LL + mi * 60LL + s;
 }
 
+static long long monotonic_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000L;
+}
+
 /* ------------------------------------------------------------------------------------------------
  * Database
  */
@@ -351,6 +358,21 @@ static int sql_exec(const char *sql)
     sqlite3_free(error);
     sqlite3_close(db);
     return rc == SQLITE_OK ? 0 : -1;
+}
+
+/* The single integer a query answers, or -1. */
+static long long count_rows(const char *sql)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    long long value = -1;
+    if (sqlite3_open(db_path, &db) == SQLITE_OK && sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW) {
+        value = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return value;
 }
 
 /* The vector's world: users, clients (named client-<id>) and routes with their vector ids. */
@@ -650,6 +672,9 @@ typedef struct {
     int has_revoked_by;
     char reason[48];
     long long expires_at;
+    char token_sha256[65];
+    char label[256];
+    int has_label;
 } share_state;
 
 static share_state read_share(const char *share_id)
@@ -659,8 +684,8 @@ static share_state read_share(const char *share_id)
     sqlite3 *db = NULL;
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_open(db_path, &db) == SQLITE_OK
-        && sqlite3_prepare_v2(db, "SELECT revoked_at, revoked_by, revoke_reason, expires_at FROM http_share "
-                                  "WHERE share_id = ?", -1, &stmt, NULL) == SQLITE_OK) {
+        && sqlite3_prepare_v2(db, "SELECT revoked_at, revoked_by, revoke_reason, expires_at, token_sha256, label "
+                                  "FROM http_share WHERE share_id = ?", -1, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, share_id, -1, SQLITE_TRANSIENT);
         if (sqlite3_step(stmt) == SQLITE_ROW) {
             state.found = 1;
@@ -674,6 +699,14 @@ static share_state read_share(const char *share_id)
                 snprintf(state.reason, sizeof(state.reason), "%s", (const char *)sqlite3_column_text(stmt, 2));
             }
             state.expires_at = sqlite3_column_int64(stmt, 3);
+            if (sqlite3_column_type(stmt, 4) != SQLITE_NULL) {
+                snprintf(state.token_sha256, sizeof(state.token_sha256), "%s",
+                         (const char *)sqlite3_column_text(stmt, 4));
+            }
+            state.has_label = sqlite3_column_type(stmt, 5) != SQLITE_NULL;
+            if (state.has_label) {
+                snprintf(state.label, sizeof(state.label), "%s", (const char *)sqlite3_column_text(stmt, 5));
+            }
         }
     }
     sqlite3_finalize(stmt);
@@ -707,6 +740,8 @@ typedef struct {
     char authorization[256];
     /* The Origin, Referer and Sec-Fetch-Site lines the device received, joined with '|'. */
     char browser_headers[512];
+    /* Every header line the device received, one per line. */
+    char all_headers[8192];
     int streaming;
     int cancelled;
     int stream_returned;
@@ -737,6 +772,7 @@ static void device_reset(int mode)
     device.cookie[0] = '\0';
     device.authorization[0] = '\0';
     device.browser_headers[0] = '\0';
+    device.all_headers[0] = '\0';
     device.streaming = 0;
     device.cancelled = 0;
     device.stream_returned = 0;
@@ -753,6 +789,8 @@ static void device_capture_headers(char *const *headers, size_t headers_len)
         if (headers[i] == NULL) {
             continue;
         }
+        size_t all_used = strlen(device.all_headers);
+        snprintf(device.all_headers + all_used, sizeof(device.all_headers) - all_used, "%s\n", headers[i]);
         if (strncasecmp(headers[i], "Cookie:", 7U) == 0) {
             ++device.cookie_headers;
             snprintf(device.cookie, sizeof(device.cookie), "%s", headers[i] + 7);
@@ -1132,6 +1170,29 @@ static void test_constants(void)
               && constant_int(exchange, "burst", ST_HTTP_SHARE_EXCHANGE_BURST), "exchange limiter constants");
     CHECK(constant_int(share, "intervalMs", ST_HTTP_SHARE_REQUEST_INTERVAL_MS)
               && constant_int(share, "burst", ST_HTTP_SHARE_REQUEST_BURST), "share limiter constants");
+    /* Every refusal code the vector names, per endpoint, is one the implementation answers with. */
+    char *codes = jget(vector_json, "codes");
+    jmember sections[8];
+    size_t section_count = jmembers(codes, sections, 8U);
+    size_t code_count = 0U;
+    for (size_t s = 0U; s < section_count; ++s) {
+        char *names[32];
+        size_t n = jitems(sections[s].value, names, 32U);
+        for (size_t c = 0U; c < n; ++c) {
+            char *code = jstring(names[c], NULL);
+            int known = 0;
+            for (size_t k = 0U; code != NULL && k < ST_HTTP_SHARE_CODE_COUNT; ++k) {
+                known = known || strcmp(code, st_http_share_codes[k]) == 0;
+            }
+            CHECK(known, "codes.%s: %s is not a code of the implementation", sections[s].key, names[c]);
+            ++code_count;
+            free(code);
+        }
+        jitems_free(names, n);
+    }
+    CHECK(section_count == 3U && code_count > 0U, "codes: %zu sections, %zu codes", section_count, code_count);
+    jmembers_free(sections, section_count);
+    free(codes);
     free(methods);
     free(reasons);
     free(actions);
@@ -1281,6 +1342,10 @@ static void test_create(void)
 {
     char *cases = jget(vector_json, "create");
     char *new_share = jget(vector_json, "newShare");
+    char *new_share_id = jget_string(new_share, "shareId");
+    char *new_token = jget_string(new_share, "token");
+    char new_token_hash[65];
+    st_http_share_token_hash(new_token, strlen(new_token), new_token_hash);
     char *items[64];
     size_t count = jitems(cases, items, 64U);
     size_t passed = 0U;
@@ -1314,10 +1379,24 @@ static void test_create(void)
         CHECK(response_header(response, "Cache-Control", 0U, cache, sizeof(cache))
                   && strcmp(cache, "private, no-store") == 0, "create %s: Cache-Control %s", name, cache);
         char *expected_body = jget(expect, "body");
+        char *expected_code = jget_string(expect, "code");
+        share_state stored = read_share(new_share_id);
         if (expected_body != NULL) {
             CHECK(jequal(expected_body, response_body(response)), "create %s: body %s, expected %s", name,
                   response_body(response), expected_body);
+            /* The row keeps the hash of the token the answer carried, and the label as answered. */
+            char *share = jget(expected_body, "share");
+            char *label = jget_string(share, "label");
+            CHECK(stored.found && strcmp(stored.token_sha256, new_token_hash) == 0
+                      && (label == NULL ? !stored.has_label : (stored.has_label && strcmp(stored.label, label) == 0)),
+                  "create %s: stored hash %s label %s", name, stored.token_sha256,
+                  stored.has_label ? stored.label : "null");
+            free(share);
+            free(label);
+        } else if (expected_code != NULL) {
+            CHECK(!stored.found, "create %s: a refused creation stored share %s", name, new_share_id);
         }
+        free(expected_code);
         char *expected_audit = jget(expect, "audit");
         CHECK(expect_audit(name, expected_audit, NULL, 0U), "create %s: audit mismatch", name);
         free(expected_audit);
@@ -1334,6 +1413,8 @@ static void test_create(void)
     free(response);
     free(cases);
     free(new_share);
+    free(new_share_id);
+    free(new_token);
     printf("create: %zu/%zu cases\n", passed, count);
 }
 
@@ -1355,20 +1436,48 @@ static void expected_cookie_line(const char *cookie, char *out, size_t out_len)
     free(same_site);
 }
 
-static int expect_revoke_columns(const char *label, const char *expect, const char *share_id, long long now_ms)
+/*
+ * Every share of the case carries the read-time revocation (system actor, the case's now) when the
+ * vector expects one, and otherwise exactly the revoke columns it was stored with.
+ */
+static int expect_revoke_columns(const char *label, const char *input, const char *expect, long long now_ms)
 {
     char *revoke = jget(expect, "revoke");
+    char *reason = jget_string(revoke, "reason");
+    char *shares = jget(input, "shares");
+    char *rows[32];
+    size_t count = shares == NULL ? 0U : jitems(shares, rows, 32U);
     int ok = 1;
-    if (revoke != NULL) {
-        char *reason = jget_string(revoke, "reason");
+    for (size_t i = 0U; i < count; ++i) {
+        char *share_id = jget_string(rows[i], "shareId");
         share_state state = read_share(share_id);
-        CHECK(state.revoked && !state.has_revoked_by && strcmp(state.reason, reason) == 0
-                  && state.revoked_at == now_ms / 1000LL,
-              "%s: revoke columns %d %s %s %lld", label, state.revoked, state.has_revoked_by ? state.revoked_by : "null",
-              state.reason, state.revoked_at);
-        free(reason);
-        free(revoke);
+        if (revoke != NULL) {
+            CHECK(state.found && state.revoked && !state.has_revoked_by && strcmp(state.reason, reason) == 0
+                      && state.revoked_at == now_ms / 1000LL,
+                  "%s: share %s revoke columns %d %s %s %lld", label, share_id, state.revoked,
+                  state.has_revoked_by ? state.revoked_by : "null", state.reason, state.revoked_at);
+        } else {
+            char *revoked_at = jget_string(rows[i], "revokedAt");
+            char *revoked_by = jget_string(rows[i], "revokedBy");
+            char *stored_reason = jget_string(rows[i], "revokeReason");
+            CHECK(state.found
+                      && (revoked_at == NULL ? !state.revoked
+                                             : (state.revoked && state.revoked_at == iso_seconds(revoked_at)))
+                      && (revoked_by == NULL ? !state.has_revoked_by
+                                             : (state.has_revoked_by && strcmp(state.revoked_by, revoked_by) == 0))
+                      && (stored_reason == NULL ? state.reason[0] == '\0' : strcmp(state.reason, stored_reason) == 0),
+                  "%s: share %s revoke columns changed to %d %lld %s %s", label, share_id, state.revoked,
+                  state.revoked_at, state.has_revoked_by ? state.revoked_by : "null", state.reason);
+            free(revoked_at);
+            free(revoked_by);
+            free(stored_reason);
+        }
+        free(share_id);
     }
+    jitems_free(rows, count);
+    free(shares);
+    free(reason);
+    free(revoke);
     return ok;
 }
 
@@ -1437,15 +1546,7 @@ static void test_exchange(void)
         }
         char *expected_audit = jget(expect, "audit");
         CHECK(expect_audit(name, expected_audit, NULL, 0U), "exchange %s: audit mismatch", name);
-        char *shares = jget(input, "shares");
-        char *first = NULL;
-        if (shares != NULL && jitems(shares, &first, 1U) == 1U) {
-            char *share_id = jget_string(first, "shareId");
-            ok = expect_revoke_columns(name, expect, share_id, now_ms) && ok;
-            free(share_id);
-        }
-        free(first);
-        free(shares);
+        ok = expect_revoke_columns(name, input, expect, now_ms) && ok;
         free(expected_audit);
         free(cookie);
         free(expected_body);
@@ -1520,6 +1621,10 @@ static void test_access(void)
             len += snprintf(request + len, sizeof(request) - (size_t)len,
                             "Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
                             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n");
+            /* The device accepts the stream, so an admitted upgrade completes with 101. */
+            pthread_mutex_lock(&device.lock);
+            device.ws_accept = 1;
+            pthread_mutex_unlock(&device.lock);
         }
         len += snprintf(request + len, sizeof(request) - (size_t)len, "\r\n");
         st_storage_http_share_fail_for_testing(!jget_bool(input, "readable", 1));
@@ -1537,6 +1642,8 @@ static void test_access(void)
             char *expected_query = jget_string(forward, "rawQuery");
             char *cookie_raw = jget(forward, "cookie");
             char *cookie = jstring(cookie_raw, NULL);
+            /* The visitor got the device's answer: its 200, or the 101 of an accepted WebSocket. */
+            CHECK(status == (upgrade ? 101 : 200), "access %s: visitor status %d: %.300s", name, status, response);
             pthread_mutex_lock(&device.lock);
             CHECK(device.http_calls + device.ws_calls == 1 && (upgrade ? device.ws_calls == 1 : device.http_calls == 1)
                       && strcmp(device.client_name, "client-7") == 0 && strcmp(device.route, route) == 0
@@ -1549,8 +1656,8 @@ static void test_access(void)
                                  : (device.cookie_headers == 1 && strcmp(device.cookie, cookie) == 0),
                   "access %s: device Cookie (%d headers) %s, expected %s", name, device.cookie_headers, device.cookie,
                   cookie == NULL ? "none" : cookie);
-            CHECK(strstr(device.cookie, "hs1.") == NULL && strstr(device.relative_path, "hs1.") == NULL
-                      && strstr(device.raw_query, "hs1.") == NULL && strstr(device.authorization, "hs1.") == NULL,
+            CHECK(strstr(device.all_headers, "hs1.") == NULL && strstr(device.relative_path, "hs1.") == NULL
+                      && strstr(device.raw_query, "hs1.") == NULL,
                   "access %s: the token reached the device", name);
             pthread_mutex_unlock(&device.lock);
             free(forward);
@@ -1588,15 +1695,18 @@ static void test_access(void)
                 char expected_line[512];
                 expected_cookie_line(cookie, expected_line, sizeof(expected_line));
                 CHECK(response_header(response, "Set-Cookie", 0U, header, sizeof(header))
-                          && strcmp(header, expected_line) == 0,
-                      "access %s: Set-Cookie %s, expected %s", name, header, expected_line);
+                          && strcmp(header, expected_line) == 0
+                          && !response_header(response, "Set-Cookie", 1U, header, 1U),
+                      "access %s: Set-Cookie %s, expected exactly %s", name, header, expected_line);
             } else {
                 CHECK(!response_header(response, "Set-Cookie", 0U, header, sizeof(header)),
                       "access %s: unexpected Set-Cookie %s", name, header);
             }
-            if (expected_status != 308) {
-                CHECK(response_header(response, "Cache-Control", 0U, header, sizeof(header))
-                          && strcmp(header, "no-store") == 0, "access %s: Cache-Control %s", name, header);
+            /* Every refusal, the redirect included, is no-store; the redirect has no body at all. */
+            CHECK(response_header(response, "Cache-Control", 0U, header, sizeof(header))
+                      && strcmp(header, "no-store") == 0, "access %s: Cache-Control %s", name, header);
+            if (expected_status == 308) {
+                CHECK(response_body(response)[0] == '\0', "access %s: redirect body %s", name, response_body(response));
             }
             free(location);
             free(allow);
@@ -1604,10 +1714,14 @@ static void test_access(void)
         }
         char *expected_audit = jget(expect, "audit");
         CHECK(expect_audit(name, expected_audit, NULL, 0U), "access %s: audit mismatch", name);
-        if (share_id != NULL) {
-            ok = expect_revoke_columns(name, expect, share_id, now_ms) && ok;
-        }
+        ok = expect_revoke_columns(name, input, expect, now_ms) && ok;
         st_admin_http_share_release_for_testing();
+        /* An accepted WebSocket ends once the visitor's socket closed; give that a moment. */
+        long long drain_deadline = monotonic_ms() + 3000;
+        while (st_admin_http_share_stream_count(NULL) != 0U && monotonic_ms() < drain_deadline) {
+            struct timespec pause = {.tv_sec = 0, .tv_nsec = 20000000L};
+            nanosleep(&pause, NULL);
+        }
         CHECK(st_admin_http_share_stream_count(NULL) == 0U, "access %s: streams left registered", name);
         free(expected_audit);
         free(status_raw);
@@ -1657,6 +1771,26 @@ static void test_headers(void)
               "requestCookie %zu: %s, expected %s", i, forwarded == NULL ? "none" : forwarded,
               expected == NULL ? "none" : expected);
         free(forwarded);
+        /* The same through the request-header rewriting the share entry applies: other headers kept. */
+        char request[4096];
+        int request_len = snprintf(request, sizeof(request), "GET /http-share/x/ HTTP/1.1\r\nAccept: */*\r\n");
+        for (size_t v = 0U; v < n; ++v) {
+            request_len += snprintf(request + request_len, sizeof(request) - (size_t)request_len, "Cookie: %s\r\n",
+                                    values[v]);
+        }
+        snprintf(request + request_len, sizeof(request) - (size_t)request_len, "\r\n");
+        char **relayed = NULL;
+        size_t relayed_len = 0U;
+        char expected_line[1024] = "";
+        if (expected != NULL) {
+            snprintf(expected_line, sizeof(expected_line), "Cookie:%s", expected);
+        }
+        CHECK(st_admin_http_share_forward_headers_for_testing(request, &relayed, &relayed_len) == 0
+                  && relayed_len == (expected == NULL ? 1U : 2U) && strcmp(relayed[0], "Accept:*/*") == 0
+                  && (expected == NULL || strcmp(relayed[1], expected_line) == 0),
+              "requestCookie %zu: relayed %zu headers, last %s, expected %s", i, relayed_len,
+              relayed_len > 0U ? relayed[relayed_len - 1U] : "none", expected == NULL ? "Accept only" : expected_line);
+        st_http_share_free_strings(relayed, relayed_len);
         for (size_t v = 0U; v < n; ++v) {
             free(values[v]);
         }
@@ -1907,6 +2041,9 @@ static void test_lifecycle(void)
         char *expected_shares = jget(expect, "shares");
         jmember shares[16];
         size_t share_count = jmembers(expected_shares, shares, 16U);
+        long long stored_rows = count_rows("SELECT COUNT(*) FROM http_share");
+        CHECK(stored_rows == (long long)share_count, "lifecycle %s: %lld share rows, expected %zu", name, stored_rows,
+              share_count);
         for (size_t s = 0U; s < share_count; ++s) {
             share_state state = read_share(shares[s].key);
             char *status = jget_string(shares[s].value, "status");
@@ -2110,11 +2247,15 @@ static void test_cookie_stripped_authorization_kept(void)
              share_id);
     CHECK(strcmp(device.browser_headers, expected_browser_headers) == 0, "cookie strip test: browser headers %s",
           device.browser_headers);
+    /* The token went in no header at all, whatever its name. */
+    CHECK(strstr(device.all_headers, token) == NULL && strstr(device.all_headers, "hs1.") == NULL,
+          "cookie strip test: the token reached the device in %s", device.all_headers);
     pthread_mutex_unlock(&device.lock);
     /* No portal headers on the share path: the target's own policy stands. */
     char header[256];
     CHECK(!response_header(response, "Content-Security-Policy", 0U, header, sizeof(header))
-              && !response_header(response, "X-Frame-Options", 0U, header, sizeof(header)),
+              && !response_header(response, "X-Frame-Options", 0U, header, sizeof(header))
+              && !response_header(response, "Referrer-Policy", 0U, header, sizeof(header)),
           "cookie strip test: portal headers on a share response");
     free(response);
     printf("http: share cookie stripped, other cookies and Authorization relayed %s\n", ok ? "ok" : "FAILED");
@@ -2148,6 +2289,14 @@ static void test_response_rewriting(void)
     CHECK(!response_header(response, "Clear-Site-Data", 0U, header, sizeof(header))
               && !response_header(response, "Expires", 0U, header, sizeof(header)),
           "rewrite test: Clear-Site-Data or Expires relayed");
+    /* Nor does the portal add its own policy headers to a relayed answer. */
+    CHECK(!response_header(response, "Content-Security-Policy", 0U, header, sizeof(header))
+              && !response_header(response, "X-Frame-Options", 0U, header, sizeof(header))
+              && !response_header(response, "Referrer-Policy", 0U, header, sizeof(header)),
+          "rewrite test: portal headers on a relayed answer");
+    pthread_mutex_lock(&device.lock);
+    CHECK(strstr(device.all_headers, token) == NULL, "rewrite test: the token reached the device");
+    pthread_mutex_unlock(&device.lock);
     CHECK(response_header(response, "Cache-Control", 0U, header, sizeof(header))
               && strcmp(header, "private, no-cache") == 0
               && !response_header(response, "Cache-Control", 1U, header, sizeof(header)),
@@ -2163,6 +2312,97 @@ static void test_response_rewriting(void)
     printf("http: upstream Set-Cookie, Cache-Control and Clear-Site-Data rewritten %s\n", ok ? "ok" : "FAILED");
 }
 
+/* A request over the real socket with an Authorization value (NULL: none) and a JSON body (NULL: none). */
+static int http_call(const char *method, const char *path, const char *authorization, const char *body,
+                     char *response)
+{
+    char request[8192];
+    int len = snprintf(request, sizeof(request), "%s %s HTTP/1.1\r\nHost: share.test\r\n", method, path);
+    if (authorization != NULL) {
+        len += snprintf(request + len, sizeof(request) - (size_t)len, "Authorization: %s\r\n", authorization);
+    }
+    if (body != NULL) {
+        len += snprintf(request + len, sizeof(request) - (size_t)len,
+                        "Content-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s", strlen(body), body);
+    } else {
+        len += snprintf(request + len, sizeof(request) - (size_t)len, "\r\n");
+    }
+    if (len < 0 || (size_t)len >= sizeof(request)) {
+        return 0;
+    }
+    return http_roundtrip(request, (size_t)len, response, RESPONSE_CAP) == 0 ? response_status(response) : 0;
+}
+
+/* Exactly one Cache-Control header, with this value. */
+static int cache_control_is(const char *response, const char *expected)
+{
+    char value[128] = "";
+    char extra[8];
+    return response_header(response, "Cache-Control", 0U, value, sizeof(value)) && strcmp(value, expected) == 0
+        && !response_header(response, "Cache-Control", 1U, extra, sizeof(extra));
+}
+
+/* A protected route created by owner through the API (so route.created is audited); its id, or 0. */
+static long long create_route_via_api(const char *owner, long long client_id, const char *name)
+{
+    char *response = (char *)malloc(RESPONSE_CAP);
+    char path[96];
+    char body[256];
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld/http-routes", client_id);
+    snprintf(body, sizeof(body),
+             "{\"route\":\"%s\",\"targetBaseUrl\":\"http://127.0.0.1:9/\",\"enabled\":true,"
+             "\"authEnabled\":true,\"authUsername\":\"basic\",\"authPassword\":\"basic-secret\"}", name);
+    int status = manage("POST", path, owner, body, response, RESPONSE_CAP);
+    long long id = status == 201 ? response_route_id(response) : 0;
+    if (id == 0) {
+        fprintf(stderr, "route create failed: %.300s\n", response);
+    }
+    free(response);
+    return id;
+}
+
+/* The entries of an access-audit listing answer: how many, with their raw objects in items. */
+static size_t audit_listing(const char *response, char **items, size_t max)
+{
+    char *entries = jget(response_body(response), "entries");
+    size_t count = entries == NULL ? 0U : jitems(entries, items, max);
+    free(entries);
+    return count;
+}
+
+/* The listing's actions, newest first, are exactly expected. */
+static int audit_actions_are(char *const *items, size_t count, const char *const *expected, size_t expected_count)
+{
+    int same = count == expected_count;
+    for (size_t i = 0U; same && i < count; ++i) {
+        char *action = jget_string(items[i], "action");
+        same = action != NULL && strcmp(action, expected[i]) == 0;
+        free(action);
+    }
+    if (!same) {
+        for (size_t i = 0U; i < count; ++i) {
+            fprintf(stderr, "  listed %s\n", items[i]);
+        }
+    }
+    return same;
+}
+
+static int entry_string_is(const char *entry, const char *key, const char *expected)
+{
+    char *value = jget_string(entry, key);
+    int same = value != NULL && strcmp(value, expected) == 0;
+    free(value);
+    return same;
+}
+
+static int entry_detail_is(const char *entry, const char *expected)
+{
+    char *detail = jget(entry, "detail");
+    int same = detail != NULL && jequal(detail, expected);
+    free(detail);
+    return same;
+}
+
 static void test_revoke_then_gone(void)
 {
     int ok = 1;
@@ -2170,7 +2410,8 @@ static void test_revoke_then_gone(void)
     char share_id[17];
     char *response = (char *)malloc(RESPONSE_CAP);
     st_http_share_set_clock_for_testing(iso_seconds(VECTOR_NOW) * 1000LL);
-    CHECK(seed_world() == 0 && create_share("alice", 42, "{\"expiresInSeconds\":3600}", token, share_id) == 0,
+    long long route_id = seed_world() == 0 ? create_route_via_api("alice", 7, "app") : 0;
+    CHECK(route_id > 0 && create_share("alice", route_id, "{\"expiresInSeconds\":3600}", token, share_id) == 0,
           "revoke test: setup failed");
     st_http_share_gcra_reset(st_http_share_request_limiter());
     device_reset(DEVICE_PLAIN);
@@ -2178,11 +2419,17 @@ static void test_revoke_then_gone(void)
     snprintf(headers, sizeof(headers), "Cookie: " ST_HTTP_SHARE_COOKIE_NAME "=%s\r\n", token);
     CHECK(share_get(share_id, "/", headers, response) == 200, "revoke test: share not usable: %.300s", response);
     char path[128];
-    snprintf(path, sizeof(path), "/api/admin/http-routes/42/shares/%s/revoke", share_id);
+    snprintf(path, sizeof(path), "/api/admin/http-routes/%lld/shares/%s/revoke", route_id, share_id);
+    char *share = NULL;
+    char *state = NULL;
     CHECK(manage("POST", path, "alice", "{}", response, RESPONSE_CAP) == 200
+              && (share = jget(response_body(response), "share")) != NULL
+              && (state = jget_string(share, "status")) != NULL && strcmp(state, "revoked") == 0
               && strstr(response, "\"revokeReason\":\"revoked-by-user\"") != NULL
               && strstr(response, "\"revokedBy\":\"alice\"") != NULL,
           "revoke test: revoke answered %.300s", response);
+    free(share);
+    free(state);
     CHECK(manage("POST", path, "alice", NULL, response, RESPONSE_CAP) == 200, "revoke test: second revoke");
     CHECK(manage("POST", path, "alice", "{\"x\":1}", response, RESPONSE_CAP) == 400
               && body_has_code(response, "SHARE_REQUEST_INVALID"), "revoke test: revoke with a body");
@@ -2192,15 +2439,274 @@ static void test_revoke_then_gone(void)
     snprintf(expected, sizeof(expected),
              ST_HTTP_SHARE_COOKIE_NAME "=; Path=/http-share/%s/; Max-Age=0; HttpOnly; Secure; SameSite=Strict", share_id);
     CHECK(status == 410 && body_has_code(response, "SHARE_REVOKED")
-              && response_header(response, "Set-Cookie", 0U, header, sizeof(header)) && strcmp(header, expected) == 0,
-          "revoke test: after revoke %d %s %.200s", status, header, response_body(response));
-    /* One audit trail: created, then revoked once. */
-    audit_row rows[8];
-    size_t count = read_audit(rows, 8U);
-    CHECK(count == 2U && strcmp(rows[0].action, "share.created") == 0 && strcmp(rows[1].action, "share.revoked") == 0
-              && strcmp(rows[1].actor, "alice") == 0, "revoke test: %zu audit rows", count);
+              && response_header(response, "Set-Cookie", 0U, header, sizeof(header)) && strcmp(header, expected) == 0
+              && !response_header(response, "Set-Cookie", 1U, header, 1U) && cache_control_is(response, "no-store"),
+          "revoke test: after revoke %d %s %.200s", status, header, response);
+    pthread_mutex_lock(&device.lock);
+    CHECK(device.http_calls == 1, "revoke test: the device saw %d requests", device.http_calls);
+    pthread_mutex_unlock(&device.lock);
+    /* The route's audit through its endpoint, newest first: revoked once, created, route created. */
+    snprintf(path, sizeof(path), "/api/admin/http-routes/%lld/access-audit", route_id);
+    char *items[64];
+    CHECK(manage("GET", path, "alice", NULL, response, RESPONSE_CAP) == 200, "revoke test: audit %.300s", response);
+    size_t count = audit_listing(response, items, 64U);
+    static const char *const actions[] = {"share.revoked", "share.created", "route.created"};
+    CHECK(audit_actions_are(items, count, actions, 3U), "revoke test: %zu audit entries", count);
+    if (count == 3U) {
+        char *detail = jget(items[0], "detail");
+        CHECK(entry_string_is(items[0], "actor", "alice") && entry_string_is(detail, "reason", "revoked-by-user"),
+              "revoke test: revoked entry %s", items[0]);
+        free(detail);
+        detail = jget(items[2], "detail");
+        CHECK(entry_string_is(detail, "exposure", "protected"), "revoke test: route entry %s", items[2]);
+        free(detail);
+    }
+    jitems_free(items, count);
     free(response);
-    printf("http: revoke, then 410 with the clearing cookie %s\n", ok ? "ok" : "FAILED");
+    printf("http: revoke, then 410 with the clearing cookie; the route's audit lists it %s\n", ok ? "ok" : "FAILED");
+}
+
+/* Java disablingTheRouteThroughTheApiEndsItsShares: the route endpoint ends the share for good. */
+static void test_route_disable_through_api(void)
+{
+    int ok = 1;
+    char token[65];
+    char share_id[17];
+    char *response = (char *)malloc(RESPONSE_CAP);
+    st_http_share_set_clock_for_testing(iso_seconds(VECTOR_NOW) * 1000LL);
+    long long route_id = seed_world() == 0 ? create_route_via_api("alice", 7, "app") : 0;
+    CHECK(route_id > 0 && create_share("alice", route_id, "{\"expiresInSeconds\":3600}", token, share_id) == 0,
+          "route disable test: setup failed");
+    char path[128];
+    snprintf(path, sizeof(path), "/api/admin/http-routes/%lld", route_id);
+    static const char disable[] = "{\"route\":\"app\",\"targetBaseUrl\":\"http://127.0.0.1:9/\",\"enabled\":false}";
+    static const char enable[] = "{\"route\":\"app\",\"targetBaseUrl\":\"http://127.0.0.1:9/\",\"enabled\":true}";
+    CHECK(manage("PUT", path, "alice", disable, response, RESPONSE_CAP) == 200,
+          "route disable test: disable answered %.300s", response);
+    share_state state = read_share(share_id);
+    CHECK(state.revoked && strcmp(state.reason, "route-disabled") == 0 && strcmp(state.revoked_by, "alice") == 0,
+          "route disable test: share %s by %s", state.reason, state.revoked_by);
+    snprintf(path, sizeof(path), "/api/admin/http-routes/%lld/access-audit", route_id);
+    char *items[64];
+    CHECK(manage("GET", path, "alice", NULL, response, RESPONSE_CAP) == 200, "route disable test: audit %.300s",
+          response);
+    size_t count = audit_listing(response, items, 64U);
+    static const char *const actions[] = {"share.revoked", "route.exposure-changed", "share.created", "route.created"};
+    CHECK(audit_actions_are(items, count, actions, 4U)
+              && entry_detail_is(items[1], "{\"from\":\"protected\",\"to\":\"disabled\"}"),
+          "route disable test: %zu audit entries", count);
+    jitems_free(items, count);
+    /* Enabling the route again does not bring the share back. */
+    snprintf(path, sizeof(path), "/api/admin/http-routes/%lld", route_id);
+    CHECK(manage("PUT", path, "alice", enable, response, RESPONSE_CAP) == 200,
+          "route disable test: enable answered %.300s", response);
+    share_state after = read_share(share_id);
+    CHECK(after.revoked && after.revoked_at == state.revoked_at && strcmp(after.reason, "route-disabled") == 0
+              && strcmp(after.revoked_by, "alice") == 0,
+          "route disable test: after enabling the route %s by %s", after.reason, after.revoked_by);
+    free(response);
+    printf("http: disabling the route through the API ends its share for good %s\n", ok ? "ok" : "FAILED");
+}
+
+/* Java disablingTheCreatorThroughTheApiEndsTheCreatorsShares: re-enabling the user revives nothing. */
+static void test_user_disable_then_reenable(void)
+{
+    int ok = 1;
+    char token[65];
+    char share_id[17];
+    char *response = (char *)malloc(RESPONSE_CAP);
+    st_http_share_set_clock_for_testing(iso_seconds(VECTOR_NOW) * 1000LL);
+    CHECK(seed_world() == 0 && create_share("alice", 42, "{\"expiresInSeconds\":3600}", token, share_id) == 0,
+          "user disable test: setup failed");
+    CHECK(manage("PUT", "/api/admin/users/alice", "admin", "{\"enabled\":false}", response, RESPONSE_CAP) == 200,
+          "user disable test: disable answered %.300s", response);
+    share_state state = read_share(share_id);
+    CHECK(state.revoked && strcmp(state.reason, "creator-lost-access") == 0 && strcmp(state.revoked_by, "admin") == 0,
+          "user disable test: share %s by %s", state.reason, state.revoked_by);
+    CHECK(manage("PUT", "/api/admin/users/alice", "admin", "{\"enabled\":true}", response, RESPONSE_CAP) == 200,
+          "user disable test: enable answered %.300s", response);
+    share_state after = read_share(share_id);
+    CHECK(after.revoked && after.revoked_at == state.revoked_at && strcmp(after.reason, "creator-lost-access") == 0
+              && strcmp(after.revoked_by, "admin") == 0,
+          "user disable test: after enabling the user %s by %s", after.reason, after.revoked_by);
+    free(response);
+    printf("http: disabling the creator ends the share, enabling it again does not revive it %s\n",
+           ok ? "ok" : "FAILED");
+}
+
+/* Java deletingTheClientThroughTheApiDeletesItsRoutesAndEndsTheirShares, with the tenant listing. */
+static void test_client_delete_through_api(void)
+{
+    int ok = 1;
+    char token[65];
+    char share_id[17];
+    char *response = (char *)malloc(RESPONSE_CAP);
+    st_http_share_set_clock_for_testing(iso_seconds(VECTOR_NOW) * 1000LL);
+    long long route_id = seed_world() == 0 ? create_route_via_api("alice", 7, "app") : 0;
+    CHECK(route_id > 0 && create_share("alice", route_id, "{\"expiresInSeconds\":3600}", token, share_id) == 0,
+          "client delete test: setup failed");
+    CHECK(manage("DELETE", "/api/admin/clients/7", "admin", NULL, response, RESPONSE_CAP) == 204,
+          "client delete test: delete answered %.300s", response);
+    char sql[128];
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM http_route_mapping WHERE id = %lld", route_id);
+    CHECK(count_rows(sql) == 0, "client delete test: the route row is still there");
+    share_state state = read_share(share_id);
+    CHECK(state.revoked && strcmp(state.reason, "client-deleted") == 0 && strcmp(state.revoked_by, "admin") == 0,
+          "client delete test: share %s by %s", state.reason, state.revoked_by);
+    char path[128];
+    snprintf(path, sizeof(path), "/api/admin/http-access-audit?routeId=%lld", route_id);
+    char *items[64];
+    CHECK(manage("GET", path, "admin", NULL, response, RESPONSE_CAP) == 200, "client delete test: audit %.300s",
+          response);
+    size_t count = audit_listing(response, items, 64U);
+    static const char *const actions[] = {"share.revoked", "route.deleted", "share.created", "route.created"};
+    CHECK(audit_actions_are(items, count, actions, 4U) && entry_detail_is(items[1], "{\"exposure\":\"protected\"}")
+              && entry_string_is(items[1], "actor", "admin"),
+          "client delete test: %zu audit entries", count);
+    jitems_free(items, count);
+    CHECK(manage("GET", "/api/admin/http-access-audit", "alice", NULL, response, RESPONSE_CAP) == 403
+              && body_has_code(response, "SHARE_FORBIDDEN"), "client delete test: tenant audit for a user");
+    free(response);
+    printf("http: deleting the client through the API deletes its route and ends the share %s\n", ok ? "ok" : "FAILED");
+}
+
+/*
+ * Java refusalsBeforeAnyControllerArePrivateOnPrivateEndpoints: without a bearer, or with one that
+ * is no token at all, the share, audit, workbench and connectivity-check endpoints answer 401 with
+ * exactly "private, no-store". Other admin endpoints keep their usual header: Java's portal header
+ * writer adds "no-cache, no-store, max-age=0, must-revalidate" (with Pragma and Expires) to every
+ * non-/http answer that sets no Cache-Control of its own, successes included, where C's JSON
+ * answers all say "no-store"; that platform difference is kept, so the 401 here is "no-store".
+ */
+static void test_refusals_private_on_private_endpoints(void)
+{
+    int ok = 1;
+    char *response = (char *)malloc(RESPONSE_CAP);
+    CHECK(seed_world() == 0, "private refusal test: setup failed");
+    static const char *const calls[][2] = {
+        {"POST", "/api/admin/http-routes/1/shares"},
+        {"GET", "/api/admin/http-routes/1/shares"},
+        {"GET", "/api/admin/http-routes/1/shares/abc"},
+        {"POST", "/api/admin/http-routes/1/shares/abc/revoke"},
+        {"GET", "/api/admin/http-routes/1/access-audit"},
+        {"GET", "/api/admin/http-access-audit"},
+        {"GET", "/api/admin/workbench"},
+        {"POST", "/api/admin/http-routes/1/connectivity-check"}
+    };
+    static const char *const bearers[] = {NULL, "Bearer not-a-token"};
+    for (size_t i = 0U; i < sizeof(calls) / sizeof(calls[0]); ++i) {
+        for (size_t b = 0U; b < sizeof(bearers) / sizeof(bearers[0]); ++b) {
+            int is_post = strcmp(calls[i][0], "POST") == 0;
+            int status = http_call(calls[i][0], calls[i][1], bearers[b], is_post ? "{}" : NULL, response);
+            CHECK(status == 401 && cache_control_is(response, "private, no-store"),
+                  "private refusal test: %s %s with %s answered %.300s", calls[i][0], calls[i][1],
+                  bearers[b] == NULL ? "no bearer" : bearers[b], response);
+        }
+    }
+    int status = http_call("GET", "/api/admin/clients", NULL, NULL, response);
+    CHECK(status == 401 && cache_control_is(response, "no-store"), "private refusal test: clients answered %.300s",
+          response);
+    free(response);
+    printf("http: refusals before any handler are private on private endpoints %s\n", ok ? "ok" : "FAILED");
+}
+
+typedef struct {
+    pthread_barrier_t *start;
+    const char *authorization;
+    int status;
+    int private_no_store;
+    int limit_reached;
+    char body[512];
+} create_racer;
+
+static void *create_racer_thread(void *arg)
+{
+    create_racer *racer = (create_racer *)arg;
+    char *response = (char *)malloc(RESPONSE_CAP);
+    pthread_barrier_wait(racer->start);
+    racer->status = http_call("POST", "/api/admin/http-routes/42/shares", racer->authorization,
+                              "{\"expiresInSeconds\": 3600}", response);
+    racer->private_no_store = cache_control_is(response, "private, no-store");
+    racer->limit_reached = body_has_code(response, "SHARE_LIMIT_REACHED");
+    snprintf(racer->body, sizeof(racer->body), "%s", response_body(response));
+    free(response);
+    return NULL;
+}
+
+/* Java creationsRacingForTheLastSlotStopAtTheLimit: one slot left, eight concurrent creations. */
+static void test_creation_race(void)
+{
+    int ok = 1;
+    char token[65];
+    char share_id[17];
+    st_http_share_set_clock_for_testing(iso_seconds(VECTOR_NOW) * 1000LL);
+    st_http_share_set_random_for_testing(NULL);
+    CHECK(seed_world() == 0, "race test: setup failed");
+    for (int i = 0; ok && i < ST_HTTP_SHARE_MAX_ACTIVE_PER_ROUTE - 1; ++i) {
+        CHECK(create_share("alice", 42, "{\"expiresInSeconds\": 3600}", token, share_id) == 0,
+              "race test: share %d not created", i);
+    }
+    enum { RACERS = 8 };
+    char *authorization = bearer_for("alice");
+    pthread_barrier_t start;
+    pthread_barrier_init(&start, NULL, RACERS);
+    create_racer racers[RACERS];
+    pthread_t threads[RACERS];
+    for (int i = 0; i < RACERS; ++i) {
+        memset(&racers[i], 0, sizeof(racers[i]));
+        racers[i].start = &start;
+        racers[i].authorization = authorization;
+        pthread_create(&threads[i], NULL, create_racer_thread, &racers[i]);
+    }
+    int created = 0;
+    int refused = 0;
+    for (int i = 0; i < RACERS; ++i) {
+        pthread_join(threads[i], NULL);
+        CHECK(racers[i].private_no_store, "race test: racer %d without private, no-store", i);
+        if (racers[i].status == 201) {
+            ++created;
+        } else {
+            CHECK(racers[i].status == 409 && racers[i].limit_reached, "race test: racer %d answered %d %s", i,
+                  racers[i].status, racers[i].body);
+            ++refused;
+        }
+    }
+    pthread_barrier_destroy(&start);
+    free(authorization);
+    char sql[160];
+    snprintf(sql, sizeof(sql),
+             "SELECT COUNT(*) FROM http_share WHERE route_id = 42 AND revoked_at IS NULL AND expires_at > %lld",
+             iso_seconds(VECTOR_NOW));
+    long long active = count_rows(sql);
+    CHECK(created == 1 && refused == RACERS - 1 && active == ST_HTTP_SHARE_MAX_ACTIVE_PER_ROUTE,
+          "race test: %d created, %d refused, %lld active", created, refused, active);
+    printf("http: %d creations racing for the last slot: %d created, %d refused %s\n", RACERS, created, refused,
+           ok ? "ok" : "FAILED");
+}
+
+/* Java anInvalidBodyIsRefusedBeforeAnyLock: the body is judged before the share store is touched. */
+static void test_invalid_body_before_store(void)
+{
+    int ok = 1;
+    char *response = (char *)malloc(RESPONSE_CAP);
+    st_http_share_set_clock_for_testing(iso_seconds(VECTOR_NOW) * 1000LL);
+    CHECK(seed_world() == 0, "invalid body test: setup failed");
+    st_storage_http_share_fail_for_testing(1);
+    int invalid = manage("POST", "/api/admin/http-routes/42/shares", "alice", "{}", response, RESPONSE_CAP);
+    int invalid_code = body_has_code(response, "SHARE_REQUEST_INVALID");
+    int invalid_private = cache_control_is(response, "private, no-store");
+    /* Control: a valid body with the same failing store does reach it. */
+    int valid = manage("POST", "/api/admin/http-routes/42/shares", "alice", "{\"expiresInSeconds\":3600}", response,
+                       RESPONSE_CAP);
+    int valid_code = body_has_code(response, "SHARE_UNAVAILABLE");
+    st_storage_http_share_fail_for_testing(0);
+    CHECK(invalid == 400 && invalid_code && invalid_private, "invalid body test: {} answered %d", invalid);
+    CHECK(valid == 503 && valid_code, "invalid body test: the failing store answered %d", valid);
+    CHECK(count_rows("SELECT COUNT(*) FROM http_share") == 0
+              && count_rows("SELECT COUNT(*) FROM http_access_audit") == 0,
+          "invalid body test: rows written");
+    free(response);
+    printf("http: an invalid create body is refused before the share store %s\n", ok ? "ok" : "FAILED");
 }
 
 typedef struct {
@@ -2220,16 +2726,17 @@ static void *ticker_thread(void *arg)
     return NULL;
 }
 
-static long long monotonic_ms(void)
-{
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000L;
-}
+/* Everything a visitor received of one response, as it arrived. */
+typedef struct {
+    char data[16384];
+    size_t len;
+} stream_capture;
 
 /* Opens a long GET through the share and waits until the first event arrived; returns the socket. */
-static int open_stream(const char *share_id, const char *token)
+static int open_stream(const char *share_id, const char *token, stream_capture *capture)
 {
+    capture->len = 0U;
+    capture->data[0] = '\0';
     int fd = connect_server();
     char request[512];
     int len = snprintf(request, sizeof(request),
@@ -2241,17 +2748,15 @@ static int open_stream(const char *share_id, const char *token)
         }
         return -1;
     }
-    char buffer[2048];
-    size_t received = 0U;
-    while (received + 1U < sizeof(buffer)) {
-        ssize_t got = recv(fd, buffer + received, sizeof(buffer) - 1U - received, 0);
+    while (capture->len + 1U < sizeof(capture->data)) {
+        ssize_t got = recv(fd, capture->data + capture->len, sizeof(capture->data) - 1U - capture->len, 0);
         if (got <= 0) {
             close(fd);
             return -1;
         }
-        received += (size_t)got;
-        buffer[received] = '\0';
-        if (strstr(buffer, "data: first") != NULL) {
+        capture->len += (size_t)got;
+        capture->data[capture->len] = '\0';
+        if (strstr(capture->data, "data: first") != NULL) {
             return fd;
         }
     }
@@ -2259,8 +2764,8 @@ static int open_stream(const char *share_id, const char *token)
     return -1;
 }
 
-/* Milliseconds until the server closes the socket (reads and drops whatever else arrives). */
-static long long wait_closed(int fd, long long started)
+/* Milliseconds until the server closes the socket; whatever else arrives is added to capture. */
+static long long wait_closed(int fd, long long started, stream_capture *capture)
 {
     char buffer[1024];
     for (;;) {
@@ -2271,7 +2776,52 @@ static long long wait_closed(int fd, long long started)
         if (got < 0) {
             return -1; /* the 10 s receive timeout ran out */
         }
+        size_t room = sizeof(capture->data) - 1U - capture->len;
+        size_t kept = (size_t)got < room ? (size_t)got : room;
+        memcpy(capture->data + capture->len, buffer, kept);
+        capture->len += kept;
+        capture->data[capture->len] = '\0';
     }
+}
+
+/*
+ * 1 when the captured response came to its framed end: the last chunk of a chunked body, or the
+ * whole Content-Length. A response cut off mid-body has neither, so its client sees an error (Java
+ * HttpClient's readAllBytes throws) instead of a complete body; a close-delimited body has no end
+ * that tells the two apart and counts as ended.
+ */
+static int response_framed_end(const stream_capture *capture)
+{
+    const char *head_end = strstr(capture->data, "\r\n\r\n");
+    if (head_end == NULL) {
+        return 0;
+    }
+    const char *body = head_end + 4;
+    size_t body_len = capture->len - (size_t)(body - capture->data);
+    char value[64];
+    if (response_header(capture->data, "Transfer-Encoding", 0U, value, sizeof(value))
+        && strcasecmp(value, "chunked") == 0) {
+        size_t at = 0U;
+        for (;;) {
+            const char *line_end = memchr(body + at, '\n', body_len - at);
+            if (line_end == NULL) {
+                return 0;
+            }
+            unsigned long long size = strtoull(body + at, NULL, 16);
+            at = (size_t)(line_end - body) + 1U;
+            if (size == 0ULL) {
+                return 1; /* the last chunk; trailers, if any, follow */
+            }
+            if (size + 2ULL > (unsigned long long)(body_len - at)) {
+                return 0;
+            }
+            at += (size_t)size + 2U;
+        }
+    }
+    if (response_header(capture->data, "Content-Length", 0U, value, sizeof(value))) {
+        return body_len >= (size_t)strtoull(value, NULL, 10);
+    }
+    return 1;
 }
 
 static int device_wait_cancelled(int timeout_ms)
@@ -2303,7 +2853,8 @@ static void test_remote_revoke_cuts_stream(void)
     ticker_state ticker;
     atomic_init(&ticker.stop, 0);
     pthread_create(&ticker.thread, NULL, ticker_thread, &ticker);
-    int fd = open_stream(share_id, token);
+    static stream_capture capture;
+    int fd = open_stream(share_id, token, &capture);
     CHECK(fd >= 0 && st_admin_http_share_stream_count(share_id) == 1U, "remote revoke test: stream not open");
     /* Another instance revokes: only the database changes, no hook runs here. */
     char *sql = sqlite3_mprintf("UPDATE http_share SET revoked_at = %lld, revoked_by = 'elsewhere', "
@@ -2312,8 +2863,13 @@ static void test_remote_revoke_cuts_stream(void)
     long long started = monotonic_ms();
     CHECK(sql_exec(sql) == 0, "remote revoke test: update failed");
     sqlite3_free(sql);
-    long long elapsed = fd >= 0 ? wait_closed(fd, started) : -1;
+    long long elapsed = fd >= 0 ? wait_closed(fd, started, &capture) : -1;
     CHECK(elapsed >= 0 && elapsed <= 5000, "remote revoke test: stream cut after %lld ms", elapsed);
+    /* Cut off, not completed: the chunked body never got its last chunk. */
+    char framing[64] = "";
+    CHECK(response_header(capture.data, "Transfer-Encoding", 0U, framing, sizeof(framing))
+              && strcmp(framing, "chunked") == 0 && !response_framed_end(&capture),
+          "remote revoke test: the response ended cleanly: %s", capture.data);
     CHECK(device_wait_cancelled(2000), "remote revoke test: the NAT stream was not reset");
     if (fd >= 0) {
         close(fd);
@@ -2408,13 +2964,15 @@ static void test_local_cascade_cuts_websocket_and_stream(void)
     /* A long HTTP response, then the owner disables the route: the hook cuts it at once. */
     CHECK(create_share("alice", 42, "{\"expiresInSeconds\":3600}", token, share_id) == 0, "cascade test: share");
     device_reset(DEVICE_STREAM);
-    fd = open_stream(share_id, token);
+    static stream_capture capture;
+    fd = open_stream(share_id, token, &capture);
     CHECK(fd >= 0, "cascade test: stream not open");
     started = monotonic_ms();
     CHECK(manage("PUT", "/api/admin/http-routes/42", "alice", "{\"enabled\":false}", response, RESPONSE_CAP) == 200,
           "cascade test: route update failed: %.300s", response);
-    long long elapsed = fd >= 0 ? wait_closed(fd, started) : -1;
+    long long elapsed = fd >= 0 ? wait_closed(fd, started, &capture) : -1;
     CHECK(elapsed >= 0 && elapsed < 1000, "cascade test: stream cut after %lld ms (no ticker runs)", elapsed);
+    CHECK(!response_framed_end(&capture), "cascade test: the response ended cleanly: %s", capture.data);
     CHECK(device_wait_cancelled(2000), "cascade test: the NAT stream was not reset");
     if (fd >= 0) {
         close(fd);
@@ -2615,6 +3173,12 @@ int main(void)
     test_cookie_stripped_authorization_kept();
     test_response_rewriting();
     test_revoke_then_gone();
+    test_route_disable_through_api();
+    test_user_disable_then_reenable();
+    test_client_delete_through_api();
+    test_refusals_private_on_private_endpoints();
+    test_creation_race();
+    test_invalid_body_before_store();
     test_remote_revoke_cuts_stream();
     test_local_cascade_cuts_websocket_and_stream();
     test_cascades_from_endpoints();
