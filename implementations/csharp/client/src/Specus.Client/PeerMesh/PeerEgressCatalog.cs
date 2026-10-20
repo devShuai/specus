@@ -227,6 +227,15 @@ internal sealed class PeerEgressCatalog(Func<long>? clock = null)
         }
     }
 
+    /// <summary>The egresses that take IPv6 packets, in order.</summary>
+    public List<long> Ipv6CapableIds()
+    {
+        lock (_gate)
+        {
+            return [.. _listed.Where(entry => entry.Value.Ipv6PacketCapable).Select(entry => entry.Key).Order()];
+        }
+    }
+
     /// <summary>Every egress the last catalogue listed, in order.</summary>
     public List<long> ListedIds()
     {
