@@ -23,7 +23,7 @@ CORE_OBJS += $(BUILD_DIR)/url_decode.o
 URL_DECODE_TESTS := $(BUILD_DIR)/specus_c_url_decode_tests
 CONNECTIVITY_LIFETIME_TESTS := $(BUILD_DIR)/specus_c_connectivity_lifetime_tests
 CONNECTIVITY_SETTER_TESTS := $(BUILD_DIR)/specus_c_connectivity_setter_tests
-CORE_OBJS += $(BUILD_DIR)/instant.o $(BUILD_DIR)/instant_storage.o
+CORE_OBJS += $(BUILD_DIR)/instant.o $(BUILD_DIR)/instant_storage.o $(BUILD_DIR)/java_uri.o
 CORE_OBJS += $(BUILD_DIR)/websocket_ticket.o
 INSTANT_TESTS := $(BUILD_DIR)/specus_c_instant_tests
 INSTANT_MIGRATION_TESTS := $(BUILD_DIR)/specus_c_instant_migration_tests
@@ -107,6 +107,9 @@ UNICODE_JAVA21_TESTS := $(BUILD_DIR)/specus_c_unicode_java21_tests
 UNICODE_JAVA21_VECTORS := ../../../protocol/test-vectors/java21-root-case-v1.json
 CORE_OBJS += $(BUILD_DIR)/unicode_java21.o
 ALL_TESTS += $(UNICODE_JAVA21_TESTS)
+JAVA_URI_TESTS := $(BUILD_DIR)/specus_c_java_uri_tests
+DOWNLOAD_LINK_VECTOR_FILE := ../../../protocol/test-vectors/client-download-link-validation-v1.json
+ALL_TESTS += $(JAVA_URI_TESTS)
 TESTS += $(CONNECTIVITY_HTTP_VECTOR_TESTS)
 ALL_TESTS += $(CONNECTIVITY_HTTP_VECTOR_TESTS)
 ALL_TESTS += $(CONNECTIVITY_RESOURCE_WIRE_TESTS)
@@ -180,6 +183,11 @@ $(BUILD_DIR)/connectivity_check.o: src/connectivity_check.h
 $(UNICODE_JAVA21_TESTS): $(CORE_OBJS) tests/unicode_java21_tests.c $(UNICODE_JAVA21_VECTORS) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/unicode_java21_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
+$(BUILD_DIR)/java_uri.o: src/java_uri.h
+
+$(JAVA_URI_TESTS): $(CORE_OBJS) tests/java_uri_tests.c $(DOWNLOAD_LINK_VECTOR_FILE) | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/java_uri_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
 $(SERVER): $(CORE_OBJS) src/main.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) src/main.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
@@ -229,8 +237,8 @@ $(CLIENT_ADDRESS_TESTS): $(CORE_OBJS) tests/client_address_tests.c | $(BUILD_DIR
 $(CLIENT_AUTH_NONCE_TESTS): $(CORE_OBJS) tests/client_auth_nonce_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/client_auth_nonce_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
-$(CLIENT_PACKAGE_TESTS): $(CORE_OBJS) tests/client_package_tests.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/client_package_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+$(CLIENT_PACKAGE_TESTS): $(CORE_OBJS) tests/client_package_tests.c $(DOWNLOAD_LINK_VECTOR_FILE) | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DST_DOWNLOAD_LINK_VECTOR_FILE='"$(abspath $(DOWNLOAD_LINK_VECTOR_FILE))"' tests/client_package_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(CRYPTO_TESTS): $(CORE_OBJS) tests/crypto_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/crypto_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
@@ -434,6 +442,7 @@ test: all
 	$(CONNECTIVITY_RATE_HTTP_TESTS)
 	$(CONNECTIVITY_RESOURCE_WIRE_TESTS) $(SERVER)
 	$(UNICODE_JAVA21_TESTS) "$(abspath $(UNICODE_JAVA21_VECTORS))"
+	$(JAVA_URI_TESTS) "$(abspath $(DOWNLOAD_LINK_VECTOR_FILE))"
 	@for test in $(TESTS); do $$test || exit 1; done
 	bash scripts/public_coordination_test.sh $(PUBLIC_COORDINATION_TESTS)
 	bash scripts/public_discovery_cluster_e2e.sh $(SERVER)

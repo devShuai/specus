@@ -130,6 +130,16 @@ Java、Go 与 .NET 服务端必须直接读取 `public-transfer-cluster-v2.json`
   Java、Go、.NET 与 C 服务端经真实 HTTP 处理代码（`/api/admin/me`、`/auth/refresh`、`/api/admin/users`、
   `DELETE /api/admin/users/{username}`）重放全部用例。
 
+## 客户端下载链接
+
+- `client-download-link-validation-v1.json`：`ClientDownloadLinkService` 新增与修改的请求校验。`createCases` 是新增的
+  请求体与结果（`error` 为整句文案；`errorPrefix` 只给前缀，因为 Java 用 `Set.of` 列允许值，次序每次启动都可能不同；
+  `stored` 为成功后的视图字段）；`updateCases` 先用 `seed` 新增一行（`seedHosted` 时再标成托管包），再用请求体修改；
+  `uriCases` 是 URL 校验依赖的 `java.net.URI` 解析：失败时 `URISyntaxException` 的消息（下标按 UTF-16 计），成功时的
+  scheme、原始 user info、host、原始 authority 与原始 path（`null` 即 Java 的 getter 返回 `null`）。由 Java 服务实际
+  运行生成，Java `ClientDownloadLinkValidationVectorTests` 重放全部用例；C 服务端经真实 HTTP 重放 `createCases` 与
+  `updateCases`，`java_uri_tests` 重放 `uriCases`。
+
 ## 拒绝规则
 
 每种实现至少覆盖：错误版本、错误 magic/type、截断、尾随字节、越界长度、错误 GCM tag/HMAC、重复
