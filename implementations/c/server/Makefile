@@ -411,8 +411,8 @@ $(TURNSTILE_VERIFIER_TESTS): $(CORE_OBJS) tests/turnstile_verifier_tests.c | $(B
 $(UPSTREAM_BROWSER_HEADERS_TESTS): $(CORE_OBJS) tests/upstream_browser_headers_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/upstream_browser_headers_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
-$(WORKBENCH_TESTS): $(CORE_OBJS) tests/workbench_tests.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/workbench_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+$(WORKBENCH_TESTS): $(CORE_OBJS) tests/workbench_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/workbench_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(MANAGEMENT_ACCOUNTS_TESTS): $(CORE_OBJS) tests/management_accounts_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/management_accounts_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
