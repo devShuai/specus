@@ -28,16 +28,37 @@ final class PeerEgressDatagram {
     private PeerEgressDatagram() {
     }
 
-    /** One parsed UDP datagram together with the IPv4 addresses that carried it. */
+    /**
+     * One parsed UDP datagram together with the addresses that carried it: the IPv4 ones, or, when
+     * the IPv6 ones are set, those with the IPv4 fields left zero.
+     */
     record Datagram(
             int sourceIp,
             int destinationIp,
             int sourcePort,
             int destinationPort,
-            byte[] payload) {
+            byte[] payload,
+            PeerEgressIpv6Packet.Address sourceIp6,
+            PeerEgressIpv6Packet.Address destinationIp6) {
 
         Datagram {
             payload = payload == null ? EMPTY : payload;
+        }
+
+        /** An IPv4 datagram. */
+        Datagram(int sourceIp, int destinationIp, int sourcePort, int destinationPort, byte[] payload) {
+            this(sourceIp, destinationIp, sourcePort, destinationPort, payload, null, null);
+        }
+
+        /** Whether the datagram travels in IPv6. */
+        boolean ipv6() {
+            return sourceIp6 != null;
+        }
+
+        /** The egress flow key of a datagram arriving from a consumer. */
+        PeerEgressFlowTable.Key flowKey() {
+            return new PeerEgressFlowTable.Key(IPV4_PROTOCOL_UDP, sourceIp, sourcePort, destinationIp,
+                    destinationPort, sourceIp6, destinationIp6);
         }
     }
 
@@ -82,9 +103,15 @@ final class PeerEgressDatagram {
                 Arrays.copyOfRange(packet, ihl + UDP_HEADER_BYTES, total));
     }
 
-    /** Renders a datagram as a complete IPv4 packet, checksums included. */
+    /**
+     * Renders a datagram as a complete IPv4 packet, or IPv6 packet when the datagram is IPv6,
+     * checksums included.
+     */
     static byte[] build(Datagram datagram) {
         int length = UDP_HEADER_BYTES + datagram.payload().length;
+        if (datagram.ipv6()) {
+            return build6(datagram, length);
+        }
         byte[] packet = new byte[PeerEgressSegment.IPV4_MIN_HEADER_BYTES + length];
 
         packet[0] = 0x45;
@@ -107,6 +134,27 @@ final class PeerEgressDatagram {
         int checksum = udpChecksum(packet, PeerEgressSegment.IPV4_MIN_HEADER_BYTES, length);
         // RFC 768: zero is reserved to mean "no checksum", so a computed zero goes on the wire as
         // its equivalent complement instead.
+        if (checksum == 0) {
+            checksum = 0xFFFF;
+        }
+        PeerEgressSegment.writeShort(packet, udp + 6, checksum);
+        return packet;
+    }
+
+    private static byte[] build6(Datagram datagram, int length) {
+        byte[] packet = new byte[PeerEgressIpv6Packet.HEADER_BYTES + length];
+        PeerEgressIpv6Packet.writeHeader(packet, IPV4_PROTOCOL_UDP, length,
+                datagram.sourceIp6(), datagram.destinationIp6());
+        int udp = PeerEgressIpv6Packet.HEADER_BYTES;
+        PeerEgressSegment.writeShort(packet, udp, datagram.sourcePort());
+        PeerEgressSegment.writeShort(packet, udp + 2, datagram.destinationPort());
+        PeerEgressSegment.writeShort(packet, udp + 4, length);
+        System.arraycopy(
+                datagram.payload(), 0,
+                packet, udp + UDP_HEADER_BYTES, datagram.payload().length);
+        int checksum = PeerEgressIpv6Packet.checksum(datagram.sourceIp6(), datagram.destinationIp6(),
+                IPV4_PROTOCOL_UDP, packet, udp, length);
+        // Zero would read as "no checksum", which IPv6 does not allow; its complement is the same sum.
         if (checksum == 0) {
             checksum = 0xFFFF;
         }

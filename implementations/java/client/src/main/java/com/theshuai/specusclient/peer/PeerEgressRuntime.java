@@ -307,23 +307,37 @@ final class PeerEgressRuntime {
     }
 
     /**
-     * The SPEG1 entry point: one decrypted payload from one consumer.
+     * {@link #handleFrame(long, String, byte[], long)} for a consumer whose mesh address is not
+     * known, which carries IPv4 only: an IPv6 packet's source has nothing to be checked against, so
+     * every one is dropped.
+     */
+    boolean handleFrame(long consumer, byte[] payload, long nowMs) {
+        return handleFrame(consumer, null, payload, nowMs);
+    }
+
+    /**
+     * The SPEG1 entry point: one decrypted payload from one consumer, whose mesh IPv4 address, as
+     * the authenticated session has it, is consumerMeshIp.
      *
      * <p>Returns false when the payload is not an egress frame at all, so the mesh dispatch can go
      * on to its other cases. A payload that carries the magic but nothing valid returns true,
      * because it was addressed here and has already been refused with its own code.
      */
-    boolean handleFrame(long consumer, byte[] payload, long nowMs) {
+    boolean handleFrame(long consumer, String consumerMeshIp, byte[] payload, long nowMs) {
         if (!PeerEgressFrame.looksLikeFrame(payload)) {
             return false;
         }
-        PeerEgressFrame.Decoded frame = PeerEgressFrame.parse(payload);
+        PeerEgressFrame.Decoded frame = PeerEgressFrame.parse(payload, PeerEgressIpv6Packet.PACKET_CAPABLE);
         if (!frame.accepted()) {
             refuse(consumer, null, frame.code(), nowMs);
             return true;
         }
         if (frame.type() == PeerEgressFrame.TYPE_IP_PACKET) {
-            handleInnerPacket(consumer, frame, nowMs);
+            if (frame.inner().ipv6()) {
+                handleInnerPacket6(consumer, consumerMeshIp, frame, nowMs);
+            } else {
+                handleInnerPacket(consumer, frame, nowMs);
+            }
         } else if (frame.type() == PeerEgressFrame.TYPE_CONTROL) {
             handleControl(consumer, frame, nowMs);
         }
@@ -354,6 +368,52 @@ final class PeerEgressRuntime {
             return;
         }
         refuse(consumer, new PeerEgressFlowTable.Key(protocol, 0, 0, 0, 0),
+                PeerEgressCodes.FRAME_TRUNCATED, nowMs);
+    }
+
+    /**
+     * handleInnerPacket for an IPv6 body ({@code protocol/spec/peer-egress.md}, IPv6 数据面, 出口).
+     * The protocol goes first, as for IPv4: anything but TCP and UDP -- ICMPv6, and any packet that
+     * starts with an extension or fragment header -- is refused with {@code EGRESS_PROTOCOL_DENIED}.
+     *
+     * <p>Then the source. It has to be the address derived from the session peer's mesh IPv4, or a
+     * consumer could speak for another device the policy allows. IPv4 has no counterpart to this in
+     * this client: the session alone identifies the consumer there. A packet from any other source is
+     * dropped without an answer and without a count; nothing is owed to an address the sender does
+     * not hold.
+     *
+     * <p>The destination is judged when the flow opens, as for IPv4: the derived prefix stands in
+     * the forced-deny list the way the mesh network does
+     * ({@link PeerEgressAuthorization#MESH_PREFIX6}).
+     */
+    private void handleInnerPacket6(long consumer, String consumerMeshIp, PeerEgressFrame.Decoded frame,
+            long nowMs) {
+        int protocol = frame.inner().protocol();
+        if (protocol != PeerEgressSegment.IPV4_PROTOCOL_TCP && protocol != PeerEgressDatagram.IPV4_PROTOCOL_UDP) {
+            refuse(consumer, new PeerEgressFlowTable.Key(protocol, 0, 0, 0, frame.inner().destinationPort(),
+                            PeerEgressIpv6Packet.Address.ZERO, PeerEgressIpv6Packet.Address.ZERO),
+                    PeerEgressCodes.PROTOCOL_DENIED, nowMs);
+            return;
+        }
+        PeerEgressIpv6Packet.Address expected = PeerEgressIpv6Packet.deviceAddress(consumerMeshIp);
+        if (expected == null || !expected.equals(PeerEgressIpv6Packet.Address.read(frame.body(), 8))) {
+            return;
+        }
+        if (protocol == PeerEgressSegment.IPV4_PROTOCOL_TCP) {
+            PeerEgressSegment.Segment segment = PeerEgressIpv6Packet.parseSegment(frame.body());
+            if (segment != null) {
+                handleSegment(consumer, segment, nowMs);
+                return;
+            }
+        } else {
+            PeerEgressDatagram.Datagram datagram = PeerEgressIpv6Packet.parseDatagram(frame.body());
+            if (datagram != null) {
+                handleDatagram(consumer, datagram, nowMs);
+                return;
+            }
+        }
+        refuse(consumer, new PeerEgressFlowTable.Key(protocol, 0, 0, 0, 0,
+                PeerEgressIpv6Packet.Address.ZERO, PeerEgressIpv6Packet.Address.ZERO),
                 PeerEgressCodes.FRAME_TRUNCATED, nowMs);
     }
 
@@ -392,10 +452,7 @@ final class PeerEgressRuntime {
 
     /** Drives one TCP segment from a consumer. */
     private void handleSegment(long consumer, PeerEgressSegment.Segment segment, long nowMs) {
-        PeerEgressFlowTable.Key key = new PeerEgressFlowTable.Key(
-                PeerEgressSegment.IPV4_PROTOCOL_TCP,
-                segment.sourceIp(), segment.sourcePort(),
-                segment.destinationIp(), segment.destinationPort());
+        PeerEgressFlowTable.Key key = segment.flowKey();
 
         lock.lock();
         PeerEgressFlowTable.Flow flow = flows.lookup(key);
@@ -649,10 +706,7 @@ final class PeerEgressRuntime {
      * four-tuple is the authorization point and every later one rides that decision.
      */
     private void handleDatagram(long consumer, PeerEgressDatagram.Datagram datagram, long nowMs) {
-        PeerEgressFlowTable.Key key = new PeerEgressFlowTable.Key(
-                PeerEgressDatagram.IPV4_PROTOCOL_UDP,
-                datagram.sourceIp(), datagram.sourcePort(),
-                datagram.destinationIp(), datagram.destinationPort());
+        PeerEgressFlowTable.Key key = datagram.flowKey();
 
         lock.lock();
         PeerEgressFlowTable.Flow flow = flows.lookup(key);
@@ -750,7 +804,7 @@ final class PeerEgressRuntime {
     /** Returns the socket's replies to the consumer. Called with the lock held. */
     private void startUdpReader(long consumer, PeerEgressFlowTable.Flow flow, UdpFlow handle) {
         executor.run(() -> {
-            byte[] buffer = new byte[UDP_READ_BUFFER];
+            byte[] buffer = new byte[flow.key.ipv6() ? PeerEgressIpv6Packet.UDP_MAX_PAYLOAD : UDP_READ_BUFFER];
             while (true) {
                 int read;
                 try {
@@ -780,7 +834,8 @@ final class PeerEgressRuntime {
                 // reply can only ever claim the address the consumer asked us to contact.
                 emitSegment(consumer, PeerEgressDatagram.build(new PeerEgressDatagram.Datagram(
                         flow.key.remoteIp(), flow.key.consumerIp(),
-                        flow.key.remotePort(), flow.key.consumerPort(), payload)));
+                        flow.key.remotePort(), flow.key.consumerPort(), payload,
+                        flow.key.remoteIp6(), flow.key.consumerIp6())));
             }
         });
     }
@@ -861,7 +916,7 @@ final class PeerEgressRuntime {
      * reservation already there, and must not dial again.
      */
     private Reservation reserve(long consumer, PeerEgressFlowTable.Key key, long nowMs) {
-        return reserveTo(consumer, key, Ipv4Cidr.format(key.remoteIp()), null, nowMs);
+        return reserveTo(consumer, key, key.remoteAddress(), null, nowMs);
     }
 
     /**
@@ -933,6 +988,9 @@ final class PeerEgressRuntime {
      * would be missed, so it is not reserved at all. Called with the lock held.
      */
     private boolean bindingMoved(long consumer, PeerEgressFlowTable.Key key, Choice destination) {
+        if (key.ipv6()) {
+            return false;
+        }
         return !java.util.Objects.equals(names.lookup(consumer, key.remoteIp()), destination.name());
     }
 
@@ -1021,13 +1079,17 @@ final class PeerEgressRuntime {
      * <p>Null for a second packet of a flow whose name is still resolving: the first one is opening it.
      */
     private Choice resolveDestination(long consumer, PeerEgressFlowTable.Key key) {
+        if (key.ipv6()) {
+            // Names are bound to IPv4 fake addresses only.
+            return new Choice(key.remoteAddress(), null);
+        }
         String name;
         Function<String, List<String>> resolver;
         lock.lock();
         try {
             name = names.lookup(consumer, key.remoteIp());
             if (name == null) {
-                return new Choice(Ipv4Cidr.format(key.remoteIp()), null);
+                return new Choice(key.remoteAddress(), null);
             }
             if (!resolving.add(key)) {
                 return null;
@@ -1105,8 +1167,8 @@ final class PeerEgressRuntime {
         }
         emitFrame(consumer, PeerEgressFrame.TYPE_CONTROL,
                 PeerEgressFrame.encodeControl(PeerEgressFrame.Control.flowReject(
-                        subject.protocolName(), Ipv4Cidr.format(subject.consumerIp()),
-                        subject.consumerPort(), Ipv4Cidr.format(subject.remoteIp()),
+                        subject.protocolName(), subject.consumerAddress(),
+                        subject.consumerPort(), subject.remoteAddress(),
                         subject.remotePort(), code)));
     }
 
@@ -1215,8 +1277,8 @@ final class PeerEgressRuntime {
             rejections.record(flow.consumer, entry.code(), nowMs);
             emitFrame(flow.consumer, PeerEgressFrame.TYPE_CONTROL,
                     PeerEgressFrame.encodeControl(PeerEgressFrame.Control.flowReject(
-                            flow.key.protocolName(), Ipv4Cidr.format(flow.key.consumerIp()),
-                            flow.key.consumerPort(), Ipv4Cidr.format(flow.key.remoteIp()),
+                            flow.key.protocolName(), flow.key.consumerAddress(),
+                            flow.key.consumerPort(), flow.key.remoteAddress(),
                             flow.key.remotePort(), entry.code())));
         }
         if (!revoked.isEmpty()) {
