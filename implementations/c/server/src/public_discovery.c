@@ -661,11 +661,12 @@ int st_public_discovery_name_availability_response(const char *path,
                                                      exclude == NULL ? "" : exclude,
                                                      &available) != 0) {
             free(requested); free(exclude);
+            /* Java: the IllegalStateException of command() through GlobalExceptionHandler. */
             return public_write_response(out,
                                          out_len,
-                                         503,
-                                         "Service Unavailable",
-                                         "{\"error\":\"coordination unavailable\"}");
+                                         409,
+                                         "Conflict",
+                                         "{\"error\":\"public transfer Redis coordination unavailable\"}");
         }
     } else {
         pthread_mutex_lock(&public_peer_lock);
@@ -1178,7 +1179,18 @@ static int public_send_hello(st_public_peer *peer, uint64_t revision)
     return result;
 }
 
-/* Returns 0 on success, -1 for I/O, -2 duplicate, -3 full, -4 display-name conflict. */
+enum {
+    PUBLIC_JOIN_OK = 0,
+    PUBLIC_JOIN_IO = -1,
+    PUBLIC_JOIN_DUPLICATE = -2,
+    PUBLIC_JOIN_FULL = -3,
+    PUBLIC_JOIN_NAME = -4,
+    /* hello sent and the peer joined, but publishing its roster failed: Java closes with 1011 */
+    PUBLIC_JOIN_ROSTER_FAILED = -5,
+    /* the Redis registration failed: Java answers "coordination unavailable" and 1008 */
+    PUBLIC_JOIN_UNAVAILABLE = -6
+};
+
 static int public_register_peer(st_public_peer *peer)
 {
     long max_room = public_env_long("SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM", 32L);
@@ -1191,10 +1203,10 @@ static int public_register_peer(st_public_peer *peer)
                                                            (int)max_room,
                                                            &revision);
             if (registration != 0) {
-                if (registration == 1) return -2;
-                if (registration == 2) return -4;
-                if (registration == 3) return -3;
-                return -1;
+                if (registration == 1) return PUBLIC_JOIN_DUPLICATE;
+                if (registration == 2) return PUBLIC_JOIN_NAME;
+                if (registration == 3) return PUBLIC_JOIN_FULL;
+                return PUBLIC_JOIN_UNAVAILABLE;
             }
         }
         pthread_mutex_lock(&public_peer_lock);
@@ -1209,22 +1221,13 @@ static int public_register_peer(st_public_peer *peer)
                 uint64_t ignored = 0U;
                 (void)st_public_coordination_unregister(&peer->cluster, &ignored);
             }
-            return -1;
+            return PUBLIC_JOIN_IO;
         }
         if (st_public_coordination_publish_roster(peer->cluster.group_id, revision) != 0
             || st_public_coordination_publish_roster(peer->cluster.net_id, revision) != 0) {
-            pthread_mutex_lock(&public_peer_lock);
-            st_public_peer **cursor = &public_peers;
-            while (*cursor != NULL && *cursor != peer) cursor = &(*cursor)->next;
-            if (*cursor == peer) *cursor = peer->next;
-            pthread_mutex_unlock(&public_peer_lock);
-            if (peer->discoverable) {
-                uint64_t ignored = 0U;
-                (void)st_public_coordination_unregister(&peer->cluster, &ignored);
-            }
-            return -1;
+            return PUBLIC_JOIN_ROSTER_FAILED;
         }
-        return 0;
+        return PUBLIC_JOIN_OK;
     }
     size_t room_count = 0U;
     pthread_mutex_lock(&public_peer_lock);
@@ -1567,27 +1570,28 @@ static void public_route_text(st_public_peer *source, const char *json)
         const char *group_id = source->cluster.group_id;
         st_public_cluster_participant target_participant;
         int found = 0;
+        /*
+         * Java handleTextMessage catches the coordination failure of findPeer or publishText and
+         * answers "invalid message"; the socket stays open.
+         */
         if (target != NULL && *target != '\0') {
             if (st_public_coordination_find_peer(&source->cluster,
                                                 target,
                                                 &target_participant,
                                                 &found) != 0) {
-                (void)public_peer_send_error(source, "coordination unavailable");
-                (void)shutdown(source->fd, SHUT_RDWR);
                 failed = 1;
             } else if (found) {
                 group_id = target_participant.group_id;
             }
         }
-        if (!failed
-            && st_public_coordination_publish_text(group_id,
+        if (failed
+            || st_public_coordination_publish_text(group_id,
                                                    target == NULL ? "" : target,
                                                    source->cluster.lease_id,
                                                    target == NULL || *target == '\0',
                                                    (const uint8_t *)envelope.data,
                                                    envelope.len) != 0) {
-            (void)public_peer_send_error(source, "coordination unavailable");
-            (void)shutdown(source->fd, SHUT_RDWR);
+            (void)public_peer_send_error(source, "invalid message");
         }
     } else if (!failed) {
         pthread_mutex_lock(&public_peer_lock);
@@ -1670,9 +1674,12 @@ static int public_route_binary(st_public_peer *source, const uint8_t *frame, siz
                                                      target,
                                                      outgoing,
                                                      outgoing_len) != 0) {
+            /*
+             * Java handleBinaryMessage catches only IllegalArgumentException; the coordination
+             * failure reaches Spring's ExceptionWebSocketHandlerDecorator, which closes with 1011.
+             */
             free(outgoing);
-            (void)public_peer_send_error(source, "coordination unavailable");
-            (void)shutdown(source->fd, SHUT_RDWR);
+            public_peer_close(source, 1011U);
             return -1;
         }
     } else {
@@ -1916,11 +1923,19 @@ int st_public_discovery_handle_websocket(int fd,
         return 1;
     }
     int registered = public_register_peer(peer);
-    if (registered != 0) {
-        if (registered == -2) (void)public_peer_send_error(peer, "peer id is already connected");
-        else if (registered == -3) (void)public_peer_send_error(peer, "room is full");
-        else if (registered == -4) (void)public_peer_send_error(peer, "client name is already in use");
-        if (registered != -1) public_peer_close(peer, 1008U);
+    if (registered == PUBLIC_JOIN_ROSTER_FAILED) {
+        public_peer_close(peer, 1011U);
+        public_remove_peer(peer);
+        pthread_mutex_destroy(&peer->send_lock);
+        free(peer);
+        return 1;
+    }
+    if (registered != PUBLIC_JOIN_OK) {
+        if (registered == PUBLIC_JOIN_DUPLICATE) (void)public_peer_send_error(peer, "peer id is already connected");
+        else if (registered == PUBLIC_JOIN_FULL) (void)public_peer_send_error(peer, "room is full");
+        else if (registered == PUBLIC_JOIN_NAME) (void)public_peer_send_error(peer, "client name is already in use");
+        else if (registered == PUBLIC_JOIN_UNAVAILABLE) (void)public_peer_send_error(peer, "coordination unavailable");
+        if (registered != PUBLIC_JOIN_IO) public_peer_close(peer, 1008U);
         pthread_mutex_destroy(&peer->send_lock);
         free(peer);
         return 1;

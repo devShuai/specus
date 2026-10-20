@@ -358,6 +358,37 @@ print(f"rosters in ten refresh cycles: {rosters}")
 for extra in extras:
     extra.sock.close()
 
+# Java fails only the operation that meets a Redis error. With MGET refused (findPeer reads the
+# presences with it; the presence refresh does not use it), a directed text gets "invalid message"
+# and its socket stays open, a binary relay closes its sender with 1011 (Spring's
+# ExceptionWebSocketHandlerDecorator), and every other socket keeps working.
+def redis_cli(*arguments):
+    subprocess.run(["redis-cli", "-h", "127.0.0.1", "-p", str(REDIS_PORT), *arguments],
+                   check=True, stdout=subprocess.DEVNULL)
+
+relay_sender = WebSocket(ADMIN_ONE, issue_ticket(ADMIN_ONE, "peer-relay", "Relay"))
+relay_sender.json_until(lambda value: value.get("type") == "hello")
+redis_cli("ACL", "SETUSER", "default", "-mget")
+try:
+    one.send(1, json.dumps({"type": "signal", "targetPeerId": "peer-b", "payload": {}},
+                           separators=(",", ":")).encode())
+    error = one.json_until(lambda value: value.get("type") == "error")
+    if error.get("error") != "invalid message":
+        raise RuntimeError(f"a failed directed text answered {error}")
+    one.send(1, b'{"type":"ping"}')
+    one.json_until(lambda value: value.get("type") == "pong")
+    relay_sender.send(2, relay)
+    code = relay_sender.close_code(5)
+    if code != 1011:
+        raise RuntimeError(f"a failed binary relay closed its sender with {code}, not 1011")
+    two.send(1, b'{"type":"ping"}')
+    two.json_until(lambda value: value.get("type") == "pong")
+finally:
+    redis_cli("ACL", "SETUSER", "default", "+mget")
+one.send(1, json.dumps({"type": "signal", "targetPeerId": "peer-b", "payload": {"again": True}},
+                       separators=(",", ":")).encode())
+message = two.json_until(lambda value: value.get("type") == "signal" and value.get("payload") == {"again": True})
+
 # The pairing-code redemption window (two per source in this run) lives in Redis, so the two
 # instances share it: the third and fourth attempts are refused whichever instance they reach.
 # These servers have no SPECUS_DATABASE_PATH, so an admitted attempt finds no room storage (503);
@@ -375,6 +406,15 @@ for name, websocket in (("one", one), ("two", two)):
     code = websocket.close_code(5)
     if code != 1011:
         raise RuntimeError(f"Redis outage closed instance {name}'s socket with {code}, not 1011")
+# A join during the outage is still upgraded, then refused as Java refuses it.
+refused_join = WebSocket(ADMIN_ONE, issue_ticket(ADMIN_ONE, "peer-outage", "Outage"))
+error = refused_join.json_until(lambda value: value.get("type") == "error")
+code = refused_join.close_code(5)
+if error.get("error") != "coordination unavailable" or code != 1008:
+    raise RuntimeError(f"join during the outage: {error} close {code}")
+status, body = request(ADMIN_TWO, "GET", "/api/public/transfer/clients/name-availability?clientName=Outage")
+if status != 409 or body != {"error": "public transfer Redis coordination unavailable"}:
+    raise RuntimeError(f"name availability during the outage: {status} {body}")
 status, refused = request(ADMIN_TWO, "POST", "/api/public/transfer/rooms/pairing-codes/redeem", redeem)
 if status != 429:
     raise RuntimeError(f"pairing-code redemption did not fail closed without Redis: {status} {refused}")
