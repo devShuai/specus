@@ -90,7 +90,7 @@ const (
 
 // tcpOutput is everything the state machine wants the caller to do. It never acts itself.
 type tcpOutput struct {
-	// Segments to send back to the consumer, already rendered as IPv4 packets.
+	// Segments to send back to the consumer, already rendered as IP packets of the flow's family.
 	Segments [][]byte
 	// Deliver is payload to write to the real socket, in order.
 	Deliver []byte
@@ -128,6 +128,9 @@ type tcpOutOfOrder struct {
 type tcpConn struct {
 	localIP, remoteIP     uint32
 	localPort, remotePort uint16
+	// An IPv6 flow keeps its addresses here instead, with the IPv4 ones zero.
+	ipv6                bool
+	localIP6, remoteIP6 [16]byte
 
 	state tcpState
 
@@ -188,6 +191,9 @@ func acceptTCPSynWithTransmit(syn tcpSegment, iss uint32, pathMTU int, idleTimeo
 	conn := &tcpConn{
 		localIP:      syn.DestinationIP,
 		remoteIP:     syn.SourceIP,
+		ipv6:         syn.IPv6,
+		localIP6:     syn.DestinationIP6,
+		remoteIP6:    syn.SourceIP6,
 		localPort:    syn.DestinationPort,
 		remotePort:   syn.SourcePort,
 		state:        tcpStateSynReceived,
@@ -209,7 +215,7 @@ func acceptTCPSynWithTransmit(syn tcpSegment, iss uint32, pathMTU int, idleTimeo
 	if syn.MSS > 0 {
 		conn.sndMSS = syn.MSS
 	}
-	if limit := pathMTU - ipv4MinHeaderLen - tcpMinHeaderLen; limit > 0 && conn.sndMSS > limit {
+	if limit := pathMTU - conn.ipHeaderLen() - tcpMinHeaderLen; limit > 0 && conn.sndMSS > limit {
 		conn.sndMSS = limit
 	}
 	if conn.sndMSS < tcpDefaultMSS {
@@ -224,11 +230,30 @@ func acceptTCPSynWithTransmit(syn tcpSegment, iss uint32, pathMTU int, idleTimeo
 }
 
 func (c *tcpConn) advertisedMSS(pathMTU int) int {
-	mss := pathMTU - ipv4MinHeaderLen - tcpMinHeaderLen
+	mss := pathMTU - c.ipHeaderLen() - tcpMinHeaderLen
 	if mss < tcpDefaultMSS {
 		mss = tcpDefaultMSS
 	}
 	return mss
+}
+
+// ipHeaderLen is what the flow's IP header takes out of the path MTU. An IPv6 header has no
+// options here: the egress writes none, and a consumer's packet with an extension header never
+// reaches a flow.
+func (c *tcpConn) ipHeaderLen() int {
+	if c.ipv6 {
+		return ipv6HeaderLen
+	}
+	return ipv4MinHeaderLen
+}
+
+// addressed fills in the flow's addresses and ports, in whichever family it was opened, so every
+// segment the flow sends goes back the way the consumer's came.
+func (c *tcpConn) addressed(segment tcpSegment) tcpSegment {
+	segment.SourceIP, segment.DestinationIP = c.localIP, c.remoteIP
+	segment.IPv6, segment.SourceIP6, segment.DestinationIP6 = c.ipv6, c.localIP6, c.remoteIP6
+	segment.SourcePort, segment.DestinationPort = c.localPort, c.remotePort
+	return segment
 }
 
 // tcpAdvertisedWindow renders the receive window into the sixteen bits the header has.
@@ -255,18 +280,14 @@ func (c *tcpConn) transmit(output *tcpOutput, packet []byte) bool {
 }
 
 func (c *tcpConn) emit(output *tcpOutput, flags uint8, payload []byte, now time.Time, mss int) bool {
-	segment := tcpSegment{
-		SourceIP:        c.localIP,
-		DestinationIP:   c.remoteIP,
-		SourcePort:      c.localPort,
-		DestinationPort: c.remotePort,
-		Seq:             c.sndNxt,
-		Ack:             c.rcvNxt,
-		Flags:           flags,
-		Window:          tcpAdvertisedWindow(c.rcvWnd),
-		MSS:             mss,
-		Payload:         payload,
-	}
+	segment := c.addressed(tcpSegment{
+		Seq:     c.sndNxt,
+		Ack:     c.rcvNxt,
+		Flags:   flags,
+		Window:  tcpAdvertisedWindow(c.rcvWnd),
+		MSS:     mss,
+		Payload: payload,
+	})
 	if flags&tcpFlagACK == 0 && flags&tcpFlagRST == 0 {
 		segment.Ack = 0
 	}
@@ -297,11 +318,7 @@ func (c *tcpConn) ack(output *tcpOutput, now time.Time) {
 
 // reset tears the flow down and tells the peer, then marks it finished.
 func (c *tcpConn) reset(output *tcpOutput) {
-	output.send(buildTCPSegment(tcpSegment{
-		SourceIP: c.localIP, DestinationIP: c.remoteIP,
-		SourcePort: c.localPort, DestinationPort: c.remotePort,
-		Seq: c.sndNxt, Flags: tcpFlagRST,
-	}))
+	output.send(buildTCPSegment(c.addressed(tcpSegment{Seq: c.sndNxt, Flags: tcpFlagRST})))
 	c.state = tcpStateClosed
 	c.retransmit = nil
 	c.pending = nil
@@ -719,13 +736,11 @@ func (c *tcpConn) onTick(now time.Time) tcpOutput {
 		} else if len(c.retransmit) > 0 && len(c.retransmit[0].payload) > 0 {
 			entry := &c.retransmit[0]
 			entry.retransmitted = true
-			c.transmit(&output, buildTCPSegment(tcpSegment{SourceIP: c.localIP, DestinationIP: c.remoteIP,
-				SourcePort: c.localPort, DestinationPort: c.remotePort, Seq: entry.seq, Ack: c.rcvNxt,
-				Flags: tcpFlagACK, Window: tcpAdvertisedWindow(c.rcvWnd), Payload: entry.payload[:1]}))
+			c.transmit(&output, buildTCPSegment(c.addressed(tcpSegment{Seq: entry.seq, Ack: c.rcvNxt,
+				Flags: tcpFlagACK, Window: tcpAdvertisedWindow(c.rcvWnd), Payload: entry.payload[:1]})))
 		} else {
-			c.transmit(&output, buildTCPSegment(tcpSegment{SourceIP: c.localIP, DestinationIP: c.remoteIP,
-				SourcePort: c.localPort, DestinationPort: c.remotePort, Seq: c.sndNxt - 1, Ack: c.rcvNxt,
-				Flags: tcpFlagACK, Window: tcpAdvertisedWindow(c.rcvWnd)}))
+			c.transmit(&output, buildTCPSegment(c.addressed(tcpSegment{Seq: c.sndNxt - 1, Ack: c.rcvNxt,
+				Flags: tcpFlagACK, Window: tcpAdvertisedWindow(c.rcvWnd)})))
 		}
 		return output
 	}
@@ -747,12 +762,10 @@ func (c *tcpConn) onTick(now time.Time) tcpOutput {
 		if c.state != tcpStateSynReceived && len(payload) > int(c.sndWnd) {
 			payload = payload[:c.sndWnd]
 		}
-		if !c.transmit(&output, buildTCPSegment(tcpSegment{
-			SourceIP: c.localIP, DestinationIP: c.remoteIP,
-			SourcePort: c.localPort, DestinationPort: c.remotePort,
+		if !c.transmit(&output, buildTCPSegment(c.addressed(tcpSegment{
 			Seq: entry.seq, Ack: c.rcvNxt, Flags: entry.flags,
 			Window: tcpAdvertisedWindow(c.rcvWnd), Payload: payload,
-		})) {
+		}))) {
 			return output
 		}
 		entry.attempts++
@@ -787,11 +800,9 @@ func (c *tcpConn) keepalive(now time.Time, output *tcpOutput) bool {
 	}
 	c.keepaliveProbes++
 	c.lastProbe = now
-	output.send(buildTCPSegment(tcpSegment{
-		SourceIP: c.localIP, DestinationIP: c.remoteIP,
-		SourcePort: c.localPort, DestinationPort: c.remotePort,
+	output.send(buildTCPSegment(c.addressed(tcpSegment{
 		Seq: c.sndNxt - 1, Ack: c.rcvNxt, Flags: tcpFlagACK, Window: tcpAdvertisedWindow(c.rcvWnd),
-	}))
+	})))
 	return false
 }
 
