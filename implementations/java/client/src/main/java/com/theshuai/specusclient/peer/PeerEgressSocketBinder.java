@@ -23,7 +23,8 @@ import lombok.extern.slf4j.Slf4j;
 
 /**
  * Binds each egress socket to the interface {@link PeerEgressSocketBinding#select} chooses:
- * {@code IP_UNICAST_IF} on Windows, {@code IP_BOUND_IF} on macOS.
+ * {@code IP_UNICAST_IF} on Windows, {@code IP_BOUND_IF} on macOS, and for a socket to an IPv6 target
+ * {@code IPV6_UNICAST_IF} and {@code IPV6_BOUND_IF}, chosen from the IPv6 table.
  *
  * <p>On Linux nothing is bound. The socket is marked with {@code SO_MARK 0x5350} instead, the mark
  * the Go and .NET egresses set, for a policy routing rule to steer to the physical interface
@@ -37,9 +38,12 @@ class PeerEgressSocketBinder {
         List<PeerEgressSocketBinding.Route> read() throws IOException;
     }
 
-    /** Sets the option binding a socket handle to an interface, as the table names it. */
+    /**
+     * Sets the option binding a socket handle to an interface, as the table names it: the IPv6 option
+     * for a socket to an IPv6 target, the IPv4 one otherwise.
+     */
     interface Applier {
-        void apply(int handle, String iface) throws IOException;
+        void apply(int handle, String iface, boolean ipv6) throws IOException;
     }
 
     /** Marks a socket before it connects. Best-effort: it never fails the dial. */
@@ -53,11 +57,19 @@ class PeerEgressSocketBinder {
     private final Marker marker;
     /** Replaceable so the real-socket tests can hand the stack a route it has to refuse. */
     RouteSource routes;
+    /** The IPv6 candidates, for a socket to an IPv6 target; replaceable like routes. */
+    RouteSource routes6;
 
     PeerEgressSocketBinder(Supplier<String> tunnel, RouteSource routes, Function<String, String> tunnelKey,
             Applier applier, Marker marker) {
+        this(tunnel, routes, null, tunnelKey, applier, marker);
+    }
+
+    PeerEgressSocketBinder(Supplier<String> tunnel, RouteSource routes, RouteSource routes6,
+            Function<String, String> tunnelKey, Applier applier, Marker marker) {
         this.tunnel = tunnel;
         this.routes = routes;
+        this.routes6 = routes6;
         this.tunnelKey = tunnelKey;
         this.applier = applier;
         this.marker = marker;
@@ -76,11 +88,13 @@ class PeerEgressSocketBinder {
     static PeerEgressSocketBinder forPlatform(String operatingSystem, Supplier<String> tunnel) {
         String os = operatingSystem.toLowerCase(Locale.ROOT);
         if (os.contains("win")) {
-            return new PeerEgressSocketBinder(tunnel, Windows::routes, Windows::interfaceKey, Windows::apply, null);
+            return new PeerEgressSocketBinder(tunnel, Windows::routes, Windows::routes6, Windows::interfaceKey,
+                    Windows::apply, null);
         }
         if (os.contains("mac") || os.contains("darwin")) {
-            Macos table = new Macos();
-            return new PeerEgressSocketBinder(tunnel, table::routes, name -> name, Macos::apply, null);
+            Macos table = new Macos(PeerEgressMacosRouteCommands.showTableArgs(), PeerEgressSocketBinding::macosRoutes);
+            Macos table6 = new Macos(PeerEgressSocketBinding.macosShowTableArgs6(), PeerEgressSocketBinding::macosRoutes6);
+            return new PeerEgressSocketBinder(tunnel, table::routes, table6::routes, name -> name, Macos::apply, null);
         }
         if (os.contains("linux")) {
             return new PeerEgressSocketBinder(tunnel, null, name -> "", null, Linux::mark);
@@ -105,36 +119,44 @@ class PeerEgressSocketBinder {
 
     /**
      * Readies channel, before it connects, for target: marks it on Linux, binds it to the interface
-     * for target on Windows and macOS.
+     * for target on Windows and macOS, with the option of the target's family.
      */
     void bind(NetworkChannel channel, InetSocketAddress target) throws IOException {
         if (marker != null) {
             marker.mark(channel);
         }
-        if (applier == null || leftUnbound(target.getAddress())) {
+        if (applier == null) {
             return;
         }
-        String chosen = choose(target.getAddress().getHostAddress());
-        applier.apply(PeerEgressSocketHandles.of(channel), chosen);
+        String chosen = choose(PeerEgressRuntime.formatTarget(target.getAddress()));
+        applier.apply(PeerEgressSocketHandles.of(channel), chosen, targetIs6(target.getAddress()));
     }
 
     /**
-     * Whether a socket to the target is dialled without an interface binding: one to an IPv6 target.
+     * Whether a socket to the target goes to an IPv6 target, and so is bound with the IPv6 option to
+     * an interface chosen from the IPv6 table.
      *
-     * <p>The binding keeps forwarded traffic off routes this node's own tunnel installed, and the
-     * tunnel installs no IPv6 route: the mesh is IPv4, and IPv6 consumer rules are not in force
-     * ({@code EGRESS_RULE_IPV6_UNSUPPORTED}). IP_UNICAST_IF and IP_BOUND_IF are IPv4 options besides.
-     * The consumer's IPv6 data plane, which will route IPv6 into the tunnel, has to bring
-     * IPV6_UNICAST_IF and IPV6_BOUND_IF with it. Java never hands back an IPv4-mapped address as an
-     * {@link java.net.Inet6Address}, so every IPv4 target still goes through the choice. The Linux
-     * mark is applied either way.
+     * <p>IPv6 sockets are bound like IPv4 ones because this build announces
+     * {@code ipv6PacketCapable}: a device that is also a consumer with the IPv6 data plane routes IPv6
+     * into its tunnel, and an unbound IPv6 socket would follow those routes back into the mesh
+     * ({@code protocol/spec/peer-egress.md}, IPv6 数据面, 出站 socket). Java never hands back an
+     * IPv4-mapped address as an {@link java.net.Inet6Address}, so such a target goes through the IPv4
+     * choice. The Linux mark is applied either way.
      */
-    static boolean leftUnbound(java.net.InetAddress target) {
+    static boolean targetIs6(java.net.InetAddress target) {
         return target instanceof java.net.Inet6Address;
     }
 
+    /**
+     * The interface a socket to destination is bound to, from the table of the destination's family.
+     */
     String choose(String destination) throws IOException {
-        List<PeerEgressSocketBinding.Route> candidates = routes.read();
+        boolean ipv6 = destination.indexOf(':') >= 0;
+        RouteSource read = ipv6 ? routes6 : routes;
+        if (read == null) {
+            throw new IOException("no " + (ipv6 ? "IPv6 " : "") + "routing table reader on this platform");
+        }
+        List<PeerEgressSocketBinding.Route> candidates = read.read();
         String key = tunnelKey(tunnel == null ? "" : tunnel.get());
         String chosen = PeerEgressSocketBinding.select(candidates, key, destination);
         if (chosen == null) {
@@ -158,7 +180,6 @@ class PeerEgressSocketBinder {
      * and these two calls cost microseconds and need no cache.
      */
     static final class Windows {
-        private static final int AF_INET = 2;
 
         interface IpHelper extends Library {
             int GetIpForwardTable2(int family, PointerByReference table);
@@ -199,12 +220,35 @@ class PeerEgressSocketBinder {
             return PeerEgressSocketBinding.windowsRoutes(forward, interfaces);
         }
 
+        /**
+         * The IPv6 candidates, read the same way: GetIpForwardTable2 and GetIpInterfaceTable asked for
+         * AF_INET6.
+         */
+        static List<PeerEgressSocketBinding.Route> routes6() throws IOException {
+            var forward = PeerEgressSocketBinding.parseWindowsForwardTable6(table(true,
+                    PeerEgressSocketBinding.WINDOWS_FORWARD_ROW_SIZE, PeerEgressSocketBinding.AF_INET6));
+            if (forward == null) {
+                throw new IOException("GetIpForwardTable2 returned a table shorter than its count");
+            }
+            var interfaces = PeerEgressSocketBinding.parseWindowsInterfaceTable6(table(false,
+                    PeerEgressSocketBinding.WINDOWS_INTERFACE_ROW_SIZE, PeerEgressSocketBinding.AF_INET6));
+            if (interfaces == null) {
+                throw new IOException("GetIpInterfaceTable returned a table shorter than its count");
+            }
+            return PeerEgressSocketBinding.windowsRoutes(forward, interfaces);
+        }
+
         /** Copies one IPv4 MIB table out of the memory the API allocated, then frees it. */
         static byte[] table(boolean forward, int rowSize) throws IOException {
+            return table(forward, rowSize, PeerEgressSocketBinding.AF_INET);
+        }
+
+        /** Copies one MIB table of an address family out of the memory the API allocated, then frees it. */
+        static byte[] table(boolean forward, int rowSize, int family) throws IOException {
             PointerByReference out = new PointerByReference();
             int status = forward
-                    ? Libraries.IPHLPAPI.GetIpForwardTable2(AF_INET, out)
-                    : Libraries.IPHLPAPI.GetIpInterfaceTable(AF_INET, out);
+                    ? Libraries.IPHLPAPI.GetIpForwardTable2(family, out)
+                    : Libraries.IPHLPAPI.GetIpInterfaceTable(family, out);
             if (status != 0) {
                 throw new IOException((forward ? "GetIpForwardTable2" : "GetIpInterfaceTable")
                         + " failed with " + status);
@@ -232,17 +276,21 @@ class PeerEgressSocketBinder {
             return Long.toString(index.getValue() & 0xFFFFFFFFL);
         }
 
-        static void apply(int handle, String iface) throws IOException {
+        static void apply(int handle, String iface, boolean ipv6) throws IOException {
             long index;
             try {
                 index = Long.parseLong(iface);
             } catch (NumberFormatException notAnIndex) {
                 throw new IOException("bind egress socket: interface " + iface + " is not an index");
             }
-            byte[] option = PeerEgressSocketBinding.windowsUnicastInterfaceOption(index);
+            byte[] option = ipv6
+                    ? PeerEgressSocketBinding.windowsUnicastInterfaceOption6(index)
+                    : PeerEgressSocketBinding.windowsUnicastInterfaceOption(index);
             try {
-                Libraries.WS2_32.setsockopt(handle, PeerEgressSocketBinding.IPPROTO_IP,
-                        PeerEgressSocketBinding.WINDOWS_IP_UNICAST_IF, option, option.length);
+                Libraries.WS2_32.setsockopt(handle,
+                        ipv6 ? PeerEgressSocketBinding.IPPROTO_IPV6 : PeerEgressSocketBinding.IPPROTO_IP,
+                        ipv6 ? PeerEgressSocketBinding.WINDOWS_IPV6_UNICAST_IF : PeerEgressSocketBinding.WINDOWS_IP_UNICAST_IF,
+                        option, option.length);
             } catch (LastErrorException failed) {
                 throw new IOException("bind egress socket to interface " + index + ": WSA error "
                         + failed.getErrorCode(), failed);
@@ -251,7 +299,8 @@ class PeerEgressSocketBinder {
     }
 
     /**
-     * macOS: the same {@code netstat -rn -f inet} the route commander reads, held for two seconds.
+     * macOS: the same {@code netstat -rn -f inet} the route commander reads, held for two seconds; or,
+     * for IPv6 targets, {@code netstat -rn -f inet6}, read and held on its own.
      *
      * <p>The choice is made on every connect and a read costs 25 ms, so a page opening twenty
      * connections would otherwise spend half a second asking. The tunnel's routes are left out of
@@ -270,14 +319,20 @@ class PeerEgressSocketBinder {
             static final LibC LIBC = Native.load("c", LibC.class);
         }
 
+        private final List<String> command;
+        private final Function<String, List<PeerEgressSocketBinding.Route>> parse;
         private List<PeerEgressSocketBinding.Route> held;
         private long readAt;
+
+        Macos(List<String> command, Function<String, List<PeerEgressSocketBinding.Route>> parse) {
+            this.command = command;
+            this.parse = parse;
+        }
 
         synchronized List<PeerEgressSocketBinding.Route> routes() throws IOException {
             if (held != null && System.nanoTime() - readAt < LIFETIME_NANOS) {
                 return held;
             }
-            List<String> command = PeerEgressMacosRouteCommands.showTableArgs();
             Process process = new ProcessBuilder(command).redirectError(ProcessBuilder.Redirect.DISCARD).start();
             String stdout;
             try (var out = process.getInputStream()) {
@@ -297,20 +352,23 @@ class PeerEgressSocketBinder {
                 held = null;
                 throw new IOException(String.join(" ", command) + " exited " + process.exitValue());
             }
-            held = PeerEgressSocketBinding.macosRoutes(stdout);
+            held = parse.apply(stdout);
             readAt = System.nanoTime();
             return held;
         }
 
-        static void apply(int handle, String iface) throws IOException {
+        static void apply(int handle, String iface, boolean ipv6) throws IOException {
             NetworkInterface network = NetworkInterface.getByName(iface);
             if (network == null) {
                 throw new IOException("bind egress socket: no interface named " + iface);
             }
+            // IPV6_BOUND_IF takes the index in host order, as IP_BOUND_IF does.
             byte[] option = PeerEgressSocketBinding.macosBoundInterfaceOption(network.getIndex());
             try {
-                Libraries.LIBC.setsockopt(handle, PeerEgressSocketBinding.IPPROTO_IP,
-                        PeerEgressSocketBinding.MACOS_IP_BOUND_IF, option, option.length);
+                Libraries.LIBC.setsockopt(handle,
+                        ipv6 ? PeerEgressSocketBinding.IPPROTO_IPV6 : PeerEgressSocketBinding.IPPROTO_IP,
+                        ipv6 ? PeerEgressSocketBinding.MACOS_IPV6_BOUND_IF : PeerEgressSocketBinding.MACOS_IP_BOUND_IF,
+                        option, option.length);
             } catch (LastErrorException failed) {
                 throw new IOException("bind egress socket to " + iface + ": errno " + failed.getErrorCode(), failed);
             }

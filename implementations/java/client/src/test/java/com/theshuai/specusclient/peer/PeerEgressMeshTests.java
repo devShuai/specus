@@ -246,6 +246,37 @@ class PeerEgressMeshTests {
     }
 
     /**
+     * An IPv6 packet is checked against the address derived from the session peer's mesh IPv4, which
+     * the mesh hands the plane with the frame: from the session's own derived address the SYN opens a
+     * flow, and a SYN from a dispatch that knows no address is dropped without an answer. The frames
+     * leave in order, so once the second SYN's answer is out, any answer to the first would be too.
+     */
+    @Test
+    void anIpv6FrameIsCheckedAgainstTheSessionsAddress() {
+        PeerEgressMesh wiring = newMesh();
+        wiring.applyEgressConfig(configFor(1, "2001:db8:1::/48"));
+
+        assertTrue(wiring.handleInboundFrame(7, syn6(40000)), "the frame was not claimed");
+        assertTrue(wiring.handleInboundFrame(7, VIRTUAL_IP, syn6(40001)), "the frame was not claimed");
+        waitFor("the SYN-ACK to be sent", () -> !frames().isEmpty());
+
+        List<byte[]> sent = frames();
+        assertEquals(1, sent.size(), "an IPv6 packet from a session with no known address was answered");
+        PeerEgressFrame.Decoded decoded = PeerEgressFrame.parse(sent.get(0), true);
+        assertTrue(decoded.accepted(), "the frame we produced does not parse");
+        assertTrue(decoded.inner().ipv6(), "the SYN-ACK is not IPv6");
+        assertEquals(40001, decoded.inner().destinationPort(), "the answer went to the wrong SYN");
+    }
+
+    private static byte[] syn6(int sourcePort) {
+        return PeerEgressFrame.encode(PeerEgressFrame.TYPE_IP_PACKET, false,
+                PeerEgressSegment.build(new PeerEgressSegment.Segment(0, 0, sourcePort, 443,
+                        1000, 0, PeerEgressSegment.FLAG_SYN, 65535, 1360, new byte[0],
+                        PeerEgressIpv6Packet.deviceAddress(VIRTUAL_IP),
+                        PeerEgressIpv6Packet.Address.parse("2001:db8:1::c8"))));
+    }
+
+    /**
      * A destination the policy does not cover is refused, and the refusal reaches the consumer as a
      * control message rather than as silence.
      */

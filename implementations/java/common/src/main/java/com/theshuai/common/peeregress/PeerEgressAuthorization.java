@@ -62,6 +62,15 @@ public final class PeerEgressAuthorization {
     public static final List<String> CLOUD_METADATA_CIDRS6 = List.of(
             "fd00:ec2::254/128");
 
+    /**
+     * The prefix every device's IPv6 address is derived in: the device's mesh IPv4 is its low 32
+     * bits ({@code protocol/spec/peer-egress.md}, IPv6 数据面, 设备地址). It is fixed and does not
+     * follow the mesh CIDR. To IPv6 it is what the Peer Mesh network is to IPv4, and it is refused
+     * for the same reason: forwarding into it would let a consumer reach another peer through this
+     * egress, past the mesh ACL.
+     */
+    public static final String MESH_PREFIX6 = "fd53:7065:6375:7300::/96";
+
     /** Unique local addresses, the IPv6 counterpart of the private ranges. */
     public static final List<String> LAN_CIDRS6 = List.of(
             "fc00::/7");
@@ -178,6 +187,7 @@ public final class PeerEgressAuthorization {
         denied.add(context.meshCidr() == null || context.meshCidr().isBlank()
                 ? PeerEgressRules.DEFAULT_MESH_CIDR
                 : context.meshCidr());
+        denied.add(MESH_PREFIX6);
         if (context.deploymentDenyCidrs() != null) {
             denied.addAll(context.deploymentDenyCidrs());
         }

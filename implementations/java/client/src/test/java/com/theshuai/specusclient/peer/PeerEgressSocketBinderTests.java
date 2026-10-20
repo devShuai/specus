@@ -17,6 +17,7 @@ import com.sun.jna.ptr.IntByReference;
 import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
 import java.net.ServerSocket;
@@ -33,6 +34,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -83,6 +85,38 @@ class PeerEgressSocketBinderTests {
                     PeerEgressSocketBinding.MACOS_IP_BOUND_IF, value, length);
         }
         return ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN).getInt();
+    }
+
+    /**
+     * Reads the IPv6 binding back: IPV6_UNICAST_IF on Windows, IPV6_BOUND_IF on macOS, both in host
+     * order as they went in.
+     */
+    private static int boundInterface6(NetworkChannel channel) throws IOException {
+        int handle = PeerEgressSocketHandles.of(channel);
+        byte[] value = new byte[4];
+        IntByReference length = new IntByReference(value.length);
+        if (windows()) {
+            Native.load("ws2_32", WinSock.class).getsockopt(handle, PeerEgressSocketBinding.IPPROTO_IPV6,
+                    PeerEgressSocketBinding.WINDOWS_IPV6_UNICAST_IF, value, length);
+        } else {
+            Native.load("c", LibC.class).getsockopt(handle, PeerEgressSocketBinding.IPPROTO_IPV6,
+                    PeerEgressSocketBinding.MACOS_IPV6_BOUND_IF, value, length);
+        }
+        return ByteBuffer.wrap(value).order(ByteOrder.nativeOrder()).getInt();
+    }
+
+    /** ::1, or the test is skipped: the IPv6 binding tests need IPv6 loopback. */
+    private static InetAddress loopback6() {
+        try {
+            InetAddress loopback = InetAddress.getByName("::1");
+            try (ServerSocket probe = new ServerSocket()) {
+                probe.bind(new InetSocketAddress(loopback, 0));
+            }
+            return loopback;
+        } catch (IOException unavailable) {
+            Assumptions.abort("no IPv6 loopback on this host (" + unavailable + "); the IPv6 binding tests need ::1");
+            return null;
+        }
     }
 
     private static NetworkInterface loopback() throws IOException {
@@ -218,13 +252,121 @@ class PeerEgressSocketBinderTests {
         }
     }
 
+    /**
+     * A socket to ::1 is bound to the loopback interface with the IPv6 option, chosen from the IPv6
+     * table, and the socket says so.
+     */
+    @Test
+    void anIpv6DialIsBoundToTheInterfaceItChose() throws IOException {
+        if (!windows() && !macos()) {
+            return;
+        }
+        InetAddress loopback = loopback6();
+        int expected = loopback().getIndex();
+        PeerEgressSocketBinder binder = PeerEgressSocketBinder.forPlatform(() -> "");
+        try (ServerSocket server = new ServerSocket()) {
+            server.bind(new InetSocketAddress(loopback, 0));
+            InetSocketAddress target = new InetSocketAddress(loopback, server.getLocalPort());
+            try (SocketChannel channel = SocketChannel.open(StandardProtocolFamily.INET6)) {
+                binder.bind(channel, target);
+                channel.socket().connect(target, 2000);
+                assertEquals(expected, boundInterface6(channel), "tcp socket's interface");
+            }
+            try (DatagramChannel channel = DatagramChannel.open(StandardProtocolFamily.INET6)) {
+                binder.bind(channel, target);
+                channel.connect(target);
+                assertEquals(expected, boundInterface6(channel), "udp socket's interface");
+            }
+        }
+    }
+
+    /** With only the tunnel's routes leading to an IPv6 target, the dial is refused, as for IPv4. */
+    @Test
+    void anIpv6DialIsRefusedWhenOnlyTheTunnelLeadsThere() throws IOException {
+        if (!windows() && !macos()) {
+            return;
+        }
+        InetAddress loopback = loopback6();
+        String name = loopbackTunnelName();
+        PeerEgressSocketBinder binder = PeerEgressSocketBinder.forPlatform(() -> name);
+        String key = binder.tunnelKey(name);
+        assertFalse(key.isEmpty(), "the loopback interface " + name + " did not resolve to a table key");
+        List<PeerEgressSocketBinding.Route> loopbackRoutes = new ArrayList<>();
+        for (PeerEgressSocketBinding.Route route : binder.routes6.read()) {
+            if (route.iface().equals(key)) {
+                loopbackRoutes.add(route);
+            }
+        }
+        assertEquals(key, PeerEgressSocketBinding.select(loopbackRoutes, "", "::1"),
+                "the real IPv6 table's loopback routes do not lead to ::1");
+        binder.routes6 = () -> loopbackRoutes;
+
+        PeerEgressSocketDialer dialer = new PeerEgressSocketDialer(binder);
+        try (ServerSocket server = new ServerSocket()) {
+            server.bind(new InetSocketAddress(loopback, 0));
+            for (String protocol : List.of("tcp", "udp")) {
+                IOException refused = assertThrows(IOException.class,
+                        () -> dialer.dial(protocol, "::1", server.getLocalPort(), 2000).close());
+                assertInstanceOf(PeerEgressSocketBinder.NoPhysicalRouteException.class, refused, protocol);
+            }
+        }
+    }
+
+    /**
+     * The stack holds an IPv6 socket to the interface the IPv6 option names: told that ::1 is behind
+     * another interface, the binder's TCP cannot connect and its UDP cannot deliver. The other
+     * interface is any with a usable IPv6 route outside loopback; the link-local prefix every IPv6
+     * interface has is enough, so this runs without IPv6 connectivity. This is the test that passes
+     * only if the option is set: unbound, ::1 is reached.
+     */
+    @Test
+    void anIpv6SocketIsHeldToTheBoundInterface() throws IOException {
+        if (!windows() && !macos()) {
+            return;
+        }
+        InetAddress loopback = loopback6();
+        PeerEgressSocketBinder real = PeerEgressSocketBinder.forPlatform(() -> "");
+        String loopbackKey = real.tunnelKey(loopbackTunnelName());
+        List<PeerEgressSocketBinding.Route> routes = real.routes6.read();
+        String other = PeerEgressSocketBinding.select(routes, loopbackKey, "2001:db8::1");
+        if (other == null) {
+            other = PeerEgressSocketBinding.select(routes, loopbackKey, "fe80::1");
+        }
+        Assumptions.assumeTrue(other != null,
+                "no interface but loopback carries an IPv6 route; this test needs one to bind to");
+        String physical = other;
+
+        PeerEgressSocketBinder lying = PeerEgressSocketBinder.forPlatform(() -> "");
+        lying.routes6 = () -> List.of(new PeerEgressSocketBinding.Route("::1/128", physical, "", 0, true));
+        try (ServerSocket server = new ServerSocket()) {
+            server.bind(new InetSocketAddress(loopback, 0));
+            IOException failure = assertThrows(IOException.class,
+                    () -> new PeerEgressSocketDialer(lying).dial("tcp", "::1", server.getLocalPort(), 2000).close(),
+                    "tcp reached ::1 while bound to " + physical);
+            assertFalse(failure instanceof PeerEgressSocketBinder.NoPhysicalRouteException,
+                    "tcp was refused before any socket existed, so nothing was tested");
+        }
+
+        try (DatagramSocket listener = new DatagramSocket(new InetSocketAddress(loopback, 0))) {
+            assertEquals("delivered", delivers(real, listener, "::1", "control6"),
+                    "udp bound to loopback did not deliver either, so silence would prove nothing");
+            assertFalse(delivers(lying, listener, "::1", "misbound6").equals("delivered"),
+                    "udp reached ::1 while bound to " + physical);
+        }
+    }
+
     /** Dials listener through binder, sends one datagram, and says whether it arrived or what stopped it. */
     private static String delivers(PeerEgressSocketBinder binder, DatagramSocket listener, String label)
+            throws IOException {
+        return delivers(binder, listener, "127.0.0.1", label);
+    }
+
+    private static String delivers(PeerEgressSocketBinder binder, DatagramSocket listener, String host, String label)
             throws IOException {
         byte[] payload = ("specus-bind-" + label).getBytes(StandardCharsets.US_ASCII);
         PeerEgressRuntime.Socket socket;
         try {
-            socket = new PeerEgressSocketDialer(binder).dial("udp", "127.0.0.1", listener.getLocalPort(), 2000);
+            socket = new PeerEgressSocketDialer(binder).dial("udp", host, listener.getLocalPort(), 2000);
         } catch (PeerEgressSocketBinder.NoPhysicalRouteException refused) {
             throw new AssertionError("udp " + label + " was refused before any socket existed", refused);
         } catch (IOException failed) {
@@ -300,6 +442,73 @@ class PeerEgressSocketBinderTests {
         Collections.sort(native_);
         Collections.sort(cmdlet);
         assertEquals(cmdlet, native_, "interfaces");
+    }
+
+    /**
+     * The native IPv6 readings agree with Get-NetRoute and Get-NetIPInterface, as the IPv4 ones do:
+     * the same rows asked for AF_INET6, where the address sits four bytes further into each
+     * SOCKADDR_INET.
+     */
+    @Test
+    void onWindowsTheNativeIpv6TablesMatchGetNetRoute() throws Exception {
+        if (!windows()) {
+            return;
+        }
+        var forward = PeerEgressSocketBinding.parseWindowsForwardTable6(PeerEgressSocketBinder.Windows.table(true,
+                PeerEgressSocketBinding.WINDOWS_FORWARD_ROW_SIZE, PeerEgressSocketBinding.AF_INET6));
+        var interfaces = PeerEgressSocketBinding.parseWindowsInterfaceTable6(PeerEgressSocketBinder.Windows.table(false,
+                PeerEgressSocketBinding.WINDOWS_INTERFACE_ROW_SIZE, PeerEgressSocketBinding.AF_INET6));
+        assertNotNull(forward);
+        assertNotNull(interfaces);
+
+        List<String> native_ = new ArrayList<>();
+        forward.forEach(row -> native_.add(row.interfaceIndex() + " " + row.prefix() + " " + row.nextHop() + " "
+                + row.metric()));
+        List<String> cmdlet = new ArrayList<>();
+        for (JsonNode row : powershell("ConvertTo-Json -Compress -InputObject @(Get-NetRoute -AddressFamily IPv6 "
+                + "-PolicyStore ActiveStore -ErrorAction SilentlyContinue|Select-Object "
+                + "InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)")) {
+            String prefix = row.path("DestinationPrefix").asText();
+            int slash = prefix.indexOf('/');
+            cmdlet.add(row.path("InterfaceIndex").asLong() + " " + canonical6(prefix.substring(0, slash))
+                    + prefix.substring(slash) + " " + canonical6(row.path("NextHop").asText()) + " "
+                    + row.path("RouteMetric").asLong());
+        }
+        Collections.sort(native_);
+        Collections.sort(cmdlet);
+        assertFalse(native_.isEmpty());
+        assertEquals(cmdlet, native_, "IPv6 routes");
+
+        native_.clear();
+        cmdlet.clear();
+        interfaces.forEach(row -> native_.add(row.interfaceIndex() + " " + row.metric() + " " + row.connected()));
+        for (JsonNode row : powershell("ConvertTo-Json -Compress -InputObject @(Get-NetIPInterface -AddressFamily IPv6 "
+                + "-ErrorAction SilentlyContinue|Select-Object InterfaceIndex,InterfaceMetric,"
+                + "@{n='Connected';e={[string]$_.ConnectionState -eq 'Connected'}})")) {
+            cmdlet.add(row.path("InterfaceIndex").asLong() + " " + row.path("InterfaceMetric").asLong() + " "
+                    + row.path("Connected").asBoolean());
+        }
+        Collections.sort(native_);
+        Collections.sort(cmdlet);
+        assertFalse(native_.isEmpty());
+        assertEquals(cmdlet, native_, "IPv6 interfaces");
+    }
+
+    /**
+     * An IPv6 address as the cmdlet writes it, in the RFC 5952 form the native reading uses. Windows
+     * may write a dotted IPv4 tail, which the pinned spelling does not read, so the address goes
+     * through the JDK's own reader first.
+     */
+    private static String canonical6(String text) throws IOException {
+        byte[] bytes = InetAddress.getByName(text).getAddress();
+        if (bytes.length == 4) {
+            byte[] mapped = new byte[16];
+            mapped[10] = (byte) 0xFF;
+            mapped[11] = (byte) 0xFF;
+            System.arraycopy(bytes, 0, mapped, 12, 4);
+            bytes = mapped;
+        }
+        return PeerEgressIpv6Packet.Address.read(bytes, 0).format();
     }
 
     private static JsonNode powershell(String script) throws Exception {

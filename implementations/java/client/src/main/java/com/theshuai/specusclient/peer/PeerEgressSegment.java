@@ -33,7 +33,11 @@ final class PeerEgressSegment {
     private PeerEgressSegment() {
     }
 
-    /** One parsed TCP segment together with the IPv4 addresses that carried it. */
+    /**
+     * One parsed TCP segment together with the addresses that carried it: the IPv4 ones, or, when
+     * the IPv6 ones are set, those with the IPv4 fields left zero ({@code protocol/spec/peer-egress.md},
+     * IPv6 数据面).
+     */
     record Segment(
             int sourceIp,
             int destinationIp,
@@ -44,10 +48,30 @@ final class PeerEgressSegment {
             int flags,
             int window,
             int mss,
-            byte[] payload) {
+            byte[] payload,
+            PeerEgressIpv6Packet.Address sourceIp6,
+            PeerEgressIpv6Packet.Address destinationIp6) {
 
         Segment {
             payload = payload == null ? EMPTY : payload;
+        }
+
+        /** An IPv4 segment. */
+        Segment(int sourceIp, int destinationIp, int sourcePort, int destinationPort, int seq, int ack,
+                int flags, int window, int mss, byte[] payload) {
+            this(sourceIp, destinationIp, sourcePort, destinationPort, seq, ack, flags, window, mss, payload,
+                    null, null);
+        }
+
+        /** Whether the segment travels in IPv6. */
+        boolean ipv6() {
+            return sourceIp6 != null;
+        }
+
+        /** The egress flow key of a segment arriving from a consumer. */
+        PeerEgressFlowTable.Key flowKey() {
+            return new PeerEgressFlowTable.Key(IPV4_PROTOCOL_TCP, sourceIp, sourcePort, destinationIp,
+                    destinationPort, sourceIp6, destinationIp6);
         }
 
         boolean has(int flag) {
@@ -110,7 +134,7 @@ final class PeerEgressSegment {
                 payload);
     }
 
-    private static int parseMss(byte[] packet, int from, int to) {
+    static int parseMss(byte[] packet, int from, int to) {
         int cursor = from;
         while (cursor < to) {
             int kind = packet[cursor] & 0xFF;
@@ -137,7 +161,8 @@ final class PeerEgressSegment {
     }
 
     /**
-     * Renders a segment as a complete IPv4 packet, checksums included.
+     * Renders a segment as a complete IPv4 packet, or IPv6 packet when the segment is IPv6,
+     * checksums included.
      *
      * <p>An mss above zero emits the MSS option, which is only meaningful on a SYN.
      */
@@ -153,16 +178,22 @@ final class PeerEgressSegment {
         }
 
         int tcpLength = TCP_MIN_HEADER_BYTES + options.length + segment.payload().length;
-        byte[] packet = new byte[IPV4_MIN_HEADER_BYTES + tcpLength];
+        int headerLength = segment.ipv6() ? PeerEgressIpv6Packet.HEADER_BYTES : IPV4_MIN_HEADER_BYTES;
+        byte[] packet = new byte[headerLength + tcpLength];
 
-        packet[0] = 0x45;
-        writeShort(packet, 2, packet.length);
-        packet[8] = 64;
-        packet[9] = (byte) IPV4_PROTOCOL_TCP;
-        writeInt(packet, 12, segment.sourceIp());
-        writeInt(packet, 16, segment.destinationIp());
+        if (segment.ipv6()) {
+            PeerEgressIpv6Packet.writeHeader(packet, IPV4_PROTOCOL_TCP, tcpLength,
+                    segment.sourceIp6(), segment.destinationIp6());
+        } else {
+            packet[0] = 0x45;
+            writeShort(packet, 2, packet.length);
+            packet[8] = 64;
+            packet[9] = (byte) IPV4_PROTOCOL_TCP;
+            writeInt(packet, 12, segment.sourceIp());
+            writeInt(packet, 16, segment.destinationIp());
+        }
 
-        int tcp = IPV4_MIN_HEADER_BYTES;
+        int tcp = headerLength;
         writeShort(packet, tcp, segment.sourcePort());
         writeShort(packet, tcp + 2, segment.destinationPort());
         writeInt(packet, tcp + 4, segment.seq());
@@ -175,6 +206,11 @@ final class PeerEgressSegment {
                 segment.payload(), 0,
                 packet, tcp + TCP_MIN_HEADER_BYTES + options.length, segment.payload().length);
 
+        if (segment.ipv6()) {
+            writeShort(packet, tcp + 16, PeerEgressIpv6Packet.checksum(segment.sourceIp6(), segment.destinationIp6(),
+                    IPV4_PROTOCOL_TCP, packet, tcp, tcpLength));
+            return packet;
+        }
         writeShort(packet, 10, checksum(packet, 0, IPV4_MIN_HEADER_BYTES));
         writeShort(packet, tcp + 16, tcpChecksum(packet, IPV4_MIN_HEADER_BYTES, tcpLength));
         return packet;
@@ -200,7 +236,8 @@ final class PeerEgressSegment {
         return build(new Segment(
                 segment.destinationIp(), segment.sourceIp(),
                 segment.destinationPort(), segment.sourcePort(),
-                seq, ack, flags, 0, 0, EMPTY));
+                seq, ack, flags, 0, 0, EMPTY,
+                segment.destinationIp6(), segment.sourceIp6()));
     }
 
     /** Reports a &lt; b in TCP's wrapping sequence space. */

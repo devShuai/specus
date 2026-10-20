@@ -2545,12 +2545,14 @@ public class PeerMeshClient implements AutoCloseable {
         }
         // Before the bare IPv4 endpoint check below: a payload carrying the SPEG1 magic is
         // addressed to the egress path and must be refused with its own code rather than dropped
-        // here as an unrecognised mesh packet.
-        if (egress.handleInboundFrame(session.peerId(), frame.plaintext())) {
+        // here as an unrecognised mesh packet. The authenticated peer's mesh address goes with it: an
+        // IPv6 packet's source is checked against the address derived from it, not taken on trust.
+        PeerInfo authenticatedPeer = peerIndex.byId().get(session.peerId());
+        if (egress.handleInboundFrame(session.peerId(),
+                authenticatedPeer == null ? null : authenticatedPeer.virtualIp(), frame.plaintext())) {
             return;
         }
 
-        PeerInfo authenticatedPeer = peerIndex.byId().get(session.peerId());
         ClientAuthLoginResponse.PeerMeshConfig currentConfig = config;
         if (authenticatedPeer == null || currentConfig == null
                 || !PeerIpPacket.matchesAuthenticatedEndpoints(

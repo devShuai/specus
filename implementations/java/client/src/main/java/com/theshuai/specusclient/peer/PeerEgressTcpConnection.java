@@ -119,6 +119,9 @@ final class PeerEgressTcpConnection {
     private final int remoteIp;
     private final int localPort;
     private final int remotePort;
+    /** An IPv6 flow keeps its addresses here instead, with the IPv4 ones zero; null for IPv4. */
+    private final PeerEgressIpv6Packet.Address localIp6;
+    private final PeerEgressIpv6Packet.Address remoteIp6;
 
     private State state;
 
@@ -167,6 +170,8 @@ final class PeerEgressTcpConnection {
         this.remoteIp = syn.sourceIp();
         this.localPort = syn.destinationPort();
         this.remotePort = syn.sourcePort();
+        this.localIp6 = syn.destinationIp6();
+        this.remoteIp6 = syn.sourceIp6();
         this.state = State.SYN_RECEIVED;
         this.iss = iss;
         this.sndUna = iss;
@@ -219,9 +224,25 @@ final class PeerEgressTcpConnection {
     }
 
     private int advertisedMss(int pathMtu) {
-        int mss = pathMtu - PeerEgressSegment.IPV4_MIN_HEADER_BYTES
-                - PeerEgressSegment.TCP_MIN_HEADER_BYTES;
+        int mss = pathMtu - ipHeaderBytes() - PeerEgressSegment.TCP_MIN_HEADER_BYTES;
         return Math.max(mss, PeerEgressSegment.DEFAULT_MSS);
+    }
+
+    /**
+     * What the flow's IP header takes out of the path MTU. An IPv6 header has no options here: the
+     * egress writes none, and a consumer's packet with an extension header never reaches a flow.
+     */
+    private int ipHeaderBytes() {
+        return localIp6 != null ? PeerEgressIpv6Packet.HEADER_BYTES : PeerEgressSegment.IPV4_MIN_HEADER_BYTES;
+    }
+
+    /**
+     * A segment of this flow, addressed in whichever family it was opened, so every segment the flow
+     * sends goes back the way the consumer's came.
+     */
+    private Segment segment(int seq, int ack, int flags, int window, int mss, byte[] payload) {
+        return new Segment(localIp, remoteIp, localPort, remotePort, seq, ack, flags, window, mss, payload,
+                localIp6, remoteIp6);
     }
 
     /** Renders one segment, queues it for retransmission when it occupies sequence space, and advances SND.NXT. */
@@ -236,8 +257,7 @@ final class PeerEgressTcpConnection {
     }
 
     private boolean emit(Output output, int flags, byte[] payload, long nowMs, int mss) {
-        Segment segment = new Segment(
-                localIp, remoteIp, localPort, remotePort,
+        Segment segment = segment(
                 sndNxt, rcvNxt, flags,
                 PeerEgressSegment.advertisedWindow(rcvWnd), mss, payload);
         if (!transmit(output, PeerEgressSegment.build(segment))) { return false; }
@@ -272,8 +292,7 @@ final class PeerEgressTcpConnection {
      * carry a value that looks meaningful.
      */
     private void reset(Output output) {
-        output.send(PeerEgressSegment.build(new Segment(
-                localIp, remoteIp, localPort, remotePort,
+        output.send(PeerEgressSegment.build(segment(
                 sndNxt, 0, PeerEgressSegment.FLAG_RST, 0, 0, new byte[0])));
         state = State.CLOSED;
         retransmit.clear();
@@ -672,7 +691,7 @@ final class PeerEgressTcpConnection {
                     seq = entry.seq;
                     payload = Arrays.copyOf(entry.payload, 1);
                 }
-                transmit(output, PeerEgressSegment.build(new Segment(localIp, remoteIp, localPort, remotePort,
+                transmit(output, PeerEgressSegment.build(segment(
                         seq, rcvNxt, PeerEgressSegment.FLAG_ACK, PeerEgressSegment.advertisedWindow(rcvWnd), 0, payload)));
             }
             return output;
@@ -690,8 +709,7 @@ final class PeerEgressTcpConnection {
                 reset(output);
                 return output;
             }
-            if (!transmit(output, PeerEgressSegment.build(new Segment(
-                    localIp, remoteIp, localPort, remotePort,
+            if (!transmit(output, PeerEgressSegment.build(segment(
                     entry.seq, rcvNxt, entry.flags,
                     PeerEgressSegment.advertisedWindow(rcvWnd), 0, state == State.SYN_RECEIVED ? entry.payload
                             : Arrays.copyOf(entry.payload, Math.min(entry.payload.length, sndWnd)))))) {
@@ -731,8 +749,7 @@ final class PeerEgressTcpConnection {
         keepaliveProbes++;
         probed = true;
         lastProbeMs = nowMs;
-        output.send(PeerEgressSegment.build(new Segment(
-                localIp, remoteIp, localPort, remotePort,
+        output.send(PeerEgressSegment.build(segment(
                 sndNxt - 1, rcvNxt, PeerEgressSegment.FLAG_ACK,
                 PeerEgressSegment.advertisedWindow(rcvWnd), 0, new byte[0])));
         return false;

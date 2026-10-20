@@ -1,6 +1,7 @@
 package com.theshuai.specusclient.peer;
 
 import com.theshuai.common.peeregress.Ipv4Cidr;
+import com.theshuai.common.peeregress.Ipv6Cidr;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -17,8 +18,10 @@ import java.util.Map;
  * this node's own tunnel routes -- which a node that is also a consumer has, for its own rules --
  * the forwarded traffic would go back into the mesh instead of out of the machine. On Windows and
  * macOS the socket is bound to the interface the operating system would have picked had the
- * tunnel's routes not been there: {@code IP_UNICAST_IF} and {@code IP_BOUND_IF}. Neither needs
- * elevation, and the stack enforces both -- bound to an interface with no route to the destination,
+ * tunnel's routes not been there: {@code IP_UNICAST_IF} and {@code IP_BOUND_IF}, and for a socket to
+ * an IPv6 target {@code IPV6_UNICAST_IF} and {@code IPV6_BOUND_IF}, chosen from the IPv6 table
+ * ({@code protocol/spec/peer-egress.md}, IPv6 数据面, 出站 socket). None needs elevation, and the
+ * stack enforces each -- bound to an interface with no route to the destination,
  * connect fails rather than leaving by another one. That is also why the interface has to be chosen
  * per destination: binding everything to the default route's interface would break every target
  * reached through a second NIC or another VPN.
@@ -36,6 +39,12 @@ public final class PeerEgressSocketBinding {
     /** {@code IP_BOUND_IF}, at level {@code IPPROTO_IP}. */
     public static final int MACOS_IP_BOUND_IF = 25;
     public static final int IPPROTO_IP = 0;
+    /** {@code IPV6_UNICAST_IF}, at level {@code IPPROTO_IPV6}. Its value is in host order. */
+    public static final int WINDOWS_IPV6_UNICAST_IF = 31;
+    /** {@code IPV6_BOUND_IF}, at level {@code IPPROTO_IPV6}. Its value is in host order, like IP_BOUND_IF's. */
+    public static final int MACOS_IPV6_BOUND_IF = 125;
+    /** {@code IPPROTO_IPV6}, the same number on Windows and macOS. */
+    public static final int IPPROTO_IPV6 = 41;
     /** {@code SOL_SOCKET} on Linux. */
     public static final int LINUX_SOL_SOCKET = 1;
     /** {@code SO_MARK} on Linux, at level {@code SOL_SOCKET}. */
@@ -60,12 +69,17 @@ public final class PeerEgressSocketBinding {
     private static final int FORWARD_NEXT_HOP_FAMILY = 44;
     private static final int FORWARD_NEXT_HOP_ADDRESS = 48;
     private static final int FORWARD_METRIC = 84;
+    // In an IPv6 row the SOCKADDR_INET is a SOCKADDR_IN6: family, port and flow information come
+    // before the address, so it starts eight bytes into the structure rather than four.
+    private static final int FORWARD_PREFIX_ADDRESS6 = 20;
+    private static final int FORWARD_NEXT_HOP_ADDRESS6 = 52;
     private static final int INTERFACE_FAMILY = 0;
     private static final int INTERFACE_INDEX = 16;
     private static final int INTERFACE_METRIC = 148;
     private static final int INTERFACE_CONNECTED = 156;
     private static final int INTERFACE_DISABLE_DEFAULT_ROUTES = 166;
-    private static final int AF_INET = 2;
+    static final int AF_INET = 2;
+    static final int AF_INET6 = 23;
 
     /**
      * A macOS route scoped to its interface. The kernel only uses one for a socket already bound to
@@ -82,6 +96,8 @@ public final class PeerEgressSocketBinding {
 
     /** Windows writes an on-link next hop as this address. */
     private static final String WINDOWS_ON_LINK = "0.0.0.0";
+    /** The same in the IPv6 table. */
+    private static final String WINDOWS_ON_LINK6 = "::";
 
     private PeerEgressSocketBinding() {
     }
@@ -100,7 +116,10 @@ public final class PeerEgressSocketBinding {
     public record Route(String prefix, String iface, String gateway, long metric, boolean usable) {
     }
 
-    /** @param nextHop the address as written, 0.0.0.0 for on-link, or empty when it is not IPv4 */
+    /**
+     * @param nextHop the address as written, 0.0.0.0 (:: in the IPv6 table) for on-link, or empty when
+     *     it is not of the table's family
+     */
     public record WindowsForwardRow(long interfaceIndex, String prefix, String nextHop, long metric) {
     }
 
@@ -113,7 +132,8 @@ public final class PeerEgressSocketBinding {
      * nothing else leads there.
      *
      * <p>Longest prefix, then the lowest metric, then the route listed first. The tunnel is compared
-     * by exact equality -- utun30 is not utun3 -- and an empty tunnel leaves nothing out. Null means
+     * by exact equality -- utun30 is not utun3 -- and an empty tunnel leaves nothing out. Only a
+     * prefix of the destination's own family can contain it. Null means
      * the dial is refused rather than left unbound, because an unbound socket is exactly the one
      * that would follow the tunnel route.
      */
@@ -258,11 +278,24 @@ public final class PeerEgressSocketBinding {
     /**
      * The route a packet to destination would take with this feature's own routes left out: the
      * tunnel's, and any prefix in owned.
+     *
+     * <p>An IPv4 destination is held against the IPv4 prefixes and an IPv6 one against the IPv6
+     * prefixes. An IPv4-mapped or zoned destination is neither: no table holds a route to it that a
+     * socket would follow.
      */
     static Route selectRoute(List<Route> routes, String tunnel, List<String> owned, String destination) {
-        Integer address = Ipv4Cidr.parseAddress(destination);
-        if (address == null) {
-            return null;
+        Integer address = null;
+        long[] address6 = null;
+        if (destination != null && destination.indexOf(':') >= 0) {
+            address6 = Ipv6Cidr.parseAddress(destination);
+            if (address6 == null || (address6[0] == 0 && (address6[1] >>> 32) == 0xFFFFL)) {
+                return null;
+            }
+        } else {
+            address = Ipv4Cidr.parseAddress(destination);
+            if (address == null) {
+                return null;
+            }
         }
         Route best = null;
         int bestBits = -1;
@@ -271,11 +304,10 @@ public final class PeerEgressSocketBinding {
                     || owned.contains(route.prefix())) {
                 continue;
             }
-            Ipv4Cidr prefix = Ipv4Cidr.parse(route.prefix());
-            if (prefix == null || !prefix.contains(address)) {
+            int bits = coverage(route.prefix(), address, address6);
+            if (bits < 0) {
                 continue;
             }
-            int bits = prefix.prefixLength();
             // Strictly better only, so a full tie keeps the route listed first.
             if (bits > bestBits || (bits == bestBits && route.metric() < best.metric())) {
                 best = route;
@@ -283,6 +315,19 @@ public final class PeerEgressSocketBinding {
             }
         }
         return best;
+    }
+
+    /**
+     * The length of prefix when it contains the destination, which is address for IPv4 and address6
+     * for IPv6; -1 when it does not, or is of the other family.
+     */
+    private static int coverage(String prefix, Integer address, long[] address6) {
+        if (prefix.indexOf(':') >= 0) {
+            Ipv6Cidr cidr = address6 == null ? null : Ipv6Cidr.parse(prefix);
+            return cidr != null && cidr.contains(address6) ? cidr.prefixLength() : -1;
+        }
+        Ipv4Cidr cidr = address == null ? null : Ipv4Cidr.parse(prefix);
+        return cidr != null && cidr.contains(address) ? cidr.prefixLength() : -1;
     }
 
     /**
@@ -343,15 +388,78 @@ public final class PeerEgressSocketBinding {
         return parsed;
     }
 
+    /**
+     * The IPv6 rows of a MIB_IPFORWARD_TABLE2, prefixes masked, as GetIpForwardTable2(AF_INET6)
+     * returns them. Null when the table is refused.
+     */
+    public static List<WindowsForwardRow> parseWindowsForwardTable6(byte[] raw) {
+        List<ByteBuffer> rows = rows(raw, WINDOWS_FORWARD_ROW_SIZE);
+        if (rows == null) {
+            return null;
+        }
+        List<WindowsForwardRow> parsed = new ArrayList<>();
+        for (ByteBuffer row : rows) {
+            if ((row.getShort(FORWARD_PREFIX_FAMILY) & 0xFFFF) != AF_INET6) {
+                continue;
+            }
+            int length = row.get(FORWARD_PREFIX_LENGTH) & 0xFF;
+            if (length > Ipv6Cidr.MAX_PREFIX) {
+                continue;
+            }
+            long[] address = address6(row, FORWARD_PREFIX_ADDRESS6);
+            String nextHop = "";
+            if ((row.getShort(FORWARD_NEXT_HOP_FAMILY) & 0xFFFF) == AF_INET6) {
+                long[] hop = address6(row, FORWARD_NEXT_HOP_ADDRESS6);
+                nextHop = Ipv6Cidr.formatAddress(hop[0], hop[1]);
+            }
+            parsed.add(new WindowsForwardRow(
+                    row.getInt(FORWARD_INTERFACE_INDEX) & 0xFFFFFFFFL,
+                    masked6(address, length),
+                    nextHop,
+                    row.getInt(FORWARD_METRIC) & 0xFFFFFFFFL));
+        }
+        return parsed;
+    }
+
+    /** Sixteen address bytes of a row, in network order, as {high, low}. */
+    private static long[] address6(ByteBuffer row, int offset) {
+        long high = 0;
+        long low = 0;
+        for (int index = 0; index < 8; index++) {
+            high = (high << 8) | (row.get(offset + index) & 0xFFL);
+            low = (low << 8) | (row.get(offset + 8 + index) & 0xFFL);
+        }
+        return new long[] {high, low};
+    }
+
+    /** An IPv6 address cut to length, written as a canonical prefix. */
+    private static String masked6(long[] address, int length) {
+        long highMask = length <= 0 ? 0 : length >= 64 ? -1L : -1L << (64 - length);
+        long lowMask = length <= 64 ? 0 : length >= 128 ? -1L : -1L << (128 - length);
+        return Ipv6Cidr.formatAddress(address[0] & highMask, address[1] & lowMask) + "/" + length;
+    }
+
     /** The IPv4 rows of a MIB_IPINTERFACE_TABLE. Null when the table is refused. */
     public static List<WindowsInterfaceRow> parseWindowsInterfaceTable(byte[] raw) {
+        return parseWindowsInterfaceTable(raw, AF_INET);
+    }
+
+    /**
+     * The IPv6 rows of a MIB_IPINTERFACE_TABLE. An interface has a row per family, and the IPv6 one
+     * carries its own metric and its own connection state. Null when the table is refused.
+     */
+    public static List<WindowsInterfaceRow> parseWindowsInterfaceTable6(byte[] raw) {
+        return parseWindowsInterfaceTable(raw, AF_INET6);
+    }
+
+    private static List<WindowsInterfaceRow> parseWindowsInterfaceTable(byte[] raw, int family) {
         List<ByteBuffer> rows = rows(raw, WINDOWS_INTERFACE_ROW_SIZE);
         if (rows == null) {
             return null;
         }
         List<WindowsInterfaceRow> parsed = new ArrayList<>();
         for (ByteBuffer row : rows) {
-            if ((row.getShort(INTERFACE_FAMILY) & 0xFFFF) != AF_INET) {
+            if ((row.getShort(INTERFACE_FAMILY) & 0xFFFF) != family) {
                 continue;
             }
             parsed.add(new WindowsInterfaceRow(
@@ -364,12 +472,13 @@ public final class PeerEgressSocketBinding {
     }
 
     /**
-     * Joins the two Windows tables into candidate routes.
+     * Joins the two Windows tables of one family into candidate routes.
      *
      * <p>Windows ranks two routes of equal length by the route's metric plus its interface's. A
      * route on an interface that is not connected is not used, nor is a default route on an
      * interface that sets DisableDefaultRoutes -- which a VPN does to keep its default from taking
-     * over. A route whose interface has no IPv4 row is not used either: nothing says it is up.
+     * over. A route whose interface has no row of the family is not used either: nothing says it is
+     * up.
      */
     public static List<Route> windowsRoutes(List<WindowsForwardRow> forward,
             List<WindowsInterfaceRow> interfaces) {
@@ -384,10 +493,12 @@ public final class PeerEgressSocketBinding {
             boolean usable = false;
             if (iface != null) {
                 metric += iface.metric();
-                usable = iface.connected()
-                        && !(row.prefix().equals("0.0.0.0/0") && iface.disableDefaultRoutes());
+                boolean isDefault = row.prefix().equals("0.0.0.0/0") || row.prefix().equals("::/0");
+                usable = iface.connected() && !(isDefault && iface.disableDefaultRoutes());
             }
-            String gateway = row.nextHop().equals(WINDOWS_ON_LINK) ? "" : row.nextHop();
+            String gateway = row.nextHop().equals(WINDOWS_ON_LINK) || row.nextHop().equals(WINDOWS_ON_LINK6)
+                    ? ""
+                    : row.nextHop();
             routes.add(new Route(row.prefix(), Long.toString(row.interfaceIndex()), gateway, metric, usable));
         }
         return routes;
@@ -405,6 +516,81 @@ public final class PeerEgressSocketBinding {
         return routes;
     }
 
+    /** Reads the IPv6 table, for a socket to an IPv6 target. */
+    public static List<String> macosShowTableArgs6() {
+        return List.of("netstat", "-rn", "-f", "inet6");
+    }
+
+    /**
+     * Candidate routes from {@code netstat -rn -f inet6}, with the same rule as IPv4: a route scoped
+     * to its interface is not one an unbound socket would follow.
+     *
+     * <p>No gateway is kept. Bypass routes, the only reader of it, are IPv4, and an IPv6 gateway is
+     * usually link-local, meaningful only with the zone this reading drops.
+     */
+    public static List<Route> macosRoutes6(String table) {
+        List<Route> routes = new ArrayList<>();
+        boolean inside = false;
+        for (String line : (table == null ? "" : table).split("\n", -1)) {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            if (trimmed.endsWith(":") && !trimmed.contains(" ")) {
+                inside = trimmed.equals("Internet6:");
+                continue;
+            }
+            if (!inside || trimmed.startsWith("Destination")) {
+                continue;
+            }
+            String[] fields = trimmed.split("\\s+");
+            if (fields.length < 4) {
+                continue;
+            }
+            String prefix = normaliseMacosPrefix6(fields[0]);
+            if (prefix.isEmpty()) {
+                continue;
+            }
+            routes.add(new Route(prefix, fields[3], "", 0, !fields[2].contains(MACOS_SCOPED_FLAG)));
+        }
+        return routes;
+    }
+
+    /**
+     * A destination of the IPv6 table as a canonical prefix, or "" when it is not one. netstat writes
+     * "default" for ::/0, a host route without a length, and a link-local destination with its zone:
+     * fe80::%lo0/64, fe80::1%lo0. The zone goes; the interface is in the Netif column anyway.
+     */
+    static String normaliseMacosPrefix6(String text) {
+        String value = text == null ? "" : text.trim();
+        if (value.equals("default")) {
+            return "::/0";
+        }
+        int slash = value.indexOf('/');
+        String address = slash < 0 ? value : value.substring(0, slash);
+        int zone = address.indexOf('%');
+        if (zone >= 0) {
+            address = address.substring(0, zone);
+        }
+        long[] parsed = Ipv6Cidr.parseAddress(address);
+        if (parsed == null) {
+            return "";
+        }
+        int bits = Ipv6Cidr.MAX_PREFIX;
+        if (slash >= 0) {
+            String length = value.substring(slash + 1);
+            if (length.isEmpty() || length.length() > 3 || (length.length() > 1 && length.charAt(0) == '0')
+                    || !length.chars().allMatch(Character::isDigit)) {
+                return "";
+            }
+            bits = Integer.parseInt(length);
+            if (bits > Ipv6Cidr.MAX_PREFIX) {
+                return "";
+            }
+        }
+        return masked6(parsed, bits);
+    }
+
     /**
      * The {@code IP_UNICAST_IF} value: the index in network byte order. In host order setsockopt
      * refuses it outright; macOS takes the same kind of value in host order, which is why the two
@@ -414,7 +600,15 @@ public final class PeerEgressSocketBinding {
         return ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt((int) index).array();
     }
 
-    /** The {@code IP_BOUND_IF} value: the index as a host-order int. */
+    /**
+     * The {@code IPV6_UNICAST_IF} value: the index in host byte order, the opposite of its IPv4
+     * sibling.
+     */
+    public static byte[] windowsUnicastInterfaceOption6(long index) {
+        return ByteBuffer.allocate(4).order(ByteOrder.nativeOrder()).putInt((int) index).array();
+    }
+
+    /** The {@code IP_BOUND_IF} value, and the {@code IPV6_BOUND_IF} one: the index as a host-order int. */
     public static byte[] macosBoundInterfaceOption(long index) {
         return ByteBuffer.allocate(4).order(ByteOrder.nativeOrder()).putInt((int) index).array();
     }
