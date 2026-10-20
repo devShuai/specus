@@ -1166,6 +1166,128 @@ static int test_expiry(void)
     return failed || retry ? -1 : 0;
 }
 
+#define SLOT_PEERS 32U
+
+static void slot_peers(unsigned subnet, struct sockaddr_in peers[SLOT_PEERS])
+{
+    for (unsigned i = 0; i < SLOT_PEERS; ++i) {
+        char text[32];
+        snprintf(text, sizeof(text), "127.0.%u.%u", subnet, i + 1U);
+        (void)peer_from_text(text, 50000U, &peers[i]);
+    }
+}
+
+/*
+ * Expired permissions and channels give their room back: Java drops them every 30 s and keeps no
+ * limit, and C's 32 of each per allocation are for live ones. A long-lived allocation used to be
+ * refused (400) once 32 distinct peers or channel numbers had ever been used on it.
+ */
+static int test_expired_permissions_and_channels_recycled(void)
+{
+    turn_fixture fixture;
+    turn_credential credential;
+    if (turn_fixture_start(&fixture, 1, "55150", "55199", "2") != 0
+        || issue_credential("public-transfer-slots", &credential) != 0) return -1;
+    struct sockaddr_in client_address, last_address, relay;
+    struct sockaddr_in first[SLOT_PEERS], second[SLOT_PEERS];
+    slot_peers(1U, first);
+    slot_peers(2U, second);
+    int client = udp_socket(&client_address);
+    int last = udp_socket_on("127.0.2.32", &last_address);
+    unsigned char response[2048];
+    int failed = client < 0 || last < 0 || allocate(client, &fixture, &credential, 1400U, &relay) != 0;
+    second[SLOT_PEERS - 1U] = last_address;
+    /* A full set of permissions and channels, all on the first 32 peers. */
+    unsigned seed = 1410U;
+    for (unsigned i = 0; !failed && i < SLOT_PEERS; ++i) {
+        int received = channel_bind(client, &fixture, &credential, 0x4000U + i, &first[i], seed++,
+                                    response, sizeof(response));
+        if (received < 20 || r16(response) != 0x0109U) {
+            fprintf(stderr, "ChannelBind %u of the first set failed (%d)\n", i + 1U, error_code(response, received));
+            failed = 1;
+        }
+    }
+    if (!failed) sleep_ms(2100L);
+    /* Once they have expired, 32 new peers and 32 new channel numbers fit again. */
+    int received = failed ? -1 : create_permissions(client, &fixture, &credential, second, SLOT_PEERS, seed++,
+                                                    response, sizeof(response));
+    if (!failed && (received < 20 || r16(response) != 0x0108U)) {
+        fprintf(stderr, "CreatePermission for 32 new peers after expiry failed (%d)\n",
+                error_code(response, received));
+        failed = 1;
+    }
+    for (unsigned i = 0; !failed && i < SLOT_PEERS; ++i) {
+        received = channel_bind(client, &fixture, &credential, 0x4020U + i, &second[i], seed++,
+                                response, sizeof(response));
+        if (received < 20 || r16(response) != 0x0109U) {
+            fprintf(stderr, "ChannelBind %u of the second set failed (%d)\n", i + 1U, error_code(response, received));
+            failed = 1;
+        }
+    }
+    failed = failed || send_channel_data(client, &fixture, 0x4020U + SLOT_PEERS - 1U, "recycled", 0U) != 0
+        || receive_exact(last, "recycled", &relay, "ChannelData on a recycled channel") != 0;
+    if (client >= 0) close(client);
+    if (last >= 0) close(last);
+    st_stun_turn_server_stop(fixture.server);
+    return failed ? -1 : 0;
+}
+
+/*
+ * Binding a peer to a new channel number moves it there (Java channelBind removes the peer's
+ * previous number): data from the peer arrives on the new number, the old number relays nothing
+ * and is free for another peer. The old binding used to stay live alongside the new one.
+ */
+static int test_channel_rebind_moves_peer(void)
+{
+    turn_fixture fixture;
+    turn_credential credential;
+    if (turn_fixture_start(&fixture, 1, "55150", "55199", NULL) != 0
+        || issue_credential("public-transfer-rebind", &credential) != 0) return -1;
+    struct sockaddr_in client_address, peer_address, other_address, relay;
+    int client = udp_socket(&client_address);
+    int peer = udp_socket(&peer_address);
+    int other = udp_socket_on("127.0.0.2", &other_address);
+    unsigned char response[2048];
+    int failed = client < 0 || peer < 0 || other < 0 || allocate(client, &fixture, &credential, 1500U, &relay) != 0;
+    int received = failed ? -1 : channel_bind(client, &fixture, &credential, 0x4000U, &peer_address, 1501U,
+                                              response, sizeof(response));
+    failed = failed || received < 20 || r16(response) != 0x0109U;
+    received = failed ? -1 : channel_bind(client, &fixture, &credential, 0x4001U, &peer_address, 1502U,
+                                          response, sizeof(response));
+    if (!failed && (received < 20 || r16(response) != 0x0109U)) {
+        fprintf(stderr, "rebinding a peer to a new channel number failed\n");
+        failed = 1;
+    }
+    if (!failed) {
+        unsigned char frame[64];
+        received = sendto(peer, "moved", 5U, 0, (struct sockaddr *)&relay, sizeof(relay)) == 5
+            ? (int)recvfrom(client, frame, sizeof(frame), 0, NULL, NULL) : -1;
+        if (received != 9 || r16(frame) != 0x4001U || memcmp(frame + 4U, "moved", 5U) != 0) {
+            fprintf(stderr, "data from a rebound peer did not arrive on its new channel (%d bytes, 0x%04x)\n",
+                    received, received >= 2 ? r16(frame) : 0U);
+            failed = 1;
+        }
+    }
+    if (!failed && (send_channel_data(client, &fixture, 0x4000U, "stale-number", 0U) != 0 || !stays_silent(peer))) {
+        fprintf(stderr, "the number a peer was moved away from still relayed\n");
+        failed = 1;
+    }
+    received = failed ? -1 : channel_bind(client, &fixture, &credential, 0x4000U, &other_address, 1503U,
+                                          response, sizeof(response));
+    if (!failed && (received < 20 || r16(response) != 0x0109U)) {
+        fprintf(stderr, "a number freed by a rebind could not be bound to another peer (%d)\n",
+                error_code(response, received));
+        failed = 1;
+    }
+    failed = failed || send_channel_data(client, &fixture, 0x4000U, "to-other", 0U) != 0
+        || receive_exact(other, "to-other", &relay, "ChannelData on a reused number") != 0;
+    if (client >= 0) close(client);
+    if (peer >= 0) close(peer);
+    if (other >= 0) close(other);
+    st_stun_turn_server_stop(fixture.server);
+    return failed ? -1 : 0;
+}
+
 /* ---- Peer Mesh SPM2 frames on the relay hot path (Java PeerMeshServiceTests) -------------- */
 
 /* An SPM2 data frame: magic, session id, sequence, then 32 opaque bytes (ciphertext and tag). */
@@ -2044,6 +2166,8 @@ int main(void)
         || test_default_private_peer_refusal() != 0
         || test_private_peers_allowed_by_switch() != 0
         || test_expiry() != 0
+        || test_expired_permissions_and_channels_recycled() != 0
+        || test_channel_rebind_moves_peer() != 0
         || test_unidentified_relay_without_turn_auth() != 0
         || test_relay_traffic_batches() != 0
         || test_turn_credential_subjects() != 0) {

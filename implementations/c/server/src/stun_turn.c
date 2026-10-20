@@ -148,6 +148,7 @@ struct st_stun_turn_server {
     turn_allocation **allocations;
     size_t allocation_count;
     size_t allocation_capacity;
+    time_t last_entry_sweep;
     /* The poll set of one pass and the allocation each relay entry belongs to (NULL: endpoint). */
     struct pollfd *poll_fds;
     turn_allocation **poll_owners;
@@ -1104,20 +1105,29 @@ static int allocation_has_permission(turn_allocation *allocation,
     return 0;
 }
 
+/*
+ * Where a permission for this peer's address goes: its own entry, else one that is free or has
+ * expired. Java keeps permissions in an unbounded map and drops expired ones; here an allocation
+ * holds TURN_MAX_PERMISSIONS live ones, and NULL means all of them are live for other peers.
+ */
+static turn_permission *permission_slot(turn_allocation *allocation, const struct sockaddr_storage *peer)
+{
+    time_t now = time(NULL);
+    turn_permission *slot = NULL;
+    for (size_t i = 0; i < TURN_MAX_PERMISSIONS; ++i) {
+        turn_permission *candidate = &allocation->permissions[i];
+        if (candidate->used && sockaddr_equal(&candidate->address, peer, 0)) return candidate;
+        if (slot == NULL && (!candidate->used || candidate->expires_at <= now)) slot = candidate;
+    }
+    return slot;
+}
+
 static int add_permission(turn_allocation *allocation,
                           const struct sockaddr_storage *peer,
                           socklen_t peer_len,
                           int ttl)
 {
-    turn_permission *slot = NULL;
-    for (size_t i = 0; i < TURN_MAX_PERMISSIONS; ++i) {
-        if (allocation->permissions[i].used
-            && sockaddr_equal(&allocation->permissions[i].address, peer, 0)) {
-            slot = &allocation->permissions[i];
-            break;
-        }
-        if (slot == NULL && !allocation->permissions[i].used) slot = &allocation->permissions[i];
-    }
+    turn_permission *slot = permission_slot(allocation, peer);
     if (slot == NULL) return -1;
     slot->used = 1;
     slot->address = *peer;
@@ -1156,13 +1166,17 @@ static int bind_channel(turn_allocation *allocation,
     turn_channel *slot = find_channel_by_number(allocation, number);
     /* RFC 5766 section 11.2: a live channel number may only be refreshed for the same peer. */
     if (slot != NULL && !sockaddr_equal(&slot->peer, peer, 1)) return -1;
-    if (slot == NULL) {
-        for (size_t i = 0; i < TURN_MAX_CHANNELS; ++i) {
-            if (!allocation->channels[i].used) {
-                slot = &allocation->channels[i];
-                break;
-            }
+    /* Java channelBind: the peer leaves the number it was bound to before, so its data comes in
+     * on the new one and the old number is free. Expired bindings give their entries back. */
+    time_t now = time(NULL);
+    for (size_t i = 0; i < TURN_MAX_CHANNELS; ++i) {
+        turn_channel *other = &allocation->channels[i];
+        if (other->used && other != slot && (other->expires_at <= now || sockaddr_equal(&other->peer, peer, 1))) {
+            other->used = 0;
         }
+    }
+    for (size_t i = 0; slot == NULL && i < TURN_MAX_CHANNELS; ++i) {
+        if (!allocation->channels[i].used) slot = &allocation->channels[i];
     }
     if (slot == NULL) return -1;
     slot->used = 1;
@@ -1426,6 +1440,8 @@ static void handle_permission_or_channel(st_stun_turn_server *server,
         uint16_t number = 0U;
         if (find_attribute(packet, len, ATTR_CHANNEL_NUMBER, &channel) != 0 || channel.length != 4U
             || (number = read_u16(channel.value)) < 0x4000U || number > 0x7fffU) rc = -1;
+        /* The permission it installs must fit before the binding changes anything. */
+        else if (permission_slot(allocation, &peers[0]) == NULL) rc = -1;
         else rc = bind_channel(allocation, number, &peers[0], peer_lens[0], server->channel_ttl);
         success_type = TURN_CHANNEL_BIND_SUCCESS;
         /* A ChannelBind binds the first peer it names; the others were only policy-checked. */
@@ -1545,12 +1561,27 @@ static void handle_relay_packet(st_stun_turn_server *server, turn_allocation *al
     (void)send_builder(server->control_fd, &indication, &allocation->client, allocation->client_len);
 }
 
+/*
+ * The periodic sweep (Java cleanupExpiredAllocations): expired allocations after every pass, and
+ * once a second (lifetimes are whole seconds) the expired permissions and channels of the others.
+ */
 static void expire_allocations(st_stun_turn_server *server)
 {
     time_t now = time(NULL);
+    int sweep_entries = now != server->last_entry_sweep;
+    server->last_entry_sweep = now;
     for (size_t i = 0; i < server->allocation_count; ++i) {
-        if (server->allocations[i]->used && server->allocations[i]->expires_at <= now) {
-            close_allocation(server->allocations[i]);
+        turn_allocation *allocation = server->allocations[i];
+        if (!allocation->used) continue;
+        if (allocation->expires_at <= now) {
+            close_allocation(allocation);
+            continue;
+        }
+        for (size_t k = 0; sweep_entries && k < TURN_MAX_PERMISSIONS; ++k) {
+            if (allocation->permissions[k].expires_at <= now) allocation->permissions[k].used = 0;
+        }
+        for (size_t k = 0; sweep_entries && k < TURN_MAX_CHANNELS; ++k) {
+            if (allocation->channels[k].expires_at <= now) allocation->channels[k].used = 0;
         }
     }
 }
