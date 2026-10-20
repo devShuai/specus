@@ -138,7 +138,7 @@ issue 要求「收藏及历史按登录身份隔离」。比较过三种做法�
 | `kind`、`object_id` | 服务引用 |
 | `at_ms` | 收藏为加入时刻，最近打开为最近一次打开的时刻；服务端时钟，毫秒精度 |
 
-- 唯一键 `(tenant_id, username, list, kind, object_id)`；为按身份读取、清空和删除账号建索引 `(tenant_id, username)`，为级联删除建索引 `(tenant_id, kind, object_id)`，为保留期清理建索引 `(list, at_ms)`。建议表名 `management_workbench_item`。
+- 唯一键 `(tenant_id, username, list, kind, object_id)`；为级联删除建索引 `(tenant_id, kind, object_id)`，为保留期清理建索引 `(list, at_ms)`。建议表名 `management_workbench_item`。
 - 时间必须保存到毫秒，排序依赖它。建议用 BIGINT 保存 epoch 毫秒；如果沿用现有的字符串时间，必须是定长、带三位小数的 UTC 格式，使字典序等于时间序。
 - **不保存**：服务名称、目标地址、访问地址、端口、客户端名称、调用者 IP、User-Agent、打开次数、停留时长、访问是否成功。
 - 不建外键，与现有表一致。
