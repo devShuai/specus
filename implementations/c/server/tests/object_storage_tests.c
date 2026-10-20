@@ -51,6 +51,23 @@ static int test_download_vector(void)
         && strstr(url, "x-oss-date=20241203T034420Z") != NULL
         && strstr(url, "x-st-grant=grant-123") != NULL
         && strstr(url, "x-oss-signature=c2fae9c2ac1a8e6ec5d0ef73e0ac015f40deaf92c3ec5626139a7cacb71225ac") != NULL;
+    /*
+     * Java presignedDownloadUsesV4AndSignsGrantMarker: a V4 query (signature version, 600 s expiry)
+     * with none of the V1 parameters OSSAccessKeyId, Expires and Signature.
+     */
+    const char *query = url == NULL ? NULL : strchr(url, '?');
+    int signature_version = 0, v4_expires = 0;
+    for (const char *param = query == NULL ? NULL : query + 1; ok && param != NULL && *param != '\0';) {
+        size_t len = strcspn(param, "&");
+        size_t name_len = strcspn(param, "=&");
+        if ((name_len == 14U && strncmp(param, "OSSAccessKeyId", 14U) == 0)
+            || (name_len == 7U && strncmp(param, "Expires", 7U) == 0)
+            || (name_len == 9U && strncmp(param, "Signature", 9U) == 0)) ok = 0;
+        if (len == 40U && strncmp(param, "x-oss-signature-version=OSS4-HMAC-SHA256", 40U) == 0) signature_version = 1;
+        if (len == 17U && strncmp(param, "x-oss-expires=600", 17U) == 0) v4_expires = 1;
+        param = param[len] == '&' ? param + len + 1U : NULL;
+    }
+    ok = ok && query != NULL && signature_version && v4_expires;
     if (!ok) fprintf(stderr, "OSS V4 Java parity vector mismatch: %s\n", url == NULL ? "(null)" : url);
     free(url);
     return ok ? 0 : -1;
@@ -632,15 +649,54 @@ static int test_capabilities_month_and_expiry_boundaries(void)
     return failed ? -1 : 0;
 }
 
+/*
+ * Java capabilitiesReadOnlyAccountSnapshotUsesEnforcedDefaultsAndClampsRemaining: an unset storage
+ * quota is the 1 GiB default, retention 0 is one hour, a download quota below the month's usage
+ * leaves nothing (usage itself uncapped), the grant is single use, the month and reset are UTC, and
+ * reading the snapshot writes nothing.
+ */
+static int test_capabilities_enforced_defaults(void)
+{
+    if (configure() != 0) return -1;
+    cap_set_limits("0", "10", "1024", "0");
+    char previous[8], current[8], next[8], resets_at[41];
+    if (cap_current_months(previous, current, next, resets_at) != 0) return -1;
+    const cap_attachment attachments[] = {
+        {1, "t1", "alice", "PUBLIC_TRANSFER", "UPLOADED", 12, CAP_PAST, CAP_FUTURE},
+    };
+    const cap_usage usage[] = {
+        {1, "t1", "alice", current, 14},
+    };
+    if (cap_create_database(CAP_DB, attachments, 1U, usage, 1U) != 0) return -1;
+    size_t before_len = 0U;
+    unsigned char *before = cap_read_file(CAP_DB, &before_len);
+    if (before == NULL) return -1;
+    char response[4096];
+    const cap_expected alice = {"true", 1024, 1, CAP_GIB, 12, CAP_GIB - 12, 10, 14, 0};
+    int len = cap_get(CAP_ROUTE, "alice", "t1", "USER", response, sizeof(response));
+    char after[8], ignored[8], ignored_next[8], ignored_reset[41];
+    int failed = cap_expect_snapshot(len, response, &alice);
+    /* The month is checked unless it turned during the request. */
+    if (cap_current_months(ignored, after, ignored_next, ignored_reset) != 0) failed = -1;
+    else if (strcmp(after, current) == 0)
+        failed |= cap_expect_text(response, "downloadUsageMonth", current)
+            | cap_expect_text(response, "downloadResetsAt", resets_at);
+    failed |= cap_file_unchanged(CAP_DB, before, before_len);
+    free(before);
+    cap_set_limits(NULL, NULL, NULL, NULL);
+    unlink(CAP_DB);
+    unsetenv("SPECUS_DATABASE_PATH");
+    return failed ? -1 : 0;
+}
+
 static int test_capabilities_storage_disabled(void)
 {
-    /* Nonpositive quotas fall back to the 1 GiB enforcement default. The C loader resolves a
-     * nonpositive size limit or retention to the 512 MiB / 72 h its upload path enforces, so
-     * those effective values are what the snapshot reports. */
+    /* Nonpositive quotas fall back to the 1 GiB enforcement default; as in Java, a nonpositive size
+     * limit is reported as zero (no positive-size upload passes it) and retention as one hour. */
     setenv("SPECUS_OBJECT_STORAGE_PROVIDER", "disabled", 1);
     cap_set_limits("0", "-5", "0", "-3");
     if (cap_seed_single_account() != 0) return -1;
-    const cap_expected disabled = {"false", CAP_DEFAULT_MAX, 72, CAP_GIB, 64, CAP_GIB - 64, CAP_GIB, 0, CAP_GIB};
+    const cap_expected disabled = {"false", 0, 1, CAP_GIB, 64, CAP_GIB - 64, CAP_GIB, 0, CAP_GIB};
     char response[4096];
     int len = cap_get(CAP_ROUTE, "alice", "t1", "USER", response, sizeof(response));
     int failed = cap_expect_snapshot(len, response, &disabled);
@@ -1462,6 +1518,13 @@ static int att_public_paths(void)
     ATT_STEP(att_action(&alice, 1, id1, "complete", ATT_OWNER_TOKEN, 200, "\"sizeBytes\":9", response,
                         sizeof(response), "complete with the actual size"));
     ATT_STEP(att_row(id1, "UPLOADED", 9, "after complete"));
+    char sql[256];
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM transfer_attachment WHERE id=%lld "
+             "AND COALESCE(uploaded_at,'')<>''", id1);
+    if (!failed && att_count(sql) != 1) {
+        fprintf(stderr, "complete did not record uploaded_at\n");
+        failed = 1;
+    }
     /* The limit counts PENDING only, so the room has room again. */
     ATT_STEP(att_public_upload(&alice, ATT_ROOM, ATT_OWNER_TOKEN, 10, 200, NULL, &id3, key3, "upload after complete"));
 
@@ -1470,6 +1533,16 @@ static int att_public_paths(void)
                         "VIEWER complete"));
     ATT_STEP(att_action(&carol, 1, id1, "presign-download", viewer_token, 200, "/api/public/transfer/downloads/",
                         response, sizeof(response), "VIEWER download"));
+    /* Java invitedViewerCanDownloadAttachmentFromPersistentRoom: the grant stores a SHA-256 hex hash
+     * of its token for this attachment, and nothing is charged before it is consumed. */
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM transfer_attachment_download_grant WHERE attachment_id=%lld "
+             "AND username='carol' AND length(token_hash)=64 AND token_hash NOT GLOB '*[^0-9a-f]*'", id1);
+    if (!failed && (att_count(sql) != 1
+                    || att_count("SELECT COUNT(*) FROM transfer_attachment_download_usage "
+                                 "WHERE username='carol'") != 0)) {
+        fprintf(stderr, "a VIEWER grant has no hex token hash or was charged before use\n");
+        failed = 1;
+    }
     char *grant = failed ? NULL : st_json_get_top_level_string(cap_body(response), "downloadUrl");
     int len = grant == NULL ? -1 : st_object_storage_build_response("GET", grant, NULL, ATT_REMOTE, NULL, NULL,
                                                                      NULL, response, sizeof(response));
@@ -1493,8 +1566,14 @@ static int att_public_paths(void)
         fprintf(stderr, "a grant refused by the download quota was consumed\n");
         failed = 1;
     }
+    long long grants = att_count("SELECT COUNT(*) FROM transfer_attachment_download_grant");
     ATT_STEP(att_action(&carol, 1, id1, "presign-download", viewer_token, 429, "download quota", response,
                         sizeof(response), "download grant over the download quota"));
+    /* Java createDownloadRejectsWhenMonthlyTrafficQuotaWouldBeExceeded: no grant is saved. */
+    if (!failed && att_count("SELECT COUNT(*) FROM transfer_attachment_download_grant") != grants) {
+        fprintf(stderr, "a presign refused by the download quota created a grant\n");
+        failed = 1;
+    }
 
     /* Storage quota (100) for dave, who already stores 50 bytes. */
     long long dave_id = 0;
@@ -1618,7 +1697,25 @@ static int att_upload_normalization(void)
         fprintf(stderr, "upload metadata was not normalised as Java does: %s\n", response);
         return -1;
     }
-    return 0;
+    /* Java createUpload: Math.max(1, retentionHours) hours, so retention 0 expires in one hour. */
+    setenv("SPECUS_OBJECT_STORAGE_RETENTION_HOURS", "0", 1);
+    char key[256];
+    int failed = att_public_upload(&fiona, "retention-room", "attachment-retention-token", 10, 200, NULL, &id, key,
+                                   "upload with retention 0");
+    unsetenv("SPECUS_OBJECT_STORAGE_RETENTION_HOURS");
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM transfer_attachment WHERE id=%lld "
+             "AND (julianday(expires_at) - julianday('now')) * 86400 BETWEEN 3540 AND 3660", id);
+    if (failed == 0 && att_count(sql) != 1) {
+        fprintf(stderr, "an upload with retention 0 does not expire in one hour\n");
+        failed = -1;
+    }
+    /* A nonpositive size limit is kept, so no positive size fits (Java normalizeSize). */
+    cap_set_limits("100", "50", "0", NULL);
+    long long ignored = 0;
+    if (failed == 0) failed = att_public_upload(&fiona, "retention-room", "attachment-retention-token", 1, 400,
+                                                NULL, &ignored, key, "upload under a size limit of 0");
+    cap_set_limits("100", "50", "64", NULL);
+    return failed ? -1 : 0;
 }
 
 /*
@@ -1903,6 +2000,7 @@ int main(void)
     if (test_capabilities_requires_authentication() != 0
         || test_capabilities_account_snapshots() != 0
         || test_capabilities_month_and_expiry_boundaries() != 0
+        || test_capabilities_enforced_defaults() != 0
         || test_capabilities_storage_disabled() != 0
         || test_capabilities_read_failures() != 0
         || test_capabilities_never_contacts_object_storage() != 0

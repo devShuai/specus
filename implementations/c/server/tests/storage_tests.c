@@ -13,6 +13,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+static int exec_script(const char *path, const char *sql);
+static void query_text(const char *path, const char *sql, char *out, size_t out_len);
+
 static int test_peer_mesh_acl_direction_migration(void)
 {
     char path[256];
@@ -360,8 +363,22 @@ static int test_peer_mesh_egress_domain_rules_migration(void)
         return 1;
     }
     sqlite3_close(db);
-    if (st_storage_init(path, 0) != 0) {
+    if (st_storage_init(path, 0) != 0 || st_storage_init(path, 0) != 0) {
         fprintf(stderr, "egress policy domain rules migration failed\n");
+        unlink(path);
+        return 1;
+    }
+    /* Java: a row written without domain rules after the migration reads the same empty list. */
+    char domain_rules[64];
+    if (exec_script(path, "INSERT INTO peer_mesh_egress_policy(tenant_id,owner_username,egress_client_id,"
+                          "egress_client_name) VALUES('default','owner',2004,'new-gateway');") != 0) {
+        unlink(path);
+        return 1;
+    }
+    query_text(path, "SELECT domain_rules FROM peer_mesh_egress_policy WHERE egress_client_id=2004",
+               domain_rules, sizeof(domain_rules));
+    if (strcmp(domain_rules, "[]") != 0) {
+        fprintf(stderr, "a policy written without domain rules reads '%s', expected []\n", domain_rules);
         unlink(path);
         return 1;
     }
@@ -813,6 +830,27 @@ static int test_peer_service_discovery_migration(void)
                     id, announced, applications);
             failures++;
         }
+        /* Java: neither an upgraded session nor a new row that does not set them announces IPv6. */
+        snprintf(sql, sizeof(sql),
+                 "SELECT client_egress_ipv6_targets + client_egress_ipv6_packets * 10 "
+                 "FROM specus_client_session WHERE id=%d", id);
+        long long ipv6 = query_int(path, sql);
+        if (ipv6 != 0) {
+            fprintf(stderr, "session %d after the migration announced IPv6 egress (%lld)\n", id, ipv6);
+            failures++;
+        }
+    }
+    /* Another startup keeps the IPv6 capabilities a session announced since. */
+    if (exec_script(path, "UPDATE specus_client_session SET client_egress_version=1, "
+                          "client_egress_ipv6_targets=1 WHERE id=2;") != 0
+        || st_storage_init(path, 0) != 0
+        || query_int(path, "SELECT client_egress_ipv6_targets FROM specus_client_session WHERE id=2") != 1
+        || query_int(path, "SELECT client_egress_ipv6_packets FROM specus_client_session WHERE id=2") != 0
+        || exec_script(path, "UPDATE specus_client_session SET client_egress_ipv6_packets=1 WHERE id=1;") != 0
+        || st_storage_init(path, 0) != 0
+        || query_int(path, "SELECT client_egress_ipv6_packets FROM specus_client_session WHERE id=1") != 1) {
+        fprintf(stderr, "a later startup reset the IPv6 egress capabilities of a session\n");
+        failures++;
     }
     if (query_int(path, "SELECT enabled FROM peer_mesh_service_sharing WHERE tenant_id='legacy-tenant'") != 0
         || query_int(path, "SELECT mdns_import_enabled FROM peer_mesh_service_sharing "
@@ -1445,6 +1483,95 @@ static int init_full_schema(const char *path)
 }
 
 /*
+ * Java ClientDownloadSchemaMigratorTests.upgradesLegacyRowsWithoutInventingVisibleVersionsAndEnforcesPortableSlots
+ * on the C table from before the version columns: legacy rows get no visible version and distinct
+ * legacy keys; duplicate version and latest declarations keep one version (the newest row's) and one
+ * latest; catalog_key is enforced by a unique index; a disabled row loses its latest slot; and a
+ * further startup changes nothing and does not write.
+ */
+static int test_client_download_catalog_migration(void)
+{
+    char path[256];
+    scratch_db_path(path, sizeof(path), "client-download-catalog");
+    int failed = exec_script(path,
+        "CREATE TABLE client_download_link (id INTEGER PRIMARY KEY AUTOINCREMENT,implementation TEXT NOT NULL,"
+        "platform TEXT NOT NULL,arch TEXT NOT NULL,display_name TEXT NOT NULL,download_url TEXT NOT NULL,"
+        "description TEXT,display_order INTEGER NOT NULL DEFAULT 0,enabled INTEGER NOT NULL DEFAULT 1,"
+        "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);"
+        "INSERT INTO client_download_link(id,implementation,platform,arch,display_name,download_url) "
+        "VALUES(1,'go','windows','x64','one','https://example.test/1'),"
+        "(2,'go','windows','x64','two','https://example.test/2');") != 0
+        || st_storage_init(path, 0) != 0;
+    if (!failed
+        && (query_int(path, "SELECT COUNT(*) FROM client_download_link WHERE version IS NULL AND is_latest = 0 "
+                            "AND hosted = 0 AND latest_slot IS NULL") != 2
+            || query_int(path, "SELECT COUNT(DISTINCT catalog_key) FROM client_download_link") != 2
+            || query_int(path, "SELECT COUNT(*) FROM client_download_link WHERE catalog_key = "
+                               "'go|windows|x64|legacy:' || id") != 2)) {
+        fprintf(stderr, "legacy client downloads gained a version, a latest slot or a shared key\n");
+        failed = 1;
+    }
+
+    /* A partially upgraded database with duplicate version and latest declarations. */
+    failed = failed
+        || exec_script(path, "UPDATE client_download_link SET version='v1.2.3', min_supported_version='v1.0.0', "
+                             "is_latest=1;") != 0
+        || st_storage_init(path, 0) != 0;
+    if (!failed
+        && (query_int(path, "SELECT COUNT(*) FROM client_download_link WHERE version IS NOT NULL") != 1
+            || query_int(path, "SELECT COUNT(*) FROM client_download_link WHERE version IS NULL "
+                               "AND min_supported_version IS NOT NULL") != 0
+            || query_int(path, "SELECT COUNT(*) FROM client_download_link WHERE id = 2 AND version = '1.2.3' "
+                               "AND min_supported_version = '1.0.0' AND catalog_key = 'go|windows|x64|1.2.3'") != 1
+            || query_int(path, "SELECT COUNT(*) FROM client_download_link WHERE is_latest = 1") != 1
+            || query_int(path, "SELECT COUNT(DISTINCT catalog_key) FROM client_download_link") != 2)) {
+        fprintf(stderr, "duplicate legacy versions or latest flags survived the migration\n");
+        failed = 1;
+    }
+    char occupied[96];
+    char message[256];
+    query_text(path, "SELECT catalog_key FROM client_download_link ORDER BY id DESC LIMIT 1", occupied,
+               sizeof(occupied));
+    char insert[384];
+    snprintf(insert, sizeof(insert),
+             "INSERT INTO client_download_link(id,implementation,platform,arch,display_name,download_url,catalog_key) "
+             "VALUES(3,'go','windows','x64','three','https://example.test/3','%s')", occupied);
+    int rc = failed ? SQLITE_OK : exec_status(path, insert, message, sizeof(message));
+    if (!failed && (rc != SQLITE_CONSTRAINT
+                    || strcmp(message, "UNIQUE constraint failed: client_download_link.catalog_key") != 0)) {
+        fprintf(stderr, "an occupied catalog key was accepted: %d %s\n", rc, message);
+        failed = 1;
+    }
+
+    /* A disabled row cannot hold the latest slot. */
+    failed = failed
+        || exec_script(path, "UPDATE client_download_link SET enabled=0, is_latest=1, "
+                             "latest_slot='go|windows|x64' WHERE id=2;") != 0
+        || st_storage_init(path, 0) != 0;
+    if (!failed
+        && query_int(path, "SELECT COUNT(*) FROM client_download_link WHERE id = 2 AND is_latest = 0 "
+                           "AND latest_slot IS NULL") != 1) {
+        fprintf(stderr, "a disabled client download kept the latest slot\n");
+        failed = 1;
+    }
+
+    /* A third run is a no-op, which every restart relies on. */
+    long counter = failed ? -1L : file_change_counter(path);
+    failed = failed || st_storage_init(path, 0) != 0;
+    if (!failed && (query_int(path, "SELECT COUNT(*) FROM client_download_link") != 2
+                    || file_change_counter(path) != counter
+                    || unique_index_on(path, "client_download_link", "catalog_key",
+                                       "ux_client_download_catalog_key") != 1
+                    || unique_index_on(path, "client_download_link", "latest_slot",
+                                       "ux_client_download_latest_slot") != 1)) {
+        fprintf(stderr, "a further startup changed the client download catalogue or lost its unique keys\n");
+        failed = 1;
+    }
+    unlink(path);
+    return failed ? 1 : 0;
+}
+
+/*
  * Java SqliteUniqueIndexStartupTests.startupEnforcesEveryUniqueKeyOfTheMapping over the 22
  * table-level unique keys that SqliteUniqueIndexMigratorTests.listsEveryTableLevelUniqueKeyOfTheMapping
  * counts (SqliteUniqueIndexMigrator.UNIQUE_KEYS): on a new database each is enforced by a full unique
@@ -1990,6 +2117,9 @@ int main(void)
         return 1;
     }
     if (test_peer_service_discovery_migration() != 0) {
+        return 1;
+    }
+    if (test_client_download_catalog_migration() != 0) {
         return 1;
     }
     if (test_connection_archive_window() != 0) {

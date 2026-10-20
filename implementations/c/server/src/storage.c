@@ -326,6 +326,354 @@ static int migrate_client_account_ids(sqlite3 *db)
     return rc;
 }
 
+/*
+ * Java ClientDownloadSchemaMigrator: two portable unique keys over client_download_link.
+ * catalog_key is implementation|platform|arch|version (legacy:<id> without a version), so a target
+ * lists each version once; latest_slot is implementation|platform|arch on the one latest row of a
+ * target and NULL on every other row. Each row is brought to the migrator's form, newest id first:
+ * the coordinates trimmed and lower-cased (ASCII only here), a version and minimum trimmed with one
+ * leading "v" dropped, a version another row already holds cleared rather than shown to update
+ * clients, the minimum of a row without a version cleared, and the latest flag kept only on an
+ * enabled, versioned row that is the first of its target. Rows already in that form are not
+ * written, so a current database sees no write; the two unique indexes are created when missing.
+ */
+typedef struct {
+    long long id;
+    char *implementation;
+    char *platform;
+    char *arch;
+    char *version;
+    char *min_supported_version;
+    char *catalog_key;
+    char *latest_slot;
+    int latest;
+    int hosted;
+    int changed;
+} client_download_catalog_row;
+
+static void free_client_download_catalog(client_download_catalog_row *rows, size_t count)
+{
+    for (size_t i = 0U; rows != NULL && i < count; ++i) {
+        free(rows[i].implementation);
+        free(rows[i].platform);
+        free(rows[i].arch);
+        free(rows[i].version);
+        free(rows[i].min_supported_version);
+        free(rows[i].catalog_key);
+        free(rows[i].latest_slot);
+    }
+    free(rows);
+}
+
+/* Java text(): the value as text with String.trim() applied, "" for NULL. */
+static char *catalog_trimmed_text(sqlite3_stmt *stmt, int column)
+{
+    const char *value = (const char *)sqlite3_column_text(stmt, column);
+    if (value == NULL) {
+        value = "";
+    }
+    size_t start = 0U;
+    size_t end = strlen(value);
+    while (start < end && (unsigned char)value[start] <= 0x20U) ++start;
+    while (end > start && (unsigned char)value[end - 1U] <= 0x20U) --end;
+    char *copy = malloc(end - start + 1U);
+    if (copy != NULL) {
+        memcpy(copy, value + start, end - start);
+        copy[end - start] = '\0';
+    }
+    return copy;
+}
+
+/* Spring StringUtils.hasText: at least one character that is not (ASCII) whitespace. */
+static int catalog_has_text(const char *value)
+{
+    for (; value != NULL && *value != '\0'; ++value) {
+        unsigned char c = (unsigned char)*value;
+        if (c != ' ' && !(c >= 0x09U && c <= 0x0dU) && !(c >= 0x1cU && c <= 0x1fU)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Java canonicalVersion: trimmed, one leading "v" dropped, NULL when no text is left. */
+static char *catalog_version(sqlite3_stmt *stmt, int column, int *failed)
+{
+    char *version = catalog_trimmed_text(stmt, column);
+    if (version == NULL) {
+        *failed = 1;
+        return NULL;
+    }
+    if (version[0] == 'v') {
+        memmove(version, version + 1, strlen(version));
+    }
+    if (!catalog_has_text(version)) {
+        free(version);
+        return NULL;
+    }
+    return version;
+}
+
+/* Java truthy: a number by its int value, text "true" (any case) or "1", anything else false. */
+static int catalog_truthy(sqlite3_stmt *stmt, int column)
+{
+    switch (sqlite3_column_type(stmt, column)) {
+    case SQLITE_INTEGER:
+        return (uint32_t)sqlite3_column_int64(stmt, column) != 0U;
+    case SQLITE_FLOAT: {
+        double value = sqlite3_column_double(stmt, column);
+        return value >= 1.0 || value <= -1.0;
+    }
+    case SQLITE_TEXT: {
+        const char *value = (const char *)sqlite3_column_text(stmt, column);
+        return value != NULL && (sqlite3_stricmp(value, "true") == 0 || strcmp(value, "1") == 0);
+    }
+    default:
+        return 0;
+    }
+}
+
+/* implementation|platform|arch, with |version (or |legacy:<id> when version is NULL) when keyed. */
+static char *catalog_join(const char *implementation, const char *platform, const char *arch,
+                          int keyed, const char *version, long long id)
+{
+    char legacy[32];
+    snprintf(legacy, sizeof(legacy), "legacy:%llu", (unsigned long long)id);
+    const char *tail = version != NULL ? version : legacy;
+    int len = keyed ? snprintf(NULL, 0, "%s|%s|%s|%s", implementation, platform, arch, tail)
+                    : snprintf(NULL, 0, "%s|%s|%s", implementation, platform, arch);
+    char *joined = len < 0 ? NULL : malloc((size_t)len + 1U);
+    if (joined != NULL) {
+        if (keyed) {
+            snprintf(joined, (size_t)len + 1U, "%s|%s|%s|%s", implementation, platform, arch, tail);
+        } else {
+            snprintf(joined, (size_t)len + 1U, "%s|%s|%s", implementation, platform, arch);
+        }
+    }
+    return joined;
+}
+
+/* The stored column is exactly value: text equal to it, or NULL for a NULL value. */
+static int catalog_same_text(sqlite3_stmt *stmt, int column, const char *value)
+{
+    int type = sqlite3_column_type(stmt, column);
+    if (value == NULL) {
+        return type == SQLITE_NULL;
+    }
+    const char *current = (const char *)sqlite3_column_text(stmt, column);
+    return type == SQLITE_TEXT && current != NULL && strcmp(current, value) == 0;
+}
+
+static int catalog_same_flag(sqlite3_stmt *stmt, int column, int value)
+{
+    return sqlite3_column_type(stmt, column) == SQLITE_INTEGER
+        && sqlite3_column_int64(stmt, column) == (value ? 1 : 0);
+}
+
+static int catalog_holds(const client_download_catalog_row *rows, size_t count, int slot, const char *key)
+{
+    for (size_t i = 0U; i < count; ++i) {
+        const char *held = slot ? rows[i].latest_slot : rows[i].catalog_key;
+        if (held != NULL && strcmp(held, key) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int read_client_download_catalog(sqlite3 *db, client_download_catalog_row **rows_out,
+                                        size_t *count_out, size_t *changed_out)
+{
+    *rows_out = NULL;
+    *count_out = 0U;
+    *changed_out = 0U;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT id, implementation, platform, arch, version, min_supported_version, is_latest, hosted, "
+            "enabled, file_size, catalog_key, latest_slot FROM client_download_link ORDER BY id DESC",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    client_download_catalog_row *rows = NULL;
+    size_t count = 0U;
+    size_t capacity = 0U;
+    size_t changed = 0U;
+    int failed = 0;
+    int step = SQLITE_DONE;
+    while (!failed && (step = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (count == capacity) {
+            size_t grown = capacity == 0U ? 16U : capacity * 2U;
+            client_download_catalog_row *larger = realloc(rows, grown * sizeof(*rows));
+            if (larger == NULL) {
+                failed = 1;
+                break;
+            }
+            rows = larger;
+            capacity = grown;
+        }
+        client_download_catalog_row *row = &rows[count++];
+        memset(row, 0, sizeof(*row));
+        row->id = sqlite3_column_int64(stmt, 0);
+        /* The flags and file_size are read by type before any column is converted to text. */
+        int stored_latest = catalog_truthy(stmt, 6);
+        int enabled = catalog_truthy(stmt, 8);
+        row->hosted = catalog_truthy(stmt, 7);
+        int changed_flags = sqlite3_column_type(stmt, 9) == SQLITE_NULL
+            || !catalog_same_flag(stmt, 7, row->hosted);
+        row->implementation = catalog_trimmed_text(stmt, 1);
+        row->platform = catalog_trimmed_text(stmt, 2);
+        row->arch = catalog_trimmed_text(stmt, 3);
+        if (row->implementation == NULL || row->platform == NULL || row->arch == NULL) {
+            failed = 1;
+            break;
+        }
+        for (char *text = row->implementation; *text != '\0'; ++text) *text = (char)tolower((unsigned char)*text);
+        for (char *text = row->platform; *text != '\0'; ++text) *text = (char)tolower((unsigned char)*text);
+        for (char *text = row->arch; *text != '\0'; ++text) *text = (char)tolower((unsigned char)*text);
+        row->version = catalog_version(stmt, 4, &failed);
+        row->min_supported_version = catalog_version(stmt, 5, &failed);
+        row->catalog_key = failed ? NULL
+            : catalog_join(row->implementation, row->platform, row->arch, 1, row->version, row->id);
+        if (row->catalog_key != NULL && catalog_holds(rows, count - 1U, 0, row->catalog_key)) {
+            /* Keep every duplicate row, but never invent a version visible to update clients. */
+            free(row->version);
+            free(row->catalog_key);
+            row->version = NULL;
+            row->catalog_key = catalog_join(row->implementation, row->platform, row->arch, 1, NULL, row->id);
+        }
+        if (row->catalog_key == NULL) {
+            failed = 1;
+            break;
+        }
+        if (row->version == NULL) {
+            free(row->min_supported_version);
+            row->min_supported_version = NULL;
+        }
+        row->latest = row->version != NULL && stored_latest && enabled;
+        if (row->latest) {
+            row->latest_slot = catalog_join(row->implementation, row->platform, row->arch, 0, NULL, 0);
+            if (row->latest_slot == NULL) {
+                failed = 1;
+                break;
+            }
+            if (catalog_holds(rows, count - 1U, 1, row->latest_slot)) {
+                free(row->latest_slot);
+                row->latest_slot = NULL;
+                row->latest = 0;
+            }
+        }
+        row->changed = changed_flags
+            || !catalog_same_flag(stmt, 6, row->latest)
+            || !catalog_same_text(stmt, 1, row->implementation)
+            || !catalog_same_text(stmt, 2, row->platform)
+            || !catalog_same_text(stmt, 3, row->arch)
+            || !catalog_same_text(stmt, 4, row->version)
+            || !catalog_same_text(stmt, 5, row->min_supported_version)
+            || !catalog_same_text(stmt, 10, row->catalog_key)
+            || !catalog_same_text(stmt, 11, row->latest_slot);
+        if (row->changed) {
+            ++changed;
+        }
+    }
+    if (!failed && step != SQLITE_DONE) {
+        failed = 1;
+    }
+    sqlite3_finalize(stmt);
+    if (failed) {
+        free_client_download_catalog(rows, count);
+        return -1;
+    }
+    *rows_out = rows;
+    *count_out = count;
+    *changed_out = changed;
+    return 0;
+}
+
+/* The keys of every changed row are cleared first, so no new key collides with one about to move. */
+static int apply_client_download_catalog(sqlite3 *db, const client_download_catalog_row *rows, size_t count)
+{
+    sqlite3_stmt *clear = NULL;
+    sqlite3_stmt *update = NULL;
+    int rc = sqlite3_prepare_v2(db,
+            "UPDATE client_download_link SET catalog_key = NULL, latest_slot = NULL WHERE id = ?",
+            -1, &clear, NULL) == SQLITE_OK
+        && sqlite3_prepare_v2(db,
+            "UPDATE client_download_link SET implementation = ?, platform = ?, arch = ?, version = ?, "
+            "min_supported_version = ?, file_size = COALESCE(file_size, 0), is_latest = ?, hosted = ?, "
+            "catalog_key = ?, latest_slot = ? WHERE id = ?",
+            -1, &update, NULL) == SQLITE_OK ? 0 : -1;
+    for (size_t i = 0U; rc == 0 && i < count; ++i) {
+        if (!rows[i].changed) continue;
+        sqlite3_bind_int64(clear, 1, rows[i].id);
+        rc = sqlite3_step(clear) == SQLITE_DONE ? 0 : -1;
+        sqlite3_reset(clear);
+    }
+    for (size_t i = 0U; rc == 0 && i < count; ++i) {
+        const client_download_catalog_row *row = &rows[i];
+        if (!row->changed) continue;
+        sqlite3_bind_text(update, 1, row->implementation, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(update, 2, row->platform, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(update, 3, row->arch, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(update, 4, row->version, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(update, 5, row->min_supported_version, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(update, 6, row->latest ? 1 : 0);
+        sqlite3_bind_int(update, 7, row->hosted ? 1 : 0);
+        sqlite3_bind_text(update, 8, row->catalog_key, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(update, 9, row->latest_slot, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(update, 10, row->id);
+        rc = sqlite3_step(update) == SQLITE_DONE ? 0 : -1;
+        sqlite3_reset(update);
+        sqlite3_clear_bindings(update);
+    }
+    sqlite3_finalize(clear);
+    sqlite3_finalize(update);
+    return rc;
+}
+
+static int migrate_client_download_catalog(sqlite3 *db)
+{
+    int rc = add_column_if_missing(db, "client_download_link", "catalog_key", "TEXT");
+    if (rc == 0) {
+        rc = add_column_if_missing(db, "client_download_link", "latest_slot", "TEXT");
+    }
+    client_download_catalog_row *rows = NULL;
+    size_t count = 0U;
+    size_t changed = 0U;
+    if (rc == 0) {
+        rc = read_client_download_catalog(db, &rows, &count, &changed);
+    }
+    if (rc == 0 && changed > 0U) {
+        free_client_download_catalog(rows, count);
+        rows = NULL;
+        count = 0U;
+        /* Inside the transaction st_storage_init creates a new database in, a savepoint of its own. */
+        int nested = !sqlite3_get_autocommit(db);
+        rc = exec_sql(db, nested ? "SAVEPOINT client_download_catalog" : "BEGIN IMMEDIATE");
+        if (rc == 0) {
+            /* Another process may have changed the catalogue while this one waited for the lock. */
+            rc = read_client_download_catalog(db, &rows, &count, &changed);
+            if (rc == 0) {
+                rc = apply_client_download_catalog(db, rows, count);
+            }
+            if (rc == 0) {
+                rc = exec_sql(db, nested ? "RELEASE client_download_catalog" : "COMMIT");
+            }
+            if (rc != 0) {
+                (void)exec_sql(db, nested
+                    ? "ROLLBACK TO client_download_catalog; RELEASE client_download_catalog" : "ROLLBACK");
+            }
+        }
+    }
+    free_client_download_catalog(rows, count);
+    if (rc == 0) {
+        rc = exec_sql(db,
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_client_download_catalog_key ON client_download_link(catalog_key);"
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_client_download_latest_slot ON client_download_link(latest_slot);");
+    }
+    return rc == 0 ? 0 : -1;
+}
+
 #define MANAGEMENT_LOGIN_NAME_MAX_CHARS 80U
 #define MANAGEMENT_LOGIN_NAME_INDEX "uq_management_user_tenant_login_name"
 
@@ -1024,6 +1372,8 @@ int st_storage_init(const char *path, int seed_demo_client)
         "hosted INTEGER NOT NULL DEFAULT 0,"
         "package_path TEXT,"
         "package_file_name TEXT,"
+        "catalog_key TEXT,"
+        "latest_slot TEXT,"
         "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
         "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
         ");"
@@ -1482,6 +1832,9 @@ int st_storage_init(const char *path, int seed_demo_client)
     }
     if (rc == 0) {
         rc = add_column_if_missing(db, "client_download_link", "package_file_name", "TEXT");
+    }
+    if (rc == 0) {
+        rc = migrate_client_download_catalog(db);
     }
     if (rc == 0) {
         rc = add_column_if_missing(db, "specus_management_user", "tenant_id", "TEXT NOT NULL DEFAULT 'default'");
@@ -4403,7 +4756,7 @@ int st_storage_upsert_client_download_link_extended(const char *path,
     sqlite3_finalize(stmt);
     if (rc == 0 && is_latest) {
         rc = sqlite3_prepare_v2(db,
-            "UPDATE client_download_link SET is_latest = 0, updated_at = CURRENT_TIMESTAMP "
+            "UPDATE client_download_link SET is_latest = 0, latest_slot = NULL, updated_at = CURRENT_TIMESTAMP "
             "WHERE implementation = ? AND platform = ? AND arch = ? AND id <> ?",
             -1, &stmt, NULL);
         if (rc == SQLITE_OK) {
@@ -4417,11 +4770,36 @@ int st_storage_upsert_client_download_link_extended(const char *path,
         }
         sqlite3_finalize(stmt);
     }
+    /*
+     * Java ClientDownloadLinkService keeps the two unique keys of ClientDownloadSchemaMigrator on
+     * every write: catalog_key from the stored target and version (legacy:<id> without one) and
+     * latest_slot on a latest row only. A target that already lists the version, or a latest slot
+     * still held, fails the unique index and the whole write rolls back.
+     */
+    int duplicate = 0;
+    if (rc == 0) {
+        rc = sqlite3_prepare_v2(db,
+            "UPDATE client_download_link SET "
+            "catalog_key = implementation || '|' || platform || '|' || arch || '|' || "
+            "CASE WHEN version IS NULL OR trim(version) = '' THEN 'legacy:' || id ELSE version END, "
+            "latest_slot = CASE WHEN is_latest <> 0 THEN implementation || '|' || platform || '|' || arch END "
+            "WHERE id = ?",
+            -1, &stmt, NULL);
+        if (rc == SQLITE_OK) {
+            sqlite3_bind_int64(stmt, 1, written_id);
+            int step = sqlite3_step(stmt);
+            duplicate = (step & 0xff) == SQLITE_CONSTRAINT;
+            rc = step == SQLITE_DONE ? 0 : -1;
+        } else {
+            rc = -1;
+        }
+        sqlite3_finalize(stmt);
+    }
     if (rc == 0) rc = exec_sql(db, "COMMIT");
     else (void)exec_sql(db, "ROLLBACK");
     sqlite3_close(db);
     if (rc != 0) {
-        return -1;
+        return duplicate ? ST_STORAGE_CLIENT_DOWNLOAD_DUPLICATE : -1;
     }
     return out_link == NULL ? 0 : st_storage_get_client_download_link(path, written_id, out_link);
 }

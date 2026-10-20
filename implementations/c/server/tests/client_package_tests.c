@@ -790,7 +790,8 @@ static int test_version_check_rules(void)
           "staged row");
     CHECK(version_check("implementation=go&platform=linux&arch=x64&current=1.0.0", NULL) == 200
               && contains(response_body(), "\"updateAvailable\":false")
-              && contains(response_body(), "\"latestVersion\":null"),
+              && contains(response_body(), "\"latestVersion\":null")
+              && contains(response_body(), "\"packageId\":null"),
           "a package without an explicit latest was published: %s", response_body());
 
     /* versionCheckSupportsAndroidAnyAndReturnsNullOptionalsWhenNoPackageExists */
@@ -999,10 +1000,14 @@ static int test_catalogue_mutations(void)
                       "\"version\":\"1.2.3\"}") > 0,
           "a non-latest external link with a query was refused");
 
-    /* markLatestRequiresEnabledValidSemanticVersion, on rows an older server stored. */
+    /*
+     * markLatestRequiresEnabledValidSemanticVersion, on rows an older server stored. The next
+     * st_storage_init keys them as Java's ClientDownloadSchemaMigrator does (43 becomes 1.2.3), so the
+     * disabled row has a version of its own rather than Java's 1.2.3, which only the newest row keeps.
+     */
     CHECK(sql_exec("INSERT INTO client_download_link(id, implementation, platform, arch, display_name, download_url, "
                    "enabled, version, sha256, file_size, is_latest, min_supported_version, hosted) VALUES "
-                   "(41, 'go', 'linux', 'x64', 'disabled', 'https://example.test/41', 0, '1.2.3', '" SHA_A "', 100, 0, NULL, 0),"
+                   "(41, 'go', 'linux', 'x64', 'disabled', 'https://example.test/41', 0, '1.2.2', '" SHA_A "', 100, 0, NULL, 0),"
                    "(42, 'go', 'linux', 'x64', 'invalid', 'https://example.test/42', 1, 'not-semver', '" SHA_A "', 100, 0, NULL, 0),"
                    "(43, 'go', 'linux', 'x64', 'canonical', 'https://example.test/43', 1, 'v1.2.3', '" SHA_A "', 100, 0, 'v1.0.0', 0),"
                    "(44, 'go', 'linux', 'x64', 'unversioned', 'https://example.test/44', 1, NULL, NULL, 0, 0, NULL, 0),"
@@ -1025,6 +1030,10 @@ static int test_catalogue_mutations(void)
     CHECK(sql_int("SELECT COUNT(*) FROM client_download_link WHERE id = 43 AND version = '1.2.3' "
                   "AND min_supported_version = '1.0.0' AND is_latest = 1") == 1,
           "mark latest did not store the canonical versions");
+    /* canonicalized.getCatalogKey() == "go|linux|x64|1.2.3", and the row holds its target's slot. */
+    CHECK(sql_int("SELECT COUNT(*) FROM client_download_link WHERE id = 43 AND catalog_key = 'go|linux|x64|1.2.3' "
+                  "AND latest_slot = 'go|linux|x64'") == 1,
+          "mark latest did not key the row by its canonical version");
     /* An unknown id is Java's IllegalArgumentException: 400 with the id. */
     CHECK(admin_call("POST", "/api/admin/client-downloads/999/latest", NULL) == 400
               && contains(response_body(), "client download link not found: 999")
@@ -1035,6 +1044,101 @@ static int test_catalogue_mutations(void)
 }
 
 /* ------------------------------------------------------------------------------------------- */
+
+/*
+ * The catalogue's unique keys (Java ClientDownloadSchemaMigrator, ClientDownloadLinkService.catalogKey
+ * and latestSlot): a target lists each version once and holds one latest. Java answers a write that
+ * would repeat a target and version with its DataIntegrityViolationException handler, 400 and the
+ * message below, for a JSON create or update and a package upload alike (checked against the Java
+ * server over HTTP). Unversioned rows each get their own legacy key.
+ */
+#define DUPLICATE_ANSWER "{\"error\":\"客户端名称已存在或数据不符合约束\"}"
+
+static int test_catalogue_unique_keys(void)
+{
+    CHECK(fresh_database("duplicates") == 0, "database setup failed");
+    use_release_fallback(NULL);
+    long long first = create_link("{\"implementation\":\"go\",\"platform\":\"linux\",\"arch\":\"x64\","
+                                  "\"displayName\":\"Go\",\"downloadUrl\":\"https://example.test/go\","
+                                  "\"version\":\"1.2.3\"}");
+    char query[256];
+    snprintf(query, sizeof(query), "SELECT COUNT(*) FROM client_download_link WHERE id = %lld "
+             "AND catalog_key = 'go|linux|x64|1.2.3' AND latest_slot IS NULL", first);
+    CHECK(first > 0 && sql_int(query) == 1, "a versioned row is not keyed by its target and version");
+    CHECK(admin_call("POST", "/api/admin/client-downloads",
+                     "{\"implementation\":\"GO\",\"platform\":\"linux\",\"arch\":\"x64\",\"displayName\":\"Go\","
+                     "\"downloadUrl\":\"https://example.test/go\",\"version\":\"v1.2.3\"}") == 400
+              && strcmp(response_body(), DUPLICATE_ANSWER) == 0,
+          "a repeated target and version was created: %s", response);
+    CHECK(admin_call("POST", "/api/admin/client-downloads",
+                     "{\"implementation\":\"go\",\"platform\":\"linux\",\"arch\":\"x64\",\"displayName\":\"Go\","
+                     "\"downloadUrl\":\"https://example.test/go\",\"version\":\"1.2.3\",\"sha256\":\"" SHA_A "\","
+                     "\"fileSize\":5,\"isLatest\":true}") == 400
+              && strcmp(response_body(), DUPLICATE_ANSWER) == 0,
+          "a repeated target and version was created as latest: %s", response);
+    CHECK(sql_int("SELECT COUNT(*) FROM client_download_link") == 1
+              && sql_int("SELECT COUNT(*) FROM client_download_link WHERE is_latest = 1 "
+                         "OR latest_slot IS NOT NULL") == 0,
+          "a refused duplicate left a row or a latest slot");
+
+    /* Rows without a version never collide: each is keyed legacy:<id>. */
+    long long legacy = create_link("{\"implementation\":\"go\",\"platform\":\"linux\",\"arch\":\"x64\","
+                                   "\"displayName\":\"Go\",\"downloadUrl\":\"https://example.test/go\"}");
+    long long legacy_two = create_link("{\"implementation\":\"go\",\"platform\":\"linux\",\"arch\":\"x64\","
+                                       "\"displayName\":\"Go\",\"downloadUrl\":\"https://example.test/go\"}");
+    snprintf(query, sizeof(query), "SELECT COUNT(*) FROM client_download_link WHERE id IN (%lld, %lld) "
+             "AND catalog_key = 'go|linux|x64|legacy:' || id", legacy, legacy_two);
+    CHECK(legacy > 0 && legacy_two > 0 && sql_int(query) == 2, "unversioned rows are not keyed by their id");
+
+    /* An update onto a listed version is refused and changes nothing; onto a free one it is keyed anew. */
+    char path[96];
+    snprintf(path, sizeof(path), "/api/admin/client-downloads/%lld", legacy);
+    CHECK(admin_call("PUT", path, "{\"implementation\":\"go\",\"platform\":\"linux\",\"arch\":\"x64\","
+                     "\"displayName\":\"Go\",\"downloadUrl\":\"https://example.test/go\","
+                     "\"version\":\"1.2.3\"}") == 400
+              && strcmp(response_body(), DUPLICATE_ANSWER) == 0,
+          "an update repeated a target and version: %s", response);
+    snprintf(query, sizeof(query), "SELECT COUNT(*) FROM client_download_link WHERE id = %lld AND version IS NULL "
+             "AND catalog_key = 'go|linux|x64|legacy:%lld'", legacy, legacy);
+    CHECK(sql_int(query) == 1, "a refused update changed the row");
+    CHECK(admin_call("PUT", path, "{\"implementation\":\"go\",\"platform\":\"linux\",\"arch\":\"x64\","
+                     "\"displayName\":\"Go\",\"downloadUrl\":\"https://example.test/go\","
+                     "\"version\":\"1.2.4\"}") == 200,
+          "an update to a free version: %s", response);
+    snprintf(query, sizeof(query), "SELECT COUNT(*) FROM client_download_link WHERE id = %lld "
+             "AND catalog_key = 'go|linux|x64|1.2.4'", legacy);
+    CHECK(sql_int(query) == 1, "an updated version was not keyed");
+    /* The same version on another target is a different key. */
+    CHECK(create_link("{\"implementation\":\"go\",\"platform\":\"linux\",\"arch\":\"arm64\",\"displayName\":\"Go\","
+                      "\"downloadUrl\":\"https://example.test/go\",\"version\":\"1.2.3\"}") > 0,
+          "the same version on another target was refused");
+
+    /* A package upload is refused the same way and leaves neither a row nor a file behind. */
+    long long rows = sql_int("SELECT COUNT(*) FROM client_download_link");
+    CHECK(upload_package(go_linux_version("1.2.3"), "hello", 5U, NULL) == 400
+              && strcmp(response_body(), DUPLICATE_ANSWER) == 0,
+          "a package repeated a target and version: %s", response);
+    CHECK(sql_int("SELECT COUNT(*) FROM client_download_link") == rows && package_entries("") == 0,
+          "a refused package upload left a row or a file");
+    long long package = 0;
+    CHECK(upload_package(go_linux_version("1.2.9"), "hello", 5U, &package) == 201, "upload: %s", response);
+    snprintf(query, sizeof(query), "SELECT COUNT(*) FROM client_download_link WHERE id = %lld "
+             "AND catalog_key = 'go|linux|x64|1.2.9'", package);
+    CHECK(sql_int(query) == 1, "a hosted package was not keyed");
+
+    /* The latest slot moves with the flag: only the newest latest row of a target holds it. */
+    long long latest_one = create_link("{\"implementation\":\"java\",\"platform\":\"any\",\"arch\":\"any\","
+        "\"displayName\":\"one\",\"downloadUrl\":\"https://example.test/one\",\"version\":\"1.0.0\","
+        "\"sha256\":\"" SHA_A "\",\"fileSize\":5,\"isLatest\":true}");
+    long long latest_two = create_link("{\"implementation\":\"java\",\"platform\":\"any\",\"arch\":\"any\","
+        "\"displayName\":\"two\",\"downloadUrl\":\"https://example.test/two\",\"version\":\"1.1.0\","
+        "\"sha256\":\"" SHA_A "\",\"fileSize\":5,\"isLatest\":true}");
+    snprintf(query, sizeof(query), "SELECT COUNT(*) FROM client_download_link WHERE (id = %lld AND is_latest = 0 "
+             "AND latest_slot IS NULL) OR (id = %lld AND is_latest = 1 AND latest_slot = 'java|any|any')",
+             latest_one, latest_two);
+    CHECK(latest_one > 0 && latest_two > 0 && sql_int(query) == 2, "the latest slot did not move");
+    return 0;
+}
 
 /* ------------------------------------------------------------------------------------------- */
 /* Shared vector: client-download-link-validation-v1.json                                        */
@@ -1123,10 +1227,16 @@ static int test_download_link_vector(void)
           "the vector has no cases");
     int failures = 0;
     char why[600];
+    /*
+     * Java replays each case against a mocked repository, so no case sees another's row. Here the
+     * catalogue is emptied before each one: several cases register the same target and version,
+     * which the catalogue's unique key would otherwise refuse.
+     */
     for (size_t i = 0; i < create_count; ++i) {
         char *name = st_json_get_top_level_string(creates[i], "name");
         char *body = st_json_get_top_level_raw(creates[i], "body");
-        int status = body == NULL ? -1 : admin_call("POST", "/api/admin/client-downloads", body);
+        int status = body == NULL || sql_exec("DELETE FROM client_download_link") != 0
+            ? -1 : admin_call("POST", "/api/admin/client-downloads", body);
         if (!answer_matches(creates[i], status, 201, why, sizeof(why))) {
             fprintf(stderr, "FAIL create %s: %s\n", name == NULL ? "?" : name, why);
             ++failures;
@@ -1138,7 +1248,7 @@ static int test_download_link_vector(void)
         char *name = st_json_get_top_level_string(updates[i], "name");
         char *body = st_json_get_top_level_raw(updates[i], "body");
         int hosted = 0;
-        long long id = create_link(seed);
+        long long id = sql_exec("DELETE FROM client_download_link") == 0 ? create_link(seed) : -1;
         char statement[160];
         snprintf(statement, sizeof(statement), "UPDATE client_download_link SET hosted = 1 WHERE id = %lld", id);
         char path[96];
@@ -1198,11 +1308,13 @@ int main(void)
         || test_version_check_rules()
         || test_public_list_release_fallback()
         || test_catalogue_mutations()
+        || test_catalogue_unique_keys()
         || test_download_link_vector();
 
     static const char *const databases[] = {
         "download", "rate", "storage", "lifecycle", "legacy-targets", "version-specificity", "version-unmarked",
-        "version-no-latest", "version-release", "list-release", "list-all-configured", "mutations", "vector"
+        "version-no-latest", "version-release", "list-release", "list-all-configured", "mutations", "duplicates",
+        "vector"
     };
     for (size_t i = 0; i < sizeof(databases) / sizeof(databases[0]); ++i) {
         char path[400];
