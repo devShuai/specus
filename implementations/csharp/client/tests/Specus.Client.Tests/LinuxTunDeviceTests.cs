@@ -13,7 +13,7 @@ namespace Specus.Client.Tests;
 /// SPECUS_ROUTE_MUTATION_TEST=1, as root inside a network namespace whose main table is empty.
 /// CI runs it as `sudo unshare -n` in peer-egress-linux.yml. Anywhere else it is skipped.
 /// </remarks>
-public sealed class LinuxTunDeviceTests
+public sealed partial class LinuxTunDeviceTests
 {
     // A device replaced under the same interface name has to be able to take that name at once. The
     // old device's reader held a reference to its handle while it polled, so disposing it returned
