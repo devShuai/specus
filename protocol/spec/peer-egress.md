@@ -131,7 +131,7 @@ IPv6 规则不与 fake-IP 池比较重叠（池是 IPv4）。有 IPv6 数据面�
 ## IPv6 数据面
 
 > 规范已定、实现待交付（#245）。三个客户端交付之前，上文「一期边界」里 IPv6 规则不生效、`SPEG1` 拒绝 IPv6 的行为照旧；
-> 服务端转发 `ipv6PacketCapable` 之前，消费端读不到它，所有出口按未声明处理。
+> 四个服务端已保存并转发 `ipv6PacketCapable`（向量 `peer-egress-ipv6-packet-announcement-v1.json`）；客户端上报它之前，目录里所有出口都是 `false`。
 
 消费端把命中规则的 IPv6 流量也引进 TUN，交给出口，与 IPv4 走同一套规则匹配、路由接管、出口授权与明确失败。三处选择：
 
