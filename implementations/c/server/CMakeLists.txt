@@ -372,7 +372,8 @@ add_test(NAME public_coordination_tests
 add_test(NAME public_discovery_cluster_e2e
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/public_discovery_cluster_e2e.sh
                  $<TARGET_FILE:specus-server-c>)
-set_tests_properties(public_discovery_cluster_e2e PROPERTIES TIMEOUT 45)
+# About 6 s locally; the margin lets a failing step's own timeout (up to 20 s) print the logs.
+set_tests_properties(public_discovery_cluster_e2e PROPERTIES TIMEOUT 90)
 add_test(NAME management_cluster_e2e
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/management_cluster_e2e.py
                     $<TARGET_FILE:specus-server-c>)
@@ -662,6 +663,9 @@ foreach(test_name IN ITEMS websocket_ticket_request websocket_ticket_quota webso
     add_test(NAME ${test_name}_tests COMMAND specus_c_${test_name}_tests)
     set_tests_properties(${test_name}_tests PROPERTIES TIMEOUT 120)
 endforeach()
+# About 30 s alone, but its ~2,100 SQLite commits each wait for an fsync, which a busy disk
+# stretches past 100 s.
+set_tests_properties(websocket_ticket_quota_tests PROPERTIES TIMEOUT 240)
 
 add_executable(specus_c_registration_expiry_tests tests/registration_expiry_tests.c)
 target_link_libraries(specus_c_registration_expiry_tests PRIVATE specus_c_core)

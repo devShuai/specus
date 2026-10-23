@@ -3,15 +3,28 @@
 #include "crypto.h"
 #include "json.h"
 #include "storage.h"
+#include <arpa/inet.h>
+#include <limits.h>
+#include <netinet/in.h>
 #include <openssl/rand.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+/* Unconsumed management tickets of both scopes together. */
 #define ST_WS_TICKET_LIMIT 1024U
+/*
+ * Java stores tickets in its database and caps no category; so does the SQLite store here. Only
+ * the in-memory store (no database configured, C only) bounds anonymous public tickets: per source
+ * (an IPv6 address counts by its /64), refusing that source past the limit, and in total, where the
+ * oldest public ticket gives way to a new one rather than anybody being refused.
+ */
+static unsigned int public_source_limit = 1024U;
+static unsigned int public_total_limit = 16384U;
 typedef struct memory_ticket {
-    char hash[65], remote_hash[65], scope[32], expires[ST_INSTANT_CAPACITY];
+    char hash[65], remote_hash[65], source[65], scope[32], expires[ST_INSTANT_CAPACITY];
     char *json;
     struct memory_ticket *next;
 } memory_ticket;
@@ -40,6 +53,25 @@ static void remote_hash(const char *remote, char out[65])
     while (len > 0U && (unsigned char)*remote <= 32U) { ++remote; --len; }
     while (len > 0U && (unsigned char)remote[len - 1U] <= 32U) --len;
     if (len > 0U) hash_text(remote, len, out);
+}
+/* The source a public ticket counts against: an IPv6 address by its /64, any other text as it is. */
+static void source_bucket(const char *remote, char out[65])
+{
+    remote_hash(remote, out);
+    if (remote == NULL) return;
+    size_t len = strlen(remote);
+    while (len > 0U && (unsigned char)*remote <= 32U) { ++remote; --len; }
+    while (len > 0U && (unsigned char)remote[len - 1U] <= 32U) --len;
+    char text[INET6_ADDRSTRLEN];
+    struct in6_addr address;
+    if (len == 0U || len >= sizeof(text)) return;
+    memcpy(text, remote, len); text[len] = '\0';
+    if (inet_pton(AF_INET6, text, &address) != 1 || IN6_IS_ADDR_V4MAPPED(&address)) return;
+    char prefix[32];
+    int written = snprintf(prefix, sizeof(prefix), "ipv6/64:%02x%02x%02x%02x%02x%02x%02x%02x",
+        address.s6_addr[0], address.s6_addr[1], address.s6_addr[2], address.s6_addr[3],
+        address.s6_addr[4], address.s6_addr[5], address.s6_addr[6], address.s6_addr[7]);
+    if (written > 0 && (size_t)written < sizeof(prefix)) hash_text(prefix, (size_t)written, out);
 }
 static int random_token(char out[64])
 {
@@ -101,24 +133,41 @@ int st_websocket_ticket_issue(const char *scope, const char *attributes_json, co
         || st_instant_public(expires, expires_at, ST_INSTANT_CAPACITY) != 0 || random_token(token) != 0) return -1;
     hash_text(token, strlen(token), hash); remote_hash(remote_address, address);
     const char *path = database_path();
+    int is_public = strcmp(scope, "public-transfer") == 0;
     if (path != NULL) {
         return st_storage_issue_websocket_ticket_limited(path, hash, scope, attributes_json,
-            *address == '\0' ? NULL : address, now, expires, ST_WS_TICKET_LIMIT);
+            *address == '\0' ? NULL : address, now, expires, is_public ? UINT_MAX : ST_WS_TICKET_LIMIT);
     }
     memory_ticket *ticket = calloc(1U, sizeof(*ticket));
     if (ticket == NULL) return -1;
     ticket->json = strdup(attributes_json);
     if (ticket->json == NULL) { free(ticket); return -1; }
     memcpy(ticket->hash, hash, sizeof(hash)); memcpy(ticket->remote_hash, address, sizeof(address));
+    source_bucket(remote_address, ticket->source);
     strcpy(ticket->scope, scope); strcpy(ticket->expires, expires);
     pthread_mutex_lock(&ticket_lock); prune_locked(now);
-    unsigned int count = 0U;
-    int is_public = strcmp(scope, "public-transfer") == 0, collision = 0;
-    for (memory_ticket *existing = memory_tickets; existing != NULL; existing = existing->next) {
-        count += (strcmp(existing->scope, "public-transfer") == 0) == is_public;
+    unsigned int count = 0U, same_source = 0U;
+    int collision = 0;
+    /* Newest first, so the last public ticket seen is the oldest. */
+    memory_ticket **oldest_public = NULL;
+    for (memory_ticket **cursor = &memory_tickets; *cursor != NULL; cursor = &(*cursor)->next) {
+        memory_ticket *existing = *cursor;
+        int existing_public = strcmp(existing->scope, "public-transfer") == 0;
+        if (existing_public == is_public) {
+            ++count;
+            same_source += is_public && strcmp(existing->source, ticket->source) == 0;
+        }
+        if (existing_public) oldest_public = cursor;
         collision |= st_constant_time_eq((const uint8_t *)hash, (const uint8_t *)existing->hash, 64U);
     }
-    int result = collision ? -1 : count >= ST_WS_TICKET_LIMIT ? -2 : 0;
+    int result = collision ? -1
+        : is_public ? (same_source >= public_source_limit ? -2 : 0)
+        : (count >= ST_WS_TICKET_LIMIT ? -2 : 0);
+    if (result == 0 && is_public && count >= public_total_limit && oldest_public != NULL) {
+        memory_ticket *evicted = *oldest_public;
+        *oldest_public = evicted->next;
+        free_ticket(evicted);
+    }
     if (result == 0) { ticket->next = memory_tickets; memory_tickets = ticket; }
     pthread_mutex_unlock(&ticket_lock);
     if (result != 0) free_ticket(ticket);
@@ -166,6 +215,13 @@ void st_websocket_ticket_revoke_memory_identity(const char *tenant_id, const cha
             *cursor = ticket->next; free_ticket(ticket);
         } else cursor = &ticket->next;
     }
+    pthread_mutex_unlock(&ticket_lock);
+}
+void st_websocket_ticket_set_public_limits_for_tests(unsigned int per_source, unsigned int total)
+{
+    pthread_mutex_lock(&ticket_lock);
+    public_source_limit = per_source;
+    public_total_limit = total;
     pthread_mutex_unlock(&ticket_lock);
 }
 void st_websocket_ticket_reset_memory_scope(const char *scope)

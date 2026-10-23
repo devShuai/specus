@@ -54,10 +54,13 @@ for that proxy's CIDRs and make the proxy overwrite `X-Real-IP` and append `X-Fo
 correctly ignores client-supplied forwarding headers. SQLite-backed room invitations and pairing codes use
 `SPECUS_AUTH_JWT_SECRET` for the pairing-code HMAC; configure a stable high-entropy secret or persisted codes
 become invalid after restart. Persistent invitation/pairing-code and diagram-version workflows remain
-SQLite-backed. Discovery writes use a five-second socket timeout by default so one slow browser cannot
-block roster delivery indefinitely; tune `SPECUS_PUBLIC_TRANSFER_DISCOVERY_WRITE_TIMEOUT_SECONDS` if needed.
+SQLite-backed. Each discovery frame must be written within five seconds by default; a browser that does not
+read is closed instead of delaying anyone else. Tune `SPECUS_PUBLIC_TRANSFER_DISCOVERY_WRITE_TIMEOUT_SECONDS`
+if needed.
 For multiple C server instances, set `SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED=true`, configure the same
 `SPECUS_PUBLIC_TRANSFER_REDIS_URI` and key prefix on every instance, and isolate prefixes between environments.
-Startup fails when Redis is missing or invalid; a later Redis/Pub/Sub failure closes local discovery sockets
-instead of silently replacing shared state with process-local state. The current URI parser supports
-`redis://`; deploy Redis on a private trusted network because `rediss://` is not yet supported.
+Startup fails when Redis is missing or invalid. Later Redis failures fail the affected operations and close
+local discovery sockets at the next presence refresh, instead of silently replacing shared state with
+process-local state; the connections come back by themselves once Redis does. The current URI parser supports
+`redis://` only; deploy Redis on a private trusted network because `rediss://` and Sentinel are not
+supported.

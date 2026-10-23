@@ -11,6 +11,7 @@
 #include <hiredis/hiredis.h>
 #include <limits.h>
 #include <utf8proc.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -19,6 +20,7 @@
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #define ST_CLUSTER_EVENT_HEADER_BYTES 26U
@@ -39,15 +41,45 @@ typedef struct {
     long command_timeout_ms;
 } st_cluster_config;
 
+/*
+ * One request/response connection (Java's stateConnection or eventPublishConnection). The lock
+ * serializes commands on the synchronous hiredis context; a context that saw an I/O error or a
+ * timeout cannot be reused, so it is dropped and the next command reconnects, no earlier than the
+ * exponential delay after a failed attempt allows. While it is down only its own commands fail.
+ */
+typedef struct {
+    pthread_mutex_t lock;
+    redisContext *context;     /* NULL while disconnected; changed under lock and state_lock */
+    int connected;             /* context != NULL, readable under state_lock alone */
+    unsigned int failures;     /* consecutive failed reconnect attempts */
+    long long retry_at_ms;     /* monotonic: no reconnect attempt before this */
+    unsigned long reconnects;  /* changed under lock and state_lock, readable under state_lock */
+    const char *name;
+} st_cluster_link;
+
+typedef struct cluster_event_node {
+    st_public_cluster_event event;
+    struct cluster_event_node *next;
+} cluster_event_node;
+
+/* Lock order: a link's lock, then state_lock. */
 typedef struct {
     pthread_mutex_t state_lock;
-    pthread_mutex_t command_lock;
-    redisContext *command;
-    redisContext *subscriber;
+    pthread_cond_t state_cond;   /* wakes the subscriber's reconnect delay and the dispatcher */
+    st_cluster_link command;
+    st_cluster_link publisher;
+    redisContext *subscriber;    /* owned by the subscriber thread; shut down to stop it */
+    unsigned long subscriber_reconnects;
     pthread_t subscriber_thread;
     int subscriber_started;
+    pthread_t dispatcher_thread;
+    int dispatcher_started;
+    cluster_event_node *queue_head;
+    cluster_event_node *queue_tail;
+    size_t queue_count;
+    size_t queue_bytes;
+    unsigned long events_dropped;
     int initialized;
-    int available;
     int stopping;
     st_cluster_config config;
     st_public_cluster_event_handler handler;
@@ -56,8 +88,12 @@ typedef struct {
 
 static st_cluster_state cluster_state = {
     .state_lock = PTHREAD_MUTEX_INITIALIZER,
-    .command_lock = PTHREAD_MUTEX_INITIALIZER
+    .state_cond = PTHREAD_COND_INITIALIZER,
+    .command = {.lock = PTHREAD_MUTEX_INITIALIZER, .name = "command"},
+    .publisher = {.lock = PTHREAD_MUTEX_INITIALIZER, .name = "publish"}
 };
+
+static int cluster_java_whitespace(utf8proc_int32_t codepoint);
 
 static const char cluster_register_script[] =
     "local members = redis.call('SMEMBERS', KEYS[3])\n"
@@ -131,27 +167,158 @@ static const char cluster_rate_script[] =
     "if count > tonumber(ARGV[1]) then return 0 end\n"
     "return 1";
 
-static int cluster_env_bool(const char *name, int fallback)
+#define ST_CLUSTER_ENABLED_ENV "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED"
+#define ST_CLUSTER_LEASE_ENV "SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS"
+#define ST_CLUSTER_REFRESH_ENV "SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS"
+#define ST_CLUSTER_TIMEOUT_ENV "SPECUS_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS"
+
+/* Java String.trim(): drops code units up to U+0020 at both ends. */
+static const char *cluster_java_trim(const char *value, size_t *len)
 {
-    const char *value = getenv(name);
-    if (value == NULL || *value == '\0') return fallback;
-    return strcmp(value, "0") != 0 && strcasecmp(value, "false") != 0
-        && strcasecmp(value, "no") != 0;
+    const char *start = value == NULL ? "" : value;
+    while (*start != '\0' && (unsigned char)*start <= 0x20U) ++start;
+    size_t end = strlen(start);
+    while (end > 0U && (unsigned char)start[end - 1U] <= 0x20U) --end;
+    *len = end;
+    return start;
 }
 
-static long cluster_env_long(const char *name, long fallback)
+/*
+ * Spring's StringToBooleanConverter: the trimmed value, case-insensitive, is one of
+ * true/on/yes/1 (1) or false/off/no/0 (0); anything else fails the binding (-1), a blank value
+ * included. Unset binds nothing (-2). So does an empty value here, where Spring resolves the
+ * placeholder to "" and fails to bind it to the primitive: C keeps the default for "NAME=".
+ */
+static int cluster_spring_bool(const char *value)
 {
-    const char *value = getenv(name);
-    if (value == NULL || *value == '\0') return fallback;
-    char *end = NULL;
-    errno = 0;
-    long parsed = strtol(value, &end, 10);
-    return errno == 0 && end != value && *end == '\0' && parsed > 0 ? parsed : fallback;
+    if (value == NULL || *value == '\0') return -2;
+    size_t len = 0U;
+    const char *start = cluster_java_trim(value, &len);
+    if (len == 0U) return -1;
+    char lowered[8];
+    if (len >= sizeof(lowered)) return -1;
+    for (size_t i = 0U; i < len; ++i) lowered[i] = (char)tolower((unsigned char)start[i]);
+    lowered[len] = '\0';
+    static const char *const true_values[] = {"true", "on", "yes", "1"};
+    static const char *const false_values[] = {"false", "off", "no", "0"};
+    for (size_t i = 0U; i < 4U; ++i) {
+        if (strcmp(lowered, true_values[i]) == 0) return 1;
+        if (strcmp(lowered, false_values[i]) == 0) return 0;
+    }
+    return -1;
+}
+
+/*
+ * Spring's StringToNumberConverterFactory for a long: NumberUtils.parseNumber removes every
+ * whitespace character and reads Long.valueOf (an optional sign and decimal digits) or, after an
+ * optional '-', a 0x, 0X or # prefix, Long.decode's hexadecimal. Anything else, overflow and a
+ * blank value included, fails the binding (-1). Unset binds nothing (-2); so does an empty value
+ * here, which Spring fails to bind to the primitive (C keeps the default, as for the switch).
+ */
+static int cluster_spring_long(const char *value, long long *out)
+{
+    if (value == NULL || *value == '\0') return -2;
+    size_t source_len = strlen(value);
+    char *compact = (char *)malloc(source_len + 1U);
+    if (compact == NULL) return -1;
+    size_t len = 0U;
+    size_t offset = 0U;
+    while (offset < source_len) {
+        utf8proc_int32_t codepoint = 0;
+        utf8proc_ssize_t consumed = utf8proc_iterate((const utf8proc_uint8_t *)value + offset,
+                                                     (utf8proc_ssize_t)(source_len - offset),
+                                                     &codepoint);
+        if (consumed <= 0) {
+            free(compact);
+            return -1;
+        }
+        if (!cluster_java_whitespace(codepoint)) {
+            memcpy(compact + len, value + offset, (size_t)consumed);
+            len += (size_t)consumed;
+        }
+        offset += (size_t)consumed;
+    }
+    compact[len] = '\0';
+    const char *cursor = compact;
+    int negative = 0;
+    int hex = 0;
+    if (*cursor == '-' || *cursor == '+') {
+        negative = *cursor == '-';
+        ++cursor;
+    }
+    if (compact[0] != '+' && (strncmp(cursor, "0x", 2U) == 0 || strncmp(cursor, "0X", 2U) == 0)) {
+        hex = 1;
+        cursor += 2;
+    } else if (compact[0] != '+' && *cursor == '#') {
+        hex = 1;
+        ++cursor;
+    }
+    int base = hex ? 16 : 10;
+    unsigned long long magnitude = 0U;
+    unsigned long long limit = negative ? (unsigned long long)LLONG_MAX + 1U : (unsigned long long)LLONG_MAX;
+    int valid = *cursor != '\0';
+    for (; valid && *cursor != '\0'; ++cursor) {
+        int digit = isdigit((unsigned char)*cursor) ? *cursor - '0'
+            : hex && isxdigit((unsigned char)*cursor) ? tolower((unsigned char)*cursor) - 'a' + 10 : -1;
+        if (digit < 0 || magnitude > (limit - (unsigned long long)digit) / (unsigned long long)base) {
+            valid = 0;
+        } else {
+            magnitude = magnitude * (unsigned long long)base + (unsigned long long)digit;
+        }
+    }
+    free(compact);
+    if (!valid) return -1;
+    *out = negative ? (magnitude == (unsigned long long)LLONG_MAX + 1U ? LLONG_MIN : -(long long)magnitude)
+                    : (long long)magnitude;
+    return 0;
 }
 
 int st_public_coordination_enabled(void)
 {
-    return cluster_env_bool("SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", 0);
+    return cluster_spring_bool(getenv(ST_CLUSTER_ENABLED_ENV)) == 1;
+}
+
+int st_public_coordination_validate_config(void)
+{
+    if (cluster_spring_bool(getenv(ST_CLUSTER_ENABLED_ENV)) == -1) {
+        fprintf(stderr, "invalid boolean %s; use true/false, on/off, yes/no or 1/0\n", ST_CLUSTER_ENABLED_ENV);
+        return -1;
+    }
+    static const char *const numbers[] = {ST_CLUSTER_LEASE_ENV, ST_CLUSTER_REFRESH_ENV, ST_CLUSTER_TIMEOUT_ENV};
+    for (size_t i = 0U; i < sizeof(numbers) / sizeof(numbers[0]); ++i) {
+        long long ignored = 0;
+        if (cluster_spring_long(getenv(numbers[i]), &ignored) == -1) {
+            fprintf(stderr, "invalid number %s\n", numbers[i]);
+            return -1;
+        }
+    }
+    /*
+     * Java also schedules refreshClusterPresence with @Scheduled(fixedDelayString) from the same
+     * value, clustering on or off: DurationFormatterUtils reads it as a sign and decimal digits
+     * (no blanks, no hexadecimal; a unit suffix would already fail the number), and the scheduler
+     * refuses a delay that is not positive. Either way Java does not start.
+     */
+    const char *refresh = getenv(ST_CLUSTER_REFRESH_ENV);
+    if (refresh != NULL && *refresh != '\0') {
+        const char *digits = refresh + (*refresh == '+' || *refresh == '-');
+        int decimal = *digits != '\0';
+        for (const char *cursor = digits; decimal && *cursor != '\0'; ++cursor)
+            decimal = *cursor >= '0' && *cursor <= '9';
+        long long period = 0;
+        if (!decimal || cluster_spring_long(refresh, &period) != 0 || period <= 0) {
+            fprintf(stderr, "%s must be a positive number of milliseconds\n", ST_CLUSTER_REFRESH_ENV);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* The bound value, or fallback when the variable binds nothing; -1 when it is not a number. */
+static int cluster_env_long(const char *name, long long fallback, long long *out)
+{
+    int parsed = cluster_spring_long(getenv(name), out);
+    if (parsed == -2) *out = fallback;
+    return parsed == -1 ? -1 : 0;
 }
 
 static int cluster_percent_decode(const char *source, size_t len, char *out, size_t out_len)
@@ -174,11 +341,39 @@ static int cluster_percent_decode(const char *source, size_t len, char *out, siz
     return 0;
 }
 
+/* Java's StringUtils.hasText: some character that is not Character.isWhitespace. */
+static int cluster_has_text(const char *value)
+{
+    if (value == NULL) return 0;
+    size_t len = strlen(value);
+    size_t offset = 0U;
+    while (offset < len) {
+        utf8proc_int32_t codepoint = 0;
+        utf8proc_ssize_t consumed = utf8proc_iterate((const utf8proc_uint8_t *)value + offset,
+                                                     (utf8proc_ssize_t)(len - offset),
+                                                     &codepoint);
+        if (consumed <= 0 || !cluster_java_whitespace(codepoint)) return 1;
+        offset += (size_t)consumed;
+    }
+    return 0;
+}
+
 static int cluster_parse_uri(st_cluster_config *config)
 {
-    const char *uri = getenv("SPECUS_PUBLIC_TRANSFER_REDIS_URI");
+    /* Java: RedisURI.create(redisUri.trim()). */
+    size_t uri_len = 0U;
+    const char *raw_uri = getenv("SPECUS_PUBLIC_TRANSFER_REDIS_URI");
+    const char *trimmed_uri = cluster_java_trim(raw_uri, &uri_len);
+    char uri_buffer[2048];
     static const char scheme[] = "redis://";
-    if (uri == NULL || strncmp(uri, scheme, sizeof(scheme) - 1U) != 0) {
+    if (raw_uri == NULL || uri_len >= sizeof(uri_buffer)) {
+        fprintf(stderr, "public transfer Redis URI must use redis://\n");
+        return -1;
+    }
+    memcpy(uri_buffer, trimmed_uri, uri_len);
+    uri_buffer[uri_len] = '\0';
+    const char *uri = uri_buffer;
+    if (strncmp(uri, scheme, sizeof(scheme) - 1U) != 0) {
         fprintf(stderr, "public transfer Redis URI must use redis://\n");
         return -1;
     }
@@ -254,29 +449,38 @@ static int cluster_parse_uri(st_cluster_config *config)
         if (end == database_text || *end != '\0' || parsed < 0 || parsed > 15) return -1;
         config->database = (int)parsed;
     }
+    /*
+     * Java keyPrefix(): a value without text means the default; otherwise trim() and drop the
+     * trailing colons, which may leave an empty prefix ("::").
+     */
     const char *prefix = getenv("SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX");
-    if (prefix == NULL || *prefix == '\0') prefix = "specus:v2:public-transfer";
-    while (isspace((unsigned char)*prefix)) ++prefix;
-    size_t prefix_len = strlen(prefix);
-    while (prefix_len > 0U && (isspace((unsigned char)prefix[prefix_len - 1U])
-            || prefix[prefix_len - 1U] == ':')) --prefix_len;
-    if (prefix_len == 0U || prefix_len >= sizeof(config->key_prefix)) return -1;
+    if (!cluster_has_text(prefix)) prefix = "specus:v2:public-transfer";
+    size_t prefix_len = 0U;
+    prefix = cluster_java_trim(prefix, &prefix_len);
+    while (prefix_len > 0U && prefix[prefix_len - 1U] == ':') --prefix_len;
+    if (prefix_len >= sizeof(config->key_prefix)) return -1;
     memcpy(config->key_prefix, prefix, prefix_len);
     config->key_prefix[prefix_len] = '\0';
-    config->lease_seconds = cluster_env_long("SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS", 30L);
-    if (config->lease_seconds < 5L) config->lease_seconds = 5L;
-    config->refresh_interval_ms = cluster_env_long(
-        "SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", 10000L);
-    config->command_timeout_ms = cluster_env_long(
-        "SPECUS_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS", 2000L);
-    if (config->command_timeout_ms < 100L) config->command_timeout_ms = 100L;
-    if (config->lease_seconds > LONG_MAX / 1000L
-        || config->refresh_interval_ms > LONG_MAX / 2L
-        || config->refresh_interval_ms <= 0L
-        || config->refresh_interval_ms * 2L >= config->lease_seconds * 1000L) {
+    long long lease = 0;
+    long long refresh = 0;
+    long long timeout = 0;
+    if (cluster_env_long(ST_CLUSTER_LEASE_ENV, 30, &lease) != 0
+        || cluster_env_long(ST_CLUSTER_REFRESH_ENV, 10000, &refresh) != 0
+        || cluster_env_long(ST_CLUSTER_TIMEOUT_ENV, 2000, &timeout) != 0) {
+        fprintf(stderr, "public transfer cluster settings must be numbers\n");
+        return -1;
+    }
+    /* Java leaseMillis() = max(5, lease) * 1000 and commandTimeoutMillis() = max(100, timeout). */
+    if (lease < 5) lease = 5;
+    if (timeout < 100) timeout = 100;
+    if (lease > LONG_MAX / 1000L || timeout > LONG_MAX || refresh > LONG_MAX / 2L
+        || refresh <= 0 || refresh * 2 >= lease * 1000) {
         fprintf(stderr, "public transfer presence refresh must be positive and less than half the lease TTL\n");
         return -1;
     }
+    config->lease_seconds = (long)lease;
+    config->refresh_interval_ms = (long)refresh;
+    config->command_timeout_ms = (long)timeout;
     return 0;
 }
 
@@ -286,7 +490,8 @@ static int cluster_reply_ok(redisReply *reply)
         && reply->str != NULL && strcasecmp(reply->str, "OK") == 0;
 }
 
-static redisContext *cluster_connect(const st_cluster_config *config)
+/* Connects, authenticates, selects the database and checks PING; quiet skips the failure log. */
+static redisContext *cluster_connect(const st_cluster_config *config, int quiet)
 {
     struct timeval connect_timeout = {
         .tv_sec = config->command_timeout_ms / 1000L,
@@ -294,8 +499,9 @@ static redisContext *cluster_connect(const st_cluster_config *config)
     };
     redisContext *redis = redisConnectWithTimeout(config->host, config->port, connect_timeout);
     if (redis == NULL || redis->err) {
-        fprintf(stderr, "public transfer Redis connect failed: %s\n",
-                redis == NULL ? "out of memory" : redis->errstr);
+        if (!quiet)
+            fprintf(stderr, "public transfer Redis connect failed: %s\n",
+                    redis == NULL ? "out of memory" : redis->errstr);
         if (redis != NULL) redisFree(redis);
         return NULL;
     }
@@ -310,7 +516,7 @@ static redisContext *cluster_connect(const st_cluster_config *config)
         else
             reply = redisCommand(redis, "AUTH %s", config->password);
         if (!cluster_reply_ok(reply)) {
-            fprintf(stderr, "public transfer Redis authentication failed\n");
+            if (!quiet) fprintf(stderr, "public transfer Redis authentication failed\n");
             freeReplyObject(reply);
             redisFree(redis);
             return NULL;
@@ -320,7 +526,7 @@ static redisContext *cluster_connect(const st_cluster_config *config)
     if (config->database != 0) {
         reply = redisCommand(redis, "SELECT %d", config->database);
         if (!cluster_reply_ok(reply)) {
-            fprintf(stderr, "public transfer Redis database selection failed\n");
+            if (!quiet) fprintf(stderr, "public transfer Redis database selection failed\n");
             freeReplyObject(reply);
             redisFree(redis);
             return NULL;
@@ -338,34 +544,141 @@ static redisContext *cluster_connect(const st_cluster_config *config)
     return redis;
 }
 
-static void cluster_mark_unavailable(void)
+static long long cluster_now_ms(void)
 {
-    st_public_cluster_event_handler handler = NULL;
-    void *context = NULL;
-    int notify = 0;
+    struct timespec now;
+    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000L;
+}
+
+/* Lettuce's default ExponentialDelay: 2^(attempt-1) ms, at most 30 s. */
+static long cluster_reconnect_delay_ms(unsigned int failures)
+{
+    if (failures == 0U) return 0L;
+    if (failures > 16U) return ST_PUBLIC_CLUSTER_RECONNECT_MAX_DELAY_MS;
+    long delay = 1L << (failures - 1U);
+    return delay > ST_PUBLIC_CLUSTER_RECONNECT_MAX_DELAY_MS ? ST_PUBLIC_CLUSTER_RECONNECT_MAX_DELAY_MS : delay;
+}
+
+/* Initialized and not stopping: operations may try Redis. */
+static int cluster_ready(void)
+{
     pthread_mutex_lock(&cluster_state.state_lock);
-    if (cluster_state.available && !cluster_state.stopping) {
-        cluster_state.available = 0;
-        handler = cluster_state.handler;
-        context = cluster_state.handler_context;
-        notify = 1;
-    }
+    int ready = cluster_state.initialized && !cluster_state.stopping;
     pthread_mutex_unlock(&cluster_state.state_lock);
-    if (notify && handler != NULL) {
-        st_public_cluster_event event;
-        memset(&event, 0, sizeof(event));
-        event.kind = ST_PUBLIC_CLUSTER_EVENT_UNAVAILABLE;
-        handler(&event, context);
+    return ready;
+}
+
+/* With link->lock held: installs context (NULL when it was dropped); reconnected counts it. */
+static void cluster_link_set_locked(st_cluster_link *link, redisContext *context, int reconnected)
+{
+    pthread_mutex_lock(&cluster_state.state_lock);
+    link->context = context;
+    link->connected = context != NULL;
+    if (reconnected) ++link->reconnects;
+    pthread_mutex_unlock(&cluster_state.state_lock);
+}
+
+/*
+ * An idle request/response connection has nothing to read; when it is readable, Redis closed it
+ * (or reset it) while idle. Lettuce notices such a close at once and reconnects in the
+ * background, so the next command runs on a new connection instead of failing on the old one.
+ */
+static int cluster_context_closed(const redisContext *context)
+{
+    struct pollfd poller = {.fd = context->fd, .events = POLLIN, .revents = 0};
+    int ready;
+    do {
+        ready = poll(&poller, 1, 0);
+    } while (ready < 0 && errno == EINTR);
+    return ready != 0;
+}
+
+/* With link->lock held: the live context, reconnecting first when the delay allows. */
+static redisContext *cluster_link_context_locked(st_cluster_link *link)
+{
+    if (link->context != NULL && cluster_context_closed(link->context)) {
+        fprintf(stderr, "[public-transfer] Redis %s connection closed by the server; reconnecting\n", link->name);
+        redisContext *closed = link->context;
+        cluster_link_set_locked(link, NULL, 0);
+        redisFree(closed);
     }
+    if (link->context != NULL) return link->context;
+    pthread_mutex_lock(&cluster_state.state_lock);
+    int usable = cluster_state.initialized && !cluster_state.stopping;
+    st_cluster_config config = cluster_state.config;
+    pthread_mutex_unlock(&cluster_state.state_lock);
+    long long now = cluster_now_ms();
+    if (!usable || now < link->retry_at_ms) return NULL;
+    redisContext *context = cluster_connect(&config, link->failures > 0U);
+    if (context == NULL) {
+        if (link->failures < UINT_MAX) ++link->failures;
+        link->retry_at_ms = cluster_now_ms() + cluster_reconnect_delay_ms(link->failures);
+        if (link->failures == 1U)
+            fprintf(stderr, "[public-transfer] Redis %s connection unavailable; retrying\n", link->name);
+        return NULL;
+    }
+    if (link->failures > 0U)
+        fprintf(stderr, "[public-transfer] Redis %s connection restored\n", link->name);
+    link->failures = 0U;
+    link->retry_at_ms = 0;
+    cluster_link_set_locked(link, context, 1);
+    return context;
+}
+
+/*
+ * One command on a link, as Lettuce's command(): an error reply or a failure only fails this
+ * call. A NULL reply (I/O error, timeout) leaves the synchronous context unusable, so it is
+ * dropped; the next command reconnects at once and backs off only when that attempt fails.
+ */
+static redisReply *cluster_link_command(st_cluster_link *link, int argc, const char **argv,
+                                        const size_t *lengths)
+{
+    pthread_mutex_lock(&link->lock);
+    redisContext *context = cluster_link_context_locked(link);
+    redisReply *reply = context == NULL ? NULL
+        : (redisReply *)redisCommandArgv(context, argc, argv, lengths);
+    if (context != NULL && reply == NULL) {
+        fprintf(stderr, "public transfer Redis %s connection failed: %s\n", link->name,
+                context->errstr[0] != '\0' ? context->errstr : "no reply");
+        cluster_link_set_locked(link, NULL, 0);
+        redisFree(context);
+    } else if (reply != NULL && reply->type == REDIS_REPLY_ERROR && reply->str != NULL) {
+        fprintf(stderr, "public transfer Redis command failed: %s\n", reply->str);
+    }
+    pthread_mutex_unlock(&link->lock);
+    return reply;
+}
+
+static redisReply *cluster_command_argv(int argc, const char **argv, const size_t *lengths)
+{
+    return cluster_link_command(&cluster_state.command, argc, argv, lengths);
 }
 
 int st_public_coordination_available(void)
 {
-    int available;
     pthread_mutex_lock(&cluster_state.state_lock);
-    available = cluster_state.available;
+    int available = cluster_state.initialized && !cluster_state.stopping
+        && cluster_state.command.connected && cluster_state.subscriber != NULL;
     pthread_mutex_unlock(&cluster_state.state_lock);
     return available;
+}
+
+void st_public_coordination_status_get(st_public_coordination_status *status)
+{
+    if (status == NULL) return;
+    memset(status, 0, sizeof(*status));
+    pthread_mutex_lock(&cluster_state.state_lock);
+    status->initialized = cluster_state.initialized;
+    status->command_connected = cluster_state.command.connected;
+    status->publisher_connected = cluster_state.publisher.connected;
+    status->subscriber_connected = cluster_state.subscriber != NULL;
+    status->command_reconnects = cluster_state.command.reconnects;
+    status->publisher_reconnects = cluster_state.publisher.reconnects;
+    status->subscriber_reconnects = cluster_state.subscriber_reconnects;
+    status->events_dropped = cluster_state.events_dropped;
+    status->events_queued = cluster_state.queue_count;
+    pthread_mutex_unlock(&cluster_state.state_lock);
 }
 
 long st_public_coordination_refresh_interval_ms(void)
@@ -374,22 +687,6 @@ long st_public_coordination_refresh_interval_ms(void)
     long interval = cluster_state.config.refresh_interval_ms;
     pthread_mutex_unlock(&cluster_state.state_lock);
     return interval > 0L ? interval : 10000L;
-}
-
-static redisReply *cluster_command_argv(int argc, const char **argv, const size_t *lengths)
-{
-    pthread_mutex_lock(&cluster_state.command_lock);
-    pthread_mutex_lock(&cluster_state.state_lock);
-    redisContext *command = cluster_state.available ? cluster_state.command : NULL;
-    pthread_mutex_unlock(&cluster_state.state_lock);
-    redisReply *reply = command == NULL ? NULL
-        : (redisReply *)redisCommandArgv(command, argc, argv, lengths);
-    int failed = reply == NULL || reply->type == REDIS_REPLY_ERROR;
-    if (failed && reply != NULL && reply->str != NULL)
-        fprintf(stderr, "public transfer Redis command failed: %s\n", reply->str);
-    pthread_mutex_unlock(&cluster_state.command_lock);
-    if (failed) cluster_mark_unavailable();
-    return reply;
 }
 
 static redisReply *cluster_eval(const char *script,
@@ -702,7 +999,7 @@ int st_public_coordination_register(const st_public_cluster_participant *partici
                                     int room_limit,
                                     uint64_t *revision)
 {
-    if (participant == NULL || revision == NULL || !st_public_coordination_available()) return -1;
+    if (participant == NULL || revision == NULL || !cluster_ready()) return -1;
     char member_id[65];
     cluster_sha_hex(participant->peer_id, member_id);
     char presence[512], name_key[512], members[512], group_revision[512];
@@ -753,7 +1050,7 @@ int st_public_coordination_register(const st_public_cluster_participant *partici
 
 int st_public_coordination_refresh(const st_public_cluster_participant *participant)
 {
-    if (participant == NULL || !st_public_coordination_available()) return -1;
+    if (participant == NULL || !cluster_ready()) return -1;
     char member_id[65];
     cluster_sha_hex(participant->peer_id, member_id);
     char presence[512], name_key[512], members[512], nets[512];
@@ -776,17 +1073,18 @@ int st_public_coordination_refresh(const st_public_cluster_participant *particip
                                      sizeof(arguments) / sizeof(arguments[0]));
     free(peer_value);
     free(name_value);
+    /* Java: an error reply throws (Redis failure); otherwise anything but 1 is a lost lease. */
     long long refreshed = 0;
-    int had_reply = reply != NULL;
+    int failed = reply == NULL || reply->type == REDIS_REPLY_ERROR;
     int result = cluster_reply_integer(reply, &refreshed) == 0 && refreshed == 1 ? 0 : 1;
     freeReplyObject(reply);
-    return had_reply ? result : -1;
+    return failed ? -1 : result;
 }
 
 int st_public_coordination_unregister(const st_public_cluster_participant *participant,
                                       uint64_t *revision)
 {
-    if (participant == NULL || revision == NULL || !st_public_coordination_available()) return -1;
+    if (participant == NULL || revision == NULL || !cluster_ready()) return -1;
     char member_id[65];
     cluster_sha_hex(participant->peer_id, member_id);
     char presence[512], name_key[512], members[512], group_revision[512];
@@ -857,18 +1155,15 @@ static int cluster_cleanup(const char *group_id,
     return 0;
 }
 
-int st_public_coordination_sweep(const st_public_cluster_participant *participant)
+int st_public_coordination_sweep(const char *group_id, const char *net_id)
 {
-    if (participant == NULL || !st_public_coordination_available()) return -1;
+    if (group_id == NULL || net_id == NULL || !cluster_ready()) return -1;
     long long removed = 0;
     uint64_t revision = 0U;
-    if (cluster_cleanup(participant->group_id,
-                        participant->net_id,
-                        &removed,
-                        &revision) != 0) return -1;
+    if (cluster_cleanup(group_id, net_id, &removed, &revision) != 0) return -1;
     if (removed > 0) {
-        if (st_public_coordination_publish_roster(participant->group_id, revision) != 0
-            || st_public_coordination_publish_roster(participant->net_id, revision) != 0) return -1;
+        if (st_public_coordination_publish_roster(group_id, revision) != 0
+            || st_public_coordination_publish_roster(net_id, revision) != 0) return -1;
     }
     return 0;
 }
@@ -1121,6 +1416,63 @@ static int cluster_participant_compare(const void *left, const void *right)
     return connected != 0 ? connected : strcmp(a->peer_id, b->peer_id);
 }
 
+/*
+ * The presences of one group as Java reads them: SMEMBERS members:<group>, then one MGET of every
+ * member's presence key. *reply is the MGET reply (NULL for an empty group); its elements are the
+ * encoded presences, nil where a lease already expired.
+ */
+static int cluster_group_presences(const char *group_id, redisReply **reply)
+{
+    *reply = NULL;
+    char members_key[512];
+    if (cluster_key(members_key, sizeof(members_key), "members", group_id) != 0) return -1;
+    char **members = NULL;
+    size_t member_count = 0U;
+    if (cluster_smembers(members_key, &members, &member_count) != 0) return -1;
+    if (member_count == 0U) {
+        cluster_strings_free(members, member_count);
+        return 0;
+    }
+    size_t argc = member_count + 1U;
+    const char **argv = (const char **)calloc(argc, sizeof(*argv));
+    size_t *lengths = (size_t *)calloc(argc, sizeof(*lengths));
+    char **keys = (char **)calloc(member_count, sizeof(*keys));
+    int failed = argv == NULL || lengths == NULL || keys == NULL;
+    if (!failed) {
+        argv[0] = "MGET";
+        lengths[0] = 4U;
+    }
+    for (size_t i = 0U; !failed && i < member_count; ++i) {
+        char key[512];
+        failed = cluster_presence_key(key, sizeof(key), group_id, members[i]) != 0
+            || (keys[i] = strdup(key)) == NULL;
+        if (!failed) {
+            argv[i + 1U] = keys[i];
+            lengths[i + 1U] = strlen(keys[i]);
+        }
+    }
+    redisReply *values = failed ? NULL : cluster_command_argv((int)argc, argv, lengths);
+    if (keys != NULL) cluster_strings_free(keys, member_count);
+    free(argv);
+    free(lengths);
+    cluster_strings_free(members, member_count);
+    if (values == NULL || values->type != REDIS_REPLY_ARRAY || values->elements != member_count) {
+        freeReplyObject(values);
+        return -1;
+    }
+    *reply = values;
+    return 0;
+}
+
+static int cluster_presence_decode(const redisReply *value,
+                                   const char *group_id,
+                                   st_public_cluster_participant *participant)
+{
+    return value != NULL && value->type == REDIS_REPLY_STRING && value->str != NULL
+        && cluster_decode_participant(value->str, value->len, participant) == 0
+        && strcmp(participant->group_id, group_id) == 0 ? 0 : -1;
+}
+
 static int cluster_read_participants(const st_public_cluster_participant *recipient,
                                      char **groups,
                                      size_t group_count,
@@ -1128,38 +1480,18 @@ static int cluster_read_participants(const st_public_cluster_participant *recipi
 {
     size_t capacity = 0U;
     for (size_t group = 0U; group < group_count; ++group) {
-        char members_key[512];
-        if (cluster_key(members_key, sizeof(members_key), "members", groups[group]) != 0) return -1;
-        char **members = NULL;
-        size_t member_count = 0U;
-        if (cluster_smembers(members_key, &members, &member_count) != 0) return -1;
-        for (size_t member = 0U; member < member_count; ++member) {
-            char presence_key[512];
-            char *encoded = NULL;
-            size_t encoded_len = 0U;
-            int found = 0;
-            if (cluster_presence_key(presence_key,
-                                     sizeof(presence_key),
-                                     groups[group],
-                                     members[member]) != 0
-                || cluster_get(presence_key, &encoded, &encoded_len, &found) != 0) {
-                cluster_strings_free(members, member_count);
+        redisReply *values = NULL;
+        if (cluster_group_presences(groups[group], &values) != 0) return -1;
+        for (size_t i = 0U; values != NULL && i < values->elements; ++i) {
+            st_public_cluster_participant participant;
+            if (cluster_presence_decode(values->element[i], groups[group], &participant) == 0
+                && cluster_visible(recipient, &participant)
+                && cluster_roster_append(roster, &capacity, &participant) != 0) {
+                freeReplyObject(values);
                 return -1;
             }
-            if (found) {
-                st_public_cluster_participant participant;
-                if (cluster_decode_participant(encoded, encoded_len, &participant) == 0
-                    && strcmp(participant.group_id, groups[group]) == 0
-                    && cluster_visible(recipient, &participant)
-                    && cluster_roster_append(roster, &capacity, &participant) != 0) {
-                    free(encoded);
-                    cluster_strings_free(members, member_count);
-                    return -1;
-                }
-            }
-            free(encoded);
         }
-        cluster_strings_free(members, member_count);
+        freeReplyObject(values);
     }
     return 0;
 }
@@ -1174,7 +1506,7 @@ void st_public_coordination_roster_free(st_public_cluster_roster *roster)
 int st_public_coordination_roster(const st_public_cluster_participant *recipient,
                                   st_public_cluster_roster *roster)
 {
-    if (recipient == NULL || roster == NULL || !st_public_coordination_available()) return -1;
+    if (recipient == NULL || roster == NULL || !cluster_ready()) return -1;
     memset(roster, 0, sizeof(*roster));
     char **groups = NULL;
     size_t group_count = 0U;
@@ -1193,9 +1525,12 @@ int st_public_coordination_roster(const st_public_cluster_participant *recipient
             cleanup_revision = revision;
         }
     }
-    if (removed_any) {
-        (void)st_public_coordination_publish_roster(recipient->group_id, cleanup_revision);
-        (void)st_public_coordination_publish_roster(recipient->net_id, cleanup_revision);
+    /* Java roster(): a failed publish fails the read like any other Redis error. */
+    if (removed_any
+        && (st_public_coordination_publish_roster(recipient->group_id, cleanup_revision) != 0
+            || st_public_coordination_publish_roster(recipient->net_id, cleanup_revision) != 0)) {
+        cluster_strings_free(groups, group_count);
+        return -1;
     }
     int result = -1;
     for (int attempt = 0; attempt < 2; ++attempt) {
@@ -1226,26 +1561,44 @@ int st_public_coordination_find_peer(const st_public_cluster_participant *recipi
                                     st_public_cluster_participant *target,
                                     int *found)
 {
-    if (recipient == NULL || peer_id == NULL || target == NULL || found == NULL) return -1;
+    if (recipient == NULL || peer_id == NULL || target == NULL || found == NULL || !cluster_ready()) return -1;
     *found = 0;
-    st_public_cluster_roster roster;
-    if (st_public_coordination_roster(recipient, &roster) != 0) return -1;
-    for (size_t i = 0U; i < roster.count; ++i) {
-        if (strcmp(roster.participants[i].peer_id, peer_id) == 0) {
-            *target = roster.participants[i];
-            *found = 1;
+    if (!cluster_has_text(peer_id)) return 0;
+    /*
+     * Java findPeer: a read-only walk of the merged scope's groups, the recipient's own group
+     * first, one SMEMBERS and one MGET per group; no cleanup and no revision reads.
+     */
+    char **groups = NULL;
+    size_t group_count = 0U;
+    if (cluster_net_groups(recipient, &groups, &group_count) != 0) return -1;
+    int result = 0;
+    for (size_t group = 0U; group < group_count && !*found && result == 0; ++group) {
+        redisReply *values = NULL;
+        if (cluster_group_presences(groups[group], &values) != 0) {
+            result = -1;
             break;
         }
+        for (size_t i = 0U; values != NULL && i < values->elements; ++i) {
+            st_public_cluster_participant participant;
+            if (cluster_presence_decode(values->element[i], groups[group], &participant) == 0
+                && strcmp(participant.peer_id, peer_id) == 0
+                && cluster_visible(recipient, &participant)) {
+                *target = participant;
+                *found = 1;
+                break;
+            }
+        }
+        freeReplyObject(values);
     }
-    st_public_coordination_roster_free(&roster);
-    return 0;
+    cluster_strings_free(groups, group_count);
+    return result;
 }
 
 int st_public_coordination_name_available(const char *display_name,
                                           const char *exclude_peer_id,
                                           int *available)
 {
-    if (display_name == NULL || available == NULL || !st_public_coordination_available()) return -1;
+    if (display_name == NULL || available == NULL || !cluster_ready()) return -1;
     char key[512];
     if (cluster_name_key(key, sizeof(key), display_name) != 0) return -1;
     char *owner = NULL;
@@ -1271,7 +1624,7 @@ int st_public_coordination_allow_rate(const char *bucket,
                                       int *allowed)
 {
     if (bucket == NULL || identity == NULL || allowed == NULL
-        || !st_public_coordination_available()) return -1;
+        || !cluster_ready()) return -1;
     size_t bucket_len = strlen(bucket);
     size_t identity_len = strlen(identity);
     uint8_t *input = (uint8_t *)malloc(bucket_len + 1U + identity_len);
@@ -1535,7 +1888,7 @@ static int cluster_publish(uint8_t kind,
 {
     uint8_t *encoded = NULL;
     size_t encoded_len = 0U;
-    if (!st_public_coordination_available()
+    if (!cluster_ready()
         || cluster_event_encode(kind,
                                 group_id,
                                 target_peer_id,
@@ -1557,7 +1910,8 @@ static int cluster_publish(uint8_t kind,
     }
     const char *argv[] = {"PUBLISH", channel, (const char *)encoded};
     size_t lengths[] = {7U, (size_t)channel_len, encoded_len};
-    redisReply *reply = cluster_command_argv(3, argv, lengths);
+    /* Java publishes on its own eventPublishConnection, apart from the state commands. */
+    redisReply *reply = cluster_link_command(&cluster_state.publisher, 3, argv, lengths);
     free(encoded);
     long long receivers = 0;
     int result = cluster_reply_integer(reply, &receivers);
@@ -1619,72 +1973,33 @@ int st_public_coordination_publish_binary(const char *group_id,
                            payload_len);
 }
 
-static void *cluster_subscriber_thread(void *unused)
+/* Waits up to delay_ms on state_cond, returning early only when stopping. */
+static void cluster_wait_ms(long delay_ms)
 {
-    (void)unused;
-    for (;;) {
-        void *raw_reply = NULL;
-        pthread_mutex_lock(&cluster_state.state_lock);
-        redisContext *subscriber = cluster_state.subscriber;
-        int stopping = cluster_state.stopping;
-        pthread_mutex_unlock(&cluster_state.state_lock);
-        if (subscriber == NULL || stopping) break;
-        if (redisGetReply(subscriber, &raw_reply) != REDIS_OK || raw_reply == NULL) {
-            freeReplyObject(raw_reply);
-            cluster_mark_unavailable();
-            break;
-        }
-        redisReply *reply = (redisReply *)raw_reply;
-        if (reply->type == REDIS_REPLY_ARRAY && reply->elements == 3U
-            && reply->element[0] != NULL && reply->element[0]->str != NULL
-            && strcmp(reply->element[0]->str, "message") == 0
-            && reply->element[2] != NULL && reply->element[2]->type == REDIS_REPLY_STRING) {
-            st_public_cluster_event event;
-            if (cluster_event_decode((const uint8_t *)reply->element[2]->str,
-                                     reply->element[2]->len,
-                                     &event) == 0) {
-                st_public_cluster_event_handler handler = NULL;
-                void *context = NULL;
-                pthread_mutex_lock(&cluster_state.state_lock);
-                handler = cluster_state.handler;
-                context = cluster_state.handler_context;
-                pthread_mutex_unlock(&cluster_state.state_lock);
-                if (handler != NULL) handler(&event, context);
-                free(event.payload);
-            }
-        }
-        freeReplyObject(reply);
+    if (delay_ms <= 0L) return;
+    struct timespec deadline;
+    (void)clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += delay_ms / 1000L;
+    deadline.tv_nsec += (delay_ms % 1000L) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        ++deadline.tv_sec;
+        deadline.tv_nsec -= 1000000000L;
     }
-    return NULL;
+    pthread_mutex_lock(&cluster_state.state_lock);
+    while (!cluster_state.stopping) {
+        if (pthread_cond_timedwait(&cluster_state.state_cond, &cluster_state.state_lock, &deadline) == ETIMEDOUT)
+            break;
+    }
+    pthread_mutex_unlock(&cluster_state.state_lock);
 }
 
-int st_public_coordination_initialize(st_public_cluster_event_handler handler, void *context)
+/* A connection subscribed to the event channel, with no read timeout (Pub/Sub may stay idle). */
+static redisContext *cluster_subscribe(const st_cluster_config *config, int quiet)
 {
-    if (!st_public_coordination_enabled()) return 0;
-    pthread_mutex_lock(&cluster_state.state_lock);
-    if (cluster_state.initialized) {
-        cluster_state.handler = handler;
-        cluster_state.handler_context = context;
-        int available = cluster_state.available;
-        pthread_mutex_unlock(&cluster_state.state_lock);
-        return available ? 0 : -1;
-    }
-    st_cluster_config config;
-    memset(&config, 0, sizeof(config));
-    if (cluster_parse_uri(&config) != 0) {
-        pthread_mutex_unlock(&cluster_state.state_lock);
-        return -1;
-    }
-    redisContext *command = cluster_connect(&config);
-    redisContext *subscriber = command == NULL ? NULL : cluster_connect(&config);
-    if (command == NULL || subscriber == NULL) {
-        if (command != NULL) redisFree(command);
-        if (subscriber != NULL) redisFree(subscriber);
-        pthread_mutex_unlock(&cluster_state.state_lock);
-        return -1;
-    }
+    redisContext *subscriber = cluster_connect(config, quiet);
+    if (subscriber == NULL) return NULL;
     char channel[512];
-    int channel_len = snprintf(channel, sizeof(channel), "%s:events", config.key_prefix);
+    int channel_len = snprintf(channel, sizeof(channel), "%s:events", config->key_prefix);
     const char *argv[] = {"SUBSCRIBE", channel};
     size_t lengths[] = {9U, channel_len < 0 ? 0U : (size_t)channel_len};
     redisReply *subscription = channel_len < 0 || (size_t)channel_len >= sizeof(channel)
@@ -1700,34 +2015,265 @@ int st_public_coordination_initialize(st_public_cluster_event_handler handler, v
                       &no_read_timeout,
                       sizeof(no_read_timeout)) != 0) subscribed = 0;
     if (!subscribed) {
-        redisFree(command);
         redisFree(subscriber);
-        pthread_mutex_unlock(&cluster_state.state_lock);
+        return NULL;
+    }
+    return subscriber;
+}
+
+/* With state_lock held: 0 queued for the dispatcher, -1 dropped because the queue is full. */
+static int cluster_enqueue_event_locked(cluster_event_node *node)
+{
+    size_t bytes = node->event.payload_len;
+    if (cluster_state.queue_count >= ST_PUBLIC_CLUSTER_EVENT_QUEUE_LIMIT
+        || bytes > ST_PUBLIC_CLUSTER_EVENT_QUEUE_MAX_BYTES - cluster_state.queue_bytes) {
+        ++cluster_state.events_dropped;
         return -1;
     }
-    cluster_state.command = command;
-    cluster_state.subscriber = subscriber;
+    node->next = NULL;
+    if (cluster_state.queue_tail == NULL) cluster_state.queue_head = node;
+    else cluster_state.queue_tail->next = node;
+    cluster_state.queue_tail = node;
+    ++cluster_state.queue_count;
+    cluster_state.queue_bytes += bytes;
+    pthread_cond_broadcast(&cluster_state.state_cond);
+    return 0;
+}
+
+static void cluster_queue_message(const redisReply *reply)
+{
+    if (reply->type != REDIS_REPLY_ARRAY || reply->elements != 3U
+        || reply->element[0] == NULL || reply->element[0]->str == NULL
+        || strcmp(reply->element[0]->str, "message") != 0
+        || reply->element[2] == NULL || reply->element[2]->type != REDIS_REPLY_STRING) return;
+    cluster_event_node *node = (cluster_event_node *)calloc(1U, sizeof(*node));
+    if (node == NULL) return;
+    if (cluster_event_decode((const uint8_t *)reply->element[2]->str,
+                             reply->element[2]->len,
+                             &node->event) != 0) {
+        free(node);
+        return;
+    }
+    pthread_mutex_lock(&cluster_state.state_lock);
+    int queued = cluster_enqueue_event_locked(node);
+    pthread_mutex_unlock(&cluster_state.state_lock);
+    if (queued != 0) {
+        fprintf(stderr, "[public-transfer] cluster event queue is full; event dropped\n");
+        free(node->event.payload);
+        free(node);
+    }
+}
+
+/*
+ * Reads the Pub/Sub connection and only decodes and queues; Lettuce's automatic reconnect: a lost
+ * connection is re-established after the exponential delay and SUBSCRIBE is sent again. Events
+ * published while it is down are missed, as with Java.
+ */
+static void *cluster_subscriber_thread(void *unused)
+{
+    (void)unused;
+    unsigned int failures = 0U;
+    for (;;) {
+        pthread_mutex_lock(&cluster_state.state_lock);
+        redisContext *subscriber = cluster_state.subscriber;
+        int stopping = cluster_state.stopping;
+        st_cluster_config config = cluster_state.config;
+        pthread_mutex_unlock(&cluster_state.state_lock);
+        if (stopping) break;
+        if (subscriber == NULL) {
+            subscriber = cluster_subscribe(&config, failures > 0U);
+            if (subscriber == NULL) {
+                if (failures < UINT_MAX) ++failures;
+                cluster_wait_ms(cluster_reconnect_delay_ms(failures));
+                continue;
+            }
+            pthread_mutex_lock(&cluster_state.state_lock);
+            stopping = cluster_state.stopping;
+            if (!stopping) {
+                cluster_state.subscriber = subscriber;
+                ++cluster_state.subscriber_reconnects;
+            }
+            pthread_mutex_unlock(&cluster_state.state_lock);
+            if (stopping) {
+                redisFree(subscriber);
+                break;
+            }
+            fprintf(stderr, "[public-transfer] Redis subscribe connection restored\n");
+            failures = 0U;
+            continue;
+        }
+        void *raw_reply = NULL;
+        if (redisGetReply(subscriber, &raw_reply) != REDIS_OK || raw_reply == NULL) {
+            freeReplyObject(raw_reply);
+            pthread_mutex_lock(&cluster_state.state_lock);
+            cluster_state.subscriber = NULL;
+            stopping = cluster_state.stopping;
+            pthread_mutex_unlock(&cluster_state.state_lock);
+            redisFree(subscriber);
+            if (stopping) break;
+            fprintf(stderr, "[public-transfer] Redis subscribe connection lost; reconnecting\n");
+            continue;
+        }
+        cluster_queue_message((redisReply *)raw_reply);
+        freeReplyObject(raw_reply);
+    }
+    return NULL;
+}
+
+/* Java's single event executor: hands queued events to the handler one at a time. */
+static void *cluster_dispatcher_thread(void *unused)
+{
+    (void)unused;
+    for (;;) {
+        pthread_mutex_lock(&cluster_state.state_lock);
+        while (!cluster_state.stopping && cluster_state.queue_head == NULL)
+            pthread_cond_wait(&cluster_state.state_cond, &cluster_state.state_lock);
+        if (cluster_state.stopping) {
+            pthread_mutex_unlock(&cluster_state.state_lock);
+            break;
+        }
+        cluster_event_node *node = cluster_state.queue_head;
+        cluster_state.queue_head = node->next;
+        if (cluster_state.queue_head == NULL) cluster_state.queue_tail = NULL;
+        --cluster_state.queue_count;
+        cluster_state.queue_bytes -= node->event.payload_len;
+        st_public_cluster_event_handler handler = cluster_state.handler;
+        void *context = cluster_state.handler_context;
+        pthread_mutex_unlock(&cluster_state.state_lock);
+        if (handler != NULL) handler(&node->event, context);
+        free(node->event.payload);
+        free(node);
+    }
+    return NULL;
+}
+
+static pthread_mutex_t cluster_lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void cluster_link_install(st_cluster_link *link, redisContext *context)
+{
+    pthread_mutex_lock(&link->lock);
+    link->failures = 0U;
+    link->retry_at_ms = 0;
+    pthread_mutex_lock(&cluster_state.state_lock);
+    link->reconnects = 0U;
+    pthread_mutex_unlock(&cluster_state.state_lock);
+    cluster_link_set_locked(link, context, 0);
+    pthread_mutex_unlock(&link->lock);
+}
+
+static redisContext *cluster_link_remove(st_cluster_link *link)
+{
+    pthread_mutex_lock(&link->lock);
+    redisContext *context = link->context;
+    link->failures = 0U;
+    link->retry_at_ms = 0;
+    cluster_link_set_locked(link, NULL, 0);
+    pthread_mutex_unlock(&link->lock);
+    return context;
+}
+
+static void cluster_stop_locked_lifecycle(void)
+{
+    pthread_mutex_lock(&cluster_state.state_lock);
+    cluster_state.stopping = 1;
+    redisContext *subscriber = cluster_state.subscriber;
+    if (subscriber != NULL && subscriber->fd >= 0) (void)shutdown(subscriber->fd, SHUT_RDWR);
+    int subscriber_started = cluster_state.subscriber_started;
+    int dispatcher_started = cluster_state.dispatcher_started;
+    pthread_t subscriber_thread = cluster_state.subscriber_thread;
+    pthread_t dispatcher_thread = cluster_state.dispatcher_thread;
+    pthread_cond_broadcast(&cluster_state.state_cond);
+    pthread_mutex_unlock(&cluster_state.state_lock);
+    if (subscriber_started && !pthread_equal(pthread_self(), subscriber_thread))
+        (void)pthread_join(subscriber_thread, NULL);
+    if (dispatcher_started && !pthread_equal(pthread_self(), dispatcher_thread))
+        (void)pthread_join(dispatcher_thread, NULL);
+    redisContext *command = cluster_link_remove(&cluster_state.command);
+    redisContext *publisher = cluster_link_remove(&cluster_state.publisher);
+    pthread_mutex_lock(&cluster_state.state_lock);
+    subscriber = cluster_state.subscriber;
+    cluster_state.subscriber = NULL;
+    cluster_event_node *queued = cluster_state.queue_head;
+    cluster_state.queue_head = NULL;
+    cluster_state.queue_tail = NULL;
+    cluster_state.queue_count = 0U;
+    cluster_state.queue_bytes = 0U;
+    cluster_state.subscriber_started = 0;
+    cluster_state.dispatcher_started = 0;
+    cluster_state.initialized = 0;
+    cluster_state.stopping = 0;
+    cluster_state.handler = NULL;
+    cluster_state.handler_context = NULL;
+    pthread_mutex_unlock(&cluster_state.state_lock);
+    while (queued != NULL) {
+        cluster_event_node *next = queued->next;
+        free(queued->event.payload);
+        free(queued);
+        queued = next;
+    }
+    if (command != NULL) redisFree(command);
+    if (publisher != NULL) redisFree(publisher);
+    if (subscriber != NULL) redisFree(subscriber);
+}
+
+int st_public_coordination_initialize(st_public_cluster_event_handler handler, void *context)
+{
+    if (!st_public_coordination_enabled()) return 0;
+    pthread_mutex_lock(&cluster_lifecycle_lock);
+    pthread_mutex_lock(&cluster_state.state_lock);
+    if (cluster_state.initialized) {
+        cluster_state.handler = handler;
+        cluster_state.handler_context = context;
+        pthread_mutex_unlock(&cluster_state.state_lock);
+        pthread_mutex_unlock(&cluster_lifecycle_lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&cluster_state.state_lock);
+    st_cluster_config config;
+    memset(&config, 0, sizeof(config));
+    if (cluster_parse_uri(&config) != 0) {
+        pthread_mutex_unlock(&cluster_lifecycle_lock);
+        return -1;
+    }
+    /* Java connects the state, publish and Pub/Sub connections and fails startup on any of them. */
+    redisContext *command = cluster_connect(&config, 0);
+    redisContext *publisher = command == NULL ? NULL : cluster_connect(&config, 0);
+    redisContext *subscriber = publisher == NULL ? NULL : cluster_subscribe(&config, 0);
+    if (command == NULL || publisher == NULL || subscriber == NULL) {
+        if (command != NULL) redisFree(command);
+        if (publisher != NULL) redisFree(publisher);
+        if (subscriber != NULL) redisFree(subscriber);
+        pthread_mutex_unlock(&cluster_lifecycle_lock);
+        return -1;
+    }
+    pthread_mutex_lock(&cluster_state.state_lock);
     cluster_state.config = config;
     cluster_state.handler = handler;
     cluster_state.handler_context = context;
+    cluster_state.subscriber = subscriber;
+    cluster_state.subscriber_reconnects = 0U;
+    cluster_state.events_dropped = 0U;
     cluster_state.stopping = 0;
-    cluster_state.available = 1;
     cluster_state.initialized = 1;
-    if (pthread_create(&cluster_state.subscriber_thread,
-                       NULL,
-                       cluster_subscriber_thread,
-                       NULL) != 0) {
-        cluster_state.command = NULL;
-        cluster_state.subscriber = NULL;
-        cluster_state.available = 0;
-        cluster_state.initialized = 0;
-        redisFree(command);
-        redisFree(subscriber);
+    pthread_mutex_unlock(&cluster_state.state_lock);
+    cluster_link_install(&cluster_state.command, command);
+    cluster_link_install(&cluster_state.publisher, publisher);
+    int started = pthread_create(&cluster_state.dispatcher_thread, NULL, cluster_dispatcher_thread, NULL) == 0;
+    pthread_mutex_lock(&cluster_state.state_lock);
+    cluster_state.dispatcher_started = started;
+    pthread_mutex_unlock(&cluster_state.state_lock);
+    if (started) {
+        started = pthread_create(&cluster_state.subscriber_thread, NULL, cluster_subscriber_thread, NULL) == 0;
+        pthread_mutex_lock(&cluster_state.state_lock);
+        cluster_state.subscriber_started = started;
         pthread_mutex_unlock(&cluster_state.state_lock);
+    }
+    if (!started) {
+        cluster_stop_locked_lifecycle();
+        pthread_mutex_unlock(&cluster_lifecycle_lock);
         return -1;
     }
-    cluster_state.subscriber_started = 1;
-    pthread_mutex_unlock(&cluster_state.state_lock);
+    pthread_mutex_unlock(&cluster_lifecycle_lock);
     fprintf(stderr,
             "[public-transfer] Redis coordination enabled prefix=%s\n",
             config.key_prefix);
@@ -1736,33 +2282,10 @@ int st_public_coordination_initialize(st_public_cluster_event_handler handler, v
 
 void st_public_coordination_shutdown(void)
 {
+    pthread_mutex_lock(&cluster_lifecycle_lock);
     pthread_mutex_lock(&cluster_state.state_lock);
-    if (!cluster_state.initialized) {
-        pthread_mutex_unlock(&cluster_state.state_lock);
-        return;
-    }
-    cluster_state.stopping = 1;
-    cluster_state.available = 0;
-    redisContext *subscriber = cluster_state.subscriber;
-    int subscriber_started = cluster_state.subscriber_started;
-    pthread_t subscriber_thread = cluster_state.subscriber_thread;
-    if (subscriber != NULL && subscriber->fd >= 0) (void)shutdown(subscriber->fd, SHUT_RDWR);
+    int initialized = cluster_state.initialized;
     pthread_mutex_unlock(&cluster_state.state_lock);
-    if (subscriber_started && !pthread_equal(pthread_self(), subscriber_thread))
-        (void)pthread_join(subscriber_thread, NULL);
-    pthread_mutex_lock(&cluster_state.command_lock);
-    pthread_mutex_lock(&cluster_state.state_lock);
-    redisContext *command = cluster_state.command;
-    subscriber = cluster_state.subscriber;
-    cluster_state.command = NULL;
-    cluster_state.subscriber = NULL;
-    cluster_state.subscriber_started = 0;
-    cluster_state.initialized = 0;
-    cluster_state.stopping = 0;
-    cluster_state.handler = NULL;
-    cluster_state.handler_context = NULL;
-    pthread_mutex_unlock(&cluster_state.state_lock);
-    if (command != NULL) redisFree(command);
-    if (subscriber != NULL) redisFree(subscriber);
-    pthread_mutex_unlock(&cluster_state.command_lock);
+    if (initialized) cluster_stop_locked_lifecycle();
+    pthread_mutex_unlock(&cluster_lifecycle_lock);
 }

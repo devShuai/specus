@@ -95,6 +95,9 @@ static int contains(const char *haystack, const char *needle)
 
 /* ---- sockets and HTTP ---------------------------------------------------------------------- */
 
+/* When positive, the next connection gets this small receive buffer (a reader that falls behind). */
+static int next_receive_buffer;
+
 static int connect_admin(void)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -102,6 +105,8 @@ static int connect_admin(void)
     struct timeval timeout = {.tv_sec = 5, .tv_usec = 0};
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    if (next_receive_buffer > 0)
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &next_receive_buffer, sizeof(next_receive_buffer));
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
@@ -799,6 +804,171 @@ static int test_viewer_text_messages(void)
     return 0;
 }
 
+typedef struct {
+    int fd;
+    int messages;
+    int sent;
+} flood_arguments;
+
+/*
+ * Enough 60,000-character messages that the server cannot buffer them all for a reader that
+ * stalls: twice the largest send buffer TCP autotuning may grow to (tcp_wmem's maximum, 4 MiB by
+ * default) plus 2 MiB, so a write must wait whatever the kernel's limit.
+ */
+static int flood_messages(void)
+{
+    long long wmem_max = 4LL * 1024 * 1024;
+    FILE *settings = fopen("/proc/sys/net/ipv4/tcp_wmem", "r");
+    if (settings != NULL) {
+        long long low = 0, initial = 0, high = 0;
+        if (fscanf(settings, "%lld %lld %lld", &low, &initial, &high) == 3 && high > 0) wmem_max = high;
+        fclose(settings);
+    }
+    long long messages = (2LL * wmem_max + 2LL * 1024 * 1024) / 60000LL + 1LL;
+    return messages > 4000LL ? 4000 : (int)messages;
+}
+
+static void *flood_slow_reader(void *argument)
+{
+    flood_arguments *flood = (flood_arguments *)argument;
+    static char message[61000];
+    int len = snprintf(message, sizeof(message), "{\"type\":\"signal\",\"targetPeerId\":\"slow-b\",\"payload\":\"");
+    memset(message + len, 'x', 60000U);
+    memcpy(message + len + 60000, "\"}", 3U);
+    for (int i = 0; i < flood->messages; ++i) {
+        if (ws_send_text(flood->fd, message) != 0) break;
+        ++flood->sent;
+    }
+    return NULL;
+}
+
+static long long monotonic_ms(void)
+{
+    struct timespec now;
+    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000L;
+}
+
+/*
+ * The frames a reader got before its stream ended: every complete frame must be a JSON text frame,
+ * and only the very end may hold a cut one. Returns the number of complete frames, -1 when the
+ * stream does not end within timeout_ms, -2 when a frame is malformed.
+ */
+static int read_until_end(int fd, long long timeout_ms)
+{
+    size_t capacity = 1U << 20U, length = 0U;
+    uint8_t *data = (uint8_t *)malloc(capacity);
+    if (data == NULL) return -2;
+    long long deadline = monotonic_ms() + timeout_ms;
+    int ended = 0;
+    while (!ended && monotonic_ms() < deadline) {
+        struct pollfd poller = {.fd = fd, .events = POLLIN, .revents = 0};
+        if (poll(&poller, 1, 100) <= 0) continue;
+        if (length == capacity) {
+            uint8_t *grown = (uint8_t *)realloc(data, capacity * 2U);
+            if (grown == NULL) break;
+            data = grown;
+            capacity *= 2U;
+        }
+        ssize_t got = recv(fd, data + length, capacity - length, 0);
+        if (got <= 0) ended = 1;
+        else length += (size_t)got;
+    }
+    int frames = 0;
+    size_t offset = 0U;
+    while (ended && frames >= 0 && offset + 2U <= length) {
+        uint8_t opcode = data[offset] & 0x0fU;
+        uint64_t payload = data[offset + 1U] & 0x7fU;
+        size_t header = 2U;
+        if (payload == 126U) {
+            if (offset + 4U > length) break;
+            payload = ((uint64_t)data[offset + 2U] << 8U) | data[offset + 3U];
+            header = 4U;
+        } else if (payload == 127U) {
+            frames = -2;
+            break;
+        }
+        if (offset + header + payload > length) break; /* the cut frame at the very end */
+        char *text = (char *)malloc((size_t)payload + 1U);
+        if (text == NULL) {
+            frames = -2;
+            break;
+        }
+        memcpy(text, data + offset + header, (size_t)payload);
+        text[payload] = '\0';
+        int valid = data[offset] == 0x81U && opcode == 0x1U && st_json_is_valid(text);
+        free(text);
+        if (!valid) {
+            frames = -2;
+            break;
+        }
+        ++frames;
+        offset += header + (size_t)payload;
+    }
+    free(data);
+    return ended ? frames : -1;
+}
+
+/*
+ * Java sends to one session under that session's own lock; Tomcat bounds the blocking send and
+ * closes the session when it times out. A browser that stops reading therefore stalls only the
+ * writes addressed to it: other rooms keep signalling and name checks answer at once, the stalled
+ * browser is closed after the write timeout (1 s here), and nothing follows a cut frame.
+ */
+static int test_slow_reader_is_isolated_and_closed(void)
+{
+    static char response[8192];
+    const participant sender = {"203.0.113.41", "slow-room", "slow-token", "slow-a", "Slow Sender", 0};
+    const participant slow = {"203.0.113.41", "slow-room", "slow-token", "slow-b", "Slow Reader", 0};
+    const participant left = {"198.51.100.41", "fast-room", "fast-token", "fast-c", "Fast Left", 0};
+    const participant right = {"198.51.100.41", "fast-room", "fast-token", "fast-d", "Fast Right", 0};
+    drained state;
+    int sender_fd = discovery_join(&sender);
+    next_receive_buffer = 2048;
+    int slow_fd = discovery_join(&slow);
+    next_receive_buffer = 0;
+    int left_fd = discovery_join(&left);
+    int right_fd = discovery_join(&right);
+    CHECK(sender_fd >= 0 && slow_fd >= 0 && left_fd >= 0 && right_fd >= 0, "slow-reader participants");
+    CHECK(drain(sender_fd, &state) == 0 && drain(left_fd, &state) == 0 && drain(right_fd, &state) == 0,
+          "initial rosters");
+    /* The case raises the per-connection message limit so the whole flood is relayed. */
+    flood_arguments flood = {sender_fd, flood_messages(), 0};
+    pthread_t flooder;
+    CHECK(pthread_create(&flooder, NULL, flood_slow_reader, &flood) == 0, "flood thread");
+    struct timespec settle = {.tv_sec = 0, .tv_nsec = 300000000L};
+    (void)nanosleep(&settle, NULL);
+    for (int round = 0; round < 3; ++round) {
+        long long started = monotonic_ms();
+        int delivered = ws_send_text(left_fd, "{\"type\":\"signal\",\"targetPeerId\":\"fast-d\",\"payload\":{}}") == 0
+            && drain(left_fd, &state) == 0 && drain(right_fd, &state) == 0 && state.others == 1
+            && contains(state.other, "\"sourcePeerId\":\"fast-c\"");
+        int name_status = http_call("GET", "/api/public/transfer/clients/name-availability?clientName=Slow%20Probe",
+                                    NULL, NULL, response, sizeof(response));
+        long long elapsed = monotonic_ms() - started;
+        CHECK(delivered && name_status == 200 && elapsed < 500,
+              "round %d: another room waited %lld ms behind the stalled reader (delivered %d, name %d)",
+              round, elapsed, delivered, name_status);
+    }
+    (void)pthread_join(flooder, NULL);
+    /* Closed once a frame misses its 1 s write budget, with no frame after the cut one. */
+    int frames = read_until_end(slow_fd, 6000);
+    CHECK(frames >= 0, "the stalled reader was %s", frames == -1 ? "never closed" : "sent a frame after a cut one");
+    close(slow_fd);
+    /* The sender stays connected and its roster loses the closed reader. */
+    int left_roster = 0;
+    for (int attempt = 0; attempt < 30 && !left_roster; ++attempt) {
+        CHECK(drain(sender_fd, &state) == 0, "the sender lost its connection");
+        left_roster = state.rosters > 0 && ROSTER_IS(state.roster, "slow-a=1");
+        if (!left_roster) (void)nanosleep(&settle, NULL);
+    }
+    CHECK(left_roster, "the sender's roster still lists the closed reader: %s", state.roster);
+    ws_close(&sender_fd);
+    ws_close(&left_fd);
+    ws_close(&right_fd);
+    return 0;
+}
+
 /* ---- PublicTransferRelayFrameTests --------------------------------------------------------- */
 
 static void write_u16(uint8_t *out, size_t value)
@@ -1244,7 +1414,8 @@ static int test_room_credentials(void)
 }
 
 typedef enum {
-    PROFILE_DEFAULT, PROFILE_ROOM_CAPACITY, PROFILE_REDEEM_TRUSTED, PROFILE_REDEEM_UNTRUSTED
+    PROFILE_DEFAULT, PROFILE_ROOM_CAPACITY, PROFILE_REDEEM_TRUSTED, PROFILE_REDEEM_UNTRUSTED,
+    PROFILE_SLOW_READER
 } fixture_profile;
 
 typedef struct {
@@ -1268,7 +1439,8 @@ static const isolated_case cases[] = {
     {"ticket-scope-and-address", test_ticket_scope_and_address, PROFILE_DEFAULT},
     {"redeem-client-address-trusted", test_redeem_client_address_trusted, PROFILE_REDEEM_TRUSTED},
     {"redeem-client-address-untrusted", test_redeem_client_address_untrusted, PROFILE_REDEEM_UNTRUSTED},
-    {"room-credentials", test_room_credentials, PROFILE_DEFAULT}
+    {"room-credentials", test_room_credentials, PROFILE_DEFAULT},
+    {"slow-reader-is-isolated-and-closed", test_slow_reader_is_isolated_and_closed, PROFILE_SLOW_READER}
 };
 
 static void case_database_path(char *out, size_t out_len, pid_t launcher_pid, size_t index)
@@ -1294,7 +1466,9 @@ static int owned_environment_entry(const char *entry)
     static const char *const names[] = {
         "SPECUS_ENV", "SPECUS_AUTH_JWT_SECRET", "SPECUS_TRUSTED_PROXIES", "SPECUS_DATABASE_PATH",
         "SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM",
-        "SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP"
+        "SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP",
+        "SPECUS_PUBLIC_TRANSFER_DISCOVERY_WRITE_TIMEOUT_SECONDS",
+        "SPECUS_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION"
     };
     for (size_t i = 0U; i < sizeof(names) / sizeof(names[0]); ++i) {
         size_t len = strlen(names[i]);
@@ -1327,7 +1501,7 @@ static char **case_environment(size_t index)
 {
     size_t count = 0U, used = 0U;
     while (environ[count] != NULL) ++count;
-    char **values = (char **)calloc(count + 7U, sizeof(*values));
+    char **values = (char **)calloc(count + 9U, sizeof(*values));
     if (values == NULL) return NULL;
     for (size_t i = 0U; i < count; ++i) {
         if (owned_environment_entry(environ[i])) continue;
@@ -1346,7 +1520,11 @@ static char **case_environment(size_t index)
         || append_environment(values, &used, "SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM",
                               profile == PROFILE_ROOM_CAPACITY ? "1" : NULL)
         || append_environment(values, &used, "SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP",
-                              profile == PROFILE_REDEEM_TRUSTED || profile == PROFILE_REDEEM_UNTRUSTED ? "1" : NULL);
+                              profile == PROFILE_REDEEM_TRUSTED || profile == PROFILE_REDEEM_UNTRUSTED ? "1" : NULL)
+        || append_environment(values, &used, "SPECUS_PUBLIC_TRANSFER_DISCOVERY_WRITE_TIMEOUT_SECONDS",
+                              profile == PROFILE_SLOW_READER ? "1" : NULL)
+        || append_environment(values, &used, "SPECUS_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION",
+                              profile == PROFILE_SLOW_READER ? "100000" : NULL);
     if (failed) { free_environment(values); return NULL; }
     return values;
 }

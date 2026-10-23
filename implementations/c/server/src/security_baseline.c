@@ -1,6 +1,7 @@
 #include "security_baseline.h"
 
 #include "object_storage.h"
+#include "public_coordination.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -145,7 +146,8 @@ int st_security_baseline_validate_current(void)
         && known_default_password(password);
     int weak_jwt_secret = text_present(jwt_secret)
         && ascii_case_equal_trimmed(jwt_secret, "replace-with-a-long-random-secret");
-    if (env_bool("SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", 0)
+    /* The switch reads as Spring binds it, the same way the coordination layer reads it. */
+    if (st_public_coordination_enabled()
         && !text_present(getenv("SPECUS_PUBLIC_TRANSFER_REDIS_URI"))) {
         fprintf(stderr,
                 "security baseline rejected SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED=true; "
