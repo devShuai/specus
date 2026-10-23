@@ -424,3 +424,7 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | `feat(c-server): honour Java's specus.netty.* socket, frame and connection limit settings` | 第 8 节两行、C server README 与 env 示例 |
 | `fix(c-server): check WINDOW_UPDATE credit as Java's StreamFlowController does` | `nat_stream_tests` 两项 |
 | `docs(alignment): NAT TCP platform differences of item 45` | 本文第 8、9、10 节，runtime-semantics；改正两处「RST 6 同 Java StreamFlowController」的注释 |
+| `docs(alignment): sanitizer runs and stream lookup cost of the NAT TCP alignment` | test-map 的 TSan 与 ASan/UBSan 说明；第 8 节按流 id 查找的开销 |
+| `Merge origin/main into fix/c-server-item45-nat` | 合入 #337–#341（Redis TLS 与 Sentinel 等），没有冲突 |
+| `test(c-server): review follow-ups of the public TCP checks` | 评审跟进：新测试只在 Linux 上构建；accept 失败的检查最多重复 3 轮，避开短暂描述符造成的漏报；缩短两处等待 |
+| `docs(c-server): bound public connection threads with TasksMax and record Go's WINDOW_UPDATE handling` | 评审跟进：systemd 单元写明 `TasksMax=15%`，env 示例按 1 GiB 设备给出较低的连接上限，README 与第 8 节改正「描述符先到」；runtime-semantics 记 Go 的 WINDOW_UPDATE 差异 |
