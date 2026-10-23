@@ -456,6 +456,31 @@ Rate批次结束时，四类连通性中Vector、Resource、Rate三类为候选�
 
 新测试在本机 WSL 另以 ASan/UBSan（连同 `client_messages_tests`、`admin_http_tests`）和 ThreadSanitizer 运行通过。集群订阅线程自身如何分发由 Redis 协调一侧处理（#35 第 45 项的 Redis 部分），不在本节。
 
+## 公网 HTTP 连接与路由请求的失败答复（2026-10-23增量）
+
+#35 第 45 项的公网 HTTP 连接部分（G2、G12、G14、G15、G16、G17）。Java 没有覆盖这些行为的测试类，本节以 Java 源码为准：`HttpSpecusController.relay`、`NatServerHandler.cancelHttpStream` 与 `channelInactive`、`HttpStreamExchange`、`HttpMediaCaptureService.CaptureSession`，以及 Tomcat 11.0.25 与 Spring Boot 4.1.1 的源码。Tomcat 部分包括 `AbstractHttp11Protocol` 默认的 `connectionTimeout` 60000、`NioEndpoint` 阻塞读写的超时（有进展就重新计时）、`Http11Processor.prepareExpectation`、`StandardContextValve` 中 `continueResponseTiming=immediately` 时立即回的 `HTTP/1.1 100 `，以及读写失败时由 `OutputBuffer`/`InputBuffer` 包成的 `ClientAbortException`。Spring Boot 部分包括 `TomcatServerProperties` 默认的 `maxConnections` 8192、`acceptCount` 100，以及 `TomcatWebServerFactoryCustomizer` 的 `isPositive` 过滤和 `(int) Duration.toMillis()`。新 ctest `http_connector_tests` 复用 `nat_stream_tests` 的真实进程夹具，每个场景各起一个服务端；媒体采集一行在 `media_capture_tests` 里。表中每条断言都在 `origin/main` `d07a6ea` 的源码上实际跑过，失败现象写在最后一列：真实进程的场景用同一测试程序指向旧源码构建的服务端，进程内的媒体测试与旧源码一起编译。
+
+| C 测试（`http_connector_tests` 场景） | 断言 | 原实现上的结果 |
+| --- | --- | --- |
+| connection timeout drops an idle connection and a stalled head（`SERVER_TOMCAT_CONNECTION_TIMEOUT=1s`） | 不发任何字节的连接、只发了半个请求头的连接，都在 0.7 到 5 s 内被服务端关闭，且没有收到任何字节 | 8 s 后仍未关闭 |
+| connection timeout answers a stalled body | `Content-Length: 100` 只发 10 字节，约 1 s 后答 `400 HTTP 请求体不完整`；以心跳为界，设备没有收到 OPEN | 8 s 内没有任何答复 |
+| connection timeout resets the stream of a browser that stopped reading | 接收缓冲 4 KiB、从不读的浏览器：设备按窗口持续发 DATA，服务端写不动后不再回窗口，超时后发 `RST 8`（实测约 2.8 MB 后停住，最后一次窗口之后约 3 s，断言 0.5 到 8 s）；明细为 200、`success=1`、无失败原因，即 Java 的客户端中断；同一 data 连接随后照常服务 HTTP 与 TCP | 20 s 内没有 RST |
+| connection timeout leaves an idle WebSocket open | 经 ticket 升级的 `/ws/connections` 空闲 2.5 s 后，ping 仍有 pong | 通过（防回归：升级时去掉超时） |
+| connection timeout in ISO-8601（`SERVER_TOMCAT_CONNECTIONTIMEOUT=pt1.000S`） | 空闲连接约 1 s 后被关闭 | 未关闭 |
+| an unusable server.tomcat.connection-timeout refuses the start | `60 s`、`1x`、`PT`、`P1DT`、`s` 都使服务端启动即退出 | 5 个值都照常启动 |
+| max-connections holds further connections in the backlog（`SERVER_TOMCAT_MAXCONNECTIONS=2`） | 两个空闲连接占满后，第三个连接发出的请求 1.5 s 内没有答复；关掉其中一个后，它得到 401 | 第三个立即得到答复 |
+| a failed accept does not end the listener | 服务端以 64 个文件描述符的软限制启动，打开 100 个连接使 accept 失败；全部关闭后，新请求在 15 s 内得到 401 | 监听线程在第一次 accept 失败时退出，之后再无答复 |
+| Expect: 100-continue gets the interim 100 | 带 `Expect: 100-continue` 的 HTTP/1.1 路由上传在发请求体之前就收到 `HTTP/1.1 100 \r\n\r\n`，随后请求体经 OPEN/DATA/FIN 到达设备，最终答 200；HTTP/1.0 请求 700 ms 内没有 100；管理接口（`Expect: 100-Continue `，大小写与尾随空白不同）也先收到 100，再答 401 | 2 s 内没有 100 |
+| a response head timeout answers 504 TimeoutException with RST 8（`SPECUS_HTTP_TIMEOUT_MS=1000`） | 设备不回响应头：收到 `RST 8`，浏览器得到 `504 {"error":"TimeoutException"}`，明细记 504 与 `TimeoutException` | `RST 30`，正文是 `direct http response timeout` |
+| an unusable response head is reset with RST 8 and answers 502 HTTP 转发请求失败 | `headers` 不是数组的响应头：收到 `RST 8`，浏览器得到 `502 {"error":"HTTP 转发请求失败"}`，明细的失败原因为 `invalid HTTP response headers` | `RST 31`，浏览器得到「客户端不在线」 |
+| a stream reset for a frame it refused answers 502 HTTP 转发请求失败 | 响应头之前先到 DATA：`RST 8`（原本如此），浏览器得到 `HTTP 转发请求失败`，明细为 `HTTP DATA is invalid for the stream state` | 浏览器得到「客户端不在线」 |
+| a stream lost with its data connection answers 502 HTTP 转发请求失败 | 等响应头时 data 连接断开：浏览器得到 `HTTP 转发请求失败`，明细为 Java 的 `control channel closed`；重新登录 data 连接后照常服务 | 浏览器得到「客户端不在线」 |
+| a share cut before the head resets with RST 8 and is recorded | 经管理 API 为受保护的路由建分享，访客请求已到设备、响应头尚未回时撤销：设备收到 `RST 8`，访客连接被关闭且没有收到任何字节（分享规范 6.6），明细记 502、`success=0`、`HTTP share ended` | `RST 31`；也不写明细（原 `ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED` 分支不记录） |
+| a share's 413 is recorded as Java's（`SPECUS_HTTP_MAX_REQUEST_BODY_SIZE=1024`） | `full` 分享上的 `Content-Length: 2048` 得到 413，明细为 413、`HTTP 请求体超过限制`、没有请求头、`request_bytes=0`、`raw_query=x=1`；2048 字节的 chunked 请求体得到 413，明细带 `X-Test:kept` 与正文预览；没有一条明细含分享 token；设备没有收到 OPEN | 第一种 413 没有写明细 |
+| `media_capture_tests` 的 `test_part_uploads_beside_the_response`（进程内监听器、fake S3，G16） | fake S3 每片上传延迟 1.5 s：三个 5 MiB 整片加 3 字节尾片的响应在 4.5 s 内转发并完成（实测约 1.5 s），同时在途的分片最多 4、至少 2（实测 4）；采集为 COMPLETE，经公开 `/play` 读跨片边界与结尾的字节顺序正确 | 约 6.06 s，同一时刻只有 1 片在上传 |
+
+`nat_stream_tests` 的 `check_http_configured_limits` 随之把两种超时的 RST 码从 30 改为 8。C 与 Java 仍不同的地方：访客中断时 RST 的原因文本，C 为 `HTTP downstream closed`，Java 为 Tomcat 异常的文本（例如 `java.net.SocketTimeoutException`）；上传阶段 data 连接断开时，Java 的正文是异常文本 `control channel closed`，C 仍答 `HTTP 转发请求失败`；分享在上传阶段被切断时，Java 的明细原因是 `stream reset`，C 记 `HTTP share ended`；请求体整体读入后才开流（停住的请求体答 400，设备看不到这个请求）、每个连接一个线程而没有 200 线程的排队、每条 data 连接 1024 个 pending 流、单帧 64 KiB、64 MiB 响应上限、分享在响应头之前被切断时中断而不答 502，都列在 [API 盘点](c-server-api-inventory.md) 第 8 节。媒体采集结束时 C 等在途分片传完、multipart 完成后才关闭访客连接，Java 把完成也放在后台（浏览器已收到 chunked 结尾）；第 7 节 `HttpMediaCaptureServiceTests` 一行的对照不受影响。
+
 ## 历史表的读法与限制
 
 - **覆盖**：保留历史记录的类级评估标签，不是本轮逐断言完整覆盖的结论。部分历史“覆盖”行仍列有“未断言／未测”项；以说明中的缺口为准，这些断言仍需补证，不能据标签勾选当前验收项。
