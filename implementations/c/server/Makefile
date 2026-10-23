@@ -88,6 +88,7 @@ STORAGE_TESTS := $(BUILD_DIR)/specus_c_storage_tests
 SESSION_ORDER_TESTS := $(BUILD_DIR)/specus_c_session_order_tests
 SESSION_SCOPE_TESTS := $(BUILD_DIR)/specus_c_session_scope_tests
 STUN_TURN_TESTS := $(BUILD_DIR)/specus_c_stun_turn_tests
+STUN_TURN_SCALE_TESTS := $(BUILD_DIR)/specus_c_stun_turn_scale_tests
 TLS_TRANSPORT_TESTS := $(BUILD_DIR)/specus_c_tls_transport_tests
 SEMANTIC_VERSION_TESTS := $(BUILD_DIR)/specus_c_semantic_version_tests
 TRAFFIC_CAPTURE_TESTS := $(BUILD_DIR)/specus_c_traffic_capture_tests
@@ -118,11 +119,16 @@ ALL_TESTS += $(CONNECTIVITY_RESOURCE_WIRE_TESTS)
 ALL_TESTS += $(CONNECTIVITY_RATE_HTTP_TESTS)
 TESTS += $(CLIENT_PACKAGE_CLOCK_TESTS)
 ALL_TESTS += $(CLIENT_PACKAGE_CLOCK_TESTS)
+TESTS += $(STUN_TURN_SCALE_TESTS)
+ALL_TESTS += $(STUN_TURN_SCALE_TESTS)
 CONTROL_WRITE_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_control_write_reference_tests
 SESSION_REFERENCE_SERVER := $(BUILD_DIR)/specus_c_session_reference_server
 SESSION_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_session_reference_tests
 TESTS += $(CONTROL_WRITE_REFERENCE_TESTS)
 ALL_TESTS += $(CONTROL_WRITE_REFERENCE_TESTS) $(SESSION_REFERENCE_SERVER) $(SESSION_REFERENCE_TESTS)
+STREAM_FD_LIFETIME_TESTS := $(BUILD_DIR)/specus_c_stream_fd_lifetime_tests
+TESTS += $(STREAM_FD_LIFETIME_TESTS)
+ALL_TESTS += $(STREAM_FD_LIFETIME_TESTS)
 HTTP_LOG_REASON_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_http_log_reason_reference_tests
 HTTP_RESET_REASON_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_http_reset_reason_reference_tests
 TESTS += $(HTTP_LOG_REASON_REFERENCE_TESTS)
@@ -137,6 +143,7 @@ ifeq ($(shell uname -s),Linux)
 CONNECTIVITY_CLOCK_OFFSET := $(BUILD_DIR)/libspecus_connectivity_clock_offset.so
 ALL_TESTS += $(CONNECTIVITY_CLOCK_OFFSET)
 CONNECTIVITY_CLOCK_TEST_COMMAND = env LD_PRELOAD="$(abspath $(CONNECTIVITY_CLOCK_OFFSET))" SPECUS_NAT_STREAM_ONLY="connectivity NAT complete" $(NAT_STREAM_TESTS) $(SERVER)
+HTTP_TIMEOUT_CLOCK_TEST_COMMAND = env LD_PRELOAD="$(abspath $(CONNECTIVITY_CLOCK_OFFSET))" SPECUS_NAT_STREAM_ONLY="SPECUS_HTTP_" $(NAT_STREAM_TESTS) $(SERVER)
 NAT_PUSH_REFERENCE_SERVER := $(BUILD_DIR)/specus_c_nat_push_reference_server
 NAT_PUSH_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_nat_push_reference_tests
 NAT_CONTROL_SIZE_VECTOR := ../../../protocol/test-vectors/nat-control-size-v1.json
@@ -199,6 +206,9 @@ $(SERVER): $(CORE_OBJS) src/main.c | $(BUILD_DIR)
 
 $(CONTROL_WRITE_REFERENCE_TESTS): $(CORE_OBJS) src/main.c tests/control_write_reference_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/control_write_reference_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(STREAM_FD_LIFETIME_TESTS): $(CORE_OBJS) src/main.c tests/stream_fd_lifetime_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/stream_fd_lifetime_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/session_reference_main.o: src/main.c tests/session_reference_recv.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -include tests/session_reference_recv.h -Dst_peer_mesh_push_on_logout=st_fixture_peer_logout -Dst_product_metrics_milestone=st_fixture_milestone -c $< -o $@
@@ -411,6 +421,9 @@ $(SESSION_SCOPE_TESTS): $(CORE_OBJS) tests/session_order_tests.c | $(BUILD_DIR)
 $(STUN_TURN_TESTS): $(CORE_OBJS) tests/stun_turn_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/stun_turn_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
+$(STUN_TURN_SCALE_TESTS): $(CORE_OBJS) tests/stun_turn_scale_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/stun_turn_scale_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
 $(TLS_TRANSPORT_TESTS): $(CORE_OBJS) tests/tls_transport_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/tls_transport_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
@@ -476,6 +489,7 @@ test: all
 	$(CLIENT_ROUTE_SCALE_TESTS) $(SERVER)
 	$(NAT_STREAM_TESTS) $(SERVER)
 	$(CONNECTIVITY_CLOCK_TEST_COMMAND)
+	$(HTTP_TIMEOUT_CLOCK_TEST_COMMAND)
 	$(PRODUCT_METRICS_TESTS) $(SERVER)
 	$(CONNECTION_ARCHIVE_TESTS) $(SERVER)
 	$(CLIENT_MESSAGES_TESTS) $(SERVER)

@@ -524,6 +524,11 @@ target_link_libraries(specus_c_stun_turn_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_stun_turn_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME stun_turn_tests COMMAND specus_c_stun_turn_tests)
 
+add_executable(specus_c_stun_turn_scale_tests tests/stun_turn_scale_tests.c)
+target_link_libraries(specus_c_stun_turn_scale_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_stun_turn_scale_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME stun_turn_scale_tests COMMAND specus_c_stun_turn_scale_tests)
+
 add_executable(specus_c_workbench_tests tests/workbench_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_workbench_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_workbench_tests PRIVATE -Wall -Wextra -Wpedantic)
@@ -565,6 +570,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             "SPECUS_NAT_STREAM_ONLY=connectivity NAT complete"
             $<TARGET_FILE:specus_c_nat_stream_tests> $<TARGET_FILE:specus-server-c>)
     set_tests_properties(nat_connectivity_clock_adjustment PROPERTIES TIMEOUT 60)
+    # The SPECUS_HTTP_TIMEOUT_MS waits of a route request, under the same wall clock 3 s behind.
+    add_test(NAME nat_http_timeout_clock_adjustment
+        COMMAND ${CMAKE_COMMAND} -E env
+            "LD_PRELOAD=$<TARGET_FILE:specus_c_connectivity_clock_offset>"
+            "SPECUS_NAT_STREAM_ONLY=SPECUS_HTTP_"
+            $<TARGET_FILE:specus_c_nat_stream_tests> $<TARGET_FILE:specus-server-c>)
+    set_tests_properties(nat_http_timeout_clock_adjustment PROPERTIES TIMEOUT 60)
 endif()
 
 # Reference tests compile private main.c code without adding switches to the shipped server.
@@ -573,6 +585,13 @@ target_link_libraries(specus_c_control_write_reference_tests PRIVATE specus_c_co
 target_compile_options(specus_c_control_write_reference_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME control_write_reference_tests COMMAND specus_c_control_write_reference_tests)
 set_tests_properties(control_write_reference_tests PROPERTIES TIMEOUT 30)
+
+# A stopped TCP stream keeps its descriptor until neither worker can still recv/send on it.
+add_executable(specus_c_stream_fd_lifetime_tests tests/stream_fd_lifetime_tests.c)
+target_link_libraries(specus_c_stream_fd_lifetime_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_stream_fd_lifetime_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME stream_fd_lifetime_tests COMMAND specus_c_stream_fd_lifetime_tests)
+set_tests_properties(stream_fd_lifetime_tests PROPERTIES TIMEOUT 60)
 
 # Only this object aliases the three observation points. The helper forwards real I/O, registry
 # and metrics calls; the ordinary specus-server-c target above never links this helper.

@@ -150,6 +150,12 @@ typedef struct external_conn {
     int thread_started;
     pthread_t writer_thread;
     int writer_thread_started;
+    /*
+     * The reader and writer that may still use fd (session->map_lock): reserved before the stream
+     * is published and given back after each one's last socket call, also when its thread could
+     * not be started. A stopped stream keeps fd open until this is 0 (close_conn_fd_locked).
+     */
+    unsigned int io_workers;
     int done;
     int counted;
     pthread_mutex_t flow_lock;
@@ -2387,13 +2393,13 @@ static void direct_pending_retire(specus_session *session, direct_http_pending *
     pthread_mutex_unlock(&session->direct_lock);
 }
 
-/* The wall-clock instant timeout_ms from now, for pthread_cond_timedwait on a default condition. */
+/* The CLOCK_MONOTONIC instant timeout_ms from now, for pthread_cond_timedwait on a pending stream. */
 static void direct_deadline_after(int64_t timeout_ms, struct timespec *deadline)
 {
-    struct timeval now;
-    gettimeofday(&now, NULL);
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
     int64_t seconds = timeout_ms / 1000;
-    long nanoseconds = (long)(timeout_ms % 1000) * 1000000L + (long)now.tv_usec * 1000L;
+    long nanoseconds = (long)(timeout_ms % 1000) * 1000000L + now.tv_nsec;
     deadline->tv_sec = now.tv_sec + (time_t)seconds + nanoseconds / 1000000000L;
     deadline->tv_nsec = nanoseconds % 1000000000L;
 }
@@ -2444,7 +2450,16 @@ static int direct_http_forward(void *ctx,
     memset(&pending, 0, sizeof(pending));
     pending.send_credit = ST_STREAM_INITIAL_WINDOW;
     pending.receive_credit = ST_STREAM_INITIAL_WINDOW;
-    pthread_cond_init(&pending.cond, NULL);
+    /* The timeouts are monotonic: a wall-clock correction must neither cut them short nor stretch them. */
+    pthread_condattr_t cond_attr;
+    int attr_ok = pthread_condattr_init(&cond_attr) == 0;
+    int cond_ok = attr_ok && pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC) == 0
+        && pthread_cond_init(&pending.cond, &cond_attr) == 0;
+    if (attr_ok) pthread_condattr_destroy(&cond_attr);
+    if (!cond_ok) {
+        session_reference_release(session);
+        return -1;
+    }
 
     pthread_mutex_lock(&session->map_lock);
     pending.stream_id = session->next_stream_id++;
@@ -4568,7 +4583,23 @@ static void release_external_count(external_conn *conn)
     pthread_mutex_unlock(&global_external_lock);
 }
 
-/* Closes a TCP stream and, the first time, tombstones it in the same map_lock section. */
+/*
+ * Closes a stopped stream's descriptor once neither worker can use it any more. The workers copy
+ * fd under map_lock and call recv/send after releasing it; closing at once would let that call
+ * reach whatever socket was given the same descriptor number since, another stream's included,
+ * reading its bytes or writing into it.
+ */
+static void close_conn_fd_locked(external_conn *conn)
+{
+    if (conn->done && conn->io_workers == 0U && conn->fd >= 0) {
+        close(conn->fd);
+        conn->fd = -1;
+    }
+}
+
+/* Stops a TCP stream and, the first time, tombstones it in the same map_lock section. The socket
+ * is shut down at once, which ends a blocked recv or send; its descriptor is closed by
+ * close_conn_fd_locked. */
 static void close_conn_locked(external_conn *conn)
 {
     if (!conn->done) {
@@ -4582,13 +4613,23 @@ static void close_conn_locked(external_conn *conn)
     conn->write_closed = 1;
     pthread_cond_broadcast(&conn->write_cond);
     pthread_mutex_unlock(&conn->write_lock);
-    if (conn->fd >= 0) {
+    if (conn->fd >= 0 && !conn->done) {
         shutdown(conn->fd, SHUT_RDWR);
-        close(conn->fd);
-        conn->fd = -1;
     }
     release_external_count(conn);
     conn->done = 1;
+    close_conn_fd_locked(conn);
+}
+
+/* A worker's last use of the stream's socket is over. */
+static void external_worker_finished(external_conn *conn)
+{
+    pthread_mutex_lock(&conn->session->map_lock);
+    if (conn->io_workers > 0U) {
+        --conn->io_workers;
+    }
+    close_conn_fd_locked(conn);
+    pthread_mutex_unlock(&conn->session->map_lock);
 }
 
 static void free_external_write_queue(external_conn *conn)
@@ -4787,9 +4828,10 @@ static void *external_writer_thread(void *arg)
             record_tcp_traffic(session, conn->port, (long long)chunk->len, 0);
             /* Captured before it is forwarded, as Java does, so capture order is relay order. */
             record_tcp_frame(session, conn, "CLIENT_TO_PUBLIC", chunk->data, chunk->len);
+            /* fd stays this stream's socket until this worker is finished, even once stopped. */
             int fd;
             pthread_mutex_lock(&session->map_lock);
-            fd = conn->fd;
+            fd = conn->done ? -1 : conn->fd;
             pthread_mutex_unlock(&session->map_lock);
             if (fd < 0 || send_all(fd, chunk->data, chunk->len) != 0) {
                 fprintf(stderr,
@@ -4823,7 +4865,7 @@ static void *external_writer_thread(void *arg)
         pthread_mutex_unlock(&conn->write_lock);
 
         pthread_mutex_lock(&session->map_lock);
-        if (conn->fd >= 0) {
+        if (conn->fd >= 0 && !conn->done) {
             (void)shutdown(conn->fd, SHUT_WR);
         }
         conn->client_write_drained = 1;
@@ -4833,6 +4875,7 @@ static void *external_writer_thread(void *arg)
         pthread_mutex_unlock(&session->map_lock);
         break;
     }
+    external_worker_finished(conn);
     return NULL;
 }
 
@@ -4845,14 +4888,16 @@ static void *external_conn_thread(void *arg)
 
     if (send_open(session, conn->stream_id, conn->channel_id, conn->port) != 0) {
         mark_conn_done(conn);
+        external_worker_finished(conn);
         return NULL;
     }
 
     uint8_t buffer[ST_IO_BUFFER_SIZE];
     for (;;) {
+        /* fd stays this stream's socket until this worker is finished, even once stopped. */
         int fd;
         pthread_mutex_lock(&session->map_lock);
-        fd = conn->fd;
+        fd = conn->done ? -1 : conn->fd;
         pthread_mutex_unlock(&session->map_lock);
         if (fd < 0) {
             break;
@@ -4894,6 +4939,7 @@ static void *external_conn_thread(void *arg)
     pthread_mutex_unlock(&session->map_lock);
     printf("[nat] external read side closed channel=%s port=%d client=%s\n",
            conn->channel_id, conn->port, session->config.client_name);
+    external_worker_finished(conn);
     return NULL;
 }
 
@@ -4943,6 +4989,8 @@ static int start_external_conn(specus_session *session,
     }
     mark_stream_opened_locked(session, conn->stream_id);
     snprintf(conn->channel_id, sizeof(conn->channel_id), "c-%u", conn->stream_id);
+    /* Both workers are reserved before anyone can stop the stream, so its socket outlives them. */
+    conn->io_workers = 2U;
     conn->next = session->conns;
     session->conns = conn;
     pthread_mutex_unlock(&session->map_lock);
@@ -4950,6 +4998,7 @@ static int start_external_conn(specus_session *session,
     if (pthread_create(&conn->writer_thread, NULL, external_writer_thread, conn) != 0) {
         perror("pthread_create");
         pthread_mutex_lock(&session->map_lock);
+        conn->io_workers -= 2U;
         close_conn_locked(conn);
         pthread_mutex_unlock(&session->map_lock);
         return -1;
@@ -4958,6 +5007,7 @@ static int start_external_conn(specus_session *session,
     if (pthread_create(&conn->thread, NULL, external_conn_thread, conn) != 0) {
         perror("pthread_create");
         pthread_mutex_lock(&session->map_lock);
+        --conn->io_workers;
         close_conn_locked(conn);
         pthread_mutex_unlock(&session->map_lock);
         pthread_join(conn->writer_thread, NULL);
@@ -5151,7 +5201,7 @@ static void process_control_data(specus_session *session, const st_nat_message *
     const char *reset_reason = NULL;
     pthread_mutex_lock(&session->map_lock);
     external_conn *conn = find_conn_locked(session, message->stream_id);
-    int unknown = conn == NULL || conn->fd < 0;
+    int unknown = conn == NULL || conn->done;
     if (!unknown) {
         int rc = 0;
         if (message->data_len > 0U) {
@@ -5197,7 +5247,7 @@ static int process_control_closed(specus_session *session, const st_nat_message 
     int duplicate_fin = 0;
     pthread_mutex_lock(&session->map_lock);
     external_conn *conn = find_conn_locked(session, message->stream_id);
-    if (conn == NULL || conn->fd < 0) {
+    if (conn == NULL || conn->done) {
         unknown = 1;
         never_opened = message->type == ST_NAT_RST
             && !st_stream_tombstones_contains(&session->closed_streams, message->stream_id);
@@ -5380,6 +5430,10 @@ static void session_shutdown(specus_session *session)
     external_conn *conn = session->conns;
     while (conn != NULL) {
         external_conn *next = conn->next;
+        /* Both workers are joined and the last of them closed the socket; a safety net only. */
+        if (conn->fd >= 0) {
+            close(conn->fd);
+        }
         free_external_write_queue(conn);
         pthread_cond_destroy(&conn->flow_cond);
         pthread_mutex_destroy(&conn->flow_lock);
@@ -6004,14 +6058,16 @@ int main(void)
     }
     st_stun_turn_server *stun_turn_server = NULL;
     if (env_bool("SPECUS_PEER_MESH_ENABLED", 0)) {
+        /* Java StunTurnServer.run: the server runs on without STUN/TURN (every later use takes NULL). */
+        const char *stun_turn_port = getenv("SPECUS_PEER_MESH_STUN_TURN_PORT");
         if (st_stun_turn_server_start(&stun_turn_server) != 0) {
-            fprintf(stderr, "Peer Mesh STUN/TURN listener failed to start\n");
-            config_release_routes(&config);
-            st_public_discovery_shutdown();
-            return 1;
+            stun_turn_server = NULL;
+            fprintf(stderr, "[peer-mesh] standard STUN/TURN UDP server failed to start on %s\n",
+                    stun_turn_port != NULL && *stun_turn_port != '\0' ? stun_turn_port : "3478");
+        } else {
+            printf("[peer-mesh] STUN/TURN UDP listener active on port %d\n",
+                   st_stun_turn_server_port(stun_turn_server));
         }
-        printf("[peer-mesh] STUN/TURN UDP listener active on port %d\n",
-               st_stun_turn_server_port(stun_turn_server));
     }
 
     st_tls_config tls_config;

@@ -1360,6 +1360,37 @@ int st_storage_authorize_peer_mesh_relay(const char *path,
                                          long long to_client_id,
                                          long long relay_bytes,
                                          int account_traffic);
+/*
+ * What the relay hot path keeps of an authorized session (Java PeerMeshService.RelayAuthorization)
+ * so that its next frames are checked in memory. expires_at is the session's expiry in the stored
+ * sortable form, empty when it never expires (missing or unparseable, as Java isExpired reads it).
+ */
+typedef struct {
+    long long source_client_id;
+    long long target_client_id;
+    char expires_at[40];
+} st_storage_peer_mesh_relay_grant;
+/*
+ * st_storage_authorize_peer_mesh_relay without counting bytes (the first frame still activates a
+ * NEGOTIATING session), filling grant when the frame is allowed. 1 allowed, 0 refused, -1 error.
+ */
+int st_storage_authorize_peer_mesh_relay_grant(const char *path,
+                                               long long session_id,
+                                               long long from_client_id,
+                                               long long to_client_id,
+                                               st_storage_peer_mesh_relay_grant *grant);
+/*
+ * Adds one batch of relayed bytes to a session (Java persistRelayTrafficBatch): an expired session
+ * is closed first, and the bytes are recorded either way, since they were relayed while it was
+ * open. 0 recorded, 1 recorded on a closed session, 2 no such session, -1 error.
+ */
+int st_storage_record_peer_mesh_relay_traffic(const char *path, long long session_id, long long relay_bytes);
+/*
+ * Called with the session's id after each committed write that can withdraw its relay
+ * authorization: a close (by a client or the management API) or a reported change of status.
+ * Traffic reports and refused reports call nothing. One listener per process; NULL removes it.
+ */
+void st_storage_set_peer_mesh_session_listener(void (*listener)(long long session_id));
 int st_storage_verify_peer_mesh_probe(const char *path,
                                       long long session_id,
                                       long long from_client_id,
