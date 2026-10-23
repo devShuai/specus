@@ -1,12 +1,13 @@
-# Sourced by the TLS E2E scripts. make_test_pki DIR HOST writes, with the openssl CLI, a throwaway
-# P-256 PKI valid for two days:
+# Sourced by the TLS E2E scripts. make_test_pki DIR HOST [EXTRA_SANS] writes, with the openssl CLI,
+# a throwaway P-256 PKI valid for two days:
 #   DIR/ca.pem, DIR/ca.key            a test CA
-#   DIR/server.pem, DIR/server.key    a server certificate for HOST (SAN DNS:HOST only) the CA signed
+#   DIR/server.pem, DIR/server.key    a server certificate for HOST (SAN DNS:HOST, plus EXTRA_SANS
+#                                     such as "IP:127.0.0.1" when given) the CA signed
 #   DIR/other-ca.pem                  an unrelated CA, for clients that must not trust the server
 # HOST never has to resolve: clients reach 127.0.0.1 and check the certificate against HOST through
 # controlTls.serverName, so neither /etc/hosts nor DNS is touched.
 make_test_pki() {
-  local dir="$1" host="$2"
+  local dir="$1" host="$2" extra_sans="${3:-}"
   cat >"$dir/pki.cnf" <<CNF
 [req]
 distinguished_name = dn
@@ -24,7 +25,7 @@ subjectKeyIdentifier = hash
 basicConstraints = CA:FALSE
 keyUsage = critical,digitalSignature
 extendedKeyUsage = serverAuth
-subjectAltName = DNS:$host
+subjectAltName = DNS:$host${extra_sans:+,$extra_sans}
 subjectKeyIdentifier = hash
 authorityKeyIdentifier = keyid
 CNF

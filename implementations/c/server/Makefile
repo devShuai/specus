@@ -1,7 +1,7 @@
 CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2
 CPPFLAGS ?= -Isrc
-LDFLAGS ?= -lpthread -lz -lsqlite3 -lssl -lcrypto -lcurl -lhiredis -lutf8proc
+LDFLAGS ?= -lpthread -lz -lsqlite3 -lhiredis_ssl -lssl -lcrypto -lcurl -lhiredis -lutf8proc
 
 # libbrotlidec is optional, as in CMakeLists.txt: with its pkg-config file, Content-Encoding br is
 # decoded (ST_HAVE_BROTLI); libbrotlienc, when present too, lets the tests compress br fixtures.
@@ -24,6 +24,7 @@ URL_DECODE_TESTS := $(BUILD_DIR)/specus_c_url_decode_tests
 CONNECTIVITY_LIFETIME_TESTS := $(BUILD_DIR)/specus_c_connectivity_lifetime_tests
 CONNECTIVITY_SETTER_TESTS := $(BUILD_DIR)/specus_c_connectivity_setter_tests
 CORE_OBJS += $(BUILD_DIR)/instant.o $(BUILD_DIR)/instant_storage.o $(BUILD_DIR)/java_uri.o
+CORE_OBJS += $(BUILD_DIR)/redis_uri.o
 CORE_OBJS += $(BUILD_DIR)/websocket_ticket.o
 CORE_OBJS += $(BUILD_DIR)/traffic_usage.o
 INSTANT_TESTS := $(BUILD_DIR)/specus_c_instant_tests
@@ -58,6 +59,7 @@ PEER_MESH_TESTS := $(BUILD_DIR)/specus_c_peer_mesh_tests
 PEER_MESH_E2E_TESTS := $(BUILD_DIR)/specus_c_peer_mesh_e2e_tests
 PRODUCT_METRICS_TESTS := $(BUILD_DIR)/specus_c_product_metrics_tests
 PUBLIC_COORDINATION_TESTS := $(BUILD_DIR)/specus_c_public_coordination_tests
+PUBLIC_COORDINATION_SENTINEL_TESTS := $(BUILD_DIR)/specus_c_public_coordination_sentinel_tests
 PUBLIC_CLUSTER_CODEC_TESTS := $(BUILD_DIR)/specus_c_public_cluster_codec_tests
 PUBLIC_TRANSFER_TESTS := $(BUILD_DIR)/specus_c_public_transfer_tests
 PROTOCOL_TESTS := $(BUILD_DIR)/specus_c_protocol_fixture_tests
@@ -98,7 +100,7 @@ UPSTREAM_BROWSER_HEADERS_TESTS := $(BUILD_DIR)/specus_c_upstream_browser_headers
 WORKBENCH_TESTS := $(BUILD_DIR)/specus_c_workbench_tests
 MANAGEMENT_ACCOUNTS_TESTS := $(BUILD_DIR)/specus_c_management_accounts_tests
 TESTS := $(ADMIN_TESTS) $(DIRECT_WEBSOCKET_TESTS) $(CLIENT_ADDRESS_TESTS) $(CLIENT_AUTH_NONCE_TESTS) $(CONNECTIVITY_CHECK_TESTS) $(CRYPTO_TESTS) $(DECOMPRESSION_LIMITS_TESTS) $(GITHUB_RELEASE_TESTS) $(HTTP_CLIENT_TESTS) $(JSON_TESTS) $(LOGIN_RATE_LIMITER_TESTS) $(OBJECT_STORAGE_TESTS) $(OIDC_TESTS) $(PASSWORD_HASH_TESTS) $(PEER_EGRESS_TESTS) $(PEER_MESH_TESTS) $(PROTOCOL_TESTS) $(SECURITY_TESTS) $(SECURITY_BASELINE_TESTS) $(STORAGE_TESTS) $(STUN_TURN_TESTS) $(TLS_TRANSPORT_TESTS) $(WORKBENCH_TESTS) $(MANAGEMENT_ACCOUNTS_TESTS) $(HTTP_SHARE_TESTS) $(SEMANTIC_VERSION_TESTS) $(TRAFFIC_CAPTURE_TESTS) $(TURNSTILE_VERIFIER_TESTS) $(UPSTREAM_BROWSER_HEADERS_TESTS) $(CLIENT_PACKAGE_TESTS) $(PUBLIC_CLUSTER_CODEC_TESTS) $(PUBLIC_TRANSFER_TESTS)
-ALL_TESTS := $(TESTS) $(PUBLIC_COORDINATION_TESTS) $(ELASTICSEARCH_TRAFFIC_TESTS) $(MEDIA_CAPTURE_TESTS) $(SESSION_LIFECYCLE_TESTS) $(SECURITY_RULES_TESTS) $(HTTP_ROUTE_LIFECYCLE_TESTS) $(NAT_STREAM_TESTS) $(PRODUCT_METRICS_TESTS) $(CONNECTION_ARCHIVE_TESTS) $(HTTP_WEBSOCKET_ROUTING_TESTS) $(TRAFFIC_DETAIL_API_TESTS) $(CLIENT_MESSAGES_TESTS) $(MANAGEMENT_WS_BACKPRESSURE_TESTS) $(DIRECT_WEBSOCKET_BACKPRESSURE_TESTS) $(MANAGEMENT_LISTS_TESTS) $(MANAGEMENT_CRUD_TESTS) $(PEER_MESH_API_TESTS) $(MANAGEMENT_OVERVIEW_TESTS)
+ALL_TESTS := $(TESTS) $(PUBLIC_COORDINATION_TESTS) $(PUBLIC_COORDINATION_SENTINEL_TESTS) $(ELASTICSEARCH_TRAFFIC_TESTS) $(MEDIA_CAPTURE_TESTS) $(SESSION_LIFECYCLE_TESTS) $(SECURITY_RULES_TESTS) $(HTTP_ROUTE_LIFECYCLE_TESTS) $(NAT_STREAM_TESTS) $(PRODUCT_METRICS_TESTS) $(CONNECTION_ARCHIVE_TESTS) $(HTTP_WEBSOCKET_ROUTING_TESTS) $(TRAFFIC_DETAIL_API_TESTS) $(CLIENT_MESSAGES_TESTS) $(MANAGEMENT_WS_BACKPRESSURE_TESTS) $(DIRECT_WEBSOCKET_BACKPRESSURE_TESTS) $(MANAGEMENT_LISTS_TESTS) $(MANAGEMENT_CRUD_TESTS) $(PEER_MESH_API_TESTS) $(MANAGEMENT_OVERVIEW_TESTS)
 ALL_TESTS += $(PEER_MESH_E2E_TESTS) $(CLIENT_ROUTE_SCALE_TESTS)
 ALL_TESTS += $(NAT_SIZING_REFERENCE_TESTS)
 ALL_TESTS += $(SQLITE_REFERENCE_TESTS)
@@ -153,6 +155,9 @@ TESTS += $(SESSION_ORDER_TESTS) $(SESSION_SCOPE_TESTS)
 ALL_TESTS += $(SESSION_ORDER_TESTS) $(SESSION_SCOPE_TESTS)
 TESTS += $(URL_DECODE_TESTS)
 ALL_TESTS += $(URL_DECODE_TESTS)
+REDIS_URI_TESTS := $(BUILD_DIR)/specus_c_redis_uri_tests
+TESTS += $(REDIS_URI_TESTS)
+ALL_TESTS += $(REDIS_URI_TESTS)
 
 .PHONY: all test release clean
 ALL_TESTS += $(SERVER_HARNESS_TESTS) $(WEBSOCKET_TICKET_API_TESTS)
@@ -196,6 +201,8 @@ $(UNICODE_JAVA21_TESTS): $(CORE_OBJS) tests/unicode_java21_tests.c $(UNICODE_JAV
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/unicode_java21_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/java_uri.o: src/java_uri.h
+$(BUILD_DIR)/redis_uri.o: src/redis_uri.h src/java_uri.h
+$(BUILD_DIR)/public_coordination.o: src/public_coordination.h src/redis_uri.h
 
 $(JAVA_URI_TESTS): $(CORE_OBJS) tests/java_uri_tests.c $(DOWNLOAD_LINK_VECTOR_FILE) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/java_uri_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
@@ -240,6 +247,9 @@ $(ADMIN_TESTS): $(CORE_OBJS) tests/admin_http_tests.c | $(BUILD_DIR)
 
 $(URL_DECODE_TESTS): $(CORE_OBJS) tests/url_decode_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/url_decode_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(REDIS_URI_TESTS): $(CORE_OBJS) tests/redis_uri_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/redis_uri_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 $(CONNECTIVITY_LIFETIME_TESTS): $(CORE_OBJS) tests/connectivity_lifetime_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/connectivity_lifetime_tests.c $(CORE_OBJS) -Wl,--wrap=free -Wl,--wrap=st_connectivity_checker_new -Wl,--wrap=st_connectivity_handle $(LDFLAGS) -o $@
 
@@ -317,6 +327,9 @@ $(PEER_MESH_E2E_TESTS): $(CORE_OBJS) tests/peer_mesh_e2e_tests.c tests/server_ha
 
 $(PUBLIC_COORDINATION_TESTS): $(CORE_OBJS) tests/public_coordination_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/public_coordination_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(PUBLIC_COORDINATION_SENTINEL_TESTS): $(CORE_OBJS) tests/public_coordination_sentinel_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/public_coordination_sentinel_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(PUBLIC_CLUSTER_CODEC_TESTS): $(CORE_OBJS) tests/public_cluster_codec_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/public_cluster_codec_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
@@ -473,6 +486,9 @@ test: all
 	$(JAVA_URI_TESTS) "$(abspath $(DOWNLOAD_LINK_VECTOR_FILE))"
 	@for test in $(TESTS); do $$test || exit 1; done
 	bash scripts/public_coordination_test.sh $(PUBLIC_COORDINATION_TESTS)
+	bash scripts/public_coordination_tls_test.sh $(PUBLIC_COORDINATION_TESTS)
+	bash scripts/public_coordination_sentinel_test.sh $(PUBLIC_COORDINATION_SENTINEL_TESTS) plain
+	bash scripts/public_coordination_sentinel_test.sh $(PUBLIC_COORDINATION_SENTINEL_TESTS) tls
 	bash scripts/public_discovery_cluster_e2e.sh $(SERVER)
 	python3 scripts/management_cluster_e2e.py $(SERVER)
 	SPECUS_TEST_OSS_START_DELAY_SECONDS=0.5 bash scripts/object_storage_e2e.sh $(SERVER)

@@ -15,6 +15,7 @@ cleanup() {
 trap cleanup EXIT
 
 redis-server --bind 127.0.0.1 --port "$PORT" --protected-mode yes \
+  --unixsocket "$TMP_DIR/redis.sock" --unixsocketperm 700 \
   --save '' --appendonly no --dir "$TMP_DIR" >"$TMP_DIR/redis.log" 2>&1 &
 REDIS_PID=$!
 
@@ -26,6 +27,7 @@ redis-cli -h 127.0.0.1 -p "$PORT" ping >/dev/null
 
 SPECUS_TEST_REDIS_PORT="$PORT" \
 SPECUS_TEST_REDIS_DIR="$TMP_DIR" \
+SPECUS_TEST_REDIS_SOCKET="$TMP_DIR/redis.sock" \
 SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED=true \
 SPECUS_PUBLIC_TRANSFER_REDIS_URI="redis://127.0.0.1:$PORT/0" \
 SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX="specus:test:coordination" \

@@ -4,12 +4,19 @@
 
 #include "crypto.h"
 #include "json.h"
+#include "redis_uri.h"
 
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <hiredis/hiredis.h>
+#include <hiredis/hiredis_ssl.h>
 #include <limits.h>
+#include <netinet/in.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
 #include <utf8proc.h>
 #include <poll.h>
 #include <pthread.h>
@@ -30,11 +37,7 @@
 #define ST_CLUSTER_REVISION_TTL_MS 604800000LL
 
 typedef struct {
-    char host[256];
-    int port;
-    char username[256];
-    char password[512];
-    int database;
+    st_redis_uri redis;
     char key_prefix[256];
     long lease_seconds;
     long refresh_interval_ms;
@@ -82,6 +85,7 @@ typedef struct {
     int initialized;
     int stopping;
     st_cluster_config config;
+    char sentinel_master[ST_REDIS_URI_HOST_BYTES + 16U]; /* last address the Sentinels gave, logged on change */
     st_public_cluster_event_handler handler;
     void *handler_context;
 } st_cluster_state;
@@ -321,26 +325,6 @@ static int cluster_env_long(const char *name, long long fallback, long long *out
     return parsed == -1 ? -1 : 0;
 }
 
-static int cluster_percent_decode(const char *source, size_t len, char *out, size_t out_len)
-{
-    if (len + 1U > out_len) return -1;
-    size_t written = 0U;
-    for (size_t i = 0U; i < len; ++i) {
-        unsigned char value = (unsigned char)source[i];
-        if (value == '%') {
-            if (i + 2U >= len || !isxdigit((unsigned char)source[i + 1U])
-                || !isxdigit((unsigned char)source[i + 2U])) return -1;
-            char hex[3] = {source[i + 1U], source[i + 2U], '\0'};
-            value = (unsigned char)strtoul(hex, NULL, 16);
-            i += 2U;
-        }
-        if (value == 0U || written + 1U >= out_len) return -1;
-        out[written++] = (char)value;
-    }
-    out[written] = '\0';
-    return 0;
-}
-
 /* Java's StringUtils.hasText: some character that is not Character.isWhitespace. */
 static int cluster_has_text(const char *value)
 {
@@ -364,90 +348,23 @@ static int cluster_parse_uri(st_cluster_config *config)
     size_t uri_len = 0U;
     const char *raw_uri = getenv("SPECUS_PUBLIC_TRANSFER_REDIS_URI");
     const char *trimmed_uri = cluster_java_trim(raw_uri, &uri_len);
-    char uri_buffer[2048];
-    static const char scheme[] = "redis://";
+    char uri_buffer[4096];
     if (raw_uri == NULL || uri_len >= sizeof(uri_buffer)) {
-        fprintf(stderr, "public transfer Redis URI must use redis://\n");
+        fprintf(stderr, "public transfer Redis URI is missing or too long\n");
         return -1;
     }
     memcpy(uri_buffer, trimmed_uri, uri_len);
     uri_buffer[uri_len] = '\0';
-    const char *uri = uri_buffer;
-    if (strncmp(uri, scheme, sizeof(scheme) - 1U) != 0) {
-        fprintf(stderr, "public transfer Redis URI must use redis://\n");
+    /*
+     * Lettuce's schemes, user information, database, query parameters and Sentinel list (see
+     * redis_uri.h); a URI Java would refuse fails startup here. The reason never shows the URI.
+     */
+    char reason[256];
+    int parsed_uri = st_redis_uri_parse(uri_buffer, &config->redis, reason, sizeof(reason));
+    memset(uri_buffer, 0, sizeof(uri_buffer));
+    if (parsed_uri != 0) {
+        fprintf(stderr, "public transfer Redis URI is invalid: %s\n", reason);
         return -1;
-    }
-    const char *authority = uri + sizeof(scheme) - 1U;
-    const char *path = strchr(authority, '/');
-    const char *authority_end = path == NULL ? uri + strlen(uri) : path;
-    const char *at = NULL;
-    for (const char *cursor = authority; cursor < authority_end; ++cursor) {
-        if (*cursor == '@') at = cursor;
-    }
-    const char *host_start = authority;
-    if (at != NULL) {
-        const char *colon = memchr(authority, ':', (size_t)(at - authority));
-        if (colon == NULL) {
-            if (cluster_percent_decode(authority,
-                                       (size_t)(at - authority),
-                                       config->password,
-                                       sizeof(config->password)) != 0) return -1;
-        } else {
-            if (cluster_percent_decode(authority,
-                                       (size_t)(colon - authority),
-                                       config->username,
-                                       sizeof(config->username)) != 0
-                || cluster_percent_decode(colon + 1,
-                                          (size_t)(at - colon - 1),
-                                          config->password,
-                                          sizeof(config->password)) != 0) return -1;
-        }
-        host_start = at + 1;
-    }
-    const char *port_start = NULL;
-    const char *host_end = authority_end;
-    if (host_start < authority_end && *host_start == '[') {
-        const char *closing = memchr(host_start, ']', (size_t)(authority_end - host_start));
-        if (closing == NULL) return -1;
-        host_start++;
-        host_end = closing;
-        if (closing + 1 < authority_end) {
-            if (closing[1] != ':') return -1;
-            port_start = closing + 2;
-        }
-    } else {
-        const char *colon = NULL;
-        for (const char *cursor = host_start; cursor < authority_end; ++cursor) {
-            if (*cursor == ':') colon = cursor;
-        }
-        if (colon != NULL) {
-            host_end = colon;
-            port_start = colon + 1;
-        }
-    }
-    if (host_end == host_start || (size_t)(host_end - host_start) >= sizeof(config->host)) return -1;
-    memcpy(config->host, host_start, (size_t)(host_end - host_start));
-    config->host[host_end - host_start] = '\0';
-    config->port = 6379;
-    if (port_start != NULL) {
-        char port_text[16];
-        size_t port_len = (size_t)(authority_end - port_start);
-        if (port_len == 0U || port_len >= sizeof(port_text)) return -1;
-        memcpy(port_text, port_start, port_len);
-        port_text[port_len] = '\0';
-        char *end = NULL;
-        long parsed = strtol(port_text, &end, 10);
-        if (end == port_text || *end != '\0' || parsed < 1 || parsed > 65535) return -1;
-        config->port = (int)parsed;
-    }
-    config->database = 0;
-    if (path != NULL && path[1] != '\0') {
-        const char *database_text = path + 1;
-        if (strchr(database_text, '?') != NULL || strchr(database_text, '#') != NULL) return -1;
-        char *end = NULL;
-        long parsed = strtol(database_text, &end, 10);
-        if (end == database_text || *end != '\0' || parsed < 0 || parsed > 15) return -1;
-        config->database = (int)parsed;
     }
     /*
      * Java keyPrefix(): a value without text means the default; otherwise trim() and drop the
@@ -490,52 +407,246 @@ static int cluster_reply_ok(redisReply *reply)
         && reply->str != NULL && strcasecmp(reply->str, "OK") == 0;
 }
 
-/* Connects, authenticates, selects the database and checks PING; quiet skips the failure log. */
-static redisContext *cluster_connect(const st_cluster_config *config, int quiet)
+/* An IPv4 or IPv6 literal: checked against the certificate's IP addresses and sent without SNI. */
+static int cluster_ip_literal(const char *host)
 {
-    struct timeval connect_timeout = {
+    unsigned char address[sizeof(struct in6_addr)];
+    return inet_pton(AF_INET, host, address) == 1 || inet_pton(AF_INET6, host, address) == 1;
+}
+
+/*
+ * TLS as Lettuce's SslChannelInitializer sets it up for rediss://: verifyPeer FULL checks the
+ * chain and the host name (an IP literal against the IP addresses of the certificate, as the
+ * JDK's HTTPS identification does), CA only the chain, NONE nothing. The trust store is OpenSSL's
+ * default, which SSL_CERT_FILE / SSL_CERT_DIR replace as javax.net.ssl.trustStore does for the
+ * JVM. No client certificate is offered (Java configures none) and the protocol is TLS 1.2 or 1.3.
+ * The SSL object goes to hiredis, which uses and frees it with the context.
+ */
+static int cluster_tls_start(redisContext *redis, const char *host, st_redis_verify_mode verify,
+                             const char *what, int quiet)
+{
+    SSL_CTX *context = SSL_CTX_new(TLS_client_method());
+    int ok = context != NULL && SSL_CTX_set_min_proto_version(context, TLS1_2_VERSION) == 1;
+    if (ok && verify != ST_REDIS_VERIFY_NONE) {
+        ok = SSL_CTX_set_default_verify_paths(context) == 1;
+        SSL_CTX_set_verify(context, SSL_VERIFY_PEER, NULL);
+    } else if (ok) {
+        SSL_CTX_set_verify(context, SSL_VERIFY_NONE, NULL);
+    }
+    SSL *ssl = ok ? SSL_new(context) : NULL;
+    SSL_CTX_free(context); /* the SSL object holds its own reference */
+    ok = ssl != NULL;
+    int ip = cluster_ip_literal(host);
+    if (ok && !ip) {
+        /* SNI as the JDK sends it: a host name with a dot, without its trailing dot. */
+        char server_name[ST_REDIS_URI_HOST_BYTES];
+        size_t len = strlen(host);
+        if (len > 0U && host[len - 1U] == '.') --len;
+        if (len < sizeof(server_name)) {
+            memcpy(server_name, host, len);
+            server_name[len] = '\0';
+            const char *dot = strchr(server_name, '.');
+            if (dot != NULL && dot != server_name) ok = SSL_set_tlsext_host_name(ssl, server_name) == 1;
+        }
+    }
+    if (ok && verify == ST_REDIS_VERIFY_FULL) {
+        X509_VERIFY_PARAM *parameters = SSL_get0_param(ssl);
+        ok = ip ? X509_VERIFY_PARAM_set1_ip_asc(parameters, host) == 1
+                : X509_VERIFY_PARAM_set1_host(parameters, host, 0U) == 1;
+    }
+    if (!ok) {
+        if (!quiet) fprintf(stderr, "public transfer %s TLS setup for %s failed\n", what, host);
+        SSL_free(ssl);
+        ERR_clear_error();
+        return -1;
+    }
+    if (redisInitiateSSL(redis, ssl) != REDIS_OK) {
+        /* On failure hiredis leaves the SSL object to the caller. */
+        long verified = SSL_get_verify_result(ssl);
+        if (!quiet)
+            fprintf(stderr, "public transfer %s TLS handshake with %s failed: %s%s%s%s\n", what, host,
+                    redis->errstr, verified != X509_V_OK ? " (" : "",
+                    verified != X509_V_OK ? X509_verify_cert_error_string(verified) : "",
+                    verified != X509_V_OK ? ")" : "");
+        SSL_free(ssl);
+        ERR_clear_error();
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * A connection to host:port, or to the URI's Unix socket, with the command timeout on connect and
+ * on every read and write (the TLS handshake included), over TLS when the URI asks for it.
+ */
+static redisContext *cluster_open(const st_cluster_config *config, const char *host, int port,
+                                  const char *what, int quiet)
+{
+    struct timeval timeout = {
         .tv_sec = config->command_timeout_ms / 1000L,
         .tv_usec = (config->command_timeout_ms % 1000L) * 1000L
     };
-    redisContext *redis = redisConnectWithTimeout(config->host, config->port, connect_timeout);
+    redisOptions options;
+    memset(&options, 0, sizeof(options));
+    if (config->redis.socket_path[0] != '\0') {
+        REDIS_OPTIONS_SET_UNIX(&options, config->redis.socket_path);
+    } else {
+        REDIS_OPTIONS_SET_TCP(&options, host, port);
+    }
+    options.connect_timeout = &timeout;
+    options.command_timeout = &timeout;
+    redisContext *redis = redisConnectWithOptions(&options);
     if (redis == NULL || redis->err) {
-        if (!quiet)
-            fprintf(stderr, "public transfer Redis connect failed: %s\n",
-                    redis == NULL ? "out of memory" : redis->errstr);
+        if (!quiet) {
+            if (config->redis.socket_path[0] != '\0')
+                fprintf(stderr, "public transfer %s connect to %s failed: %s\n", what, config->redis.socket_path,
+                        redis == NULL ? "out of memory" : redis->errstr);
+            else
+                fprintf(stderr, "public transfer %s connect to %s:%d failed: %s\n", what, host, port,
+                        redis == NULL ? "out of memory" : redis->errstr);
+        }
         if (redis != NULL) redisFree(redis);
         return NULL;
     }
-    if (redisSetTimeout(redis, connect_timeout) != REDIS_OK) {
+    if (config->redis.tls && cluster_tls_start(redis, host, config->redis.verify, what, quiet) != 0) {
         redisFree(redis);
         return NULL;
     }
+    return redis;
+}
+
+/*
+ * Lettuce's connection handshake: AUTH with the URI's credentials (data nodes only; a Sentinel
+ * gets none from the URI), the client name, SELECT (data nodes only). A refusal fails the
+ * connection. The library name and version are sent best effort, as Lettuce sends them.
+ */
+static int cluster_handshake(redisContext *redis, const st_redis_uri *uri, int data_node,
+                             const char *what, int quiet)
+{
     redisReply *reply = NULL;
-    if (config->password[0] != '\0') {
-        if (config->username[0] != '\0')
-            reply = redisCommand(redis, "AUTH %s %s", config->username, config->password);
+    if (data_node && uri->password[0] != '\0') {
+        if (uri->username[0] != '\0')
+            reply = redisCommand(redis, "AUTH %s %s", uri->username, uri->password);
         else
-            reply = redisCommand(redis, "AUTH %s", config->password);
-        if (!cluster_reply_ok(reply)) {
-            if (!quiet) fprintf(stderr, "public transfer Redis authentication failed\n");
-            freeReplyObject(reply);
-            redisFree(redis);
-            return NULL;
-        }
+            reply = redisCommand(redis, "AUTH %s", uri->password);
+        int authenticated = cluster_reply_ok(reply);
         freeReplyObject(reply);
+        if (!authenticated) {
+            if (!quiet) fprintf(stderr, "public transfer %s authentication failed\n", what);
+            return -1;
+        }
     }
-    if (config->database != 0) {
-        reply = redisCommand(redis, "SELECT %d", config->database);
-        if (!cluster_reply_ok(reply)) {
+    if (uri->client_name[0] != '\0') {
+        reply = redisCommand(redis, "CLIENT SETNAME %s", uri->client_name);
+        int named = cluster_reply_ok(reply);
+        if (!named && !quiet)
+            fprintf(stderr, "public transfer %s refused the client name: %s\n", what,
+                    reply != NULL && reply->type == REDIS_REPLY_ERROR ? reply->str : "no reply");
+        freeReplyObject(reply);
+        if (!named) return -1;
+    }
+    if (data_node && uri->database != 0) {
+        reply = redisCommand(redis, "SELECT %d", uri->database);
+        int selected = cluster_reply_ok(reply);
+        freeReplyObject(reply);
+        if (!selected) {
             if (!quiet) fprintf(stderr, "public transfer Redis database selection failed\n");
-            freeReplyObject(reply);
-            redisFree(redis);
-            return NULL;
+            return -1;
         }
-        freeReplyObject(reply);
     }
-    reply = redisCommand(redis, "PING");
+    if (uri->library_name[0] != '\0')
+        freeReplyObject(redisCommand(redis, "CLIENT SETINFO LIB-NAME %s", uri->library_name));
+    if (uri->library_version[0] != '\0')
+        freeReplyObject(redisCommand(redis, "CLIENT SETINFO LIB-VER %s", uri->library_version));
+    return redis->err == 0 ? 0 : -1;
+}
+
+/*
+ * Lettuce's lookupRedis: the Sentinels in the URI's order until one accepts a connection, then
+ * that Sentinel's SENTINEL GET-MASTER-ADDR-BY-NAME answer. An unknown master or a failed reply ends
+ * the lookup there, as it does for Lettuce. Every (re)connect asks again, so a connection that is
+ * re-established after a failover reaches the promoted master.
+ */
+static int cluster_sentinel_master(const st_cluster_config *config, char *host, size_t host_len, int *port,
+                                   int quiet)
+{
+    const st_redis_uri *uri = &config->redis;
+    for (size_t i = 0U; i < uri->sentinel_count; ++i) {
+        const st_redis_endpoint *sentinel = &uri->sentinels[i];
+        redisContext *redis = cluster_open(config, sentinel->host, sentinel->port, "Redis Sentinel", quiet);
+        if (redis != NULL && cluster_handshake(redis, uri, 0, "Redis Sentinel", quiet) != 0) {
+            redisFree(redis);
+            redis = NULL;
+        }
+        if (redis == NULL) continue;
+        const char *argv[] = {"SENTINEL", "GET-MASTER-ADDR-BY-NAME", uri->master_id};
+        size_t lengths[] = {8U, strlen(argv[1]), strlen(uri->master_id)};
+        redisReply *reply = (redisReply *)redisCommandArgv(redis, 3, argv, lengths);
+        int found = reply != NULL && reply->type == REDIS_REPLY_ARRAY && reply->elements == 2U
+            && reply->element[0]->type == REDIS_REPLY_STRING && reply->element[1]->type == REDIS_REPLY_STRING
+            && reply->element[0]->len > 0U && reply->element[0]->len < host_len;
+        if (found) {
+            char *end = NULL;
+            long value = strtol(reply->element[1]->str, &end, 10);
+            found = end != reply->element[1]->str && *end == '\0' && value > 0L && value <= 65535L;
+            if (found) {
+                memcpy(host, reply->element[0]->str, reply->element[0]->len);
+                host[reply->element[0]->len] = '\0';
+                *port = (int)value;
+            }
+        }
+        if (!found && !quiet)
+            fprintf(stderr, "public transfer Redis Sentinel %s:%d gave no address for master %s%s%s\n",
+                    sentinel->host, sentinel->port, uri->master_id,
+                    reply != NULL && reply->type == REDIS_REPLY_ERROR ? ": " : "",
+                    reply != NULL && reply->type == REDIS_REPLY_ERROR ? reply->str : "");
+        freeReplyObject(reply);
+        redisFree(redis);
+        return found ? 0 : -1;
+    }
+    if (!quiet) fprintf(stderr, "public transfer Redis: no Sentinel could be reached for master %s\n", uri->master_id);
+    return -1;
+}
+
+/* Logs the master's address when the Sentinels report a different one (first lookup, failover). */
+static void cluster_note_master(const char *master_id, const char *host, int port)
+{
+    char address[sizeof(cluster_state.sentinel_master)];
+    snprintf(address, sizeof(address), "%s:%d", host, port);
+    pthread_mutex_lock(&cluster_state.state_lock);
+    int changed = strcmp(cluster_state.sentinel_master, address) != 0;
+    if (changed) memcpy(cluster_state.sentinel_master, address, sizeof(address));
+    pthread_mutex_unlock(&cluster_state.state_lock);
+    if (changed) fprintf(stderr, "[public-transfer] Redis Sentinel master %s is at %s\n", master_id, address);
+}
+
+/*
+ * Finds the node (through the Sentinels when the URI lists them), connects, runs the handshake and
+ * checks PING; quiet skips the failure logs.
+ */
+static redisContext *cluster_connect(const st_cluster_config *config, int quiet)
+{
+    char host[ST_REDIS_URI_HOST_BYTES];
+    int port = config->redis.server.port;
+    if (config->redis.sentinel) {
+        if (cluster_sentinel_master(config, host, sizeof(host), &port, quiet) != 0) return NULL;
+        cluster_note_master(config->redis.master_id, host, port);
+    } else {
+        memcpy(host, config->redis.server.host, sizeof(host));
+    }
+    redisContext *redis = cluster_open(config, host, port, "Redis", quiet);
+    if (redis == NULL) return NULL;
+    if (cluster_handshake(redis, &config->redis, 1, "Redis", quiet) != 0) {
+        redisFree(redis);
+        return NULL;
+    }
+    redisReply *reply = redisCommand(redis, "PING");
     int pong = reply != NULL && (reply->type == REDIS_REPLY_STATUS || reply->type == REDIS_REPLY_STRING)
         && reply->str != NULL && strcasecmp(reply->str, "PONG") == 0;
+    if (!pong && !quiet)
+        fprintf(stderr, "public transfer Redis did not answer PING: %s\n",
+                reply != NULL && reply->type == REDIS_REPLY_ERROR ? reply->str
+                : redis->errstr[0] != '\0' ? redis->errstr : "unexpected reply");
     freeReplyObject(reply);
     if (!pong) {
         redisFree(redis);
@@ -2077,11 +2188,11 @@ static void *cluster_subscriber_thread(void *unused)
         pthread_mutex_lock(&cluster_state.state_lock);
         redisContext *subscriber = cluster_state.subscriber;
         int stopping = cluster_state.stopping;
-        st_cluster_config config = cluster_state.config;
         pthread_mutex_unlock(&cluster_state.state_lock);
         if (stopping) break;
         if (subscriber == NULL) {
-            subscriber = cluster_subscribe(&config, failures > 0U);
+            /* The configuration is set before this thread starts and kept until it is joined. */
+            subscriber = cluster_subscribe(&cluster_state.config, failures > 0U);
             if (subscriber == NULL) {
                 if (failures < UINT_MAX) ++failures;
                 cluster_wait_ms(cluster_reconnect_delay_ms(failures));
@@ -2228,8 +2339,9 @@ int st_public_coordination_initialize(st_public_cluster_event_handler handler, v
         pthread_mutex_unlock(&cluster_lifecycle_lock);
         return 0;
     }
+    cluster_state.sentinel_master[0] = '\0';
     pthread_mutex_unlock(&cluster_state.state_lock);
-    st_cluster_config config;
+    static st_cluster_config config; /* large; only touched under cluster_lifecycle_lock */
     memset(&config, 0, sizeof(config));
     if (cluster_parse_uri(&config) != 0) {
         pthread_mutex_unlock(&cluster_lifecycle_lock);
@@ -2273,10 +2385,16 @@ int st_public_coordination_initialize(st_public_cluster_event_handler handler, v
         pthread_mutex_unlock(&cluster_lifecycle_lock);
         return -1;
     }
-    pthread_mutex_unlock(&cluster_lifecycle_lock);
+    static const char *const verify_names[] = {"NONE", "CA", "FULL"};
     fprintf(stderr,
-            "[public-transfer] Redis coordination enabled prefix=%s\n",
-            config.key_prefix);
+            "[public-transfer] Redis coordination enabled prefix=%s transport=%s%s%s%s%s\n",
+            config.key_prefix,
+            config.redis.socket_path[0] != '\0' ? "unix" : config.redis.tls ? "tls" : "tcp",
+            config.redis.tls ? " verifyPeer=" : "",
+            config.redis.tls ? verify_names[config.redis.verify] : "",
+            config.redis.sentinel ? " sentinel-master=" : "",
+            config.redis.sentinel ? config.redis.master_id : "");
+    pthread_mutex_unlock(&cluster_lifecycle_lock);
     return 0;
 }
 
