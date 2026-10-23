@@ -68,8 +68,13 @@ whose `controlTls.enabled` is unset follow it.
 make -C implementations/c/server test
 ```
 
-The C build uses pthreads, zlib, SQLite3, OpenSSL, libcurl, hiredis, and utf8proc. The full test target
-also starts an isolated `redis-server` for coordination and two-process WebSocket coverage.
+The C build uses pthreads, zlib, SQLite3, OpenSSL, libcurl, hiredis (0.14 or later), and utf8proc. The
+Redis TLS URIs (`rediss://`, `rediss-sentinel://`) also need hiredis' TLS layer, `hiredis_ssl`, from
+hiredis 1.0 or later: Ubuntu 24.04's `libhiredis-dev` (1.2) includes it, the hiredis 0.14 of Ubuntu 22.04
+and Debian 12 does not. CMake and the Makefile (through `pkg-config hiredis_ssl`) use it when present;
+without it the build still works and those URIs fail startup with a message saying so. The full test
+target also starts isolated `redis-server` processes (a TLS one and a Sentinel setup among them) for
+coordination and two-process WebSocket coverage.
 
 ## Run
 
@@ -164,7 +169,7 @@ Additional runtime knobs:
 | `SPECUS_PEER_MESH_CATALOG_TTL_SECONDS` | `300` | Live service-catalog lease before stale withdrawal. Values outside `1..86400` fall back to `300`. |
 | `SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM` | `32` | Maximum discoverable peers in one token/public room. |
 | `SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED` | `false` | Enables Java-compatible Redis presence, merged roster revisions, Pub/Sub routing, global name checks, and shared discovery-message, pairing-code redemption and public presign-upload limits. Read as Spring binds it: `true`/`false`, `on`/`off`, `yes`/`no` or `1`/`0` in any case, blanks around ignored; any other value, a blank one included, fails startup. An empty value keeps the default (Spring fails startup on it). A Redis failure fails only the operation that meets it (see below); there is no process-local fallback. |
-| `SPECUS_PUBLIC_TRANSFER_REDIS_URI` | unset | Required in cluster mode. Supports `redis://[user[:password]@]host[:port][/0..15]`, surrounding blanks trimmed; TLS `rediss://`, Sentinel and query parameters are rejected (no TLS or Sentinel transport in C). |
+| `SPECUS_PUBLIC_TRANSFER_REDIS_URI` | unset | Required in cluster mode. Read as Java's Lettuce `RedisURI.create` reads it, surrounding blanks trimmed: `redis://`, `rediss://` or `redis+ssl://` (TLS), `redis-sentinel://` or `rediss-sentinel://` (the master named by `#id` or `sentinelMasterId=` is looked up through the comma-separated Sentinels, again on every reconnect, so a failover is followed), `redis-socket:///path`; `[user[:password]@]` authenticates the data nodes only, the database comes from the path or `database=`/`db=`, `clientName=` names the connections, `verifyPeer=NONE\|CA\|FULL` (default `FULL`: chain and host name), `timeout=` is checked and then replaced by the command timeout, as in Java. TLS trusts OpenSSL's default CA store (override with `SSL_CERT_FILE`/`SSL_CERT_DIR`) and offers no client certificate, so Redis needs `tls-auth-clients no` or `optional`; with Sentinel and `FULL`, Sentinels report the nodes by IP address, so every node's certificate must carry its IP address. Each listed Sentinel that accepts connections but does not answer costs up to one command timeout per (re)connect. A URI Java refuses fails startup; so does `redis+tls://` (STARTTLS, which Redis does not speak). Upgrade note: like Java, a host name with `_` cannot take a port (`redis://redis_cache:6379` now fails to connect; `redis://redis_cache` works), and `@`, `#`, `?`, `/` in a password must be percent-encoded; older C builds accepted such a host with a port and an unescaped `@`, `#` or `?`. |
 | `SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX` | `specus:v2:public-transfer` | Redis keys/channel prefix, trimmed and stripped of trailing colons; a blank value means the default. Use a distinct value per environment. |
 | `SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS` | `30` | Shared discovery presence TTL; values below 5 count as 5. Like the next two, it must be a number even when clustering is off (blanks inside are removed, `0x`/`#` hexadecimal accepted, as Spring binds numbers); an empty value keeps the default. |
 | `SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS` | `10000` | Presence refresh period; even when clustering is off it must be a positive decimal number (Java also schedules its refresh task with it), and in cluster mode less than half the lease TTL. |

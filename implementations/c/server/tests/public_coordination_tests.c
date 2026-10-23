@@ -477,15 +477,32 @@ static int test_event_queue_is_bounded(void)
 /* The fixture's own redis-server, started again on the same port after SHUTDOWN. */
 static pid_t restarted_redis = -1;
 
-/* posix_spawn rather than fork: this process already runs the coordination threads. */
+/*
+ * posix_spawn rather than fork: this process already runs the coordination threads. In the
+ * rediss:// run (public_coordination_tls_test.sh) the TLS port comes back with the plain one.
+ */
 static pid_t start_redis(void)
 {
     char port[16];
     snprintf(port, sizeof(port), "%d", fixture_port());
     const char *dir = getenv("SPECUS_TEST_REDIS_DIR");
-    char *const argv[] = {"redis-server", "--bind", "127.0.0.1", "--port", port,
-                          "--protected-mode", "yes", "--save", "", "--appendonly", "no",
-                          "--dir", (char *)(dir == NULL ? "/tmp" : dir), NULL};
+    const char *tls_port = getenv("SPECUS_TEST_REDIS_TLS_PORT");
+    char *argv[32] = {"redis-server", "--bind", "127.0.0.1", "--port", port,
+                      "--protected-mode", "yes", "--save", "", "--appendonly", "no",
+                      "--dir", (char *)(dir == NULL ? "/tmp" : dir)};
+    size_t argc = 13U;
+    if (tls_port != NULL) {
+        const char *const tls[] = {"--tls-port", tls_port,
+                                   "--tls-cert-file", getenv("SPECUS_TEST_REDIS_TLS_CERT"),
+                                   "--tls-key-file", getenv("SPECUS_TEST_REDIS_TLS_KEY"),
+                                   "--tls-ca-cert-file", getenv("SPECUS_TEST_REDIS_TLS_CA"),
+                                   "--tls-auth-clients", "no"};
+        for (size_t i = 0U; i < sizeof(tls) / sizeof(tls[0]); ++i) {
+            if (tls[i] == NULL) return -1;
+            argv[argc++] = (char *)tls[i];
+        }
+    }
+    argv[argc] = NULL;
     posix_spawn_file_actions_t actions;
     if (posix_spawn_file_actions_init(&actions) != 0) return -1;
     (void)posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
@@ -607,8 +624,19 @@ static int probe_timeout(void)
     return 0;
 }
 
+/* Starts with the URI in the environment and runs one command over it. */
+static int probe_connects(void)
+{
+    if (st_public_coordination_initialize(NULL, NULL) != 0) return 40;
+    int allowed = 0;
+    int ran = st_public_coordination_allow_rate("tls-probe", "probe", 1000, 30, &allowed) == 0 && allowed;
+    st_public_coordination_shutdown();
+    return ran ? 0 : 41;
+}
+
 static int run_probe(const char *probe)
 {
+    if (strcmp(probe, "connects") == 0) return probe_connects();
     if (strcmp(probe, "disabled") == 0)
         return !st_public_coordination_enabled() && st_public_coordination_validate_config() == 0 ? 0 : 10;
     if (strcmp(probe, "enabled") == 0)
@@ -748,6 +776,89 @@ static int test_spring_binding(void)
     for (size_t i = 0U; i < sizeof(checks) / sizeof(checks[0]); ++i) {
         if (checks[i].result != 0) {
             fprintf(stderr, "Spring binding: %s (probe exit %d)\n", checks[i].label, checks[i].result);
+            failed = 1;
+        }
+    }
+    return failed;
+}
+
+/*
+ * redis-socket:// and redis+socket://, which Lettuce connects through Netty's native transport:
+ * the path is the socket and the database comes from the query. Plain run only.
+ */
+static int test_unix_socket(void)
+{
+    const char *socket_path = getenv("SPECUS_TEST_REDIS_SOCKET");
+    if (socket_path == NULL) return 0;
+    char by_socket[256], by_alias[256], missing[256];
+    snprintf(by_socket, sizeof(by_socket), "redis-socket://%s?database=1", socket_path);
+    snprintf(by_alias, sizeof(by_alias), "redis+socket://%s", socket_path);
+    snprintf(missing, sizeof(missing), "redis-socket://%s.missing", socket_path);
+    static const char uri_env[] = "SPECUS_PUBLIC_TRANSFER_REDIS_URI";
+    int failed = 0;
+    if (PROBE("connects", uri_env, by_socket) != 0 || PROBE("connects", uri_env, by_alias) != 0) {
+        fprintf(stderr, "Unix socket: the coordination layer did not connect through %s\n", socket_path);
+        failed = 1;
+    }
+    if (PROBE("refused", uri_env, missing) != 0) {
+        fprintf(stderr, "Unix socket: a missing socket did not fail startup\n");
+        failed = 1;
+    }
+    return failed;
+}
+
+/*
+ * rediss:// verified as Lettuce's SslVerifyMode does, in the TLS run only: FULL (the default)
+ * needs a trusted chain and the connected host in the certificate (DNS:localhost and
+ * IP:127.0.0.1 here, so 127.0.0.2 is not in it), CA only the chain, NONE nothing. The trust store
+ * is OpenSSL's default; the script points SSL_CERT_FILE at the test CA, as a Java deployment points
+ * javax.net.ssl.trustStore at its CA. Neither side offers a client certificate.
+ */
+static int test_tls_verification(void)
+{
+    const char *tls_port = getenv("SPECUS_TEST_REDIS_TLS_PORT");
+    const char *other_ca = getenv("SPECUS_TEST_REDIS_OTHER_CA");
+    const char *other_port = getenv("SPECUS_TEST_REDIS_OTHER_TLS_PORT");
+    if (tls_port == NULL) return 0;
+    if (other_ca == NULL || other_port == NULL) {
+        fprintf(stderr, "the TLS run needs SPECUS_TEST_REDIS_OTHER_CA and SPECUS_TEST_REDIS_OTHER_TLS_PORT\n");
+        return 1;
+    }
+    char by_name[96], unnamed[96], unnamed_ca[128], ssl_alias[96], by_ip[96], by_ip_ca[128], by_ip_none[128];
+    char tls_to_plain[96], plain_to_tls[96], other_name[96], other_name_ca[128];
+    /* The second server's certificate names only other.invalid. */
+    snprintf(other_name, sizeof(other_name), "rediss://localhost:%s/0", other_port);
+    snprintf(other_name_ca, sizeof(other_name_ca), "rediss://localhost:%s/0?verifyPeer=CA", other_port);
+    snprintf(by_name, sizeof(by_name), "rediss://localhost:%s/0", tls_port);
+    snprintf(unnamed, sizeof(unnamed), "rediss://127.0.0.2:%s/0", tls_port);
+    snprintf(unnamed_ca, sizeof(unnamed_ca), "rediss://127.0.0.2:%s/0?verifyPeer=CA", tls_port);
+    snprintf(ssl_alias, sizeof(ssl_alias), "redis+ssl://127.0.0.1:%s/0", tls_port);
+    snprintf(by_ip, sizeof(by_ip), "rediss://127.0.0.1:%s/0", tls_port);
+    snprintf(by_ip_ca, sizeof(by_ip_ca), "rediss://127.0.0.1:%s/0?verifyPeer=ca", tls_port);
+    snprintf(by_ip_none, sizeof(by_ip_none), "rediss://127.0.0.1:%s/0?verifyPeer=NONE", tls_port);
+    snprintf(tls_to_plain, sizeof(tls_to_plain), "rediss://127.0.0.1:%d/0", fixture_port());
+    snprintf(plain_to_tls, sizeof(plain_to_tls), "redis://127.0.0.1:%s/0", tls_port);
+    static const char uri_env[] = "SPECUS_PUBLIC_TRANSFER_REDIS_URI";
+    struct {
+        const char *label;
+        int result;
+    } checks[] = {
+        {"FULL accepts the host name in the certificate", PROBE("connects", uri_env, by_name)},
+        {"FULL refuses a host name the certificate does not name", PROBE("refused", uri_env, other_name)},
+        {"CA accepts that host name", PROBE("connects", uri_env, other_name_ca)},
+        {"FULL refuses an address the certificate does not name", PROBE("refused", uri_env, unnamed)},
+        {"CA accepts that address", PROBE("connects", uri_env, unnamed_ca)},
+        {"redis+ssl:// is rediss://", PROBE("connects", uri_env, ssl_alias)},
+        {"FULL refuses an untrusted CA", PROBE("refused", uri_env, by_ip, "SSL_CERT_FILE", other_ca)},
+        {"CA refuses an untrusted CA", PROBE("refused", uri_env, by_ip_ca, "SSL_CERT_FILE", other_ca)},
+        {"NONE accepts an untrusted CA", PROBE("connects", uri_env, by_ip_none, "SSL_CERT_FILE", other_ca)},
+        {"rediss:// to a plain port fails", PROBE("refused", uri_env, tls_to_plain)},
+        {"redis:// to the TLS port fails", PROBE("refused", uri_env, plain_to_tls)}
+    };
+    int failed = 0;
+    for (size_t i = 0U; i < sizeof(checks) / sizeof(checks[0]); ++i) {
+        if (checks[i].result != 0) {
+            fprintf(stderr, "TLS verification: %s (probe exit %d)\n", checks[i].label, checks[i].result);
             failed = 1;
         }
     }
@@ -932,6 +1043,8 @@ int main(int argc, char **argv)
         || test_timeout_fails_only_the_call() != 0
         || test_event_queue_is_bounded() != 0
         || test_spring_binding() != 0
+        || test_unix_socket() != 0
+        || test_tls_verification() != 0
         || test_reconnect_after_restart() != 0;
     st_public_coordination_shutdown();
     if (restarted_redis > 0) {
