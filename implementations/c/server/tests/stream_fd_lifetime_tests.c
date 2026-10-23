@@ -23,6 +23,7 @@ static int observed_create(pthread_t *thread, const pthread_attr_t *attr,
  * Every scenario but the LATE_ACCEPT ones then checks that the stream, however it ended, is freed
  * by its last worker and the stopped listener by its own thread while the session lives on: both
  * used to stay in the session, with their threads unjoined, until the data connection ended.
+ * ACCEPT_ERROR fails the listener's first accept() with EMFILE, which used to end the listener.
  */
 #define main specus_server_entry_for_stream_fd_lifetime
 #define recv held_recv
@@ -51,6 +52,7 @@ enum {
     LATE_ACCEPT_AFTER_RELEASE,  /* the same, the listener released by a newer login of the client */
     LATE_ACCEPT_DURING_SHUTDOWN, /* the same, the data connection ending */
     STREAM_FINISHED,    /* both directions of the stream end normally, nothing held */
+    ACCEPT_ERROR,       /* the first accept() fails with EMFILE, as when descriptors run out */
     SCENARIOS
 };
 
@@ -63,6 +65,8 @@ static struct {
     int released;
     int creation_failed;
     unsigned int worker_creations;
+    unsigned int accept_failures;
+    int peer_connected;
 } fixture = {.lock = PTHREAD_MUTEX_INITIALIZER, .accepted_fd = -1};
 
 static int late_accept_scenario(int scenario)
@@ -96,6 +100,19 @@ static ssize_t held_send(int fd, const void *buffer, size_t len, int flags)
 
 static int held_accept(int fd, struct sockaddr *address, socklen_t *length)
 {
+    pthread_mutex_lock(&fixture.lock);
+    int fail = fixture.scenario == ACCEPT_ERROR && fixture.accept_failures == 0U;
+    if (fail) {
+        /* Fails once a connection is waiting, which stays in the backlog, as it does when no
+         * descriptor is left for it. */
+        while (!fixture.peer_connected) pthread_cond_wait(&fixture.changed, &fixture.lock);
+        ++fixture.accept_failures;
+    }
+    pthread_mutex_unlock(&fixture.lock);
+    if (fail) {
+        errno = EMFILE;
+        return -1;
+    }
     int result = accept(fd, address, length);
     if (result >= 0) {
         pthread_mutex_lock(&fixture.lock);
@@ -259,6 +276,8 @@ static void run_scenario(int scenario)
     fixture.accepted_fd = -1;
     fixture.held = fixture.released = fixture.creation_failed = 0;
     fixture.worker_creations = 0U;
+    fixture.accept_failures = 0U;
+    fixture.peer_connected = 0;
     specus_session session = {0};
     int control[2];
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, control) == 0, "control socketpair");
@@ -284,6 +303,10 @@ static void run_scenario(int scenario)
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     int peer = socket(AF_INET, SOCK_STREAM, 0);
     REQUIRE(peer >= 0 && connect(peer, (struct sockaddr *)&address, length) == 0, "public connection");
+    pthread_mutex_lock(&fixture.lock);
+    fixture.peer_connected = 1;
+    pthread_cond_broadcast(&fixture.changed);
+    pthread_mutex_unlock(&fixture.lock);
 
     if (scenario == HOLD_SEND) {
         /* Feed the real writer through its production queue once the stream is published. */
@@ -295,6 +318,14 @@ static void run_scenario(int scenario)
     }
     if (scenario == STREAM_FINISHED) {
         REQUIRE(published_stream(&session) != NULL, "stream publication");
+    } else if (scenario == ACCEPT_ERROR) {
+        /* Netty pauses 1 s after the failed accept and then takes the waiting connection. */
+        REQUIRE(published_stream(&session) != NULL,
+                "the listener stopped on a failed accept instead of taking the waiting connection");
+        pthread_mutex_lock(&fixture.lock);
+        unsigned int failures = fixture.accept_failures;
+        pthread_mutex_unlock(&fixture.lock);
+        REQUIRE(failures == 1U, "accept failed once");
     } else {
         wait_fixture(scenario == FAIL_WRITER || scenario == FAIL_READER);
     }
@@ -337,7 +368,7 @@ static void run_scenario(int scenario)
         REQUIRE(fcntl(accepted_fd, F_GETFD) >= 0, "stream descriptor closed while a worker is about to use it");
         release_fixture();
     }
-    if (scenario == STREAM_FINISHED) {
+    if (scenario == STREAM_FINISHED || scenario == ACCEPT_ERROR) {
         /* Both directions end normally: the public peer closes, the client's FIN is drained. */
         external_conn *conn = published_stream(&session);
         REQUIRE(conn != NULL, "stream publication");

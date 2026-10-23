@@ -513,6 +513,9 @@ Rate批次结束时，四类连通性中Vector、Resource、Rate三类为候选�
 | `stream_fd_lifetime_tests` 场景 7 LATE_ACCEPT_DURING_SHUTDOWN | 同上，data 连接结束（`session_shutdown` 在另一线程里等监听线程） | 监听描述符当场被关闭 |
 | `stream_fd_lifetime_tests` 场景 0–4、8 的收尾（NAT-BP-01） | 流不论怎样结束（停在 recv、停在 send、写线程或读线程起不来、读线程启动前被停止、场景 8 两侧正常关闭：公网对端关闭、客户端 FIN 写完），会话存活期间 10 s 内从会话里消失、描述符已关闭、外部连接计数归零；随后 UNREGISTER 停掉的监听同样从会话里消失、描述符已关闭 | 六个场景都失败：流一直留在会话里，直到 data 连接结束（测试为在原实现上编译，只去掉了新条件变量的初始化） |
 | `nat_public_tcp_tests`「closed public connections are released while the data connection lives」（真实进程，新增） | 同一条 data 连接上先关 20 条预热，再先后建立并关闭 300 条公网连接（公网对端关闭、收到 FIN 后客户端回 FIN）：服务端 `/proc/<pid>/maps` 的行数不超过关闭前加 64（实测 236 → 236）；之后新的公网连接照常双向转发 | 306 → 1506，多出 1200 个映射，即每条连接两个未 join 线程的栈与保护页 |
+| `stream_fd_lifetime_tests` 场景 9 ACCEPT_ERROR（NAT-BP-05） | 公网对端连上之后，监听线程的第一次 accept 以 `EMFILE` 失败：监听不结束，约 1 s 后接受这条等着的连接并发布为流；之后两侧正常关闭，流与监听照常回收 | 监听线程退出，等着的连接一直没有被接受 |
+| `nat_public_tcp_tests`「a failed accept pauses the public port instead of closing it」 | 用 `prlimit` 把服务端的 `RLIMIT_NOFILE` 软上限设为它最小的空闲描述符号，再连公网端口：服务端记 `[nat] accept failed port=<端口> ... retrying in 1000 ms`；恢复上限后，这条连接得到 OPEN（已阻塞的 accept 用它预留的描述符接下，或在暂停后接下），随后新的公网连接照常双向转发 | 第一条连接被接下后监听线程退出，新连接被拒绝（`public OPEN` 失败） |
+| `nat_public_tcp_tests`「a failed accept pauses the control port instead of ending the server」 | 同样压低上限后连控制端口：服务端记 `[server] accept failed`、进程仍在运行；恢复上限后新的控制登录成功，原有的控制连接应答心跳，公网连接照常转发 | 服务端进入优雅停机并退出 |
 
 ## 历史表的读法与限制
 

@@ -62,6 +62,8 @@
 #define ST_MAX_STALE_SESSION_SCAN 256U
 /* A displaced client has at most one control and one data connection; slack covers a race. */
 #define ST_MAX_DISPLACED_SESSIONS 8U
+/* Netty's ServerBootstrapAcceptor stops accepting this long after accept() fails, then resumes. */
+#define ST_ACCEPT_ERROR_PAUSE_MS 1000
 
 typedef struct {
     long long id;
@@ -2160,6 +2162,8 @@ static void release_session_listeners(specus_session *session)
         }
         listener->done = 1;
     }
+    /* A listener pausing after a failed accept ends at once. */
+    pthread_cond_broadcast(&session->nat_threads_cond);
     pthread_mutex_unlock(&session->map_lock);
 }
 
@@ -5159,6 +5163,72 @@ static int start_external_conn(specus_listener *listener,
     return 0;
 }
 
+/*
+ * accept() failures Java never sees: OpenJDK's Net.accept retries ECONNABORTED (the connection
+ * was reset before it was taken) itself and reports EINTR and EAGAIN as nothing accepted. Every
+ * other failure is an IOException to Netty.
+ */
+static int accept_retry_at_once(int accept_errno)
+{
+    return accept_errno == EINTR || accept_errno == ECONNABORTED || accept_errno == EAGAIN
+        || accept_errno == EWOULDBLOCK;
+}
+
+/*
+ * The control listener's pause after a failed accept (see listener_pause_after_accept_error).
+ * Returns 1 when a shutdown was requested meanwhile; the byte stays in the pipe.
+ */
+static long long accept_monotonic_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000L;
+}
+
+static int control_accept_pause(int shutdown_fd)
+{
+    long long deadline = accept_monotonic_ms() + ST_ACCEPT_ERROR_PAUSE_MS;
+    for (;;) {
+        long long remaining = deadline - accept_monotonic_ms();
+        if (remaining <= 0) {
+            return 0;
+        }
+        struct pollfd wake = {.fd = shutdown_fd, .events = POLLIN, .revents = 0};
+        int ready = poll(&wake, 1, (int)remaining);
+        if (ready > 0) {
+            return 1;
+        }
+        if (ready < 0 && errno != EINTR) {
+            return 0;
+        }
+    }
+}
+
+/*
+ * Netty's ServerBootstrapAcceptor, on an IOException from accept (EMFILE, ENFILE, ENOBUFS,
+ * ENOMEM, a network error of the pending connection, ...): the server channel stays open, reads
+ * stop for 1 s, then accepting resumes. Returns 1 when the listener was stopped meanwhile.
+ */
+static int listener_pause_after_accept_error(specus_listener *listener)
+{
+    specus_session *session = listener->session;
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += ST_ACCEPT_ERROR_PAUSE_MS / 1000;
+    deadline.tv_nsec += (long)(ST_ACCEPT_ERROR_PAUSE_MS % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&session->map_lock);
+    while (!listener->done && session->active
+           && pthread_cond_timedwait(&session->nat_threads_cond, &session->map_lock, &deadline) != ETIMEDOUT) {
+    }
+    int stopped = listener->done || !session->active;
+    pthread_mutex_unlock(&session->map_lock);
+    return stopped;
+}
+
 static void *listener_thread(void *arg)
 {
     specus_listener *listener = (specus_listener *)arg;
@@ -5171,10 +5241,21 @@ static void *listener_thread(void *arg)
         socklen_t remote_len = sizeof(remote);
         int fd = accept(listener->fd, (struct sockaddr *)&remote, &remote_len);
         if (fd < 0) {
-            if (errno == EINTR) {
+            int accept_errno = errno;
+            if (accept_retry_at_once(accept_errno)) {
                 continue;
             }
-            break;
+            /* Stopping the listener shuts its socket down, after which accept() fails with EINVAL. */
+            if (accept_errno == EINVAL || accept_errno == EBADF || accept_errno == ENOTSOCK) {
+                break;
+            }
+            /* Running out of descriptors or memory does not close the port, as in Netty. */
+            fprintf(stderr, "[nat] accept failed port=%d client=%s: %s; retrying in %d ms\n",
+                    listener->port, session->config.client_name, strerror(accept_errno), ST_ACCEPT_ERROR_PAUSE_MS);
+            if (listener_pause_after_accept_error(listener)) {
+                break;
+            }
+            continue;
         }
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -5280,6 +5361,8 @@ static void stop_specus_listener(specus_session *session, int port)
             listener->done = 1;
         }
     }
+    /* A listener pausing after a failed accept ends at once. */
+    pthread_cond_broadcast(&session->nat_threads_cond);
     pthread_mutex_unlock(&session->map_lock);
 }
 
@@ -6357,6 +6440,13 @@ int main(void)
         return 1;
     }
 
+    /*
+     * Like Netty's server channel the control listener outlives a failed accept: running out of
+     * descriptors or memory pauses it for 1 s (ServerBootstrapAcceptor) instead of ending the
+     * process. Only a listener that is itself broken ends it, and then with a failure status, so
+     * a supervisor restarts it.
+     */
+    int exit_status = 0;
     for (;;) {
         struct pollfd ready[2];
         ready[0].fd = listener;
@@ -6366,10 +6456,18 @@ int main(void)
         ready[1].events = POLLIN;
         ready[1].revents = 0;
         if (poll(ready, 2, -1) < 0) {
-            if (errno == EINTR) {
+            int poll_errno = errno;
+            if (poll_errno == EINTR) {
                 continue;
             }
-            perror("poll");
+            fprintf(stderr, "[server] control listener poll failed: %s\n", strerror(poll_errno));
+            if (poll_errno == ENOMEM) {
+                if (control_accept_pause(shutdown_pipe[0])) {
+                    break;
+                }
+                continue;
+            }
+            exit_status = 1;
             break;
         }
         if (ready[1].revents != 0) {
@@ -6378,24 +6476,38 @@ int main(void)
         if ((ready[0].revents & POLLIN) == 0) {
             if ((ready[0].revents & (POLLERR | POLLNVAL)) != 0) {
                 fprintf(stderr, "control listener failed\n");
+                exit_status = 1;
                 break;
             }
             continue;
         }
         client_args *args = (client_args *)calloc(1, sizeof(*args));
         if (args == NULL) {
-            fprintf(stderr, "out of memory\n");
-            break;
+            fprintf(stderr, "[server] accept failed: out of memory; retrying in %d ms\n", ST_ACCEPT_ERROR_PAUSE_MS);
+            if (control_accept_pause(shutdown_pipe[0])) {
+                break;
+            }
+            continue;
         }
         args->remote_len = sizeof(args->remote);
         args->fd = accept(listener, (struct sockaddr *)&args->remote, &args->remote_len);
         if (args->fd < 0) {
+            int accept_errno = errno;
             free(args);
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED) {
+            if (accept_retry_at_once(accept_errno)) {
                 continue;
             }
-            perror("accept");
-            break;
+            if (accept_errno == EBADF || accept_errno == EINVAL || accept_errno == ENOTSOCK) {
+                fprintf(stderr, "control listener failed: %s\n", strerror(accept_errno));
+                exit_status = 1;
+                break;
+            }
+            fprintf(stderr, "[server] accept failed: %s; retrying in %d ms\n", strerror(accept_errno),
+                    ST_ACCEPT_ERROR_PAUSE_MS);
+            if (control_accept_pause(shutdown_pipe[0])) {
+                break;
+            }
+            continue;
         }
         /* Linux does not pass O_NONBLOCK on to accepted sockets, but other systems do. */
         int accepted_flags = fcntl(args->fd, F_GETFL, 0);
@@ -6464,5 +6576,5 @@ int main(void)
     st_tls_server_context_free(config.tls_context);
     config_release_routes(&config);
     st_public_discovery_shutdown();
-    return 0;
+    return exit_status;
 }
