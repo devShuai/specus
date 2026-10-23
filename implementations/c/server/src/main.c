@@ -404,8 +404,9 @@ static int env_int_range(const char *name, int default_value, int min_value, int
         return 0;
     }
     char *end = NULL;
+    errno = 0;
     long parsed = strtol(value, &end, 10);
-    if (end == value || *end != '\0' || parsed < min_value || parsed > max_value) {
+    if (errno != 0 || end == value || *end != '\0' || parsed < min_value || parsed > max_value) {
         fprintf(stderr, "invalid %s; expected integer in [%d,%d]\n", name, min_value, max_value);
         return -1;
     }
@@ -421,8 +422,10 @@ static int env_i64_range(const char *name, int64_t default_value, int64_t min_va
         return 0;
     }
     char *end = NULL;
+    /* A number past what strtoll can hold (it saturates) is no number of the setting, as for Spring. */
+    errno = 0;
     long long parsed = strtoll(value, &end, 10);
-    if (end == value || *end != '\0' || parsed < min_value || parsed > max_value) {
+    if (errno != 0 || end == value || *end != '\0' || parsed < min_value || parsed > max_value) {
         fprintf(stderr, "invalid %s; expected integer in [%lld,%lld]\n",
                 name, (long long)min_value, (long long)max_value);
         return -1;
@@ -894,14 +897,18 @@ static int load_config(server_config *config)
         || env_int_range("SPECUS_MAX_PORT_EXTERNAL_CONNECTIONS", 512, 1, 1000000,
                          &config->max_port_external_connections) != 0
         || env_int_range("SPECUS_ADMIN_PORT", 0, 0, 65535, &config->admin_port) != 0
-        || env_i64_range("SPECUS_HTTP_TIMEOUT_MS", 30000, 0, INT64_MAX, &config->http_timeout_ms) != 0
+        || env_i64_range("SPECUS_HTTP_TIMEOUT_MS", 30000, INT64_MIN, INT64_MAX, &config->http_timeout_ms) != 0
         || env_i64_range("SPECUS_HTTP_MAX_REQUEST_BODY_SIZE", ST_HTTP_MAX_REQUEST_BODY, INT_MIN, INT_MAX,
                          &config->http_max_request_body) != 0) {
         return -1;
     }
-    /* Java's body limit filter takes a negative limit as 0: any body at all is too large. */
+    /* Java's body limit filter takes a negative limit as 0: any body at all is too large. A
+     * negative timeout, which Java's Future.get takes as nothing to wait for, times out at once. */
     if (config->http_max_request_body < 0) {
         config->http_max_request_body = 0;
+    }
+    if (config->http_timeout_ms < 0) {
+        config->http_timeout_ms = 0;
     }
     if (copy_config_string(config->static_root, sizeof(config->static_root),
                            "SPECUS_STATIC_ROOT",

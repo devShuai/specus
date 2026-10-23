@@ -71,6 +71,55 @@ static int check_trim(const char *path, const st_storage_http_exchange_record *h
     return unsetenv("SPECUS_ELASTICSEARCH_HTTP_MAX_STORE_SIZE") == 0 && ok ? 0 : -1;
 }
 
+/*
+ * A target as long as the request head allows: relativePath and rawQuery are cut to Java's 1024
+ * and 2048 characters before they are stored, never inside a UTF-8 sequence, so the list and the
+ * detail still read them back. Stored whole, one such exchange failed every page that held it.
+ */
+static int check_long_target(const char *path, const st_storage_http_exchange_record *http, long long client_id)
+{
+    if (setenv("SPECUS_ELASTICSEARCH_HTTP_INDEX", "specus-http-long-target", 1) != 0) return -1;
+    st_elasticsearch_traffic_reset_for_tests();
+    char relative_path[3002];
+    relative_path[0] = '/';
+    memset(relative_path + 1, 'p', 3000U);
+    relative_path[3001] = '\0';
+    /* 2045 'a', then a 3-byte character that still fits the 2048 and a 4-byte one (two UTF-16
+     * units) that does not. */
+    char raw_query[2100];
+    memcpy(raw_query, "q=", 2U);
+    memset(raw_query + 2, 'a', 2045U);
+    snprintf(raw_query + 2047, sizeof(raw_query) - 2047U, "\xe2\x82\xac\xf0\x9d\x84\x9e&tail=1");
+    char expected_query[2100];
+    snprintf(expected_query, sizeof(expected_query), "%.2050s", raw_query);
+    st_storage_http_exchange_record long_target = *http;
+    long_target.route = "long-target";
+    long_target.relative_path = relative_path;
+    long_target.raw_query = raw_query;
+    if (st_storage_record_http_exchange(path, &long_target) != 0) return -1;
+    st_elasticsearch_traffic_flush();
+    st_storage_http_exchange *exchanges = (st_storage_http_exchange *)calloc(2U, sizeof(*exchanges));
+    size_t count = 0U;
+    long long total = 0;
+    int found = 0;
+    int ok = exchanges != NULL
+        && st_storage_list_http_exchanges_visible(path, client_id, "long-target", NULL, NULL, NULL, "default",
+                                                  "admin", 1, 0, 10, exchanges, 1U, &count, &total) == 0
+        && count == 1U && strlen(exchanges[0].relative_path) == 1024U
+        && strspn(exchanges[0].relative_path + 1, "p") == 1023U && strcmp(exchanges[0].raw_query, expected_query) == 0
+        && st_storage_get_http_exchange_visible(path, exchanges[0].id, "default", "admin", 1, &exchanges[1],
+                                                &found) == 0
+        && found && strcmp(exchanges[1].raw_query, expected_query) == 0;
+    if (!ok) {
+        fprintf(stderr, "Elasticsearch long target: %zu listed, path %zu bytes, query %zu bytes\n", count,
+                exchanges == NULL ? 0U : strlen(exchanges[0].relative_path),
+                exchanges == NULL ? 0U : strlen(exchanges[0].raw_query));
+    }
+    if (exchanges != NULL && found) st_storage_http_exchange_free_bodies(&exchanges[1]);
+    free(exchanges);
+    return ok ? 0 : -1;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2 || st_storage_init(argv[1], 1) != 0) return 1;
@@ -287,6 +336,9 @@ int main(int argc, char **argv)
      * size_in_bytes only without it. */
     if (check_trim(argv[1], &http, client.id, "specus-http-zero-dataset", 1) != 0
         || check_trim(argv[1], &http, client.id, "specus-http-no-dataset", 0) != 0) {
+        return 1;
+    }
+    if (check_long_target(argv[1], &http, client.id) != 0) {
         return 1;
     }
     puts("elasticsearch traffic tests passed");

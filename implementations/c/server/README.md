@@ -192,6 +192,8 @@ Additional runtime knobs:
 | `SPECUS_STATIC_ROOT` | `implementations/java/server/src/main/resources/static` | Static SPA root used by the management listener. |
 | `SPECUS_HTTP_ROUTES` | unset | Optional comma-separated HTTP route snapshot, `route=targetBaseUrl,route2=https://host/base`, returned from client auth login and pushed in `NAT_CONTROL`. |
 | `SPECUS_HTTP_REWRITE_MAX_BODY_BYTES` | `10485760` | Max streamed HTTP response body size eligible for path rewriting when the SQLite HTTP route has `pathRewriteEnabled=true`; `0` disables rewriting. |
+| `SPECUS_HTTP_MAX_REQUEST_BODY_SIZE` | `16777216` | Java `specus.http.max-request-body-size`: the largest request body of a Direct HTTP route or share (`413` beyond it); an int, a negative value is `0`. C reads the whole body into memory before forwarding it, so a larger limit is that much memory per concurrent upload. |
+| `SPECUS_HTTP_TIMEOUT_MS` | `30000` | Java `specus.http.timeout-ms`: how long a route or share request waits for the response head once its body went up, and for the window of each body chunk; `504` and `RST 30` after it. A negative value times out at once. |
 
 Compressed response rewriting has an additional non-configurable safety boundary shared with Java:
 decompressed output may not exceed 64 MiB or `max(64 KiB, compressed size × 100)`, whichever is

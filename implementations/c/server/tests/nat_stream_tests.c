@@ -2123,10 +2123,12 @@ static int check_http_configured_limits(test_server *server, client_pair *pair)
     close_fd(&browser);
 
     /* A body of the whole limit, more than the 1 MiB initial window, which the client never widens. */
+    /* Timed from before the request: the server may send the first window before the OPEN is read
+     * here, and the upper bound covers the 2 MiB the request carries. */
+    started = monotonic_ms();
     browser = browser_post(server, pair, CONFIGURED_BODY_LIMIT, 1);
     CHECK(browser >= 0, "upload");
     CHECK(expect_http_open(pair->data, &stream_id) == 0, "no request OPEN for the upload");
-    started = monotonic_ms();
     CHECK(wait_rst(pair->data, stream_id, &code) == 0 && code == 30U, "upload window timeout reset (code %u)", code);
     waited = monotonic_ms() - started;
     CHECK(waited >= 1400 && waited < 4500, "upload window timeout after %lld ms, expected about 1500", waited);
