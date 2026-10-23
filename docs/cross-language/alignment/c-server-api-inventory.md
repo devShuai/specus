@@ -250,6 +250,8 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | Allocate 找不到可用的 relay 端口或 socket 时回 `508 insufficient-capacity` | Java `bindRelaySocket` 抛出异常，被接收循环吞掉，客户端收不到应答、只能重传到超时；C 立即回一个明确的错误 |
 | 没有中继相关的 Micrometer 指标：`specus.peer_mesh.turn.*`（relay 队列深度、高水位与丢弃，发送失败，通用中继字节、配额拒绝、目的地址拒绝与字节配额关闭）与 `specus.peer_mesh.relay.traffic.*`（flush 失败、待写字节、flush 滞后） | C 没有指标注册表与导出端点（`/api/admin/metrics` 是管理概览，不是 Micrometer），Java 默认的 actuator 也只暴露 health。对应事件 C 写日志：配额拒绝、字节配额关闭与目的地址拒绝写 `[peer-mesh][audit]` 行，批量写库失败写 `[peer-mesh] relay traffic flush failed` 行；relay 发送没有工作队列，见 test-map `StunTurnServerMetricsTests` 行 |
 | 会话关闭后，关闭前已经中继、还没写库的那批 relay 字节照记 | Java 本实例关闭会话（`markClosed`）时丢弃这部分 `pendingRelayBytes`，别的实例关闭的会话则照记（`persistRelayTrafficBatch`）；C 一律照记，只会少丢数据 |
+| 停止时写出待写的 relay 字节 | Java `PeerMeshService` 没有 `@PreDestroy` 的 flush，停止时最多丢掉一个 flush 间隔（默认 5 秒）的待写字节；C 在 STUN/TURN 停止时写出，只会少丢数据 |
+| 内置 STUN/TURN 起不来（端口被占用、公网地址或 `SPECUS_PEER_MESH_RELAY_ADDRESS` 解析不了）时整个 C 进程启动失败 | Java 记一条 warn 后照常运行，只是没有 STUN/TURN；C 的 `main.c` 对 STUN/TURN 启动失败一向直接退出，配置错误在启动时就暴露，不会带着一个不可用的中继跑下去 |
 
 ## 9. 待办（按影响排序）
 
