@@ -194,9 +194,15 @@ Additional runtime knobs:
 | `SPECUS_OIDC_TENANT_CLAIM` | `tenant_id` | Accepted for parity with Java, where it does not select the tenant either: OIDC accounts are created in `SPECUS_AUTH_TENANT_ID`, and tenant and role always come from the bound local account. |
 | `SPECUS_CONTROL_READ_IDLE_SECONDS` | `60` | Control-channel read idle timeout. |
 | `SPECUS_CONTROL_WRITE_TIMEOUT_SECONDS` | `30` | Maximum blocking control/data socket write time before the affected session is closed. |
-| `SPECUS_MAX_GLOBAL_EXTERNAL_CONNECTIONS` | `4096` | Global external TCP connection cap. |
-| `SPECUS_MAX_CLIENT_EXTERNAL_CONNECTIONS` | `1024` | Per-control-session external TCP connection cap. |
-| `SPECUS_MAX_PORT_EXTERNAL_CONNECTIONS` | `512` | Per-public-port external TCP connection cap. |
+| `SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS` | `10000` | Java `specus.netty.max-external-connections`: public TCP connections open at once over the whole server; one beyond it is accepted and closed, and counted as rejected for the client's tenant. `0` or less is no limit. Each public connection runs a reader and a writer thread here. When neither this nor its Spring form `SPECUS_NETTY_MAXEXTERNALCONNECTIONS` is set, the former C name `SPECUS_MAX_GLOBAL_EXTERNAL_CONNECTIONS` is read instead. |
+| `SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_CLIENT` | `10000` | The same per data connection (Java counts per `NatServerHandler`); former C name `SPECUS_MAX_CLIENT_EXTERNAL_CONNECTIONS`. |
+| `SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT` | `10000` | The same per public port of a data connection; former C name `SPECUS_MAX_PORT_EXTERNAL_CONNECTIONS`. |
+| `SPECUS_NETTY_SO_BACKLOG` | `8192` | Listen backlog of the control port and of every public port (the kernel caps it at `net.core.somaxconn`). `0` is the JDK's `50`, a negative value keeps Netty's default, somaxconn. |
+| `SPECUS_NETTY_KEEP_ALIVE` | `true` | `SO_KEEPALIVE` on every accepted control, data and public socket, with the system's keepalive timing: a peer that vanished without FIN or RST ends its stream instead of holding it until the data connection ends. |
+| `SPECUS_NETTY_TCP_NO_DELAY` | `true` | `TCP_NODELAY` on the same sockets. |
+| `SPECUS_NETTY_REUSE_ADDRESS` | `true` | `SO_REUSEADDR` on both kinds of listener. A port that UNREGISTER or a newer login stopped is free again at once only with it. |
+| `SPECUS_NETTY_MAX_FRAME_SIZE` | `33554432` | The largest control or data frame after login, its 11-byte header included; a larger one closes the connection. C reads no frame above 32 MiB, so a larger value acts as 32 MiB. |
+| `SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE` | `16384` | The same before login. Must lie between `11` and `SPECUS_NETTY_MAX_FRAME_SIZE`, as Java's `NettyServer` requires, or the server does not start. A login request is still at most 16 KiB. |
 | `SPECUS_DATABASE_PATH` | unset | Optional SQLite database path for clients and mappings. |
 | `SPECUS_DB_SEED_DEMO_CLIENT` | `true` | Request enabled `Demo client` metadata when initializing SQLite. Honoured only in `dev`/`test`; production always disables seeding. |
 | `SPECUS_ADMIN_PORT` | `0` | Optional lightweight management API listener; `0` disables it. |
@@ -208,6 +214,13 @@ Additional runtime knobs:
 | `SERVER_TOMCAT_CONNECTION_TIMEOUT` (or `SERVER_TOMCAT_CONNECTIONTIMEOUT`) | `60000` | The Java server's `server.tomcat.connection-timeout`, Tomcat's 60 s by default: a request head, request body or answer on the management listener (`/http/**` and `/http-share/**` included) that makes no progress for that long fails. A connection that sends nothing or stalls its head is dropped without an answer, a stalled body is answered `400`, and a caller that stops reading a streamed route response has its NAT stream reset with `RST 8`. A write fails only after that long without progress; any progress starts the time again. Once a WebSocket handler took the upgrade, the connection has no read timeout and Tomcat's 20 s WebSocket send timeout (a route or share WebSocket whose browser stops reading is reset with `RST 31`); a request that only carries the upgrade headers keeps the connection timeout. A Spring duration: milliseconds, or with a unit (`60s`, `500ms`, `1m`), or ISO-8601 (`PT60S`); `0` or less is no timeout, anything else refuses the start. |
 | `SERVER_TOMCAT_MAX_CONNECTIONS` (or `SERVER_TOMCAT_MAXCONNECTIONS`) | `8192` | `server.tomcat.max-connections`: at most this many management-listener sockets are open (each one has a thread); further connections wait in the listen backlog until one closes. `0` or less keeps the default, as Spring Boot does. Read as Spring binds an int (`NumberUtils.parseNumber`): every whitespace character is dropped, `0x`, `0X` or `#` is hexadecimal, and a value that does not bind refuses the start. |
 | `SERVER_TOMCAT_ACCEPT_COUNT` (or `SERVER_TOMCAT_ACCEPTCOUNT`) | `100` | `server.tomcat.accept-count`: the listen backlog of the management listener. `0` or less keeps the default; read like `SERVER_TOMCAT_MAX_CONNECTIONS`. |
+
+The `SPECUS_NETTY_*` settings above are Java's `specus.netty.*` (`application.yml`) and are read as
+Spring binds them: each also under its Spring form without the inner underscores (for example
+`SPECUS_NETTY_SOBACKLOG`), which wins when both are set; numbers as `SERVER_TOMCAT_MAX_CONNECTIONS`
+(all whitespace dropped, `0x`/`#` hexadecimal), booleans as `true/false`, `on/off`, `yes/no` or
+`1/0` in any case. A value that does not bind refuses the start; an empty one keeps the default.
+`SPECUS_NETTY_WRITE_BUFFER_LOW/HIGH_WATER_MARK` and the Netty thread counts have no C counterpart.
 
 Compressed response rewriting has an additional non-configurable safety boundary shared with Java:
 decompressed output may not exceed 64 MiB or `max(64 KiB, compressed size × 100)`, whichever is

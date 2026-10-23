@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
@@ -97,9 +98,23 @@ typedef struct {
     int control_read_idle_seconds;
     int control_write_timeout_seconds;
     int per_machine_user_max_instances;
+    /*
+     * Java's specus.netty.* (NettyServerProperties), bound as Spring binds them (load_netty_options).
+     * The external connection limits are max-external-connections, -per-client (per data
+     * connection, as Java's NatServerHandler counts) and -per-port; 0 or less is no limit.
+     */
     int max_global_external_connections;
     int max_client_external_connections;
     int max_port_external_connections;
+    /* SO_BACKLOG of the control and public listeners, as bound (see netty_listen_backlog). */
+    int netty_so_backlog;
+    int netty_reuse_address;
+    /* Child options of every accepted control, data and public socket. */
+    int netty_keep_alive;
+    int netty_tcp_no_delay;
+    /* The largest frame read after and before login, header included, at most ST_MAX_FRAME_SIZE. */
+    size_t netty_max_frame_size;
+    size_t netty_pre_auth_max_frame_size;
     /* SPECUS_HTTP_TIMEOUT_MS and SPECUS_HTTP_MAX_REQUEST_BODY_SIZE, as Java's specus.http.*. */
     int64_t http_timeout_ms;
     int64_t http_max_request_body;
@@ -735,6 +750,111 @@ static int env_spring_int(const char *name, int default_value, int *out)
     return 0;
 }
 
+/*
+ * A boolean as Spring binds it (StringToBooleanConverter): String.trim(), then, ignoring case,
+ * true/on/yes/1 or false/off/no/0. Anything else, a blank value included, fails the binding and
+ * with it the start; unset or empty keeps default_value, as env_spring_int.
+ */
+static int env_spring_bool(const char *name, int default_value, int *out)
+{
+    const char *value = getenv(name);
+    if (value == NULL || *value == '\0') {
+        *out = default_value;
+        return 0;
+    }
+    const char *start = value;
+    while (*start != '\0' && (unsigned char)*start <= 0x20U) {
+        ++start;
+    }
+    size_t len = strlen(start);
+    while (len > 0U && (unsigned char)start[len - 1U] <= 0x20U) {
+        --len;
+    }
+    static const char *const truths[] = {"true", "on", "yes", "1"};
+    static const char *const falsehoods[] = {"false", "off", "no", "0"};
+    for (size_t i = 0U; i < sizeof(truths) / sizeof(truths[0]); ++i) {
+        if (len == strlen(truths[i]) && strncasecmp(start, truths[i], len) == 0) {
+            *out = 1;
+            return 0;
+        }
+        if (len == strlen(falsehoods[i]) && strncasecmp(start, falsehoods[i], len) == 0) {
+            *out = 0;
+            return 0;
+        }
+    }
+    fprintf(stderr, "invalid %s; use true/false, on/off, yes/no or 1/0\n", name);
+    return -1;
+}
+
+/*
+ * The variable a specus.netty.* property is bound from: Spring's canonical name (dashes dropped)
+ * or its legacy one (dashes as underscores, the one application.yml names), else the name this
+ * server read before, kept as an alias.
+ */
+static const char *netty_env_name(const char *canonical, const char *legacy, const char *alias)
+{
+    if (getenv(canonical) != NULL) {
+        return canonical;
+    }
+    if (alias != NULL && getenv(legacy) == NULL && getenv(alias) != NULL) {
+        return alias;
+    }
+    return legacy;
+}
+
+/*
+ * Java's specus.netty.* (application.yml, NettyServerProperties) with its defaults, bound as Spring
+ * binds them; a value Spring cannot bind, or one NettyServer.validateConfiguration refuses (the
+ * pre-auth frame size outside [header size, max frame size]), refuses the start.
+ * WRITE_BUFFER_LOW/HIGH_WATER_MARK and the thread counts have no counterpart (API inventory §8).
+ */
+static int load_netty_options(server_config *config)
+{
+    int max_frame_size = 0;
+    int pre_auth_max_frame_size = 0;
+    if (env_spring_int(netty_env_name("SPECUS_NETTY_MAXEXTERNALCONNECTIONS", "SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS",
+                                      "SPECUS_MAX_GLOBAL_EXTERNAL_CONNECTIONS"),
+                       10000, &config->max_global_external_connections) != 0
+        || env_spring_int(netty_env_name("SPECUS_NETTY_MAXEXTERNALCONNECTIONSPERCLIENT",
+                                         "SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_CLIENT",
+                                         "SPECUS_MAX_CLIENT_EXTERNAL_CONNECTIONS"),
+                          10000, &config->max_client_external_connections) != 0
+        || env_spring_int(netty_env_name("SPECUS_NETTY_MAXEXTERNALCONNECTIONSPERPORT",
+                                         "SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT",
+                                         "SPECUS_MAX_PORT_EXTERNAL_CONNECTIONS"),
+                          10000, &config->max_port_external_connections) != 0
+        || env_spring_int(netty_env_name("SPECUS_NETTY_SOBACKLOG", "SPECUS_NETTY_SO_BACKLOG", NULL), 8192,
+                          &config->netty_so_backlog) != 0
+        || env_spring_bool(netty_env_name("SPECUS_NETTY_REUSEADDRESS", "SPECUS_NETTY_REUSE_ADDRESS", NULL), 1,
+                           &config->netty_reuse_address) != 0
+        || env_spring_bool(netty_env_name("SPECUS_NETTY_KEEPALIVE", "SPECUS_NETTY_KEEP_ALIVE", NULL), 1,
+                           &config->netty_keep_alive) != 0
+        || env_spring_bool(netty_env_name("SPECUS_NETTY_TCPNODELAY", "SPECUS_NETTY_TCP_NO_DELAY", NULL), 1,
+                           &config->netty_tcp_no_delay) != 0
+        || env_spring_int(netty_env_name("SPECUS_NETTY_MAXFRAMESIZE", "SPECUS_NETTY_MAX_FRAME_SIZE", NULL),
+                          (int)ST_MAX_FRAME_SIZE, &max_frame_size) != 0
+        || env_spring_int(netty_env_name("SPECUS_NETTY_PREAUTHMAXFRAMESIZE", "SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE",
+                                         NULL),
+                          (int)ST_PRE_AUTH_MAX_FRAME_SIZE, &pre_auth_max_frame_size) != 0) {
+        return -1;
+    }
+    if (pre_auth_max_frame_size < (int)ST_HEADER_SIZE || pre_auth_max_frame_size > max_frame_size) {
+        fprintf(stderr, "SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE must be between the protocol header (%u) and "
+                        "SPECUS_NETTY_MAX_FRAME_SIZE\n", ST_HEADER_SIZE);
+        return -1;
+    }
+    /* The protocol layer reads no frame beyond 32 MiB, Java's default, whatever is configured above. */
+    if (max_frame_size > (int)ST_MAX_FRAME_SIZE) {
+        fprintf(stderr, "SPECUS_NETTY_MAX_FRAME_SIZE=%d is read as %u: no larger frame is read\n",
+                max_frame_size, ST_MAX_FRAME_SIZE);
+        max_frame_size = (int)ST_MAX_FRAME_SIZE;
+    }
+    config->netty_max_frame_size = (size_t)max_frame_size;
+    config->netty_pre_auth_max_frame_size = (size_t)(pre_auth_max_frame_size < max_frame_size
+                                                         ? pre_auth_max_frame_size : max_frame_size);
+    return 0;
+}
+
 static int copy_config_string(char *dest, size_t dest_len, const char *name, const char *value)
 {
     if (value == NULL || *value == '\0') {
@@ -1191,12 +1311,7 @@ static int load_config(server_config *config)
                          &config->control_write_timeout_seconds) != 0
         || env_int_range("SPECUS_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES", 1, 1, 1000000,
                          &config->per_machine_user_max_instances) != 0
-        || env_int_range("SPECUS_MAX_GLOBAL_EXTERNAL_CONNECTIONS", 4096, 1, 1000000,
-                         &config->max_global_external_connections) != 0
-        || env_int_range("SPECUS_MAX_CLIENT_EXTERNAL_CONNECTIONS", 1024, 1, 1000000,
-                         &config->max_client_external_connections) != 0
-        || env_int_range("SPECUS_MAX_PORT_EXTERNAL_CONNECTIONS", 512, 1, 1000000,
-                         &config->max_port_external_connections) != 0
+        || load_netty_options(config) != 0
         || env_int_range("SPECUS_ADMIN_PORT", 0, 0, 65535, &config->admin_port) != 0
         || env_i64_range("SPECUS_HTTP_TIMEOUT_MS", 30000, INT64_MIN, INT64_MAX, &config->http_timeout_ms) != 0
         || env_i64_range("SPECUS_HTTP_MAX_REQUEST_BODY_SIZE", ST_HTTP_MAX_REQUEST_BODY, INT_MIN, INT_MAX,
@@ -4060,7 +4175,29 @@ static void remote_endpoint(const struct sockaddr_storage *remote,
     snprintf(text, text_len, "unknown");
 }
 
-static int create_listener_on(const char *bind_address, int port)
+/*
+ * The backlog Netty's server channel listens with for SO_BACKLOG: as given; 0 as the JDK's 50
+ * (ServerSocketChannelImpl.bind); a negative one Netty refuses to set and keeps its default, the
+ * kernel's somaxconn, to which listen(2) also caps any larger value.
+ */
+static int netty_listen_backlog(int so_backlog)
+{
+    if (so_backlog > 0) {
+        return so_backlog;
+    }
+    return so_backlog == 0 ? 50 : INT_MAX;
+}
+
+/* The child options Netty sets on every accepted socket, control, data and public alike. */
+static void apply_netty_child_options(int fd, const server_config *config)
+{
+    int value = config->netty_tcp_no_delay ? 1 : 0;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value));
+    value = config->netty_keep_alive ? 1 : 0;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &value, sizeof(value));
+}
+
+static int create_listener_on(const char *bind_address, int port, const server_config *config)
 {
     char port_text[16];
     snprintf(port_text, sizeof(port_text), "%d", port);
@@ -4082,11 +4219,15 @@ static int create_listener_on(const char *bind_address, int port)
             continue;
         }
         int yes = 1;
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        /* Netty's SO_REUSEADDR server option. A stopped listener frees its port at once only
+         * with it: its socket is shut down but stays open until its thread ends. */
+        int reuse = config->netty_reuse_address ? 1 : 0;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
         if (address->ai_family == AF_INET6) {
             setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &yes, sizeof(yes));
         }
-        if (bind(fd, address->ai_addr, address->ai_addrlen) == 0 && listen(fd, 128) == 0) {
+        if (bind(fd, address->ai_addr, address->ai_addrlen) == 0
+            && listen(fd, netty_listen_backlog(config->netty_so_backlog)) == 0) {
             break;
         }
         close(fd);
@@ -4099,9 +4240,9 @@ static int create_listener_on(const char *bind_address, int port)
     return fd;
 }
 
-static int create_listener(int port)
+static int create_listener(int port, const server_config *config)
 {
-    return create_listener_on("0.0.0.0", port);
+    return create_listener_on("0.0.0.0", port, config);
 }
 
 static void configure_control_socket(int fd, const server_config *config)
@@ -4913,9 +5054,12 @@ static int try_count_external_connection(external_conn *conn)
     int client_count = 0;
     int port_count = 0;
     count_external_locked(session, conn->port, &client_count, &port_count);
-    /* Java records every refusal by a connection limit against the client's tenant. */
-    if (client_count >= session->config.max_client_external_connections
-        || port_count >= session->config.max_port_external_connections) {
+    /* Java records every refusal by a connection limit against the client's tenant; a limit of 0
+     * or less is no limit (RemotePortServerManager, NatServerHandler.tryIncrement). */
+    int max_client = session->config.max_client_external_connections;
+    int max_port = session->config.max_port_external_connections;
+    int max_global = session->config.max_global_external_connections;
+    if ((max_client > 0 && client_count >= max_client) || (max_port > 0 && port_count >= max_port)) {
         pthread_mutex_lock(&global_external_lock);
         record_rejected_external_locked(session->config.tenant_id);
         pthread_mutex_unlock(&global_external_lock);
@@ -4923,7 +5067,7 @@ static int try_count_external_connection(external_conn *conn)
     }
 
     pthread_mutex_lock(&global_external_lock);
-    if (global_external_connections >= session->config.max_global_external_connections) {
+    if (max_global > 0 && global_external_connections >= max_global) {
         record_rejected_external_locked(session->config.tenant_id);
         pthread_mutex_unlock(&global_external_lock);
         return -1;
@@ -5257,8 +5401,7 @@ static void *listener_thread(void *arg)
             }
             continue;
         }
-        int one = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        apply_netty_child_options(fd, &session->config);
         start_external_conn(listener, fd, &remote);
     }
 
@@ -5295,7 +5438,7 @@ static int listener_exists_locked(specus_session *session, int port)
 
 static int start_specus_listener(specus_session *session, int port, char *reason, size_t reason_len)
 {
-    int fd = create_listener(port);
+    int fd = create_listener(port, &session->config);
     if (fd < 0) {
         snprintf(reason, reason_len, "port %d bind failed", port);
         return -1;
@@ -5802,7 +5945,9 @@ static void *client_thread(void *arg)
     for (;;) {
         st_frame_header header;
         uint8_t *body = NULL;
-        size_t frame_limit = logged_in ? ST_MAX_FRAME_SIZE : ST_PRE_AUTH_MAX_FRAME_SIZE;
+        /* Java's Spliter: SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE until login, then MAX_FRAME_SIZE. */
+        size_t frame_limit = logged_in ? session->config.netty_max_frame_size
+                                       : session->config.netty_pre_auth_max_frame_size;
         int rc = read_frame(session, frame_limit, &header, &body);
         if (rc != 1 && session_write_failed(session)) {
             /* A failed write, on whichever thread sent it, shut the socket down and so ended the read. */
@@ -6336,7 +6481,7 @@ int main(void)
         st_public_discovery_shutdown();
         return 1;
     }
-    int listener = create_listener_on(config.bind_address, config.port);
+    int listener = create_listener_on(config.bind_address, config.port, &config);
     if (listener < 0) {
         shutdown_wake_close(shutdown_pipe);
         st_stun_turn_server_stop(stun_turn_server);
@@ -6517,8 +6662,7 @@ int main(void)
         args->config = config;
         /* Shared until the login loads the account's own set; the listener's config keeps it. */
         args->config.owns_routes = 0;
-        int one = 1;
-        setsockopt(args->fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        apply_netty_child_options(args->fd, &config);
         configure_control_socket(args->fd, &config);
 
         pthread_t thread;

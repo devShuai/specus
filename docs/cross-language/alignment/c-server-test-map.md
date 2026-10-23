@@ -516,6 +516,17 @@ Rate批次结束时，四类连通性中Vector、Resource、Rate三类为候选�
 | `stream_fd_lifetime_tests` 场景 9 ACCEPT_ERROR（NAT-BP-05） | 公网对端连上之后，监听线程的第一次 accept 以 `EMFILE` 失败：监听不结束，约 1 s 后接受这条等着的连接并发布为流；之后两侧正常关闭，流与监听照常回收 | 监听线程退出，等着的连接一直没有被接受 |
 | `nat_public_tcp_tests`「a failed accept pauses the public port instead of closing it」 | 用 `prlimit` 把服务端的 `RLIMIT_NOFILE` 软上限设为它最小的空闲描述符号，再连公网端口：服务端记 `[nat] accept failed port=<端口> ... retrying in 1000 ms`；恢复上限后，这条连接得到 OPEN（已阻塞的 accept 用它预留的描述符接下，或在暂停后接下），随后新的公网连接照常双向转发 | 第一条连接被接下后监听线程退出，新连接被拒绝（`public OPEN` 失败） |
 | `nat_public_tcp_tests`「a failed accept pauses the control port instead of ending the server」 | 同样压低上限后连控制端口：服务端记 `[server] accept failed`、进程仍在运行；恢复上限后新的控制登录成功，原有的控制连接应答心跳，公网连接照常转发 | 服务端进入优雅停机并退出 |
+| `nat_public_tcp_tests`「accepted public and data sockets have SO_KEEPALIVE by default」（NAT-BP-06） | 经 sock_diag（`NETLINK_SOCK_DIAG`）读服务端那一侧的 socket：空闲的公网连接与 data 连接都有 keepalive 定时器（`idiag_timer=2`） | 公网 socket 没有 keepalive 定时器 |
+| `nat_public_tcp_tests`「SPECUS_NETTY_KEEP_ALIVE=false leaves SO_KEEPALIVE off」 | 同上，3 s 内两个 socket 都没有 keepalive 定时器 | 通过（原实现本来就不设） |
+| `nat_public_tcp_tests`「both listeners take Java's SO_BACKLOG of 8192 (capped at somaxconn)」（NAT-BP-08） | 控制端口与公网端口两个监听 socket 的 accept 队列上限（sock_diag 的 `idiag_wqueue`）都等于 min(8192, somaxconn)（本机 4096） | 都是 128 |
+| `nat_public_tcp_tests`「SPECUS_NETTY_SO_BACKLOG sets both listeners' backlog」（`SPECUS_NETTY_SO_BACKLOG= 0x4D `） | 两个监听都是 77（Spring 去掉空白、按十六进制绑定） | 都是 128 |
+| `nat_public_tcp_tests`「SPECUS_NETTY_MAX_FRAME_SIZE caps frames after login」（`=1048576`） | 登录后正好 1 MiB 的帧被读取（未知流回 RST 7，心跳照常应答），多 1 字节的帧使 data 连接被关闭，控制连接保持 | 多 1 字节的帧照常读取，连接不关 |
+| `nat_public_tcp_tests`「SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE caps frames before login」（`=64`） | 超过 64 字节的登录请求得不到任何应答，连接被关闭 | 登录成功 |
+| `nat_public_tcp_tests`「unusable specus.netty.* values refuse the start」 | `SPECUS_NETTY_SO_BACKLOG=abc`、`SPECUS_NETTY_KEEP_ALIVE=maybe`、`SPECUS_NETTY_TCP_NO_DELAY=`（一个空格）、`SPECUS_NETTY_REUSE_ADDRESS=enabled`、`SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT=1x`、`SPECUS_NETTY_MAXFRAMESIZE=2147483648`、`SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE=10`、`SPECUS_NETTY_MAX_FRAME_SIZE=8192`（小于默认的预认证上限）都使服务端启动即退出，并记下对应的变量名 | 8 个值都照常启动 |
+| `nat_public_tcp_tests`「SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT limits a port's connections」（NAT-BP-07，`=1`） | 第一条公网连接得到 OPEN；第二条被服务端接受后立即关闭（EOF），以心跳为界 data 连接上没有它的 OPEN | 第二条也得到 OPEN |
+| `nat_public_tcp_tests`「the Java limit name wins over the old one, and 0 is no limit」（`SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT=0`、`SPECUS_MAX_PORT_EXTERNAL_CONNECTIONS=1`） | 同一端口三条并发连接都得到 OPEN | 第二条被拒绝 |
+| `nat_public_tcp_tests`「a port takes more than 512 connections under Java's default limit」 | 不设任何上限变量，同一端口 520 条并发公网连接都得到 OPEN（测试进程先把描述符上限提到 4096，服务端继承） | 第 513 条被拒绝 |
+| `management_overview_tests`（既有） | 旧变量名 `SPECUS_MAX_PORT_EXTERNAL_CONNECTIONS=1` 仍然生效，被拒绝的连接计入概览 | 通过 |
 
 ## 历史表的读法与限制
 

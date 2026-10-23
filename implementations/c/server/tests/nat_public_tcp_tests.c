@@ -6,7 +6,12 @@
  *   - a public connection both sides closed leaves nothing behind while the data connection lives:
  *     the server's mappings (thread stacks) do not grow with the number of connections it served;
  *   - a failed accept (descriptors exhausted with prlimit) pauses the public port or the control
- *     port for Netty's 1 s instead of closing the port or ending the server.
+ *     port for Netty's 1 s instead of closing the port or ending the server;
+ *   - Java's specus.netty.* settings and defaults (application.yml) apply: SO_KEEPALIVE on accepted
+ *     sockets and SO_BACKLOG on both listeners (read back from the kernel with sock_diag), the frame
+ *     size limits before and after login, the external connection limits under Java's names with
+ *     Java's default of 10000 and 0 as no limit, and the start is refused for values Spring cannot
+ *     bind or NettyServer.validateConfiguration refuses.
  *
  * The test plays the client on real control/data sockets and the public peers on real TCP
  * sockets; every check runs on its own server.
@@ -21,8 +26,13 @@
 #include "protocol.h"
 #include "storage.h"
 
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
+#include <linux/inet_diag.h>
+#include <linux/netlink.h>
+#include <linux/sock_diag.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -358,6 +368,375 @@ static int check_control_listener_survives_failed_accept(test_server *server, cl
 }
 
 /* ------------------------------------------------------------------------------------------- */
+/* specus.netty.* socket options, read back from the kernel (sock_diag)                          */
+
+/* Kernel TCP states (include/net/tcp_states.h). */
+#define DIAG_ESTABLISHED 1
+#define DIAG_LISTEN 10
+
+typedef struct {
+    int found;
+    /* 0 none, 1 retransmit, 2 keepalive (sk_timer), 3 TIME_WAIT, 4 zero window probe. */
+    unsigned int timer;
+    /* For a listening socket: the accept queue's length and its limit, the effective backlog. */
+    unsigned int rqueue;
+    unsigned int wqueue;
+} socket_diag;
+
+/* The IPv4 TCP socket in `state` with local port sport and, unless 0, remote port dport. */
+static int tcp_socket_diag(int state, int sport, int dport, socket_diag *out)
+{
+    memset(out, 0, sizeof(*out));
+    int fd = socket(AF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC, NETLINK_SOCK_DIAG);
+    if (fd < 0) {
+        return -1;
+    }
+    struct {
+        struct nlmsghdr header;
+        struct inet_diag_req_v2 request;
+    } message;
+    memset(&message, 0, sizeof(message));
+    message.header.nlmsg_len = sizeof(message);
+    message.header.nlmsg_type = SOCK_DIAG_BY_FAMILY;
+    message.header.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    message.request.sdiag_family = AF_INET;
+    message.request.sdiag_protocol = IPPROTO_TCP;
+    message.request.idiag_states = 1U << state;
+    struct sockaddr_nl kernel;
+    memset(&kernel, 0, sizeof(kernel));
+    kernel.nl_family = AF_NETLINK;
+    if (sendto(fd, &message, sizeof(message), 0, (struct sockaddr *)&kernel, sizeof(kernel)) < 0) {
+        close(fd);
+        return -1;
+    }
+    long buffer[8192];
+    for (;;) {
+        ssize_t received = recv(fd, buffer, sizeof(buffer), 0);
+        if (received <= 0) {
+            close(fd);
+            return -1;
+        }
+        unsigned int len = (unsigned int)received;
+        for (struct nlmsghdr *header = (struct nlmsghdr *)buffer; NLMSG_OK(header, len);
+             header = NLMSG_NEXT(header, len)) {
+            if (header->nlmsg_type == NLMSG_DONE) {
+                close(fd);
+                return 0;
+            }
+            if (header->nlmsg_type == NLMSG_ERROR) {
+                close(fd);
+                return -1;
+            }
+            const struct inet_diag_msg *diag = (const struct inet_diag_msg *)NLMSG_DATA(header);
+            if (ntohs(diag->id.idiag_sport) == sport && (dport == 0 || ntohs(diag->id.idiag_dport) == dport)) {
+                out->found = 1;
+                out->timer = diag->idiag_timer;
+                out->rqueue = diag->idiag_rqueue;
+                out->wqueue = diag->idiag_wqueue;
+            }
+        }
+    }
+}
+
+static int local_port(int fd)
+{
+    struct sockaddr_in address;
+    socklen_t length = sizeof(address);
+    if (getsockname(fd, (struct sockaddr *)&address, &length) != 0) {
+        return -1;
+    }
+    return ntohs(address.sin_port);
+}
+
+/* Whether the server's side of an idle connection has its keepalive timer running, within 3 s. */
+static int server_keepalive_armed(int server_port, int client_fd, int *armed)
+{
+    int client_port = local_port(client_fd);
+    long long deadline = monotonic_ms() + 3000;
+    for (;;) {
+        socket_diag diag;
+        if (client_port < 0 || tcp_socket_diag(DIAG_ESTABLISHED, server_port, client_port, &diag) != 0 || !diag.found) {
+            return -1;
+        }
+        /* A retransmit timer, while one is pending, is reported instead of the keepalive timer. */
+        *armed = diag.timer == 2U;
+        if (*armed || monotonic_ms() >= deadline) {
+            return 0;
+        }
+        sleep_ms(50);
+    }
+}
+
+/*
+ * Netty's child options (TcpServer, NettyServer): SO_KEEPALIVE from SPECUS_NETTY_KEEP_ALIVE,
+ * true by default, on every accepted public socket and on the control and data connections. The
+ * C server never set it, so a public peer that vanished without FIN or RST held its stream (and
+ * its place under the connection limits) until the data connection ended; Java's socket errors out.
+ */
+static int check_keepalive(int expected, client_pair *pair, int control_port)
+{
+    int public_fd = -1;
+    uint32_t stream_id = 0U;
+    CHECK(open_public_stream_id(pair->data, pair->public_port, &public_fd, &stream_id) == 0, "public OPEN");
+    int public_armed = -1;
+    int data_armed = -1;
+    int read_public = server_keepalive_armed(pair->public_port, public_fd, &public_armed) == 0;
+    int read_data = server_keepalive_armed(control_port, pair->data, &data_armed) == 0;
+    close_fd(&public_fd);
+    CHECK(read_public && read_data, "read the server's sockets through sock_diag");
+    CHECK(public_armed == expected, "the server's public socket %s SO_KEEPALIVE", public_armed ? "has" : "lacks");
+    CHECK(data_armed == expected, "the server's data connection socket %s SO_KEEPALIVE", data_armed ? "has" : "lacks");
+    CHECK(expect_stream_frame(pair->data, ST_NAT_FIN, stream_id) == 0
+              && send_nat(pair->data, ST_NAT_FIN, stream_id, 0U, NULL, 0U) == 0,
+          "close the stream");
+    return 0;
+}
+
+static int check_keepalive_by_default(test_server *server, client_pair *pair)
+{
+    return check_keepalive(1, pair, server->control_port);
+}
+
+static int check_keepalive_switched_off(test_server *server, client_pair *pair)
+{
+    return check_keepalive(0, pair, server->control_port);
+}
+
+static int somaxconn(void)
+{
+    FILE *file = fopen("/proc/sys/net/core/somaxconn", "r");
+    int value = -1;
+    if (file != NULL) {
+        if (fscanf(file, "%d", &value) != 1) {
+            value = -1;
+        }
+        fclose(file);
+    }
+    return value;
+}
+
+/* SO_BACKLOG of both server channels: Java's 8192 (the kernel caps it at somaxconn), or as set. */
+static int check_backlog(test_server *server, client_pair *pair, int expected)
+{
+    socket_diag control;
+    socket_diag public_port;
+    CHECK(tcp_socket_diag(DIAG_LISTEN, server->control_port, 0, &control) == 0 && control.found,
+          "the control listener through sock_diag");
+    CHECK(tcp_socket_diag(DIAG_LISTEN, pair->public_port, 0, &public_port) == 0 && public_port.found,
+          "the public listener through sock_diag");
+    printf("     backlog: control %u, public %u (expected %d)\n", control.wqueue, public_port.wqueue, expected);
+    CHECK((int)control.wqueue == expected, "the control listener's backlog is %u, not %d", control.wqueue, expected);
+    CHECK((int)public_port.wqueue == expected, "the public listener's backlog is %u, not %d", public_port.wqueue,
+          expected);
+    return 0;
+}
+
+static int check_backlog_by_default(test_server *server, client_pair *pair)
+{
+    int cap = somaxconn();
+    CHECK(cap > 0, "read somaxconn");
+    return check_backlog(server, pair, cap < 8192 ? cap : 8192);
+}
+
+static int check_backlog_configured(test_server *server, client_pair *pair)
+{
+    return check_backlog(server, pair, 77);
+}
+
+#define CONFIGURED_MAX_FRAME (1024 * 1024)
+#define NAT_FRAME_OVERHEAD (11 + 16)
+
+/* A DATA frame of exactly frame_size bytes, header included, for a stream that does not exist. */
+static int send_data_frame_of(int fd, size_t frame_size)
+{
+    size_t data_len = frame_size - NAT_FRAME_OVERHEAD;
+    uint8_t *data = (uint8_t *)calloc(1U, data_len);
+    if (data == NULL) {
+        return -1;
+    }
+    int rc = send_nat(fd, ST_NAT_DATA, 0x7fff0001U, 0U, data, data_len);
+    free(data);
+    return rc;
+}
+
+/*
+ * SPECUS_NETTY_MAX_FRAME_SIZE caps every frame after login (Java's Spliter, header included). A
+ * frame of exactly the limit is read (and its unknown stream reset); one byte more closes the data
+ * connection. The C server read every frame up to 32 MiB whatever was configured.
+ */
+static int check_max_frame_size(test_server *server, client_pair *pair)
+{
+    (void)server;
+    CHECK(send_data_frame_of(pair->data, CONFIGURED_MAX_FRAME) == 0, "a frame of exactly the limit");
+    CHECK(expect_channel_alive(pair->data) == 0, "a frame of exactly SPECUS_NETTY_MAX_FRAME_SIZE must be read");
+    /* The server may close as soon as it has read the header, so the send itself may fail. */
+    (void)send_data_frame_of(pair->data, CONFIGURED_MAX_FRAME + 1);
+    CHECK(expect_channel_closed(pair->data, IO_TIMEOUT_MS) == 0,
+          "a frame one byte over SPECUS_NETTY_MAX_FRAME_SIZE must close the data connection");
+    close_fd(&pair->data);
+    CHECK(expect_channel_alive(pair->control) == 0, "the control connection must stay");
+    return 0;
+}
+
+/* SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE caps the frames before login: a larger login request is not read. */
+static int test_pre_auth_frame_size(test_server *server)
+{
+    runtime_session runtime;
+    CHECK(create_credential(server->db_path, "ck_pre_auth", "pre-auth-secret", 2) == 0, "credential");
+    CHECK(http_client_login(server, "ck_pre_auth", "pre-auth-secret", "machine-pre-auth", "pre-auth", &runtime) == 0,
+          "http login");
+    int control = -1;
+    char reason[256];
+    int rc = channel_login(server->control_port, &runtime, "control", &control, reason, sizeof(reason));
+    close_fd(&control);
+    CHECK(rc == -1, "a login request beyond SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE=64 must not be answered (rc=%d)", rc);
+    return 0;
+}
+
+/* Values Spring cannot bind, or that NettyServer.validateConfiguration refuses, stop the start. */
+static int expect_refused_start(const char *assignment, const char *message)
+{
+    test_server server;
+    if (server_prepare(&server) != 0) {
+        fprintf(stderr, "cannot prepare server directory\n");
+        return 1;
+    }
+    server.extra_env[0] = assignment;
+    int started = server_start(&server) == 0;
+    int logged = !started && wait_log(&server, message, 1000) == 0;
+    if (started) {
+        (void)server_stop(&server, 20000);
+    }
+    int failed = started || !logged;
+    if (failed) {
+        fprintf(stderr, "%s: %s\n", assignment,
+                started ? "the server started" : "the server stopped without the expected message");
+    }
+    server_cleanup(&server, failed);
+    return failed;
+}
+
+static int test_unusable_netty_settings(void)
+{
+    static const struct {
+        const char *assignment;
+        const char *message;
+    } cases[] = {
+        {"SPECUS_NETTY_SO_BACKLOG=abc", "invalid SPECUS_NETTY_SO_BACKLOG"},
+        {"SPECUS_NETTY_KEEP_ALIVE=maybe", "invalid SPECUS_NETTY_KEEP_ALIVE"},
+        {"SPECUS_NETTY_TCP_NO_DELAY= ", "invalid SPECUS_NETTY_TCP_NO_DELAY"},
+        {"SPECUS_NETTY_REUSE_ADDRESS=enabled", "invalid SPECUS_NETTY_REUSE_ADDRESS"},
+        {"SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT=1x", "invalid SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT"},
+        {"SPECUS_NETTY_MAXFRAMESIZE=2147483648", "invalid SPECUS_NETTY_MAXFRAMESIZE"},
+        {"SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE=10", "SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE must be between"},
+        {"SPECUS_NETTY_MAX_FRAME_SIZE=8192", "SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE must be between"},
+    };
+    int failures = 0;
+    for (size_t i = 0U; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        failures += expect_refused_start(cases[i].assignment, cases[i].message);
+    }
+    CHECK(failures == 0, "%d unusable specus.netty.* value(s) did not refuse the start", failures);
+    return 0;
+}
+
+/* No OPEN arrives on the data connection before the answer to a heartbeat sent now. */
+static int expect_no_open(int data_fd)
+{
+    st_buffer heartbeat = st_protocol_encode_empty_packet(ST_CMD_HEARTBEAT_REQUEST);
+    CHECK(send_buffer(data_fd, &heartbeat) == 0, "heartbeat");
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    for (;;) {
+        long long remaining = deadline - monotonic_ms();
+        CHECK(remaining > 0, "no heartbeat answer");
+        st_frame_header header;
+        uint8_t *body = NULL;
+        CHECK(read_frame(data_fd, (int)remaining, &header, &body) == 1, "data connection closed");
+        int open = 0;
+        st_nat_message message;
+        if (header.command == ST_CMD_NAT_MESSAGE && st_protocol_decode_nat_message(body, header.length, &message) == 0) {
+            open = message.type == ST_NAT_OPEN;
+            st_nat_message_free(&message);
+        }
+        free(body);
+        CHECK(!open, "a public connection beyond the limit was opened");
+        if (header.command == ST_CMD_HEARTBEAT_RESPONSE) {
+            return 0;
+        }
+    }
+}
+
+/* SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT=1: the second connection is accepted and closed. */
+static int check_port_limit_from_java_name(test_server *server, client_pair *pair)
+{
+    (void)server;
+    int first = -1;
+    uint32_t stream_id = 0U;
+    CHECK(open_public_stream_id(pair->data, pair->public_port, &first, &stream_id) == 0, "first public OPEN");
+    int second = connect_local(pair->public_port);
+    int closed = second >= 0 && expect_socket_eof(second, IO_TIMEOUT_MS) == 0;
+    close_fd(&second);
+    int quiet = expect_no_open(pair->data) == 0;
+    close_fd(&first);
+    CHECK(closed && quiet, "the connection beyond SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT=1 must be closed");
+    return 0;
+}
+
+/* The Java name wins over the old C one, and 0 is no limit (RemotePortServerManager.tryIncrement). */
+static int check_java_name_overrides_alias(test_server *server, client_pair *pair)
+{
+    (void)server;
+    int fds[3] = {-1, -1, -1};
+    int opened = 1;
+    for (size_t i = 0U; opened && i < 3U; ++i) {
+        uint32_t stream_id = 0U;
+        opened = open_public_stream_id(pair->data, pair->public_port, &fds[i], &stream_id) == 0;
+    }
+    for (size_t i = 0U; i < 3U; ++i) {
+        close_fd(&fds[i]);
+    }
+    CHECK(opened, "SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT=0 must lift the limit SPECUS_MAX_PORT_EXTERNAL_CONNECTIONS=1 set");
+    return 0;
+}
+
+/* Java's default of 10000 per port: well past the C server's former 512. */
+#define DEFAULT_LIMIT_CONNECTIONS 520
+
+static int check_default_port_limit(test_server *server, client_pair *pair)
+{
+    (void)server;
+    int *fds = (int *)malloc(DEFAULT_LIMIT_CONNECTIONS * sizeof(int));
+    CHECK(fds != NULL, "allocation");
+    int opened = 0;
+    int failed = 0;
+    for (; !failed && opened < DEFAULT_LIMIT_CONNECTIONS; ++opened) {
+        uint32_t stream_id = 0U;
+        fds[opened] = -1;
+        failed = open_public_stream_id(pair->data, pair->public_port, &fds[opened], &stream_id) != 0;
+    }
+    for (int i = 0; i < opened; ++i) {
+        close_fd(&fds[i]);
+    }
+    free(fds);
+    CHECK(!failed, "public connection %d of one port was refused under Java's default limit", opened);
+    return 0;
+}
+
+static int raise_descriptor_limit(rlim_t wanted)
+{
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+        return -1;
+    }
+    if (limit.rlim_cur != RLIM_INFINITY && limit.rlim_cur < wanted) {
+        limit.rlim_cur = limit.rlim_max == RLIM_INFINITY || limit.rlim_max >= wanted ? wanted : limit.rlim_max;
+        if (setrlimit(RLIMIT_NOFILE, &limit) != 0) {
+            return -1;
+        }
+    }
+    return limit.rlim_cur == RLIM_INFINITY || limit.rlim_cur >= wanted ? 0 : -1;
+}
+
+/* ------------------------------------------------------------------------------------------- */
 
 typedef int (*pair_check)(test_server *server, client_pair *pair);
 
@@ -406,6 +785,48 @@ int main(int argc, char **argv)
                           check_nat_listener_survives_failed_accept, long_idle);
     failures += run_check("a failed accept pauses the control port instead of ending the server",
                           check_control_listener_survives_failed_accept, long_idle);
+    failures += run_check("accepted public and data sockets have SO_KEEPALIVE by default",
+                          check_keepalive_by_default, long_idle);
+    static const char *const keepalive_off[] = {"SPECUS_CONTROL_READ_IDLE_SECONDS=900",
+                                                "SPECUS_NETTY_KEEP_ALIVE=false", NULL};
+    failures += run_check("SPECUS_NETTY_KEEP_ALIVE=false leaves SO_KEEPALIVE off", check_keepalive_switched_off,
+                          keepalive_off);
+    failures += run_check("both listeners take Java's SO_BACKLOG of 8192 (capped at somaxconn)",
+                          check_backlog_by_default, long_idle);
+    static const char *const backlog_77[] = {"SPECUS_CONTROL_READ_IDLE_SECONDS=900", "SPECUS_NETTY_SO_BACKLOG= 0x4D ",
+                                             NULL};
+    failures += run_check("SPECUS_NETTY_SO_BACKLOG sets both listeners' backlog", check_backlog_configured,
+                          backlog_77);
+    static const char *const max_frame[] = {"SPECUS_CONTROL_READ_IDLE_SECONDS=900",
+                                            "SPECUS_NETTY_MAX_FRAME_SIZE=1048576", NULL};
+    failures += run_check("SPECUS_NETTY_MAX_FRAME_SIZE caps frames after login", check_max_frame_size, max_frame);
+    static const char *const pre_auth[] = {"SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE=64", NULL};
+    if (selected("SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE caps frames before login")) {
+        failures += run_on_fresh_server("SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE caps frames before login",
+                                        test_pre_auth_frame_size, pre_auth);
+    }
+    if (selected("unusable specus.netty.* values refuse the start")) {
+        int failed = test_unusable_netty_settings() != 0;
+        printf("%s unusable specus.netty.* values refuse the start\n", failed ? "FAIL" : "ok  ");
+        failures += failed;
+    }
+    static const char *const port_limit[] = {"SPECUS_CONTROL_READ_IDLE_SECONDS=900",
+                                             "SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT=1", NULL};
+    failures += run_check("SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT limits a port's connections",
+                          check_port_limit_from_java_name, port_limit);
+    static const char *const no_port_limit[] = {"SPECUS_CONTROL_READ_IDLE_SECONDS=900",
+                                                "SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT=0",
+                                                "SPECUS_MAX_PORT_EXTERNAL_CONNECTIONS=1", NULL};
+    failures += run_check("the Java limit name wins over the old one, and 0 is no limit",
+                          check_java_name_overrides_alias, no_port_limit);
+    /* The server inherits the limit: 520 public connections take more than the usual 1024 with both ends. */
+    if (raise_descriptor_limit(4096) == 0) {
+        failures += run_check("a port takes more than 512 connections under Java's default limit",
+                              check_default_port_limit, long_idle);
+    } else {
+        fprintf(stderr, "cannot raise the descriptor limit to 4096 for the default-limit check\n");
+        failures += 1;
+    }
     if (failures != 0) {
         fprintf(stderr, "%d public TCP check(s) failed\n", failures);
         return 1;
