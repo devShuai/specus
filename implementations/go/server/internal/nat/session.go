@@ -519,6 +519,12 @@ func (s *clientSession) openWSStream(metadata map[string]any,
 		func() error {
 			return s.conn.Send(protocol.NatMessage{Type: protocol.NatFin, StreamID: streamID})
 		},
+		func(code uint32, reason string) error {
+			return s.conn.Send(protocol.NatMessage{
+				Type: protocol.NatRST, StreamID: streamID, Value: code,
+				Metadata: map[string]any{"reason": reason},
+			})
+		},
 		func(specus *directhttp.WebSocketSpecus) { s.removeWSStream(streamID, specus) })
 	s.mu.Lock()
 	if s.natStreamLimitReachedLocked() {
