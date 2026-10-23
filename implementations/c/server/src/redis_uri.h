@@ -44,7 +44,18 @@ typedef struct {
     char client_name[256];
     char library_name[128];
     char library_version[128];
+    /*
+     * java.net.URI could not read the authority as [user@]host[:port] (an '_' in the host name, or
+     * an unescaped '@', '#', '?' or '/' in the password), so the host is everything after the last
+     * '@', ":port" included, as Lettuce takes it. Such a URI connects only when that is a name.
+     */
+    int host_unparsed;
+    /* The host or socket path may hold part of a password (see above): logs must not print it. */
+    int host_hidden;
 } st_redis_uri;
+
+/* Overwrites len bytes in a way the compiler cannot drop (passwords). */
+void st_redis_uri_clear(void *data, size_t len);
 
 /*
  * Parses text (already trimmed, as Java trims it) the way java.net.URI and Lettuce's

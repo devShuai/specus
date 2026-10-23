@@ -6,18 +6,21 @@
 #include "json.h"
 #include "redis_uri.h"
 
-#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <hiredis/hiredis.h>
-#include <hiredis/hiredis_ssl.h>
 #include <limits.h>
+#include <utf8proc.h>
+/* rediss:// needs hiredis_ssl (hiredis 1.0+); CMakeLists.txt and the Makefile define this when found. */
+#ifdef ST_HAVE_HIREDIS_SSL
+#include <arpa/inet.h>
+#include <hiredis/hiredis_ssl.h>
 #include <netinet/in.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
-#include <utf8proc.h>
+#endif
 #include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -361,11 +364,18 @@ static int cluster_parse_uri(st_cluster_config *config)
      */
     char reason[256];
     int parsed_uri = st_redis_uri_parse(uri_buffer, &config->redis, reason, sizeof(reason));
-    memset(uri_buffer, 0, sizeof(uri_buffer));
+    st_redis_uri_clear(uri_buffer, sizeof(uri_buffer));
     if (parsed_uri != 0) {
         fprintf(stderr, "public transfer Redis URI is invalid: %s\n", reason);
         return -1;
     }
+#ifndef ST_HAVE_HIREDIS_SSL
+    if (config->redis.tls) {
+        fprintf(stderr, "public transfer Redis URI asks for TLS, but this build has no hiredis_ssl "
+                        "(hiredis 1.0 or later); rebuild with it or use redis://\n");
+        return -1;
+    }
+#endif
     /*
      * Java keyPrefix(): a value without text means the default; otherwise trim() and drop the
      * trailing colons, which may leave an empty prefix ("::").
@@ -407,6 +417,7 @@ static int cluster_reply_ok(redisReply *reply)
         && reply->str != NULL && strcasecmp(reply->str, "OK") == 0;
 }
 
+#ifdef ST_HAVE_HIREDIS_SSL
 /* An IPv4 or IPv6 literal: checked against the certificate's IP addresses and sent without SNI. */
 static int cluster_ip_literal(const char *host)
 {
@@ -422,8 +433,8 @@ static int cluster_ip_literal(const char *host)
  * JVM. No client certificate is offered (Java configures none) and the protocol is TLS 1.2 or 1.3.
  * The SSL object goes to hiredis, which uses and frees it with the context.
  */
-static int cluster_tls_start(redisContext *redis, const char *host, st_redis_verify_mode verify,
-                             const char *what, int quiet)
+static int cluster_tls_start(redisContext *redis, const char *host, const char *shown,
+                             st_redis_verify_mode verify, const char *what, int quiet)
 {
     SSL_CTX *context = SSL_CTX_new(TLS_client_method());
     int ok = context != NULL && SSL_CTX_set_min_proto_version(context, TLS1_2_VERSION) == 1;
@@ -455,7 +466,7 @@ static int cluster_tls_start(redisContext *redis, const char *host, st_redis_ver
                 : X509_VERIFY_PARAM_set1_host(parameters, host, 0U) == 1;
     }
     if (!ok) {
-        if (!quiet) fprintf(stderr, "public transfer %s TLS setup for %s failed\n", what, host);
+        if (!quiet) fprintf(stderr, "public transfer %s TLS setup for %s failed\n", what, shown);
         SSL_free(ssl);
         ERR_clear_error();
         return -1;
@@ -464,7 +475,7 @@ static int cluster_tls_start(redisContext *redis, const char *host, st_redis_ver
         /* On failure hiredis leaves the SSL object to the caller. */
         long verified = SSL_get_verify_result(ssl);
         if (!quiet)
-            fprintf(stderr, "public transfer %s TLS handshake with %s failed: %s%s%s%s\n", what, host,
+            fprintf(stderr, "public transfer %s TLS handshake with %s failed: %s%s%s%s\n", what, shown,
                     redis->errstr, verified != X509_V_OK ? " (" : "",
                     verified != X509_V_OK ? X509_verify_cert_error_string(verified) : "",
                     verified != X509_V_OK ? ")" : "");
@@ -474,51 +485,55 @@ static int cluster_tls_start(redisContext *redis, const char *host, st_redis_ver
     }
     return 0;
 }
+#endif
 
 /*
  * A connection to host:port, or to the URI's Unix socket, with the command timeout on connect and
- * on every read and write (the TLS handshake included), over TLS when the URI asks for it.
+ * on every read and write (the TLS handshake included), over TLS when the URI asks for it. With
+ * hidden the logs name "the URI's host" instead: it may hold part of a password (redis_uri.h).
+ * Only hiredis 0.14 calls here, so plain redis:// builds without hiredis_ssl.
  */
-static redisContext *cluster_open(const st_cluster_config *config, const char *host, int port,
+static redisContext *cluster_open(const st_cluster_config *config, const char *host, int port, int hidden,
                                   const char *what, int quiet)
 {
     struct timeval timeout = {
         .tv_sec = config->command_timeout_ms / 1000L,
         .tv_usec = (config->command_timeout_ms % 1000L) * 1000L
     };
-    redisOptions options;
-    memset(&options, 0, sizeof(options));
-    if (config->redis.socket_path[0] != '\0') {
-        REDIS_OPTIONS_SET_UNIX(&options, config->redis.socket_path);
-    } else {
-        REDIS_OPTIONS_SET_TCP(&options, host, port);
-    }
-    options.connect_timeout = &timeout;
-    options.command_timeout = &timeout;
-    redisContext *redis = redisConnectWithOptions(&options);
-    if (redis == NULL || redis->err) {
+    const char *socket_path = config->redis.socket_path;
+    const char *shown = hidden ? "the URI's host" : host;
+    redisContext *redis = socket_path[0] != '\0' ? redisConnectUnixWithTimeout(socket_path, timeout)
+                                                 : redisConnectWithTimeout(host, port, timeout);
+    if (redis == NULL || redis->err || redisSetTimeout(redis, timeout) != REDIS_OK) {
         if (!quiet) {
-            if (config->redis.socket_path[0] != '\0')
-                fprintf(stderr, "public transfer %s connect to %s failed: %s\n", what, config->redis.socket_path,
-                        redis == NULL ? "out of memory" : redis->errstr);
+            const char *reason = redis == NULL ? "out of memory" : redis->errstr;
+            if (socket_path[0] != '\0')
+                fprintf(stderr, "public transfer %s connect to %s failed: %s\n", what,
+                        hidden ? "the URI's socket" : socket_path, reason);
+            else if (hidden)
+                fprintf(stderr, "public transfer %s connect to %s failed: %s\n", what, shown, reason);
             else
-                fprintf(stderr, "public transfer %s connect to %s:%d failed: %s\n", what, host, port,
-                        redis == NULL ? "out of memory" : redis->errstr);
+                fprintf(stderr, "public transfer %s connect to %s:%d failed: %s\n", what, host, port, reason);
         }
         if (redis != NULL) redisFree(redis);
         return NULL;
     }
-    if (config->redis.tls && cluster_tls_start(redis, host, config->redis.verify, what, quiet) != 0) {
+#ifdef ST_HAVE_HIREDIS_SSL
+    if (config->redis.tls && cluster_tls_start(redis, host, shown, config->redis.verify, what, quiet) != 0) {
         redisFree(redis);
         return NULL;
     }
+#endif
     return redis;
 }
 
 /*
  * Lettuce's connection handshake: AUTH with the URI's credentials (data nodes only; a Sentinel
- * gets none from the URI), the client name, SELECT (data nodes only). A refusal fails the
- * connection. The library name and version are sent best effort, as Lettuce sends them.
+ * gets none from the URI), the client name, SELECT (data nodes only), then a round trip that must
+ * answer. Lettuce's HELLO is such a round trip on every connection, a Sentinel's included, so a
+ * node that accepts the connection but never answers, or closes it, fails here; for a Sentinel
+ * that means trying the next one. A refusal fails the connection. The library name and version
+ * are sent best effort, as Lettuce sends them.
  */
 static int cluster_handshake(redisContext *redis, const st_redis_uri *uri, int data_node,
                              const char *what, int quiet)
@@ -558,14 +573,23 @@ static int cluster_handshake(redisContext *redis, const st_redis_uri *uri, int d
         freeReplyObject(redisCommand(redis, "CLIENT SETINFO LIB-NAME %s", uri->library_name));
     if (uri->library_version[0] != '\0')
         freeReplyObject(redisCommand(redis, "CLIENT SETINFO LIB-VER %s", uri->library_version));
-    return redis->err == 0 ? 0 : -1;
+    reply = redisCommand(redis, "PING");
+    int pong = reply != NULL && (reply->type == REDIS_REPLY_STATUS || reply->type == REDIS_REPLY_STRING)
+        && reply->str != NULL && strcasecmp(reply->str, "PONG") == 0;
+    if (!pong && !quiet)
+        fprintf(stderr, "public transfer %s did not answer PING: %s\n", what,
+                reply != NULL && reply->type == REDIS_REPLY_ERROR ? reply->str
+                : redis->errstr[0] != '\0' ? redis->errstr : "unexpected reply");
+    freeReplyObject(reply);
+    return pong ? 0 : -1;
 }
 
 /*
- * Lettuce's lookupRedis: the Sentinels in the URI's order until one accepts a connection, then
- * that Sentinel's SENTINEL GET-MASTER-ADDR-BY-NAME answer. An unknown master or a failed reply ends
- * the lookup there, as it does for Lettuce. Every (re)connect asks again, so a connection that is
- * re-established after a failover reaches the promoted master.
+ * Lettuce's lookupRedis: the Sentinels in the URI's order until one completes a connection (TCP,
+ * TLS and the handshake's round trip), then that Sentinel's SENTINEL GET-MASTER-ADDR-BY-NAME
+ * answer. An unknown master or a failed reply ends the lookup there, as it does for Lettuce. Every
+ * (re)connect asks again, so a connection that is re-established after a failover reaches the
+ * promoted master. Each Sentinel that swallows packets costs up to one command timeout.
  */
 static int cluster_sentinel_master(const st_cluster_config *config, char *host, size_t host_len, int *port,
                                    int quiet)
@@ -573,7 +597,8 @@ static int cluster_sentinel_master(const st_cluster_config *config, char *host, 
     const st_redis_uri *uri = &config->redis;
     for (size_t i = 0U; i < uri->sentinel_count; ++i) {
         const st_redis_endpoint *sentinel = &uri->sentinels[i];
-        redisContext *redis = cluster_open(config, sentinel->host, sentinel->port, "Redis Sentinel", quiet);
+        redisContext *redis = cluster_open(config, sentinel->host, sentinel->port, uri->host_hidden,
+                                           "Redis Sentinel", quiet);
         if (redis != NULL && cluster_handshake(redis, uri, 0, "Redis Sentinel", quiet) != 0) {
             redisFree(redis);
             redis = NULL;
@@ -597,7 +622,7 @@ static int cluster_sentinel_master(const st_cluster_config *config, char *host, 
         }
         if (!found && !quiet)
             fprintf(stderr, "public transfer Redis Sentinel %s:%d gave no address for master %s%s%s\n",
-                    sentinel->host, sentinel->port, uri->master_id,
+                    uri->host_hidden ? "(the URI's host)" : sentinel->host, sentinel->port, uri->master_id,
                     reply != NULL && reply->type == REDIS_REPLY_ERROR ? ": " : "",
                     reply != NULL && reply->type == REDIS_REPLY_ERROR ? reply->str : "");
         freeReplyObject(reply);
@@ -621,34 +646,31 @@ static void cluster_note_master(const char *master_id, const char *host, int por
 }
 
 /*
- * Finds the node (through the Sentinels when the URI lists them), connects, runs the handshake and
- * checks PING; quiet skips the failure logs.
+ * Finds the node (through the Sentinels when the URI lists them), connects and runs the handshake,
+ * whose PING must answer; quiet skips the failure logs.
  */
 static redisContext *cluster_connect(const st_cluster_config *config, int quiet)
 {
     char host[ST_REDIS_URI_HOST_BYTES];
     int port = config->redis.server.port;
+    int hidden = 0;
     if (config->redis.sentinel) {
         if (cluster_sentinel_master(config, host, sizeof(host), &port, quiet) != 0) return NULL;
         cluster_note_master(config->redis.master_id, host, port);
     } else {
         memcpy(host, config->redis.server.host, sizeof(host));
+        hidden = config->redis.host_hidden;
     }
-    redisContext *redis = cluster_open(config, host, port, "Redis", quiet);
+    redisContext *redis = cluster_open(config, host, port, hidden, "Redis", quiet);
+    if (redis == NULL && config->redis.host_unparsed && !quiet)
+        fprintf(stderr,
+                "public transfer Redis URI: java.net.URI cannot read its authority as host[:port] (an '_' in "
+                "the host name, or an unescaped '@', '#', '?' or '/' in the password), so Lettuce and C take "
+                "everything after the last '@' as the host name; percent-encode such characters "
+                "(%%40, %%23, %%3F, %%2F) or use a host name without '_'\n");
     if (redis == NULL) return NULL;
+    st_redis_uri_clear(host, sizeof(host));
     if (cluster_handshake(redis, &config->redis, 1, "Redis", quiet) != 0) {
-        redisFree(redis);
-        return NULL;
-    }
-    redisReply *reply = redisCommand(redis, "PING");
-    int pong = reply != NULL && (reply->type == REDIS_REPLY_STATUS || reply->type == REDIS_REPLY_STRING)
-        && reply->str != NULL && strcasecmp(reply->str, "PONG") == 0;
-    if (!pong && !quiet)
-        fprintf(stderr, "public transfer Redis did not answer PING: %s\n",
-                reply != NULL && reply->type == REDIS_REPLY_ERROR ? reply->str
-                : redis->errstr[0] != '\0' ? redis->errstr : "unexpected reply");
-    freeReplyObject(reply);
-    if (!pong) {
         redisFree(redis);
         return NULL;
     }
@@ -715,13 +737,20 @@ static redisContext *cluster_link_context_locked(st_cluster_link *link)
         redisFree(closed);
     }
     if (link->context != NULL) return link->context;
+    if (cluster_now_ms() < link->retry_at_ms) return NULL;
+    /*
+     * The reconnect runs on the caller's thread with this link's lock held, as Lettuce's command
+     * waits for its reconnect: through Sentinels, each one that swallows packets adds up to one
+     * command timeout. The copy holds the password and is cleared afterwards.
+     */
+    st_cluster_config config;
     pthread_mutex_lock(&cluster_state.state_lock);
     int usable = cluster_state.initialized && !cluster_state.stopping;
-    st_cluster_config config = cluster_state.config;
+    if (usable) config = cluster_state.config;
     pthread_mutex_unlock(&cluster_state.state_lock);
-    long long now = cluster_now_ms();
-    if (!usable || now < link->retry_at_ms) return NULL;
+    if (!usable) return NULL;
     redisContext *context = cluster_connect(&config, link->failures > 0U);
+    st_redis_uri_clear(&config, sizeof(config));
     if (context == NULL) {
         if (link->failures < UINT_MAX) ++link->failures;
         link->retry_at_ms = cluster_now_ms() + cluster_reconnect_delay_ms(link->failures);
@@ -2315,6 +2344,8 @@ static void cluster_stop_locked_lifecycle(void)
     cluster_state.stopping = 0;
     cluster_state.handler = NULL;
     cluster_state.handler_context = NULL;
+    /* The threads that read it are joined; the URI holds the password. */
+    st_redis_uri_clear(&cluster_state.config.redis, sizeof(cluster_state.config.redis));
     pthread_mutex_unlock(&cluster_state.state_lock);
     while (queued != NULL) {
         cluster_event_node *next = queued->next;
@@ -2341,9 +2372,11 @@ int st_public_coordination_initialize(st_public_cluster_event_handler handler, v
     }
     cluster_state.sentinel_master[0] = '\0';
     pthread_mutex_unlock(&cluster_state.state_lock);
-    static st_cluster_config config; /* large; only touched under cluster_lifecycle_lock */
+    /* Large, and it holds the password: only touched under cluster_lifecycle_lock, cleared after use. */
+    static st_cluster_config config;
     memset(&config, 0, sizeof(config));
     if (cluster_parse_uri(&config) != 0) {
+        st_redis_uri_clear(&config, sizeof(config));
         pthread_mutex_unlock(&cluster_lifecycle_lock);
         return -1;
     }
@@ -2355,6 +2388,7 @@ int st_public_coordination_initialize(st_public_cluster_event_handler handler, v
         if (command != NULL) redisFree(command);
         if (publisher != NULL) redisFree(publisher);
         if (subscriber != NULL) redisFree(subscriber);
+        st_redis_uri_clear(&config, sizeof(config));
         pthread_mutex_unlock(&cluster_lifecycle_lock);
         return -1;
     }
@@ -2382,6 +2416,7 @@ int st_public_coordination_initialize(st_public_cluster_event_handler handler, v
     }
     if (!started) {
         cluster_stop_locked_lifecycle();
+        st_redis_uri_clear(&config, sizeof(config));
         pthread_mutex_unlock(&cluster_lifecycle_lock);
         return -1;
     }
@@ -2394,6 +2429,7 @@ int st_public_coordination_initialize(st_public_cluster_event_handler handler, v
             config.redis.tls ? verify_names[config.redis.verify] : "",
             config.redis.sentinel ? " sentinel-master=" : "",
             config.redis.sentinel ? config.redis.master_id : "");
+    st_redis_uri_clear(&config, sizeof(config));
     pthread_mutex_unlock(&cluster_lifecycle_lock);
     return 0;
 }

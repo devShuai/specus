@@ -41,40 +41,135 @@ static int uri_hex(int c)
     return isdigit(c) ? c - '0' : tolower(c) - 'a' + 10;
 }
 
+void st_redis_uri_clear(void *data, size_t len)
+{
+    volatile unsigned char *bytes = (volatile unsigned char *)data;
+    while (len-- > 0U) *bytes++ = 0U;
+}
+
+static void uri_free_secret(char *value)
+{
+    if (value == NULL) return;
+    st_redis_uri_clear(value, strlen(value));
+    free(value);
+}
+
+/* The parse result may hold the password (user information, authority, error text). */
+static void uri_java_free_secret(st_java_uri *uri)
+{
+    char *const fields[] = {uri->error, uri->scheme, uri->user_info, uri->host, uri->raw_authority,
+                            uri->raw_path, uri->raw_query, uri->raw_fragment};
+    for (size_t i = 0U; i < sizeof(fields) / sizeof(fields[0]); ++i)
+        if (fields[i] != NULL) st_redis_uri_clear(fields[i], strlen(fields[i]));
+    st_java_uri_free(uri);
+}
+
 /*
- * java.net.URI's getters (decode(s, true)): every %XX escape outside square brackets becomes its
- * byte. A NULL component stays NULL. -1 for an escaped NUL, which a C string cannot carry.
+ * The length of the well-formed UTF-8 sequence at bytes, or minus the number of bytes one U+FFFD
+ * replaces, as the JDK's UTF-8 decoder counts them: the lead byte and the continuation bytes that
+ * could still belong to it, except that an encoded surrogate (ED A0..BF xx) is one unit of three.
  */
-static int uri_decode(const char *raw, char **out)
+static int uri_utf8_sequence(const unsigned char *bytes, size_t len)
+{
+    unsigned char lead = bytes[0];
+    unsigned char low = 0x80U;
+    unsigned char high = 0xBFU;
+    size_t need = 0U;
+    if (lead < 0x80U) return 1;
+    if (lead >= 0xC2U && lead <= 0xDFU) {
+        need = 2U;
+    } else if (lead >= 0xE0U && lead <= 0xEFU) {
+        need = 3U;
+        if (lead == 0xE0U) low = 0xA0U;
+    } else if (lead >= 0xF0U && lead <= 0xF4U) {
+        need = 4U;
+        if (lead == 0xF0U) low = 0x90U;
+        if (lead == 0xF4U) high = 0x8FU;
+    } else {
+        return -1;
+    }
+    size_t i = 1U;
+    for (; i < need && i < len; ++i) {
+        unsigned char c = bytes[i];
+        if (c < (i == 1U ? low : 0x80U) || c > (i == 1U ? high : 0xBFU)) return -(int)i;
+    }
+    if (i == need && lead == 0xEDU && bytes[1] >= 0xA0U) return -3;
+    return i == need ? (int)need : -(int)i;
+}
+
+/*
+ * java.net.URI's decode(s, bracketExempt): each run of %XX escapes is decoded as UTF-8 with
+ * Java's REPLACE action, an ill-formed sequence becoming U+FFFD. getUserInfo, getAuthority and
+ * getPath leave escapes inside [...] as written; getQuery and getFragment decode them too. NULL
+ * stays NULL. -1 for an escaped NUL, which a C string cannot carry.
+ */
+static int uri_decode(const char *raw, int bracket_exempt, char **out)
 {
     *out = NULL;
     if (raw == NULL) return 0;
     size_t len = strlen(raw);
+    /* Three raw bytes per escape, at most three decoded ones (U+FFFD) for each. */
     char *decoded = (char *)malloc(len + 1U);
-    if (decoded == NULL) return -1;
+    unsigned char *run = (unsigned char *)malloc(len / 3U + 1U);
+    if (decoded == NULL || run == NULL) {
+        free(decoded);
+        free(run);
+        return -1;
+    }
     size_t used = 0U;
     int bracketed = 0;
-    for (size_t i = 0U; i < len; ++i) {
+    int rc = 0;
+    for (size_t i = 0U; i < len && rc == 0;) {
         unsigned char c = (unsigned char)raw[i];
         if (c == '[') bracketed = 1;
         else if (bracketed && c == ']') bracketed = 0;
-        if (c == '%' && !bracketed) {
+        if (c != '%' || (bracketed && bracket_exempt)) {
+            decoded[used++] = (char)c;
+            ++i;
+            continue;
+        }
+        size_t run_len = 0U;
+        while (i < len && raw[i] == '%') {
             if (len - i < 3U || !isxdigit((unsigned char)raw[i + 1U]) || !isxdigit((unsigned char)raw[i + 2U])) {
-                free(decoded);
-                return -1;
+                rc = -1;
+                break;
             }
-            c = (unsigned char)(uri_hex((unsigned char)raw[i + 1U]) * 16 + uri_hex((unsigned char)raw[i + 2U]));
-            i += 2U;
-            if (c == 0U) {
-                free(decoded);
-                return -1;
+            run[run_len++] = (unsigned char)(uri_hex((unsigned char)raw[i + 1U]) * 16
+                                             + uri_hex((unsigned char)raw[i + 2U]));
+            i += 3U;
+        }
+        for (size_t k = 0U; k < run_len && rc == 0;) {
+            if (run[k] == 0U) {
+                rc = -1;
+                break;
+            }
+            int sequence = uri_utf8_sequence(run + k, run_len - k);
+            if (sequence > 0) {
+                memcpy(decoded + used, run + k, (size_t)sequence);
+                used += (size_t)sequence;
+                k += (size_t)sequence;
+            } else {
+                memcpy(decoded + used, "\xEF\xBF\xBD", 3U);
+                used += 3U;
+                k += (size_t)-sequence;
             }
         }
-        decoded[used++] = (char)c;
     }
+    st_redis_uri_clear(run, len / 3U + 1U);
+    free(run);
     decoded[used] = '\0';
+    if (rc != 0) {
+        uri_free_secret(decoded);
+        return -1;
+    }
     *out = decoded;
     return 0;
+}
+
+/* An '@' after the authority: an unescaped '#', '?' or '/' in the password cut it there. */
+static int uri_at_after_authority(const char *raw)
+{
+    return raw != NULL && strchr(raw, '@') != NULL;
 }
 
 /* Integer.parseInt for ASCII text: an optional sign, then decimal digits within int range. */
@@ -206,13 +301,12 @@ static int uri_apply_query(char *query, st_redis_uri *out, char *error, size_t e
             size_t digits = 0U;
             while (isdigit((unsigned char)value[digits])) ++digits;
             if (digits > 0U) {
-                char number[16];
+                /* Integer.parseInt of the leading digits: leading zeros are fine, overflow is not. */
+                char *number = strndup(value, digits);
                 int database = 0;
-                if (digits >= sizeof(number)) return uri_fail(error, error_len, "invalid database parameter");
-                memcpy(number, value, digits);
-                number[digits] = '\0';
-                if (uri_java_int(number, &database) != 0)
-                    return uri_fail(error, error_len, "invalid database parameter");
+                int parsed = number == NULL ? -1 : uri_java_int(number, &database);
+                free(number);
+                if (parsed != 0) return uri_fail(error, error_len, "invalid database parameter");
                 out->database = database;
             }
         }
@@ -309,6 +403,7 @@ static int uri_server(const st_java_uri *uri, const char *authority, st_redis_ur
     if (uri_copy(out->server.host, sizeof(out->server.host), host, strlen(host)) != 0)
         return uri_fail(error, error_len, "host is too long");
     out->server.port = ST_REDIS_DEFAULT_PORT;
+    out->host_unparsed = 1;
     return 0;
 }
 
@@ -363,12 +458,14 @@ static int uri_build(const st_java_uri *uri, st_redis_uri *out, char *error, siz
     char *fragment = NULL;
     char *fallback_info = NULL;
     int rc = -1;
-    if (uri_decode(uri->raw_authority, &authority) != 0 || uri_decode(uri->user_info, &user_info) != 0
-        || uri_decode(uri->raw_path, &path) != 0 || uri_decode(uri->raw_query, &query) != 0
-        || uri_decode(uri->raw_fragment, &fragment) != 0) {
+    if (uri_decode(uri->raw_authority, 1, &authority) != 0 || uri_decode(uri->user_info, 1, &user_info) != 0
+        || uri_decode(uri->raw_path, 1, &path) != 0 || uri_decode(uri->raw_query, 0, &query) != 0
+        || uri_decode(uri->raw_fragment, 0, &fragment) != 0) {
         (void)uri_fail(error, error_len, "the URI holds an escaped NUL byte (%%00)");
         goto done;
     }
+    int cut_password = uri_at_after_authority(uri->raw_query) || uri_at_after_authority(uri->raw_fragment);
+    /* (Sentinel lists are always registry-based authorities; their hosts are parsed, so not hidden.) */
     if (out->sentinel) {
         if (uri_sentinels(uri, authority, out, error, error_len) != 0) goto done;
         if (fragment != NULL && fragment[0] != '\0'
@@ -389,6 +486,8 @@ static int uri_build(const st_java_uri *uri, st_redis_uri *out, char *error, siz
     } else if (uri_server(uri, authority, out, error, error_len) != 0) {
         goto done;
     }
+    /* Where the host or socket path may hold part of the password (redis_uri.h). */
+    out->host_hidden = cut_password || (!socket && uri_at_after_authority(uri->raw_path)) || out->host_unparsed;
     /* getUserInfo(), or for a registry-based authority what precedes its last '@'. */
     const char *info = user_info;
     if ((info == NULL || info[0] == '\0') && authority != NULL) {
@@ -422,12 +521,12 @@ static int uri_build(const st_java_uri *uri, st_redis_uri *out, char *error, siz
     }
     rc = 0;
 done:
-    free(authority);
-    free(user_info);
-    free(path);
-    free(query);
-    free(fragment);
-    free(fallback_info);
+    uri_free_secret(authority);
+    uri_free_secret(user_info);
+    uri_free_secret(path);
+    uri_free_secret(query);
+    uri_free_secret(fragment);
+    uri_free_secret(fallback_info);
     return rc;
 }
 
@@ -446,14 +545,14 @@ int st_redis_uri_parse(const char *text, st_redis_uri *uri, char *error, size_t 
         int written = len > 0U ? (int)(len > 200U ? 200U : len) : 0;
         (void)uri_fail(error, error_len, "%.*s", written, written > 0 ? parsed.error : "");
         if (written == 0) (void)uri_fail(error, error_len, "not a valid URI");
-        st_java_uri_free(&parsed);
-        memset(uri, 0, sizeof(*uri));
+        uri_java_free_secret(&parsed);
+        st_redis_uri_clear(uri, sizeof(*uri));
         return -1;
     }
     int rc = uri_build(&parsed, uri, error, error_len);
-    st_java_uri_free(&parsed);
+    uri_java_free_secret(&parsed);
     if (rc != 0) {
-        memset(uri, 0, sizeof(*uri));
+        st_redis_uri_clear(uri, sizeof(*uri));
         uri->verify = ST_REDIS_VERIFY_FULL;
     }
     return rc;

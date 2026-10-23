@@ -33,10 +33,32 @@ static const uri_case cases[] = {
     {"redis://secret@h", "h:6379 db=0 pass=secret"},
     {"redis://user:@h", "h:6379 db=0"},      /* an empty password means no AUTH, user name or not */
     {"redis://user:a:b@h", "h:6379 db=0 user=user pass=a:b"},
-    /* Not a server authority for java.net.URI: Lettuce takes what follows the last '@' as host. */
-    {"redis://a@b@h:6380", "h:6380:6379 db=0 pass=a@b"},
-    {"redis://redis_1/0", "redis_1:6379 db=0"},
-    {"redis://redis_1:6380/0", "redis_1:6380:6379 db=0"},
+    /*
+     * Not a server authority for java.net.URI: Lettuce takes what follows the last '@' as host, so
+     * these connect only without a port. C logs such hosts masked: they may hold password text.
+     */
+    {"redis://a@b@h:6380", "h:6380:6379 db=0 pass=a@b unparsed hidden"},
+    {"redis://redis_1/0", "redis_1:6379 db=0 unparsed hidden"},
+    {"redis://redis_1:6380/0", "redis_1:6380:6379 db=0 unparsed hidden"},
+    {"redis://::1/0", "::1:6379 db=0 unparsed hidden"},
+    /* An unescaped '#' or '?' in the password ends the authority there. */
+    {"redis://:abc#def@host:6379/0", ":abc:6379 db=0 unparsed hidden"},
+    {"redis://pass#word@h", "pass:6379 db=0 hidden"},
+    {"redis://:pa?ss@h:6379", ":pa:6379 db=0 unparsed hidden"},
+    /* Escapes: UTF-8 with U+FFFD for ill-formed bytes, as Java's decoder replaces them. */
+    {"redis://:%C3%A9t%C3%A9@h", "h:6379 db=0 pass=\xC3\xA9t\xC3\xA9"},
+    {"redis://:%FF@h", "h:6379 db=0 pass=\xEF\xBF\xBD"},
+    {"redis://:a%FFb@h", "h:6379 db=0 pass=a\xEF\xBF\xBD" "b"},
+    {"redis://:%E2%82@h", "h:6379 db=0 pass=\xEF\xBF\xBD"},
+    {"redis://:%E2%28x@h", "h:6379 db=0 pass=\xEF\xBF\xBD(x"},
+    {"redis://:%C0%80@h", "h:6379 db=0 pass=\xEF\xBF\xBD\xEF\xBF\xBD"},
+    {"redis://:%ED%A0%80@h", "h:6379 db=0 pass=\xEF\xBF\xBD"},  /* an encoded surrogate: one U+FFFD */
+    {"redis://:%ED%A0A@h", "h:6379 db=0 pass=\xEF\xBF\xBD" "A"},
+    {"redis://:%F0%9F%98%80@h", "h:6379 db=0 pass=\xF0\x9F\x98\x80"},
+    {"redis://:%F0%9F%98@h", "h:6379 db=0 pass=\xEF\xBF\xBD"},
+    /* getQuery and getFragment decode escapes inside [...] too; the path keeps them. */
+    {"redis://h?clientName=a[&database=%31", "h:6379 db=1 client=a["},
+    {"redis-sentinel://s1#a[%41]", "sentinel[s1:26379] master=a[A] db=0"},
     /* The database: the path (Integer.parseInt), then database= or db= in the query. */
     {"redis://h/16", "h:6379 db=16"},
     {"redis://h/+1", "h:6379 db=1"},
@@ -52,6 +74,7 @@ static const uri_case cases[] = {
     {"redis://h?database=7abc", "h:6379 db=7"},
     {"redis://h?database=abc", "h:6379 db=0"},
     {"redis://h?database=99999999999", NULL},
+    {"redis://h?database=00000000000000000001", "h:6379 db=1"},
     /* Other parameters: & or ; separate them, unknown ones are ignored. */
     {"redis://h/0?timeout=5s&clientName=specus-a;foo=bar", "h:6379 db=0 client=specus-a"},
     {"redis://h?clientname=", "h:6379 db=0"},
@@ -143,11 +166,56 @@ static void describe(const st_redis_uri *uri, char *out, size_t out_len)
     if (uri->client_name[0] != '\0') APPEND(" client=%s", uri->client_name);
     if (uri->library_name[0] != '\0' || uri->library_version[0] != '\0')
         APPEND(" lib=%s/%s", uri->library_name, uri->library_version);
+    /* C only, not compared with Java: how the host is treated in the logs. */
+    if (uri->host_unparsed) APPEND(" unparsed");
+    if (uri->host_hidden) APPEND(" hidden");
 #undef APPEND
 }
 
-int main(void)
+/*
+ * --print: one "URI<TAB>description" line per case, the flags left out, non-ASCII written as
+ * <U+XXXX> and refusals as REFUSED, the form a small Java program around RedisURI.create prints,
+ * so the two outputs can be compared line by line when Lettuce changes.
+ */
+static void print_cases(void)
 {
+    for (size_t i = 0U; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        st_redis_uri uri;
+        char error[256];
+        char actual[1024];
+        if (st_redis_uri_parse(cases[i].uri, &uri, error, sizeof(error)) != 0) {
+            printf("%s\tREFUSED\n", cases[i].uri);
+            continue;
+        }
+        uri.host_unparsed = 0;
+        uri.host_hidden = 0;
+        describe(&uri, actual, sizeof(actual));
+        printf("%s\t", cases[i].uri);
+        for (const unsigned char *c = (const unsigned char *)actual; *c != '\0';) {
+            unsigned int point = *c;
+            int extra = point >= 0xF0U ? 3 : point >= 0xE0U ? 2 : point >= 0xC0U ? 1 : 0;
+            if (extra == 0) {
+                putchar((int)*c++);
+                continue;
+            }
+            point &= 0x3FU >> extra;
+            ++c;
+            for (int k = 0; k < extra && *c != '\0'; ++k) point = (point << 6) | (*c++ & 0x3FU);
+            if (point >= 0x10000U)
+                printf("<U+%04X><U+%04X>", 0xD800U + ((point - 0x10000U) >> 10), 0xDC00U + ((point - 0x10000U) & 0x3FFU));
+            else
+                printf("<U+%04X>", point);
+        }
+        putchar('\n');
+    }
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 1 && strcmp(argv[1], "--print") == 0) {
+        print_cases();
+        return 0;
+    }
     int failed = 0;
     for (size_t i = 0U; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         st_redis_uri uri;

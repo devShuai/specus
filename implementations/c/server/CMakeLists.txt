@@ -11,8 +11,10 @@ find_package(OpenSSL REQUIRED)
 find_package(CURL REQUIRED)
 find_path(HIREDIS_INCLUDE_DIR hiredis/hiredis.h REQUIRED)
 find_library(HIREDIS_LIBRARY hiredis REQUIRED)
-# rediss:// and rediss-sentinel://: hiredis' TLS layer, shipped with libhiredis-dev (hiredis 1.x).
-find_library(HIREDIS_SSL_LIBRARY hiredis_ssl REQUIRED)
+# Optional: hiredis' TLS layer for rediss:// and rediss-sentinel:// (hiredis 1.0 or later; part of
+# libhiredis-dev on Ubuntu 24.04, absent from the hiredis 0.14 of Ubuntu 22.04 and Debian 12).
+# Without it those URIs fail startup with a message and the TLS tests are not registered.
+find_library(HIREDIS_SSL_LIBRARY hiredis_ssl)
 find_path(UTF8PROC_INCLUDE_DIR utf8proc.h REQUIRED)
 find_library(UTF8PROC_LIBRARY utf8proc REQUIRED)
 
@@ -62,7 +64,14 @@ add_library(specus_c_core
     src/websocket_ticket.c
 )
 target_include_directories(specus_c_core PUBLIC src PRIVATE ${HIREDIS_INCLUDE_DIR} ${UTF8PROC_INCLUDE_DIR})
-target_link_libraries(specus_c_core PUBLIC ZLIB::ZLIB SQLite::SQLite3 ${HIREDIS_SSL_LIBRARY} OpenSSL::SSL OpenSSL::Crypto CURL::libcurl ${HIREDIS_LIBRARY} ${UTF8PROC_LIBRARY})
+target_link_libraries(specus_c_core PUBLIC ZLIB::ZLIB SQLite::SQLite3 OpenSSL::SSL OpenSSL::Crypto CURL::libcurl ${HIREDIS_LIBRARY} ${UTF8PROC_LIBRARY})
+if(HIREDIS_SSL_LIBRARY)
+    message(STATUS "hiredis_ssl found: rediss:// and rediss-sentinel:// are supported")
+    target_compile_definitions(specus_c_core PRIVATE ST_HAVE_HIREDIS_SSL)
+    target_link_libraries(specus_c_core PUBLIC ${HIREDIS_SSL_LIBRARY})
+else()
+    message(STATUS "hiredis_ssl not found: rediss:// and rediss-sentinel:// fail startup")
+endif()
 target_compile_options(specus_c_core PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(specus_c_unicode_java21_tests tests/unicode_java21_tests.c)
@@ -387,10 +396,6 @@ target_compile_options(specus_c_public_coordination_tests PRIVATE -Wall -Wextra 
 add_test(NAME public_coordination_tests
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/public_coordination_test.sh
                  $<TARGET_FILE:specus_c_public_coordination_tests>)
-# The same suite over rediss:// against a TLS port with a throwaway CA, plus the verifyPeer probes.
-add_test(NAME public_coordination_tls_tests
-    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/public_coordination_tls_test.sh
-                 $<TARGET_FILE:specus_c_public_coordination_tests>)
 # redis-sentinel:// and rediss-sentinel://: master discovery and SENTINEL FAILOVER with a master,
 # a replica and one Sentinel (distinct port ranges, so the two may run in parallel).
 add_executable(specus_c_public_coordination_sentinel_tests tests/public_coordination_sentinel_tests.c)
@@ -399,9 +404,15 @@ target_compile_options(specus_c_public_coordination_sentinel_tests PRIVATE -Wall
 add_test(NAME public_coordination_sentinel_tests
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/public_coordination_sentinel_test.sh
                  $<TARGET_FILE:specus_c_public_coordination_sentinel_tests> plain)
-add_test(NAME public_coordination_sentinel_tls_tests
-    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/public_coordination_sentinel_test.sh
-                 $<TARGET_FILE:specus_c_public_coordination_sentinel_tests> tls)
+if(HIREDIS_SSL_LIBRARY)
+    # The same suite over rediss:// against a TLS port with a throwaway CA, plus the verifyPeer probes.
+    add_test(NAME public_coordination_tls_tests
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/public_coordination_tls_test.sh
+                     $<TARGET_FILE:specus_c_public_coordination_tests>)
+    add_test(NAME public_coordination_sentinel_tls_tests
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/public_coordination_sentinel_test.sh
+                     $<TARGET_FILE:specus_c_public_coordination_sentinel_tests> tls)
+endif()
 add_test(NAME public_discovery_cluster_e2e
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/public_discovery_cluster_e2e.sh
                  $<TARGET_FILE:specus-server-c>)

@@ -818,13 +818,17 @@ static int test_tls_verification(void)
 {
     const char *tls_port = getenv("SPECUS_TEST_REDIS_TLS_PORT");
     const char *other_ca = getenv("SPECUS_TEST_REDIS_OTHER_CA");
+    const char *other_port = getenv("SPECUS_TEST_REDIS_OTHER_TLS_PORT");
     if (tls_port == NULL) return 0;
-    if (other_ca == NULL) {
-        fprintf(stderr, "the TLS run needs SPECUS_TEST_REDIS_OTHER_CA\n");
+    if (other_ca == NULL || other_port == NULL) {
+        fprintf(stderr, "the TLS run needs SPECUS_TEST_REDIS_OTHER_CA and SPECUS_TEST_REDIS_OTHER_TLS_PORT\n");
         return 1;
     }
     char by_name[96], unnamed[96], unnamed_ca[128], ssl_alias[96], by_ip[96], by_ip_ca[128], by_ip_none[128];
-    char tls_to_plain[96], plain_to_tls[96];
+    char tls_to_plain[96], plain_to_tls[96], other_name[96], other_name_ca[128];
+    /* The second server's certificate names only other.invalid. */
+    snprintf(other_name, sizeof(other_name), "rediss://localhost:%s/0", other_port);
+    snprintf(other_name_ca, sizeof(other_name_ca), "rediss://localhost:%s/0?verifyPeer=CA", other_port);
     snprintf(by_name, sizeof(by_name), "rediss://localhost:%s/0", tls_port);
     snprintf(unnamed, sizeof(unnamed), "rediss://127.0.0.2:%s/0", tls_port);
     snprintf(unnamed_ca, sizeof(unnamed_ca), "rediss://127.0.0.2:%s/0?verifyPeer=CA", tls_port);
@@ -840,6 +844,8 @@ static int test_tls_verification(void)
         int result;
     } checks[] = {
         {"FULL accepts the host name in the certificate", PROBE("connects", uri_env, by_name)},
+        {"FULL refuses a host name the certificate does not name", PROBE("refused", uri_env, other_name)},
+        {"CA accepts that host name", PROBE("connects", uri_env, other_name_ca)},
         {"FULL refuses an address the certificate does not name", PROBE("refused", uri_env, unnamed)},
         {"CA accepts that address", PROBE("connects", uri_env, unnamed_ca)},
         {"redis+ssl:// is rediss://", PROBE("connects", uri_env, ssl_alias)},

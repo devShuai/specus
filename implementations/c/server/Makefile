@@ -1,7 +1,19 @@
 CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2
 CPPFLAGS ?= -Isrc
-LDFLAGS ?= -lpthread -lz -lsqlite3 -lhiredis_ssl -lssl -lcrypto -lcurl -lhiredis -lutf8proc
+LDFLAGS ?= -lpthread -lz -lsqlite3 -lssl -lcrypto -lcurl -lhiredis -lutf8proc
+
+# hiredis_ssl is optional, as in CMakeLists.txt: with its pkg-config file (hiredis 1.0 or later),
+# rediss:// and rediss-sentinel:// work and their tests run; without it those URIs fail startup.
+HIREDIS_SSL_LIBS := $(shell pkg-config --libs hiredis_ssl 2>/dev/null)
+ifneq ($(HIREDIS_SSL_LIBS),)
+CPPFLAGS += -DST_HAVE_HIREDIS_SSL
+LDFLAGS += $(HIREDIS_SSL_LIBS)
+REDIS_TLS_TEST_COMMANDS = bash scripts/public_coordination_tls_test.sh $(PUBLIC_COORDINATION_TESTS) && \
+	bash scripts/public_coordination_sentinel_test.sh $(PUBLIC_COORDINATION_SENTINEL_TESTS) tls
+else
+REDIS_TLS_TEST_COMMANDS = echo "hiredis_ssl not found: Redis TLS tests skipped"
+endif
 
 # libbrotlidec is optional, as in CMakeLists.txt: with its pkg-config file, Content-Encoding br is
 # decoded (ST_HAVE_BROTLI); libbrotlienc, when present too, lets the tests compress br fixtures.
@@ -492,9 +504,8 @@ test: all
 	$(JAVA_URI_TESTS) "$(abspath $(DOWNLOAD_LINK_VECTOR_FILE))"
 	@for test in $(TESTS); do $$test || exit 1; done
 	bash scripts/public_coordination_test.sh $(PUBLIC_COORDINATION_TESTS)
-	bash scripts/public_coordination_tls_test.sh $(PUBLIC_COORDINATION_TESTS)
 	bash scripts/public_coordination_sentinel_test.sh $(PUBLIC_COORDINATION_SENTINEL_TESTS) plain
-	bash scripts/public_coordination_sentinel_test.sh $(PUBLIC_COORDINATION_SENTINEL_TESTS) tls
+	$(REDIS_TLS_TEST_COMMANDS)
 	bash scripts/public_discovery_cluster_e2e.sh $(SERVER)
 	python3 scripts/management_cluster_e2e.py $(SERVER)
 	SPECUS_TEST_OSS_START_DELAY_SECONDS=0.5 bash scripts/object_storage_e2e.sh $(SERVER)

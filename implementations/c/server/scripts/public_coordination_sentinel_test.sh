@@ -17,6 +17,8 @@ DEAD_PORT=$((BASE + 3)) # nothing listens here: the first Sentinel of the URI is
 MASTER_TLS_PORT=$((BASE + 4))
 REPLICA_TLS_PORT=$((BASE + 5))
 SENTINEL_TLS_PORT=$((BASE + 6))
+HUNG_PORT=$((BASE + 7))    # accepts and never answers (a hung Sentinel, or a proxy with a dead backend)
+CLOSING_PORT=$((BASE + 8)) # accepts and closes at once
 PASSWORD="sentinel-test-secret"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/specus-c-redis-sentinel.XXXXXX")"
 PIDS=()
@@ -113,20 +115,55 @@ if redis-cli -p "$DEAD_PORT" ping >/dev/null 2>&1; then
   exit 1
 fi
 
+# Two Sentinels that accept the connection but are no use: Lettuce's handshake round trip fails on
+# them, which counts as a connection failure, so it goes on to the next Sentinel; C must as well.
+python3 - "$HUNG_PORT" "$CLOSING_PORT" >"$TMP_DIR/listeners.log" 2>&1 <<'PY' &
+import socket
+import sys
+import threading
+
+def listen(port):
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", port))
+    server.listen(64)
+    return server
+
+hung = listen(int(sys.argv[1]))
+closing = listen(int(sys.argv[2]))
+held = []
+
+def hold():
+    while True:
+        connection, _ = hung.accept()
+        held.append(connection)  # never read, never answered
+
+threading.Thread(target=hold, daemon=True).start()
+while True:
+    connection, _ = closing.accept()
+    connection.close()
+PY
+PIDS+=("$!")
+listening() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+wait_for "the hung listener" listening "$HUNG_PORT"
+wait_for "the closing listener" listening "$CLOSING_PORT"
+
 QUERY="sentinelMasterId=mymaster&clientName=specus-c-sentinel"
-SENTINELS="127.0.0.1:$DEAD_PORT,127.0.0.1:$SENTINEL_ADDRESS_PORT"
+SENTINELS="127.0.0.1:$DEAD_PORT,127.0.0.1:$HUNG_PORT,127.0.0.1:$CLOSING_PORT,127.0.0.1:$SENTINEL_ADDRESS_PORT"
 if ! SPECUS_TEST_MASTER_PORT="$MASTER_PORT" \
   SPECUS_TEST_REPLICA_PORT="$REPLICA_PORT" \
   SPECUS_TEST_SENTINEL_PORT="$SENTINEL_PORT" \
   SPECUS_TEST_REPLICA_ADDRESS_PORT="$REPLICA_ADDRESS_PORT" \
+  SPECUS_TEST_MASTER_ADDRESS_PORT="$MASTER_ADDRESS_PORT" \
   SPECUS_TEST_DATA_PASSWORD="$PASSWORD" \
   SPECUS_TEST_UNKNOWN_MASTER_URI="$SCHEME://:$PASSWORD@$SENTINELS/0?sentinelMasterId=nosuchmaster" \
   SPECUS_TEST_NO_SENTINEL_URI="$SCHEME://:$PASSWORD@127.0.0.1:$DEAD_PORT/0?$QUERY" \
   SPECUS_TEST_WRONG_PASSWORD_URI="$SCHEME://:wrong-password@$SENTINELS/0?$QUERY" \
+  SPECUS_TEST_UNNAMED_URI="$SCHEME://:$PASSWORD@$SENTINELS/0?sentinelMasterId=mymaster" \
   SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED=true \
   SPECUS_PUBLIC_TRANSFER_REDIS_URI="$SCHEME://:$PASSWORD@$SENTINELS/0?$QUERY" \
   SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX="specus:test:sentinel" \
-  SPECUS_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS=1000 \
+  SPECUS_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS=300 \
   "$TEST_BINARY"; then
   dump_logs
   exit 1

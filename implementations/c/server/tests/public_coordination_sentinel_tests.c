@@ -18,7 +18,8 @@
 /*
  * redis-sentinel:// (or rediss-sentinel://) as Lettuce follows it, against the master, replica and
  * Sentinel that public_coordination_sentinel_test.sh starts: the master is found through the
- * Sentinel list (an unreachable Sentinel first), the URI's password reaches the data nodes and
+ * Sentinel list (first an unreachable Sentinel, one that accepts and never answers and one that
+ * closes the connection at once), the URI's password reaches the data nodes and
  * never a Sentinel, every connection carries the client name, and after SENTINEL FAILOVER the
  * connections that the old master drops come back on the promoted one, because each reconnect asks
  * the Sentinels again. The fixture talks to every node over its plain port.
@@ -117,6 +118,39 @@ static int sentinel_master_port(void)
     return port;
 }
 
+/* Sentinel stops acting for 30 s in TILT mode, entered when its timer stalls or the clock jumps. */
+static int sentinel_in_tilt(void)
+{
+    redisReply *info = fixture_command(env_port("SPECUS_TEST_SENTINEL_PORT"), 0, "INFO sentinel");
+    int tilt = info != NULL && (info->type == REDIS_REPLY_STRING || info->type == REDIS_REPLY_VERB)
+        && strstr(info->str, "sentinel_tilt:1") != NULL;
+    freeReplyObject(info);
+    return tilt;
+}
+
+/*
+ * One SENTINEL MASTER answer: whether the Sentinel still names the original master and has no
+ * failover running. Only then may a failover be (re)started: a failover that is not running cannot
+ * complete in the meantime (the master is healthy), so this never fails back over a promoted node.
+ */
+static int failover_may_start(int original_port)
+{
+    redisReply *master = fixture_command(env_port("SPECUS_TEST_SENTINEL_PORT"), 0, "SENTINEL MASTER mymaster");
+    int port = -1;
+    int running = 1;
+    if (master != NULL && master->type == REDIS_REPLY_ARRAY) {
+        for (size_t i = 0U; i + 1U < master->elements; i += 2U) {
+            const redisReply *key = master->element[i];
+            const redisReply *value = master->element[i + 1U];
+            if (key->type != REDIS_REPLY_STRING || value->type != REDIS_REPLY_STRING) continue;
+            if (strcmp(key->str, "port") == 0) port = atoi(value->str);
+            if (strcmp(key->str, "flags") == 0) running = strstr(value->str, "failover_in_progress") != NULL;
+        }
+    }
+    freeReplyObject(master);
+    return port == original_port && !running;
+}
+
 static int role_is_master(int port)
 {
     redisReply *info = fixture_command(port, 1, "INFO replication");
@@ -161,14 +195,14 @@ static int round_trip(const st_public_cluster_participant *source, const char *t
     return received ? 0 : -1;
 }
 
-/* Starts this binary with another URI; it exits 0 when that URI fails startup. */
-static int refused_with(const char *uri)
+/* Starts this binary with another URI; it exits 0 when startup with it is refused (or succeeds). */
+static int start_with(const char *uri, const char *mode)
 {
     pid_t child = fork();
     if (child < 0) return -1;
     if (child == 0) {
         if (setenv("SPECUS_PUBLIC_TRANSFER_REDIS_URI", uri, 1) != 0) _exit(98);
-        char *const argv[] = {"public_coordination_sentinel_tests", "--refused", NULL};
+        char *const argv[] = {"public_coordination_sentinel_tests", (char *)mode, NULL};
         execv("/proc/self/exe", argv);
         _exit(127);
     }
@@ -187,10 +221,10 @@ static int fail(const char *message)
 int main(int argc, char **argv)
 {
     (void)signal(SIGPIPE, SIG_IGN);
-    if (argc > 1 && strcmp(argv[1], "--refused") == 0) {
-        int refused = st_public_coordination_initialize(NULL, NULL) == -1;
+    if (argc > 1 && (strcmp(argv[1], "--refused") == 0 || strcmp(argv[1], "--starts") == 0)) {
+        int started = st_public_coordination_initialize(NULL, NULL) == 0;
         st_public_coordination_shutdown();
-        return refused ? 0 : 1;
+        return started == (strcmp(argv[1], "--starts") == 0) ? 0 : 1;
     }
     int master = env_port("SPECUS_TEST_MASTER_PORT");
     int replica = env_port("SPECUS_TEST_REPLICA_PORT");
@@ -207,10 +241,20 @@ int main(int argc, char **argv)
     };
     for (size_t i = 0U; i < sizeof(refusals) / sizeof(refusals[0]); ++i) {
         const char *uri = getenv(refusals[i][0]);
-        if (uri == NULL || refused_with(uri) != 0) {
+        if (uri == NULL || start_with(uri, "--refused") != 0) {
             fprintf(stderr, "sentinel test: startup with %s did not fail\n", refusals[i][1]);
             return 1;
         }
+    }
+    /*
+     * Without a client name only the handshake's own round trip (Lettuce's HELLO, C's PING) finds
+     * out that a Sentinel which accepted the connection never answers or has closed it; both then
+     * go on to the next Sentinel instead of failing the lookup.
+     */
+    const char *unnamed = getenv("SPECUS_TEST_UNNAMED_URI");
+    if (unnamed == NULL || start_with(unnamed, "--starts") != 0) {
+        fprintf(stderr, "sentinel test: a Sentinel that accepted and never answered (or closed) ended the lookup\n");
+        return 1;
     }
 
     if (!st_public_coordination_enabled() || st_public_coordination_initialize(capture_event, NULL) != 0)
@@ -226,21 +270,25 @@ int main(int argc, char **argv)
         || st_public_coordination_register(&first, 10, &revision) != 0 || round_trip(&first, "before-failover") != 0)
         return fail("registration or Pub/Sub on the first master");
 
-    /* A forced failover; NOGOODSLAVE until the Sentinel has seen the replica. */
-    long long deadline = now_ms() + 20000;
-    int started = 0;
-    while (!started && now_ms() < deadline) {
-        redisReply *reply = fixture_command(env_port("SPECUS_TEST_SENTINEL_PORT"), 0, "SENTINEL FAILOVER mymaster");
-        started = reply != NULL && reply->type == REDIS_REPLY_STATUS;
-        freeReplyObject(reply);
-        if (!started) sleep_ms(200);
+    /*
+     * A forced failover: NOGOODSLAVE until the Sentinel has seen the replica. Normally done in a
+     * second or two; a Sentinel in TILT mode (WSL clock jumps, a starved runner) freezes it for
+     * 30 s and then aborts it, so the wait outlasts TILT and the failover is started again.
+     */
+    int master_address = env_port("SPECUS_TEST_MASTER_ADDRESS_PORT");
+    long long deadline = now_ms() + 90000;
+    int tilted = 0;
+    while ((sentinel_master_port() != replica_address || !role_is_master(replica)) && now_ms() < deadline) {
+        if (sentinel_in_tilt()) {
+            tilted = 1;
+        } else if (failover_may_start(master_address)) {
+            freeReplyObject(fixture_command(env_port("SPECUS_TEST_SENTINEL_PORT"), 0, "SENTINEL FAILOVER mymaster"));
+        }
+        sleep_ms(200);
     }
-    if (!started) return fail("the Sentinel did not start a failover");
-    deadline = now_ms() + 30000;
-    while ((sentinel_master_port() != replica_address || !role_is_master(replica)) && now_ms() < deadline)
-        sleep_ms(100);
     if (sentinel_master_port() != replica_address || !role_is_master(replica))
         return fail("the Sentinel did not promote the replica");
+    if (tilted) fprintf(stderr, "sentinel test: the Sentinel went through TILT mode; the failover was restarted\n");
 
     /*
      * The old master is still up and still a master, so nothing has dropped the connections yet.
