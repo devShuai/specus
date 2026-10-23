@@ -403,6 +403,34 @@ static void test_negotiation(void)
         {"*/json", NULL},
         {"application/json;q=x", NULL},
         {"application/json;q=2", NULL},
+        /* Measured on the Java server: Spring sorts the ranges by specificity (quality, then a
+         * concrete type before a wildcard type or subtype) before pairing them with v3, v2, json,
+         * and keeps the chosen range's parameters other than q in Content-Type. */
+        {"*/*, application/json", "application/json"},
+        {"application/*, application/json", "application/json"},
+        {"application/*+json, application/json", "application/json"},
+        {"*/*;q=0.5, application/*;q=0.5, application/json;q=0.5", "application/json"},
+        {"application/*;q=0.9, application/json;q=0.9", "application/json"},
+        {"application/json;q=0.5, */*", "application/vnd.spring-boot.actuator.v3+json"},
+        {"application/vnd.spring-boot.actuator.v2+json, application/json",
+         "application/vnd.spring-boot.actuator.v2+json"},
+        {"application/json, application/vnd.spring-boot.actuator.v2+json", "application/json"},
+        {"application/json; q=0.5 , application/vnd.spring-boot.actuator.v2+json ;q=0.5", "application/json"},
+        {"text/plain;q=1, */*;q=0.1", "application/vnd.spring-boot.actuator.v3+json"},
+        {",", "application/vnd.spring-boot.actuator.v3+json"},
+        {" , ", "application/vnd.spring-boot.actuator.v3+json"},
+        {"*;q=0.8", "application/vnd.spring-boot.actuator.v3+json"},
+        {"application/json;q=\"0.5\", application/vnd.spring-boot.actuator.v2+json;q=0.4", "application/json"},
+        {"application/json;q=.5", "application/json"},
+        {"application/json;q=0", "application/json"},
+        {"application/json;foo=\"a,b\"", "application/json;foo=\"a,b\""},
+        {"application/json;foo=\"a,b\", text/plain", "application/json;foo=\"a,b\""},
+        {"text/html, application/json;charset=utf-8", "application/json;charset=utf-8"},
+        {"application/json;foo=bar, application/json", "application/json;foo=bar"},
+        {"application/json;a b=c", NULL},
+        {"application/json;charset=bogus", NULL},
+        {"application/json;foo=", NULL},
+        {"application/json;=x", NULL},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         char line[160];
@@ -421,8 +449,20 @@ static void test_negotiation(void)
         }
         release(&value);
     }
-    /* Negotiation comes before the handler: a missing metric or a bad tag is 406 as well. */
+    /* MimeTypeUtils.sortBySpecificity refuses more than 50 media types. */
+    char many[1024] = "";
+    for (int i = 0; i < 51; ++i) {
+        strcat(many, i == 0 ? "application/json" : ",application/json");
+    }
     answer value;
+    ask("GET", "/actuator/metrics", many, &value);
+    EXPECT(value.status == 406, "51 media types: %d", value.status);
+    release(&value);
+    many[strlen(many) - strlen(",application/json")] = '\0';
+    ask("GET", "/actuator/metrics", many, &value);
+    EXPECT(value.status == 200, "50 media types: %d", value.status);
+    release(&value);
+    /* Negotiation comes before the handler: a missing metric or a bad tag is 406 as well. */
     ask("GET", "/actuator/metrics/nonexistent.metric", "text/plain", &value);
     EXPECT(value.status == 406, "a missing metric with Accept text/plain: %d", value.status);
     release(&value);
@@ -697,10 +737,104 @@ static void test_protocol_reasons(void)
     }
 }
 
+/* ---- the other management settings Java reads (each case measured on the Java server) -------- */
+
+static const char *const management_names[] = {
+    "MANAGEMENT_ENDPOINT_METRICS_ACCESS", "MANAGEMENT_ENDPOINT_METRICS_ENABLED",
+    "MANAGEMENT_ENDPOINTS_ACCESS_DEFAULT", "MANAGEMENT_ENDPOINTS_ENABLEDBYDEFAULT",
+    "MANAGEMENT_ENDPOINTS_ENABLED_BY_DEFAULT", "MANAGEMENT_ENDPOINTS_ACCESS_MAXPERMITTED",
+    "MANAGEMENT_ENDPOINTS_ACCESS_MAX_PERMITTED", "MANAGEMENT_SERVER_PORT", "MANAGEMENT_SERVER_ADDRESS",
+    "MANAGEMENT_ENDPOINTS_WEB_BASEPATH", "MANAGEMENT_ENDPOINTS_WEB_BASE_PATH",
+    "MANAGEMENT_ENDPOINTS_WEB_PATHMAPPING_METRICS", "MANAGEMENT_ENDPOINTS_WEB_PATH_MAPPING_METRICS",
+};
+
+static void clear_management(void)
+{
+    for (size_t i = 0; i < sizeof(management_names) / sizeof(management_names[0]); ++i) {
+        unsetenv(management_names[i]);
+    }
+}
+
+static void test_management_settings(void)
+{
+    static const struct {
+        const char *settings[3];
+        int expected;
+    } cases[] = {
+        {{NULL}, 1},
+        {{"MANAGEMENT_ENDPOINT_METRICS_ACCESS=none"}, 0},
+        {{"MANAGEMENT_ENDPOINT_METRICS_ACCESS=READ_ONLY"}, 1},
+        {{"MANAGEMENT_ENDPOINT_METRICS_ACCESS=Read-Only"}, 1},
+        {{"MANAGEMENT_ENDPOINT_METRICS_ACCESS=readOnly"}, 1},
+        {{"MANAGEMENT_ENDPOINT_METRICS_ACCESS= "}, 1},
+        {{"MANAGEMENT_ENDPOINT_METRICS_ACCESS=bogus"}, -1},
+        {{"MANAGEMENT_ENDPOINT_METRICS_ENABLED=false"}, 0},
+        {{"MANAGEMENT_ENDPOINT_METRICS_ENABLED=maybe"}, -1},
+        {{"MANAGEMENT_ENDPOINT_METRICS_ACCESS=read-only", "MANAGEMENT_ENDPOINT_METRICS_ENABLED=true"}, -1},
+        {{"MANAGEMENT_ENDPOINTS_ACCESS_DEFAULT=none"}, 0},
+        {{"MANAGEMENT_ENDPOINTS_ACCESS_DEFAULT=none", "MANAGEMENT_ENDPOINT_METRICS_ACCESS=read-only"}, 1},
+        {{"MANAGEMENT_ENDPOINTS_ACCESS_DEFAULT=none", "MANAGEMENT_ENDPOINT_METRICS_ENABLED=yes"}, 1},
+        {{"MANAGEMENT_ENDPOINTS_ENABLEDBYDEFAULT=false"}, 0},
+        {{"MANAGEMENT_ENDPOINTS_ENABLED_BY_DEFAULT=off"}, 0},
+        {{"MANAGEMENT_ENDPOINTS_ENABLEDBYDEFAULT=true", "MANAGEMENT_ENDPOINT_METRICS_ACCESS=none"}, 0},
+        {{"MANAGEMENT_ENDPOINTS_ACCESS_DEFAULT=none", "MANAGEMENT_ENDPOINTS_ENABLEDBYDEFAULT=false"}, -1},
+        {{"MANAGEMENT_ENDPOINTS_ACCESS_MAXPERMITTED=none"}, 0},
+        {{"MANAGEMENT_ENDPOINTS_ACCESS_MAX_PERMITTED=none"}, 0},
+        {{"MANAGEMENT_ENDPOINTS_ACCESS_MAXPERMITTED=read-only"}, 1},
+        {{"MANAGEMENT_ENDPOINT_METRICS_ACCESS=unrestricted", "MANAGEMENT_ENDPOINTS_ACCESS_MAXPERMITTED=none"}, 0},
+        {{"MANAGEMENT_SERVER_PORT=-1"}, 0},
+        {{"MANAGEMENT_SERVER_PORT=0"}, 0},
+        {{"MANAGEMENT_SERVER_PORT=9090"}, 0},
+        {{"MANAGEMENT_SERVER_PORT=8088"}, 1},
+        {{"MANAGEMENT_SERVER_PORT= 80 88 "}, 1},
+        {{"MANAGEMENT_SERVER_PORT=0x1F98"}, 1},
+        {{"MANAGEMENT_SERVER_PORT=x1"}, -1},
+        {{"MANAGEMENT_SERVER_PORT=+0x1F98"}, -1},
+        {{"MANAGEMENT_SERVER_ADDRESS=127.0.0.2"}, -1},
+        {{"MANAGEMENT_SERVER_ADDRESS=127.0.0.2", "MANAGEMENT_SERVER_PORT=9090"}, 0},
+        {{"MANAGEMENT_SERVER_ADDRESS= "}, 1},
+        {{"MANAGEMENT_ENDPOINTS_WEB_BASEPATH=/manage/"}, 0},
+        {{"MANAGEMENT_ENDPOINTS_WEB_BASE_PATH=/"}, 0},
+        {{"MANAGEMENT_ENDPOINTS_WEB_BASEPATH="}, 0},
+        {{"MANAGEMENT_ENDPOINTS_WEB_BASEPATH=/actuator/"}, 1},
+        {{"MANAGEMENT_ENDPOINTS_WEB_BASEPATH=manage"}, -1},
+        {{"MANAGEMENT_ENDPOINTS_WEB_PATHMAPPING_METRICS=stats"}, 0},
+        {{"MANAGEMENT_ENDPOINTS_WEB_PATH_MAPPING_METRICS=stats"}, 0},
+        {{"MANAGEMENT_ENDPOINTS_WEB_PATHMAPPING_METRICS=metrics"}, 1},
+    };
+    setenv("SPECUS_ADMIN_PORT", "8088", 1);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        clear_management();
+        char label[256] = "";
+        for (size_t s = 0; s < 3U && cases[i].settings[s] != NULL; ++s) {
+            char assignment[160];
+            snprintf(assignment, sizeof(assignment), "%s", cases[i].settings[s]);
+            char *equals = strchr(assignment, '=');
+            *equals = '\0';
+            setenv(assignment, equals + 1, 1);
+            strncat(label, cases[i].settings[s], sizeof(label) - strlen(label) - 2U);
+            strcat(label, " ");
+        }
+        int valid = st_metrics_validate_current() == 0;
+        int exposed = st_metrics_endpoint_exposed();
+        answer value;
+        ask("GET", "/actuator/metrics", NULL, &value);
+        int expected_valid = cases[i].expected >= 0;
+        int expected_exposed = cases[i].expected == 1;
+        EXPECT(valid == expected_valid && exposed == expected_exposed && (value.rc == 1) == expected_exposed,
+               "%s: valid %d exposed %d answered %d, want %d", label, valid, exposed, value.rc, cases[i].expected);
+        release(&value);
+    }
+    clear_management();
+    unsetenv("SPECUS_ADMIN_PORT");
+}
+
 int main(void)
 {
     test_format_double();
     test_exposure();
+    setenv("MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE", "metrics", 1);
+    test_management_settings();
     setenv("MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE", "health,metrics", 1);
     unsetenv("MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_EXCLUDE");
     test_java_bodies();

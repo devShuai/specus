@@ -122,14 +122,26 @@ static int scrape(const test_server *server, const char *name, const char *query
     return 0;
 }
 
+/*
+ * Waits up to 2 s for the measurement to read expected: a datagram the test sent without an answer
+ * (a Send indication) is counted when the STUN/TURN thread gets to it, not before sendto returns.
+ */
 static int expect_value(const test_server *server, const char *name, const char *query, const char *expected)
 {
     char value[64] = "";
-    if (scrape(server, name, query, value, sizeof(value)) != 0 || strcmp(value, expected) != 0) {
-        fprintf(stderr, "%s%s is %s, want %s\n", name, query == NULL ? "" : query, value, expected);
-        return -1;
+    long long deadline = monotonic_ms() + 2000;
+    for (;;) {
+        int rc = scrape(server, name, query, value, sizeof(value));
+        if (rc == 0 && strcmp(value, expected) == 0) {
+            return 0;
+        }
+        if (rc != 0 || monotonic_ms() >= deadline) {
+            break;
+        }
+        sleep_ms(20);
     }
-    return 0;
+    fprintf(stderr, "%s%s is %s, want %s\n", name, query == NULL ? "" : query, value, expected);
+    return -1;
 }
 
 /* ---- the control channel --------------------------------------------------------------------- */
@@ -684,23 +696,23 @@ static int scenario_relay_bytes_flushed(test_server *server)
 }
 
 /* Java fails to start on an endpoint id it cannot read; so does C. */
-static int invalid_exposure_refused(void)
+static int refused_start(const char *label, const char *variable, const char *value, const char *reason)
 {
     test_server server;
     CHECK(server_prepare(&server) == 0, "cannot prepare the server directory");
-    setenv("MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE", "health,Metrics", 1);
+    setenv(variable, value, 1);
     int started = server_start(&server) == 0;
-    unsetenv("MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE");
+    unsetenv(variable);
     FILE *log = fopen(server.log_path, "r");
     char line[512];
     int reported = 0;
     while (log != NULL && fgets(line, sizeof(line), log) != NULL) {
-        reported = reported || strstr(line, "'value' must not start with an uppercase letter") != NULL;
+        reported = reported || strstr(line, reason) != NULL;
     }
     if (log != NULL) fclose(log);
     int failed = started || !reported;
     server_cleanup(&server, failed);
-    printf("%s an invalid exposure setting stops the start\n", failed ? "FAIL" : "ok  ");
+    printf("%s %s\n", failed ? "FAIL" : "ok  ", label);
     return failed;
 }
 
@@ -713,7 +725,20 @@ int main(int argc, char **argv)
     server_binary = argv[1];
     clear_environment();
     int failures = run_on_fresh_server("no metrics routes without exposure", scenario_not_exposed, NULL);
-    failures += invalid_exposure_refused();
+    failures += refused_start("an invalid exposure setting stops the start", "MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE",
+                              "health,Metrics", "'value' must not start with an uppercase letter");
+    /* Spring Boot: a management address needs a management port of its own. */
+    failures += refused_start("a management address without its own port stops the start", "MANAGEMENT_SERVER_ADDRESS",
+                              "127.0.0.2", "Management-specific server address cannot be configured");
+    /* Exposed, but Java serves it on another port, or not at all: nothing on this listener. */
+    setenv("MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE", "metrics", 1);
+    setenv("MANAGEMENT_SERVER_PORT", "9", 1);
+    failures += run_on_fresh_server("no metrics routes when the management port is another", scenario_not_exposed, NULL);
+    unsetenv("MANAGEMENT_SERVER_PORT");
+    setenv("MANAGEMENT_ENDPOINT_METRICS_ACCESS", "none", 1);
+    failures += run_on_fresh_server("no metrics routes when the endpoint's access is none", scenario_not_exposed, NULL);
+    unsetenv("MANAGEMENT_ENDPOINT_METRICS_ACCESS");
+    unsetenv("MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE");
 
     peer_mesh_environment("600000");
     setenv("MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE", "health,metrics", 1);

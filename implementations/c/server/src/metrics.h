@@ -64,9 +64,16 @@ int st_metrics_format_double(double value, char *out, size_t out_len);
  * endpoint id, with Spring's message in error (Java does not start then).
  */
 int st_metrics_exposure(const char *include, const char *exclude, char *error, size_t error_len);
-/* st_metrics_exposure over MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE/_EXCLUDE; invalid is 0. */
+/*
+ * Whether the endpoint answers on the management listener, from the environment: exposed by
+ * MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE/_EXCLUDE, available by MANAGEMENT_ENDPOINT_METRICS_ACCESS
+ * (or _ENABLED), MANAGEMENT_ENDPOINTS_ACCESS_DEFAULT (or _ENABLEDBYDEFAULT) and
+ * MANAGEMENT_ENDPOINTS_ACCESS_MAXPERMITTED, and left at /actuator/metrics on this port by
+ * MANAGEMENT_SERVER_PORT, MANAGEMENT_ENDPOINTS_WEB_BASEPATH and _PATHMAPPING_METRICS. Settings that
+ * move the endpoint in Java (another port, path or mapping) take it away here. Invalid is 0.
+ */
 int st_metrics_endpoint_exposed(void);
-/* The startup check: 0, or -1 after printing why the exposure settings were refused. */
+/* The startup check: 0, or -1 after printing why Java would refuse to start with these settings. */
 int st_metrics_validate_current(void);
 
 /*

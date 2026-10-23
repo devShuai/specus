@@ -3,6 +3,7 @@
 #include "metrics.h"
 
 #include <float.h>
+#include <iconv.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -451,25 +452,256 @@ int st_metrics_exposure(const char *include, const char *exclude, char *error, s
     return included && !excluded;
 }
 
+static void java_trim(const char **start, const char **end);
+static int ascii_equal_ignore_case(const char *left, size_t left_len, const char *right, size_t right_len);
+static int hex_digit(char c);
+
+static int blank_text(const char *value)
+{
+    for (; value != NULL && *value != '\0'; ++value) {
+        if ((unsigned char)*value > ' ') return 0;
+    }
+    return 1;
+}
+
+/* The variable Spring reads for a property: the canonical name (dashes dropped), else the one that
+ * keeps a dash as '_', as the other Spring settings of this server are read. */
+static const char *env_name(const char *canonical, const char *dashed)
+{
+    return getenv(canonical) != NULL || dashed == NULL ? canonical : dashed;
+}
+
+static void set_errorf(char *error, size_t error_len, const char *name, const char *value, const char *reason)
+{
+    if (error != NULL && error_len > 0U) {
+        snprintf(error, error_len, "%s=\"%s\" refused: %s", name, value == NULL ? "" : value, reason);
+    }
+}
+
+/* Endpoint Access by Spring's lenient enum conversion: 0 NONE, 1 READ_ONLY, 2 UNRESTRICTED, -2 not
+ * set (absent or blank), -1 no such constant ("Read-Only" and "readOnly" are READ_ONLY). */
+static int access_value(const char *value)
+{
+    if (value == NULL) {
+        return -2;
+    }
+    char canonical[16];
+    size_t len = 0U;
+    int blank = 1;
+    for (const char *cursor = value; *cursor != '\0'; ++cursor) {
+        char c = *cursor;
+        if ((unsigned char)c > ' ') blank = 0;
+        int letter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        if (!letter && !(c >= '0' && c <= '9')) continue;
+        if (len + 1U >= sizeof(canonical)) return -1;
+        canonical[len++] = (char)(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
+    }
+    canonical[len] = '\0';
+    if (blank) return -2;
+    if (strcmp(canonical, "none") == 0) return 0;
+    if (strcmp(canonical, "readonly") == 0) return 1;
+    if (strcmp(canonical, "unrestricted") == 0) return 2;
+    return -1;
+}
+
+/* Spring's StringToBooleanConverter: 1, 0, -2 when absent or blank, -1 for any other word. */
+static int boolean_value(const char *value)
+{
+    if (value == NULL) {
+        return -2;
+    }
+    const char *start = value;
+    const char *end = value + strlen(value);
+    java_trim(&start, &end);
+    if (start == end) return -2;
+    static const char *const truths[] = {"true", "on", "yes", "1"};
+    static const char *const falsehoods[] = {"false", "off", "no", "0"};
+    for (size_t i = 0; i < 4U; ++i) {
+        if (ascii_equal_ignore_case(start, (size_t)(end - start), truths[i], strlen(truths[i]))) return 1;
+        if (ascii_equal_ignore_case(start, (size_t)(end - start), falsehoods[i], strlen(falsehoods[i]))) return 0;
+    }
+    return -1;
+}
+
+/*
+ * An Integer property as Spring's NumberUtils.parseNumber reads it: all whitespace removed, then
+ * Integer.decode for 0x, 0X or # (after an optional '-'), Integer.valueOf otherwise. 1 with *out,
+ * 0 when absent or blank, -1 when it does not convert.
+ */
+static int spring_integer(const char *value, long long *out)
+{
+    if (value == NULL) {
+        return 0;
+    }
+    char text[32];
+    size_t len = 0U;
+    for (const char *cursor = value; *cursor != '\0'; ++cursor) {
+        if (*cursor == ' ' || (*cursor >= '\t' && *cursor <= '\r') || (*cursor >= 0x1c && *cursor <= 0x1f)) continue;
+        if (len + 1U >= sizeof(text)) return -1;
+        text[len++] = *cursor;
+    }
+    text[len] = '\0';
+    if (len == 0U) return 0;
+    const char *digits = text;
+    int negative = 0;
+    if (*digits == '-' || *digits == '+') {
+        negative = *digits == '-';
+        ++digits;
+    }
+    int base = 10;
+    /* NumberUtils.isHexNumber looks for the prefix after a '-' only; "+0x1" is no number. */
+    if (text[0] != '+' && (strncmp(digits, "0x", 2U) == 0 || strncmp(digits, "0X", 2U) == 0)) {
+        base = 16;
+        digits += 2;
+    } else if (text[0] != '+' && *digits == '#') {
+        base = 16;
+        ++digits;
+    }
+    if (*digits == '\0' || *digits == '-' || *digits == '+') return -1;
+    long long parsed = 0;
+    for (; *digits != '\0'; ++digits) {
+        int digit = hex_digit(*digits);
+        if (digit < 0 || digit >= base) return -1;
+        parsed = parsed * base + digit;
+        if (parsed > 2147483648LL) return -1;
+    }
+    parsed = negative ? -parsed : parsed;
+    if (parsed > 2147483647LL || parsed < -2147483648LL) return -1;
+    *out = parsed;
+    return 1;
+}
+
+/*
+ * Whether the metrics endpoint is available at all, as Spring Boot's PropertiesEndpointAccessResolver
+ * decides: management.endpoint.metrics.access, else its deprecated .enabled, else
+ * management.endpoints.access.default, else .enabled-by-default, else UNRESTRICTED; then capped by
+ * management.endpoints.access.max-permitted. Read access is enough (the endpoint only reads).
+ * 1 available, 0 not, -1 for a value or a pair of values Java refuses to start with.
+ */
+static int metrics_access(char *error, size_t error_len)
+{
+    const char *access_name = "MANAGEMENT_ENDPOINT_METRICS_ACCESS";
+    const char *enabled_name = "MANAGEMENT_ENDPOINT_METRICS_ENABLED";
+    const char *default_name = "MANAGEMENT_ENDPOINTS_ACCESS_DEFAULT";
+    const char *by_default_name = env_name("MANAGEMENT_ENDPOINTS_ENABLEDBYDEFAULT", "MANAGEMENT_ENDPOINTS_ENABLED_BY_DEFAULT");
+    const char *max_name = env_name("MANAGEMENT_ENDPOINTS_ACCESS_MAXPERMITTED", "MANAGEMENT_ENDPOINTS_ACCESS_MAX_PERMITTED");
+    int access = access_value(getenv(access_name));
+    int enabled = boolean_value(getenv(enabled_name));
+    int fallback = access_value(getenv(default_name));
+    int by_default = boolean_value(getenv(by_default_name));
+    int max = access_value(getenv(max_name));
+    static const char no_constant[] = "No enum constant org.springframework.boot.actuate.endpoint.Access";
+    static const char not_boolean[] = "Failed to convert to type java.lang.Boolean";
+    if (access == -1) return set_errorf(error, error_len, access_name, getenv(access_name), no_constant), -1;
+    if (fallback == -1) return set_errorf(error, error_len, default_name, getenv(default_name), no_constant), -1;
+    if (max == -1) return set_errorf(error, error_len, max_name, getenv(max_name), no_constant), -1;
+    if (enabled == -1) return set_errorf(error, error_len, enabled_name, getenv(enabled_name), not_boolean), -1;
+    if (by_default == -1) return set_errorf(error, error_len, by_default_name, getenv(by_default_name), not_boolean), -1;
+    if (access >= 0 && enabled >= 0) {
+        return set_errorf(error, error_len, access_name, getenv(access_name),
+                          "management.endpoint.metrics.access and .enabled are mutually exclusive"), -1;
+    }
+    if (fallback >= 0 && by_default >= 0) {
+        return set_errorf(error, error_len, default_name, getenv(default_name),
+                          "management.endpoints.access.default and .enabled-by-default are mutually exclusive"), -1;
+    }
+    int resolved = access >= 0 ? access
+        : enabled >= 0 ? (enabled ? 2 : 0)
+        : fallback >= 0 ? fallback
+        : by_default >= 0 ? (by_default ? 2 : 0)
+        : 2;
+    if (max >= 0 && resolved > max) resolved = max;
+    return resolved > 0;
+}
+
+/*
+ * Whether Java would serve the endpoint on this listener, under /actuator/metrics. A management
+ * port other than the listener's (or negative, which turns the HTTP endpoints off), another
+ * management.endpoints.web.base-path or another path mapping moves or removes it in Java, and C
+ * serves it nowhere then rather than somewhere Java does not. 1 here, 0 not here, -1 for settings
+ * Java refuses to start with (an unreadable port or base path, an address without a separate port).
+ */
+static int metrics_on_this_listener(char *error, size_t error_len)
+{
+    long long port = 0;
+    long long listener = 0;
+    const char *port_value = getenv("MANAGEMENT_SERVER_PORT");
+    int port_set = spring_integer(port_value, &port);
+    if (port_set < 0) {
+        return set_errorf(error, error_len, "MANAGEMENT_SERVER_PORT", port_value,
+                          "Failed to convert to type java.lang.Integer"), -1;
+    }
+    /* ManagementPortType: no port, or the server's own port (0 is a random one), is the same port. */
+    if (port_set > 0 && port < 0) {
+        return 0;
+    }
+    if (port_set > 0 && (port == 0 || spring_integer(getenv("SPECUS_ADMIN_PORT"), &listener) <= 0
+                         || listener != port)) {
+        return 0;
+    }
+    const char *address = getenv("MANAGEMENT_SERVER_ADDRESS");
+    if (!blank_text(address)) {
+        return set_errorf(error, error_len, "MANAGEMENT_SERVER_ADDRESS", address,
+                          "Management-specific server address cannot be configured as the management server "
+                          "is not listening on a separate port"), -1;
+    }
+    const char *base_name = env_name("MANAGEMENT_ENDPOINTS_WEB_BASEPATH", "MANAGEMENT_ENDPOINTS_WEB_BASE_PATH");
+    const char *base = getenv(base_name);
+    if (base != NULL) {
+        size_t len = strlen(base);
+        if (len > 0U && base[0] != '/') {
+            return set_errorf(error, error_len, base_name, base, "'basePath' must start with '/' or be empty"), -1;
+        }
+        /* WebEndpointProperties.cleanBasePath drops one trailing '/'. */
+        if (len > 0U && base[len - 1U] == '/') --len;
+        if (len != strlen("/actuator") || memcmp(base, "/actuator", len) != 0) {
+            return 0;
+        }
+    }
+    const char *mapping = getenv(env_name("MANAGEMENT_ENDPOINTS_WEB_PATHMAPPING_METRICS",
+                                          "MANAGEMENT_ENDPOINTS_WEB_PATH_MAPPING_METRICS"));
+    if (mapping != NULL && strcmp(mapping, "metrics") != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+/* 1 when the endpoint answers on this listener, 0 when not, -1 when Java would not start. */
+static int endpoint_state(char *error, size_t error_len)
+{
+    char exposure_error[128] = "";
+    const char *include = getenv("MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE");
+    const char *exclude = getenv("MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_EXCLUDE");
+    int included = 0;
+    int excluded = 0;
+    if (exposure_list(include, &included, exposure_error, sizeof(exposure_error)) != 0) {
+        return set_errorf(error, error_len, "MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE", include, exposure_error), -1;
+    }
+    if (exposure_list(exclude, &excluded, exposure_error, sizeof(exposure_error)) != 0) {
+        return set_errorf(error, error_len, "MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_EXCLUDE", exclude, exposure_error), -1;
+    }
+    int available = metrics_access(error, error_len);
+    if (available < 0) {
+        return -1;
+    }
+    int here = metrics_on_this_listener(error, error_len);
+    if (here < 0) {
+        return -1;
+    }
+    return included && !excluded && available && here;
+}
+
 int st_metrics_endpoint_exposed(void)
 {
-    return st_metrics_exposure(getenv("MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE"),
-                               getenv("MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_EXCLUDE"), NULL, 0U) == 1;
+    return endpoint_state(NULL, 0U) == 1;
 }
 
 int st_metrics_validate_current(void)
 {
-    static const char *const names[] = {
-        "MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE", "MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_EXCLUDE"
-    };
-    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
-        char error[128];
-        int ignored = 0;
-        const char *value = getenv(names[i]);
-        if (exposure_list(value, &ignored, error, sizeof(error)) != 0) {
-            fprintf(stderr, "[metrics] %s=\"%s\" refused: %s\n", names[i], value, error);
-            return -1;
-        }
+    char error[384];
+    if (endpoint_state(error, sizeof(error)) < 0) {
+        fprintf(stderr, "[metrics] %s\n", error);
+        return -1;
     }
     return 0;
 }
@@ -817,123 +1049,344 @@ static int ascii_equal_ignore_case(const char *left, size_t left_len, const char
     return 1;
 }
 
-/* MimeType.isCompatibleWith for one Accept range and an application/... type the endpoint produces. */
-static int range_accepts(const char *type, size_t type_len, const char *subtype, size_t subtype_len,
-                         const char *produced)
+/* String.trim: everything up to and including ' ' goes from both ends. */
+static void java_trim(const char **start, const char **end)
 {
-    const char *produced_subtype = strchr(produced, '/') + 1;
-    if (type_len == 1U && type[0] == '*') {
-        return 1;
-    }
-    if (!ascii_equal_ignore_case(type, type_len, "application", 11U)) {
+    while (*start < *end && (unsigned char)**start <= ' ') ++*start;
+    while (*end > *start && (unsigned char)(*end)[-1] <= ' ') --*end;
+}
+
+static int token_text(const char *text, size_t len)
+{
+    if (len == 0U) {
         return 0;
     }
-    if ((subtype_len == 1U && subtype[0] == '*')
-        || ascii_equal_ignore_case(subtype, subtype_len, produced_subtype, strlen(produced_subtype))) {
+    for (size_t i = 0; i < len; ++i) {
+        if (!token_char(text[i])) return 0;
+    }
+    return 1;
+}
+
+/* MimeType.isQuotedString: two double or two single quotes around it. */
+static int quoted_text(const char *text, size_t len)
+{
+    return len >= 2U && ((text[0] == '"' && text[len - 1U] == '"') || (text[0] == '\'' && text[len - 1U] == '\''));
+}
+
+/* The end of the parameter that starts at cursor: the next ';' outside double quotes, or end. */
+static const char *parameter_end(const char *cursor, const char *end)
+{
+    int quoted = 0;
+    for (; cursor < end; ++cursor) {
+        if (*cursor == '"') quoted = !quoted;
+        else if (*cursor == ';' && !quoted) break;
+    }
+    return cursor;
+}
+
+/* Spring's limit: MimeTypeUtils.sortBySpecificity refuses to sort more media types than this. */
+#define ACCEPT_MAX_RANGES 50U
+
+/* One media range of the Accept header as MimeTypeUtils.parseMimeType reads it (pointers into the header). */
+typedef struct {
+    const char *type;
+    size_t type_len;
+    const char *subtype;
+    size_t subtype_len;
+    double quality;
+    int has_quality;
+    /* Every attribute=value parameter, q included (MimeType.getParameters().size()). */
+    size_t parameters;
+    /* What follows the first ';', NULL when nothing does. */
+    const char *params;
+    const char *params_end;
+} media_range;
+
+/*
+ * Parses one comma-separated element; 1 when it is a media range, 0 when it is blank (skipped, as
+ * MediaType.parseMediaTypes skips it), -1 when Spring refuses it (406).
+ */
+static int parse_media_range(const char *start, const char *end, media_range *range)
+{
+    java_trim(&start, &end);
+    if (start >= end) {
+        return 0;
+    }
+    memset(range, 0, sizeof(*range));
+    range->quality = 1.0;
+    const char *semicolon = memchr(start, ';', (size_t)(end - start));
+    const char *type_start = start;
+    const char *type_end = semicolon == NULL ? end : semicolon;
+    java_trim(&type_start, &type_end);
+    if (type_end - type_start == 1 && *type_start == '*') {
+        /* java.net.HttpURLConnection's "*; q=.2", read as all media types. */
+        range->type = "*";
+        range->type_len = 1U;
+        range->subtype = "*";
+        range->subtype_len = 1U;
+    } else {
+        const char *slash = memchr(type_start, '/', (size_t)(type_end - type_start));
+        if (slash == NULL || slash == type_start || slash + 1 >= type_end
+            || !token_text(type_start, (size_t)(slash - type_start))
+            || !token_text(slash + 1, (size_t)(type_end - slash - 1))) {
+            return -1;
+        }
+        range->type = type_start;
+        range->type_len = (size_t)(slash - type_start);
+        range->subtype = slash + 1;
+        range->subtype_len = (size_t)(type_end - slash - 1);
+        if (range->type_len == 1U && range->type[0] == '*'
+            && !(range->subtype_len == 1U && range->subtype[0] == '*')) {
+            return -1;
+        }
+    }
+    if (semicolon == NULL) {
+        return 1;
+    }
+    range->params = semicolon + 1;
+    range->params_end = end;
+    for (const char *cursor = range->params; cursor <= end;) {
+        const char *next = parameter_end(cursor, end);
+        const char *param = cursor;
+        const char *param_end = next;
+        java_trim(&param, &param_end);
+        cursor = next + 1;
+        const char *equals = param == param_end ? NULL : memchr(param, '=', (size_t)(param_end - param));
+        if (equals == NULL) {
+            /* An empty parameter, or one without '=', is skipped. */
+            continue;
+        }
+        const char *name_end = equals;
+        const char *value = equals + 1;
+        const char *name = param;
+        java_trim(&name, &name_end);
+        java_trim(&value, &param_end);
+        size_t name_len = (size_t)(name_end - name);
+        size_t value_len = (size_t)(param_end - value);
+        if (!token_text(name, name_len) || value_len == 0U) {
+            return -1;
+        }
+        ++range->parameters;
+        int quoted = quoted_text(value, value_len);
+        const char *bare = quoted ? value + 1 : value;
+        size_t bare_len = quoted ? value_len - 2U : value_len;
+        if (ascii_equal_ignore_case(name, name_len, "q", 1U)) {
+            /* MediaType: Double.parseDouble of the unquoted value, between 0 and 1. */
+            char number[64];
+            if (bare_len == 0U || bare_len >= sizeof(number)) {
+                return -1;
+            }
+            memcpy(number, bare, bare_len);
+            number[bare_len] = '\0';
+            char *number_end = NULL;
+            double quality = strtod(number, &number_end);
+            while (number_end != NULL && (unsigned char)*number_end <= ' ' && *number_end != '\0') ++number_end;
+            if (number_end == number || *number_end != '\0' || !(quality >= 0.0 && quality <= 1.0)) {
+                return -1;
+            }
+            range->quality = quality;
+            range->has_quality = 1;
+        } else if (name_len == 7U && memcmp(name, "charset", 7U) == 0) {
+            /* MimeType: Charset.forName of the unquoted value; iconv knows the same common names. */
+            char charset[64];
+            if (bare_len == 0U || bare_len >= sizeof(charset)) {
+                return -1;
+            }
+            memcpy(charset, bare, bare_len);
+            charset[bare_len] = '\0';
+            iconv_t converter = iconv_open("UTF-8", charset);
+            if (converter == (iconv_t)-1) {
+                return -1;
+            }
+            iconv_close(converter);
+        } else if (!quoted && !token_text(value, value_len)) {
+            return -1;
+        }
+    }
+    return 1;
+}
+
+static int range_wildcard_type(const media_range *range)
+{
+    return range->type_len == 1U && range->type[0] == '*';
+}
+
+/* MimeType.isWildcardSubtype: "*" or a suffix wildcard such as "*+json". */
+static int range_wildcard_subtype(const media_range *range)
+{
+    return (range->subtype_len == 1U && range->subtype[0] == '*')
+        || (range->subtype_len >= 2U && range->subtype[0] == '*' && range->subtype[1] == '+');
+}
+
+/* MediaType.isMoreSpecific: the quality first, then concrete over wildcard, then more parameters. */
+static int range_more_specific(const media_range *a, const media_range *b)
+{
+    if (a->quality != b->quality) {
+        return a->quality > b->quality;
+    }
+    int a_wild = range_wildcard_type(a);
+    int b_wild = range_wildcard_type(b);
+    if (a_wild != b_wild) {
+        return !a_wild;
+    }
+    int a_wild_subtype = range_wildcard_subtype(a);
+    int b_wild_subtype = range_wildcard_subtype(b);
+    if (a_wild_subtype != b_wild_subtype) {
+        return !a_wild_subtype;
+    }
+    return ascii_equal_ignore_case(a->type, a->type_len, b->type, b->type_len)
+        && ascii_equal_ignore_case(a->subtype, a->subtype_len, b->subtype, b->subtype_len)
+        && a->parameters > b->parameters;
+}
+
+/* MimeType.isCompatibleWith for one Accept range and an application/... type the endpoint produces. */
+static int range_accepts(const media_range *range, const char *produced)
+{
+    const char *produced_subtype = strchr(produced, '/') + 1;
+    if (range_wildcard_type(range)) {
+        return 1;
+    }
+    if (!ascii_equal_ignore_case(range->type, range->type_len, "application", 11U)) {
+        return 0;
+    }
+    if ((range->subtype_len == 1U && range->subtype[0] == '*')
+        || ascii_equal_ignore_case(range->subtype, range->subtype_len, produced_subtype, strlen(produced_subtype))) {
         return 1;
     }
     /* A suffix wildcard: the subtype *+json takes every +json subtype. */
-    if (subtype_len > 2U && subtype[0] == '*' && subtype[1] == '+') {
+    if (range->subtype_len > 2U && range->subtype[0] == '*' && range->subtype[1] == '+') {
         const char *suffix = strchr(produced_subtype, '+');
         return suffix != NULL
-            && ascii_equal_ignore_case(subtype + 1, subtype_len - 1U, suffix, strlen(suffix));
+            && ascii_equal_ignore_case(range->subtype + 1, range->subtype_len - 1U, suffix, strlen(suffix));
     }
     return 0;
 }
 
-/*
- * The produced type Spring MVC picks for the Accept header: every (range, produced type) pair that
- * is compatible, ordered by the range's quality (stable, so the header's order and then the
- * endpoint's v3, v2, json order decide ties). -1 when none is acceptable or the header does not
- * parse (both 406 in Java).
- */
-static int negotiate(const char *accept)
+/* A compatible (range, produced type) pair: AbstractMessageConverterMethodProcessor.getMostSpecificMediaType. */
+typedef struct {
+    size_t produced;
+    /* The Accept range itself when it is the more specific of the two (its parameters are written
+     * into Content-Type), NULL when the produced type is. */
+    const media_range *range;
+    double quality;
+    size_t parameters;
+} media_candidate;
+
+static int candidate_more_specific(const media_candidate *a, const media_candidate *b)
 {
-    if (accept == NULL) {
-        return 0;
+    if (a->quality != b->quality) {
+        return a->quality > b->quality;
     }
-    const char *cursor = accept;
-    while (*cursor == ' ' || *cursor == '\t') ++cursor;
-    if (*cursor == '\0') {
-        return 0;
-    }
-    int best = -1;
-    double best_quality = -1.0;
-    for (;;) {
-        size_t len = strcspn(cursor, ",");
-        const char *start = cursor;
-        const char *end = cursor + len;
-        while (start < end && (*start == ' ' || *start == '\t')) ++start;
-        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) --end;
-        if (start < end) {
-            const char *params = memchr(start, ';', (size_t)(end - start));
-            const char *type_end = params == NULL ? end : params;
-            while (type_end > start && (type_end[-1] == ' ' || type_end[-1] == '\t')) --type_end;
-            const char *slash = memchr(start, '/', (size_t)(type_end - start));
-            if (slash == NULL || slash == start || slash + 1 >= type_end) {
-                return -1;
+    /* Both are concrete; the same type tells them apart by the number of parameters only. */
+    return a->produced == b->produced && a->parameters > b->parameters;
+}
+
+/*
+ * Spring MVC's choice of the produced type for the Accept header, written into content_type: the
+ * ranges are sorted by MimeTypeUtils.sortBySpecificity (a bubble sort that swaps a pair when the
+ * later one is more specific: higher quality, then a concrete type before a wildcard type or subtype, then more
+ * parameters), each compatible (range, produced type) pair in that order and v3, v2, json order
+ * gives the more specific of the two with the range's quality, those are sorted again, and the
+ * first wins. The range's parameters other than q stay in Content-Type, as Spring writes the
+ * selected media type. A blank header is all media types. -1 when none is compatible or the header
+ * does not parse (both 406 in Java), -2 when memory runs out.
+ */
+static int negotiate(const char *accept, text_builder *content_type)
+{
+    media_range ranges[ACCEPT_MAX_RANGES];
+    size_t count = 0U;
+    if (accept != NULL) {
+        /* MimeTypeUtils.tokenize: commas inside double quotes do not split, a backslash escapes. */
+        const char *start = accept;
+        int quoted = 0;
+        for (const char *cursor = accept;; ++cursor) {
+            if (*cursor == '\\' && cursor[1] != '\0') {
+                ++cursor;
+                continue;
             }
-            for (const char *c = start; c < type_end; ++c) {
-                if (c != slash && !token_char(*c)) return -1;
+            if (*cursor == '"') {
+                quoted = !quoted;
             }
-            size_t type_len = (size_t)(slash - start);
-            const char *subtype = slash + 1;
-            size_t subtype_len = (size_t)(type_end - subtype);
-            if (type_len == 1U && *start == '*' && !(subtype_len == 1U && *subtype == '*')) {
-                return -1;
-            }
-            double quality = 1.0;
-            while (params != NULL && params < end) {
-                const char *param = params + 1;
-                const char *next = memchr(param, ';', (size_t)(end - param));
-                const char *param_end = next == NULL ? end : next;
-                while (param < param_end && (*param == ' ' || *param == '\t')) ++param;
-                const char *equals = memchr(param, '=', (size_t)(param_end - param));
-                if (equals == NULL) {
-                    /* MimeTypeUtils skips an empty parameter or one without '='. */
-                    params = next;
-                    continue;
-                }
-                if (equals == param) {
+            if ((*cursor == ',' && !quoted) || *cursor == '\0') {
+                media_range range;
+                int parsed = parse_media_range(start, cursor, &range);
+                if (parsed < 0) {
                     return -1;
                 }
-                size_t name_len = (size_t)(equals - param);
-                while (name_len > 0U && (param[name_len - 1U] == ' ' || param[name_len - 1U] == '\t')) --name_len;
-                if (ascii_equal_ignore_case(param, name_len, "q", 1U)) {
-                    char number[32];
-                    const char *value = equals + 1;
-                    while (value < param_end && (*value == ' ' || *value == '\t')) ++value;
-                    size_t value_len = (size_t)(param_end - value);
-                    while (value_len > 0U && (value[value_len - 1U] == ' ' || value[value_len - 1U] == '\t')) {
-                        --value_len;
-                    }
-                    if (value_len == 0U || value_len >= sizeof(number)) {
+                if (parsed > 0) {
+                    if (count == ACCEPT_MAX_RANGES) {
                         return -1;
                     }
-                    memcpy(number, value, value_len);
-                    number[value_len] = '\0';
-                    char *number_end = NULL;
-                    quality = strtod(number, &number_end);
-                    if (number_end == number || *number_end != '\0' || !(quality >= 0.0 && quality <= 1.0)) {
-                        return -1;
-                    }
+                    ranges[count++] = range;
                 }
-                params = next;
-            }
-            for (size_t p = 0; p < PRODUCED_COUNT; ++p) {
-                if (range_accepts(start, type_len, subtype, subtype_len, produced_types[p])
-                    && quality > best_quality) {
-                    best = (int)p;
-                    best_quality = quality;
-                }
+                if (*cursor == '\0') break;
+                start = cursor + 1;
             }
         }
-        if (cursor[len] == '\0') {
-            break;
-        }
-        cursor += len + 1U;
     }
-    return best;
+    if (count == 0U) {
+        ranges[0] = (media_range){"*", 1U, "*", 1U, 1.0, 0, 0U, NULL, NULL};
+        count = 1U;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        for (size_t j = 1; j < count - i; ++j) {
+            if (range_more_specific(&ranges[j], &ranges[j - 1U])) {
+                media_range swap = ranges[j];
+                ranges[j] = ranges[j - 1U];
+                ranges[j - 1U] = swap;
+            }
+        }
+    }
+    media_candidate candidates[ACCEPT_MAX_RANGES * PRODUCED_COUNT];
+    size_t candidate_count = 0U;
+    for (size_t i = 0; i < count; ++i) {
+        const media_range *range = &ranges[i];
+        for (size_t p = 0; p < PRODUCED_COUNT; ++p) {
+            if (!range_accepts(range, produced_types[p])) continue;
+            /* The produced type with the range's quality is the more specific one unless the range
+             * is concrete: then it is the same type with at least as many parameters. */
+            int produced_wins = range_wildcard_type(range) || range_wildcard_subtype(range);
+            candidates[candidate_count++] = (media_candidate){
+                p, produced_wins ? NULL : range, range->quality,
+                produced_wins ? (size_t)range->has_quality : range->parameters
+            };
+        }
+    }
+    if (candidate_count == 0U) {
+        return -1;
+    }
+    for (size_t i = 0; i < candidate_count; ++i) {
+        for (size_t j = 1; j < candidate_count - i; ++j) {
+            if (candidate_more_specific(&candidates[j], &candidates[j - 1U])) {
+                media_candidate swap = candidates[j];
+                candidates[j] = candidates[j - 1U];
+                candidates[j - 1U] = swap;
+            }
+        }
+    }
+    const media_candidate *chosen = &candidates[0];
+    buffer_puts(content_type, produced_types[chosen->produced]);
+    const media_range *range = chosen->range;
+    for (const char *cursor = range == NULL ? NULL : range->params; cursor != NULL && cursor <= range->params_end;) {
+        const char *next = parameter_end(cursor, range->params_end);
+        const char *param = cursor;
+        const char *param_end = next;
+        java_trim(&param, &param_end);
+        cursor = next + 1;
+        const char *equals = param == param_end ? NULL : memchr(param, '=', (size_t)(param_end - param));
+        if (equals == NULL) continue;
+        const char *name = param;
+        const char *name_end = equals;
+        const char *value = equals + 1;
+        java_trim(&name, &name_end);
+        java_trim(&value, &param_end);
+        if (ascii_equal_ignore_case(name, (size_t)(name_end - name), "q", 1U)) continue;
+        buffer_puts(content_type, ";");
+        buffer_append(content_type, name, (size_t)(name_end - name));
+        buffer_puts(content_type, "=");
+        buffer_append(content_type, value, (size_t)(param_end - value));
+    }
+    return content_type->failed ? -2 : 0;
 }
 
 /*
@@ -1034,8 +1487,14 @@ int st_metrics_actuator_response(const char *method,
         snprintf(headers, sizeof(headers), "Allow: GET\r\n%sContent-Type: application/json\r\n", disposition_header);
         return finish_response(405, "Method Not Allowed", headers, body, sizeof(body) - 1U, 1, response, response_len);
     }
-    int produced = negotiate(accept);
-    if (produced < 0) {
+    text_builder content_type = {NULL, 0U, 0U, 0};
+    int negotiated = negotiate(accept, &content_type);
+    if (negotiated == -2) {
+        free(content_type.data);
+        return -1;
+    }
+    if (negotiated < 0) {
+        free(content_type.data);
         return finish_response(406, "Not Acceptable",
                                "Accept: application/vnd.spring-boot.actuator.v3+json, "
                                "application/vnd.spring-boot.actuator.v2+json, application/json\r\n",
@@ -1049,6 +1508,7 @@ int st_metrics_actuator_response(const char *method,
         size_t tag_count = 0U;
         int parsed = parse_tags(path, &tags, &tag_count);
         if (parsed == -1) {
+            free(content_type.data);
             return -1;
         }
         if (parsed == -2) {
@@ -1056,12 +1516,14 @@ int st_metrics_actuator_response(const char *method,
             static const char bad_request[] = "{\"error\":\"Bad Request\"}";
             char headers[160];
             snprintf(headers, sizeof(headers), "%sContent-Type: application/json\r\n", disposition_header);
+            free(content_type.data);
             return finish_response(400, "Bad Request", headers, bad_request, sizeof(bad_request) - 1U, !head,
                                    response, response_len);
         }
         char *name = (char *)malloc(segment_len + 1U);
         if (name == NULL) {
             free_tags(tags, tag_count);
+            free(content_type.data);
             return -1;
         }
         memcpy(name, segment, segment_len);
@@ -1071,17 +1533,24 @@ int st_metrics_actuator_response(const char *method,
         free_tags(tags, tag_count);
         if (!found) {
             free(body.data);
+            free(content_type.data);
             /* The endpoint answered null: 404 without a body. */
             return finish_response(404, "Not Found", "", NULL, 0U, 0, response, response_len);
         }
     }
-    if (body.failed) {
+    text_builder headers = {NULL, 0U, 0U, 0};
+    buffer_puts(&headers, "Content-Type: ");
+    buffer_append(&headers, content_type.data, content_type.len);
+    buffer_puts(&headers, "\r\n");
+    buffer_puts(&headers, disposition_header);
+    free(content_type.data);
+    if (body.failed || headers.failed) {
         free(body.data);
+        free(headers.data);
         return -1;
     }
-    char headers[256];
-    snprintf(headers, sizeof(headers), "Content-Type: %s\r\n%s", produced_types[produced], disposition_header);
-    int rc = finish_response(200, "OK", headers, body.data, body.len, !head, response, response_len);
+    int rc = finish_response(200, "OK", headers.data, body.data, body.len, !head, response, response_len);
     free(body.data);
+    free(headers.data);
     return rc;
 }
