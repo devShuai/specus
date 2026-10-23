@@ -1289,6 +1289,176 @@ static int ensure_reported_unique_index(sqlite3 *db, const reported_unique_key *
     return 0;
 }
 
+/*
+ * The two traffic counters, keyed as Java's TrafficUsage and ResourceTrafficUsage: by the client's
+ * account, not its name, through the table-level unique indexes of USAGE_KEYS. tenant_id is last,
+ * where it was added to the databases written before it existed.
+ */
+#define TRAFFIC_USAGE_COLUMNS                             \
+    "id INTEGER PRIMARY KEY AUTOINCREMENT,"               \
+    "client_id INTEGER,"                                  \
+    "client_name TEXT NOT NULL,"                          \
+    "usage_date TEXT NOT NULL,"                           \
+    "upload_bytes INTEGER NOT NULL DEFAULT 0,"            \
+    "download_bytes INTEGER NOT NULL DEFAULT 0,"          \
+    "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP," \
+    "tenant_id TEXT"
+
+#define RESOURCE_TRAFFIC_USAGE_COLUMNS                    \
+    "id INTEGER PRIMARY KEY AUTOINCREMENT,"               \
+    "client_id INTEGER,"                                  \
+    "client_name TEXT NOT NULL,"                          \
+    "resource_type TEXT NOT NULL,"                        \
+    "resource_key TEXT NOT NULL,"                         \
+    "resource_id INTEGER,"                                \
+    "resource_name TEXT,"                                 \
+    "usage_date TEXT NOT NULL,"                           \
+    "upload_bytes INTEGER NOT NULL DEFAULT 0,"            \
+    "download_bytes INTEGER NOT NULL DEFAULT 0,"          \
+    "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP," \
+    "tenant_id TEXT"
+
+/* A counter table's Java key (SqliteUniqueIndexMigrator MERGE_COUNTERS) and the name key C used. */
+typedef struct {
+    const char *table;
+    const char *definition;     /* its columns, as a rebuild creates them */
+    const char *copied;         /* the columns a rebuild copies, updated_at aside */
+    const char *legacy_columns; /* C's old inline UNIQUE, as SQL literals */
+    size_t legacy_count;
+    const char *index;          /* Java's index name */
+    const char *columns;        /* Java's key, as the index lists it */
+    const char *quoted_columns; /* the same names as SQL literals */
+    size_t column_count;
+    const char *not_null;       /* every key column IS NOT NULL: NULLs never collide */
+    const char *join;           /* a row t of the table to its group m */
+} usage_key;
+
+static const usage_key USAGE_KEYS[] = {
+    {"traffic_usage", TRAFFIC_USAGE_COLUMNS,
+     "id, client_id, client_name, usage_date, upload_bytes, download_bytes, tenant_id",
+     "'client_name','usage_date'", 2U,
+     "uk_specus_traffic_client_date", "client_id, usage_date", "'client_id','usage_date'", 2U,
+     "client_id IS NOT NULL AND usage_date IS NOT NULL",
+     "t.client_id = m.client_id AND t.usage_date = m.usage_date"},
+    {"resource_traffic_usage", RESOURCE_TRAFFIC_USAGE_COLUMNS,
+     "id, client_id, client_name, resource_type, resource_key, resource_id, resource_name, usage_date, "
+     "upload_bytes, download_bytes, tenant_id",
+     "'client_name','resource_type','resource_key','usage_date'", 4U,
+     "uk_resource_traffic_resource_date", "tenant_id, client_id, resource_type, resource_key, usage_date",
+     "'tenant_id','client_id','resource_type','resource_key','usage_date'", 5U,
+     "tenant_id IS NOT NULL AND client_id IS NOT NULL AND resource_type IS NOT NULL "
+     "AND resource_key IS NOT NULL AND usage_date IS NOT NULL",
+     "t.tenant_id = m.tenant_id AND t.client_id = m.client_id AND t.resource_type = m.resource_type "
+     "AND t.resource_key = m.resource_key AND t.usage_date = m.usage_date"},
+};
+
+/* 1 when a full unique index, a table constraint's included, is on exactly these columns. */
+static int has_unique_index_on(sqlite3 *db, const char *table, const char *quoted_columns, size_t column_count)
+{
+    char sql[768];
+    snprintf(sql, sizeof(sql),
+             "SELECT COUNT(*) FROM pragma_index_list('%s') il WHERE il.\"unique\" AND NOT il.partial "
+             "AND (SELECT COUNT(*) FROM pragma_index_info(il.name)) = %zu "
+             "AND (SELECT COUNT(*) FROM pragma_index_info(il.name) WHERE lower(name) IN (%s)) = %zu",
+             table, column_count, quoted_columns, column_count);
+    long long count = schema_count(db, sql);
+    return count < 0 ? -1 : count > 0;
+}
+
+/*
+ * Java SqliteUniqueIndexMigrator for a counter (Duplicates.MERGE_COUNTERS). C keyed both tables by
+ * client name with an inline UNIQUE that SQLite cannot drop, so such a table is first rebuilt under
+ * its name with every row, id and the id sequence. Rows that then share Java's key (one client's
+ * day under two names, from before a rename) are summed into the newest, whose updated_at becomes
+ * the group's latest, and the others deleted; then Java's index is created. All in one
+ * transaction, a savepoint inside the one a new database is created in; a current database is
+ * only read.
+ */
+static int migrate_usage_key(sqlite3 *db, const usage_key *key)
+{
+    int legacy = has_unique_index_on(db, key->table, key->legacy_columns, key->legacy_count);
+    int keyed = has_unique_index_on(db, key->table, key->quoted_columns, key->column_count);
+    if (legacy < 0 || keyed < 0) {
+        return -1;
+    }
+    if (!legacy && keyed) {
+        return 0;
+    }
+    int nested = !sqlite3_get_autocommit(db);
+    if (exec_sql(db, nested ? "SAVEPOINT usage_key" : "BEGIN IMMEDIATE") != 0) {
+        return -1;
+    }
+    /* Another process may have migrated it while this one waited for the write lock. */
+    legacy = has_unique_index_on(db, key->table, key->legacy_columns, key->legacy_count);
+    int rc = legacy < 0 ? -1 : 0;
+    char sql[2048];
+    if (rc == 0 && legacy) {
+        const char *t = key->table;
+        int written = snprintf(sql, sizeof(sql),
+            "CREATE TABLE %s_rekeyed (%s);"
+            "INSERT INTO %s_rekeyed(%s, updated_at) SELECT %s, COALESCE(updated_at, '') FROM %s;"
+            "DELETE FROM sqlite_sequence WHERE name = '%s_rekeyed';"
+            "INSERT INTO sqlite_sequence(name, seq) SELECT '%s_rekeyed', "
+            "MAX(COALESCE((SELECT seq FROM sqlite_sequence WHERE name = '%s'), 0), "
+            "COALESCE((SELECT MAX(id) FROM %s_rekeyed), 0));"
+            "DROP TABLE %s;"
+            "ALTER TABLE %s_rekeyed RENAME TO %s;",
+            t, key->definition, t, key->copied, key->copied, t, t, t, t, t, t, t, t);
+        rc = written > 0 && (size_t)written < sizeof(sql) ? exec_sql(db, sql) : -1;
+    }
+    long long groups = 0;
+    long long rows = 0;
+    if (rc == 0) {
+        int written = snprintf(sql, sizeof(sql),
+            "DROP TABLE IF EXISTS temp.usage_merge;"
+            "CREATE TEMP TABLE usage_merge AS SELECT %s, MAX(id) AS keep_id, SUM(upload_bytes) AS up, "
+            "SUM(download_bytes) AS down, MAX(updated_at) AS at, COUNT(*) AS n FROM %s WHERE %s "
+            "GROUP BY %s HAVING COUNT(*) > 1;",
+            key->columns, key->table, key->not_null, key->columns);
+        rc = written > 0 && (size_t)written < sizeof(sql) ? exec_sql(db, sql) : -1;
+    }
+    if (rc == 0) {
+        groups = schema_count(db, "SELECT COUNT(*) FROM temp.usage_merge");
+        rows = schema_count(db, "SELECT COALESCE(SUM(n), 0) FROM temp.usage_merge");
+        rc = groups < 0 || rows < 0 ? -1 : 0;
+    }
+    if (rc == 0 && groups > 0) {
+        /* Both statements in this transaction: a sum is never kept without its rows deleted. */
+        const char *t = key->table;
+        int written = snprintf(sql, sizeof(sql),
+            "UPDATE %s SET upload_bytes = (SELECT up FROM temp.usage_merge WHERE keep_id = %s.id), "
+            "download_bytes = (SELECT down FROM temp.usage_merge WHERE keep_id = %s.id), "
+            "updated_at = (SELECT at FROM temp.usage_merge WHERE keep_id = %s.id) "
+            "WHERE id IN (SELECT keep_id FROM temp.usage_merge);"
+            "DELETE FROM %s WHERE id IN "
+            "(SELECT t.id FROM %s t JOIN temp.usage_merge m ON %s WHERE t.id <> m.keep_id);",
+            t, t, t, t, t, t, key->join);
+        rc = written > 0 && (size_t)written < sizeof(sql) ? exec_sql(db, sql) : -1;
+    }
+    if (rc == 0) {
+        snprintf(sql, sizeof(sql), "DROP TABLE temp.usage_merge;CREATE UNIQUE INDEX IF NOT EXISTS %s ON %s(%s)",
+                 key->index, key->table, key->columns);
+        rc = exec_sql(db, sql);
+    }
+    if (rc == 0 && exec_sql(db, nested ? "RELEASE usage_key" : "COMMIT") != 0) {
+        rc = -1;
+    }
+    if (rc != 0) {
+        (void)exec_sql(db, nested ? "ROLLBACK TO usage_key; RELEASE usage_key" : "ROLLBACK");
+        fprintf(stderr, "[schema] %s could not be keyed by (%s)\n", key->table, key->columns);
+        return -1;
+    }
+    if (legacy) {
+        fprintf(stderr, "[schema] rebuilt %s keyed by (%s) instead of the client name\n", key->table, key->columns);
+    }
+    if (groups > 0) {
+        fprintf(stderr, "[schema] merged %lld group(s) of rows of %s sharing (%s) into their newest row by summing "
+                        "(upload_bytes, download_bytes), before creating unique index %s; deleted the other %lld row(s)\n",
+                groups, key->table, key->columns, key->index, rows - groups);
+    }
+    return 0;
+}
+
 int st_storage_init(const char *path, int seed_demo_client)
 {
     sqlite3 *db = NULL;
@@ -1536,30 +1706,8 @@ int st_storage_init(const char *path, int seed_demo_client)
         "connected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
         "disconnected_at TEXT"
         ");"
-        "CREATE TABLE IF NOT EXISTS traffic_usage ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "client_id INTEGER,"
-        "client_name TEXT NOT NULL,"
-        "usage_date TEXT NOT NULL,"
-        "upload_bytes INTEGER NOT NULL DEFAULT 0,"
-        "download_bytes INTEGER NOT NULL DEFAULT 0,"
-        "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
-        "UNIQUE(client_name, usage_date)"
-        ");"
-        "CREATE TABLE IF NOT EXISTS resource_traffic_usage ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "client_id INTEGER,"
-        "client_name TEXT NOT NULL,"
-        "resource_type TEXT NOT NULL,"
-        "resource_key TEXT NOT NULL,"
-        "resource_id INTEGER,"
-        "resource_name TEXT,"
-        "usage_date TEXT NOT NULL,"
-        "upload_bytes INTEGER NOT NULL DEFAULT 0,"
-        "download_bytes INTEGER NOT NULL DEFAULT 0,"
-        "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
-        "UNIQUE(client_name, resource_type, resource_key, usage_date)"
-        ");"
+        "CREATE TABLE IF NOT EXISTS traffic_usage (" TRAFFIC_USAGE_COLUMNS ");"
+        "CREATE TABLE IF NOT EXISTS resource_traffic_usage (" RESOURCE_TRAFFIC_USAGE_COLUMNS ");"
         "CREATE TABLE IF NOT EXISTS peer_mesh_device ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "tenant_id TEXT NOT NULL DEFAULT 'default',"
@@ -2008,6 +2156,10 @@ int st_storage_init(const char *path, int seed_demo_client)
     }
     if (rc == 0) {
         rc = add_usage_tenant_column(db, "resource_traffic_usage");
+    }
+    /* After the columns: Java's keys need client_id and tenant_id, and take their tenant over. */
+    for (size_t i = 0U; rc == 0 && i < sizeof(USAGE_KEYS) / sizeof(USAGE_KEYS[0]); ++i) {
+        rc = migrate_usage_key(db, &USAGE_KEYS[i]);
     }
     if (rc == 0) {
         rc = add_column_if_missing(db, "peer_mesh_acl", "direction", "TEXT NOT NULL DEFAULT 'OUTBOUND'");
@@ -5692,10 +5844,11 @@ static int update_client_on_db(sqlite3 *db,
     /*
      * The other operational records that carry the name follow the account, as Java
      * ClientNameReferenceRepository.rename does; history (connection records, traffic detail)
-     * keeps the name it was captured under. Traffic usage is keyed by name here, so a row a deleted
-     * client of the new name left for the same day gives way to the renamed client's row. Logins
-     * resolve the account by id, so the runtime sessions' name is only what they show; it follows
-     * the account too, as Go renames it.
+     * keeps the name it was captured under. Traffic usage is keyed by the account, so its rows are
+     * renamed in place and a deleted client's rows under the new name stay as they are; the legacy
+     * rows written before client_id existed are found by the old name. Logins resolve the account
+     * by id, so the runtime sessions' name is only what they show; it follows the account too, as
+     * Go renames it.
      */
     static const char *const references_sql[] = {
         "UPDATE specus_client_identity SET client_name = ?1 WHERE client_id = ?2",
@@ -5705,9 +5858,9 @@ static int update_client_on_db(sqlite3 *db,
         "WHERE source_client_id = ?2",
         "UPDATE peer_mesh_acl SET target_client_name = ?1, updated_at = CURRENT_TIMESTAMP "
         "WHERE target_client_id = ?2",
-        "UPDATE OR REPLACE traffic_usage SET client_name = ?1 "
+        "UPDATE traffic_usage SET client_name = ?1 "
         "WHERE client_id = ?2 OR (client_id IS NULL AND client_name = ?3)",
-        "UPDATE OR REPLACE resource_traffic_usage SET client_name = ?1 "
+        "UPDATE resource_traffic_usage SET client_name = ?1 "
         "WHERE client_id = ?2 OR (client_id IS NULL AND client_name = ?3)"
     };
     for (size_t i = 0; rc == 0 && previous_name != NULL && strcmp(previous_name, client_name) != 0
@@ -7436,6 +7589,151 @@ int st_storage_list_connection_stats_visible(const char *path,
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
+/* Java TrafficUsageService's updated_at, Instant.now().toString(): fractional seconds included. */
+static int traffic_usage_updated_at(char out[ST_INSTANT_CAPACITY])
+{
+    char now[ST_INSTANT_CAPACITY];
+    return st_instant_now(now) == 0 && st_instant_public(now, out, ST_INSTANT_CAPACITY) == 0 ? 0 : -1;
+}
+
+/* The account a traffic count belongs to, as Java's flush resolves it. */
+typedef struct {
+    long long id;
+    char tenant_id[64];
+    char client_name[256];
+} traffic_usage_account;
+
+/*
+ * The account by id, or by name when no id is given (Java findClientByName): 1 when it exists,
+ * 0 when it does not (Java then drops the count), -1 on a storage error.
+ */
+static int find_traffic_usage_account(sqlite3 *db, long long client_id, const char *client_name,
+                                      traffic_usage_account *account)
+{
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            client_id > 0 ? "SELECT rowid, tenant_id, client_name FROM client_account WHERE rowid = ?"
+                          : "SELECT rowid, tenant_id, client_name FROM client_account WHERE client_name = ?",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    if (client_id > 0) {
+        sqlite3_bind_int64(stmt, 1, client_id);
+    } else {
+        sqlite3_bind_text(stmt, 1, client_name == NULL ? "" : client_name, -1, SQLITE_TRANSIENT);
+    }
+    int step = sqlite3_step(stmt);
+    int found = step == SQLITE_ROW ? 1 : step == SQLITE_DONE ? 0 : -1;
+    if (found == 1) {
+        account->id = sqlite3_column_int64(stmt, 0);
+        if (copy_text_column(stmt, 1, account->tenant_id, sizeof(account->tenant_id)) != 0
+            || copy_text_column(stmt, 2, account->client_name, sizeof(account->client_name)) != 0) {
+            found = -1;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+/*
+ * Java TrafficUsageService.upsertTrafficUsage: the account's day, (client_id, usage_date), takes
+ * the account's current tenant and name and adds the bytes.
+ */
+static int upsert_traffic_usage_on_db(sqlite3 *db,
+                                      const traffic_usage_account *account,
+                                      const char *usage_date,
+                                      long long upload_bytes,
+                                      long long download_bytes,
+                                      const char *updated_at)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "INSERT INTO traffic_usage(tenant_id, client_id, client_name, usage_date, upload_bytes, download_bytes, "
+        "updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7) "
+        "ON CONFLICT(client_id, usage_date) DO UPDATE SET "
+        "tenant_id = excluded.tenant_id, "
+        "client_name = excluded.client_name, "
+        "upload_bytes = traffic_usage.upload_bytes + excluded.upload_bytes, "
+        "download_bytes = traffic_usage.download_bytes + excluded.download_bytes, "
+        "updated_at = excluded.updated_at",
+        -1,
+        &stmt,
+        NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, account->tenant_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, account->id);
+        sqlite3_bind_text(stmt, 3, account->client_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 4, usage_date, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 5, upload_bytes);
+        sqlite3_bind_int64(stmt, 6, download_bytes);
+        sqlite3_bind_text(stmt, 7, updated_at, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+    } else {
+        rc = -1;
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+/*
+ * Java ResourceTrafficUsage's row, (tenant_id, client_id, resource_type, resource_key, usage_date):
+ * the account's current name and the resource's id and name as given replace the stored ones.
+ */
+static int upsert_resource_traffic_usage_on_db(sqlite3 *db,
+                                               const traffic_usage_account *account,
+                                               const char *resource_type,
+                                               const char *resource_key,
+                                               long long resource_id,
+                                               const char *resource_name,
+                                               const char *usage_date,
+                                               long long upload_bytes,
+                                               long long download_bytes,
+                                               const char *updated_at)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "INSERT INTO resource_traffic_usage(tenant_id, client_id, client_name, resource_type, resource_key, "
+        "resource_id, resource_name, usage_date, upload_bytes, download_bytes, updated_at) "
+        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) "
+        "ON CONFLICT(tenant_id, client_id, resource_type, resource_key, usage_date) DO UPDATE SET "
+        "client_name = excluded.client_name, "
+        "resource_id = excluded.resource_id, "
+        "resource_name = excluded.resource_name, "
+        "upload_bytes = resource_traffic_usage.upload_bytes + excluded.upload_bytes, "
+        "download_bytes = resource_traffic_usage.download_bytes + excluded.download_bytes, "
+        "updated_at = excluded.updated_at",
+        -1,
+        &stmt,
+        NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, account->tenant_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, account->id);
+        sqlite3_bind_text(stmt, 3, account->client_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 4, resource_type, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 5, resource_key, -1, SQLITE_TRANSIENT);
+        if (resource_id > 0) {
+            sqlite3_bind_int64(stmt, 6, resource_id);
+        } else {
+            sqlite3_bind_null(stmt, 6);
+        }
+        if (resource_name == NULL) {
+            sqlite3_bind_null(stmt, 7);
+        } else {
+            sqlite3_bind_text(stmt, 7, resource_name, -1, SQLITE_TRANSIENT);
+        }
+        sqlite3_bind_text(stmt, 8, usage_date, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 9, upload_bytes);
+        sqlite3_bind_int64(stmt, 10, download_bytes);
+        sqlite3_bind_text(stmt, 11, updated_at, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+    } else {
+        rc = -1;
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
 int st_storage_record_traffic_usage(const char *path,
                                     long long client_id,
                                     const char *client_name,
@@ -7443,39 +7741,130 @@ int st_storage_record_traffic_usage(const char *path,
                                     long long upload_bytes,
                                     long long download_bytes)
 {
+    char updated_at[ST_INSTANT_CAPACITY];
+    if (traffic_usage_updated_at(updated_at) != 0) {
+        return -1;
+    }
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
         return -1;
     }
+    traffic_usage_account account;
+    int found = find_traffic_usage_account(db, client_id, client_name, &account);
+    int rc = found < 0 ? -1
+        : found == 0 ? 0
+        : upsert_traffic_usage_on_db(db, &account, usage_date, upload_bytes, download_bytes, updated_at);
+    sqlite3_close(db);
+    return rc;
+}
+
+static char *storage_dup_text(const char *text);
+
+/*
+ * Java resolveResource for one of the account's resource keys: the mapping on the port or the
+ * route of that name, with Java's name for it; no resource is id 0 and "端口 <port>" or the bare
+ * route. *resource_name is the caller's to free.
+ */
+static int resolve_traffic_resource(sqlite3 *db,
+                                    const traffic_usage_account *account,
+                                    const char *resource_key,
+                                    const char **resource_type,
+                                    long long *resource_id,
+                                    char **resource_name)
+{
+    *resource_id = 0;
+    *resource_name = NULL;
+    int http = strncmp(resource_key, "http:", 5U) == 0;
+    const char *route = resource_key + 5;
+    long port = strncmp(resource_key, "tcp:", 4U) == 0 ? strtol(resource_key + 4, NULL, 10) : 0L;
+    *resource_type = http ? "HTTP_ROUTE" : "TCP_SPECUS";
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db,
-        "INSERT INTO traffic_usage(client_id, client_name, usage_date, upload_bytes, download_bytes, updated_at, "
-        "tenant_id) "
-        "VALUES(?1,?2,?3,?4,?5,CURRENT_TIMESTAMP,(SELECT tenant_id FROM client_account WHERE client_name = ?2)) "
-        "ON CONFLICT(client_name, usage_date) DO UPDATE SET "
-        "client_id = COALESCE(traffic_usage.client_id, excluded.client_id), "
-        "tenant_id = COALESCE(traffic_usage.tenant_id, excluded.tenant_id), "
-        "upload_bytes = upload_bytes + excluded.upload_bytes, "
-        "download_bytes = download_bytes + excluded.download_bytes, "
-        "updated_at = excluded.updated_at",
-        -1,
-        &stmt,
-        NULL);
-    if (rc == SQLITE_OK) {
-        if (client_id > 0) {
-            sqlite3_bind_int64(stmt, 1, client_id);
-        } else {
-            sqlite3_bind_null(stmt, 1);
-        }
-        sqlite3_bind_text(stmt, 2, client_name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 3, usage_date, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt, 4, upload_bytes);
-        sqlite3_bind_int64(stmt, 5, download_bytes);
-        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+    if (sqlite3_prepare_v2(db,
+            http ? "SELECT id, route || ' -> ' || target_base_url FROM http_route_mapping "
+                   "WHERE client_name = ?1 AND route = ?2 ORDER BY id LIMIT 1"
+                 : "SELECT id, listen_port || ' -> ' || target_address || ':' || target_port FROM specus_mapping "
+                   "WHERE client_name = ?1 AND listen_port = ?2 ORDER BY id LIMIT 1",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, account->client_name, -1, SQLITE_TRANSIENT);
+    if (http) {
+        sqlite3_bind_text(stmt, 2, route, -1, SQLITE_TRANSIENT);
     } else {
-        rc = -1;
+        sqlite3_bind_int64(stmt, 2, port);
+    }
+    int step = sqlite3_step(stmt);
+    int rc = step == SQLITE_ROW || step == SQLITE_DONE ? 0 : -1;
+    if (step == SQLITE_ROW) {
+        *resource_id = sqlite3_column_int64(stmt, 0);
+        *resource_name = storage_dup_text((const char *)sqlite3_column_text(stmt, 1));
+    } else if (step == SQLITE_DONE && http) {
+        *resource_name = storage_dup_text(route);
+    } else if (step == SQLITE_DONE) {
+        char name[32];
+        snprintf(name, sizeof(name), "端口 %ld", port);
+        *resource_name = storage_dup_text(name);
     }
     sqlite3_finalize(stmt);
+    return rc == 0 && *resource_name == NULL ? -1 : rc;
+}
+
+int st_storage_flush_traffic_usage(const char *path, const st_storage_traffic_delta *deltas, size_t delta_count)
+{
+    if (delta_count == 0U) {
+        return 0;
+    }
+    /* One instant for the whole flush; its UTC date is the day the bytes go to, as in Java. */
+    char now[ST_INSTANT_CAPACITY];
+    char updated_at[ST_INSTANT_CAPACITY];
+    char usage_date[11];
+    if (st_instant_now(now) != 0 || st_instant_public(now, updated_at, sizeof(updated_at)) != 0) {
+        return -1;
+    }
+    memcpy(usage_date, now, 10U);
+    usage_date[10] = '\0';
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    int rc = exec_sql(db, "BEGIN IMMEDIATE");
+    int began = rc == 0;
+    for (size_t i = 0U; rc == 0 && i < delta_count; ++i) {
+        const st_storage_traffic_delta *delta = &deltas[i];
+        if (delta->client_name == NULL || (delta->upload_bytes <= 0 && delta->download_bytes <= 0)) {
+            continue;
+        }
+        traffic_usage_account account;
+        int found = find_traffic_usage_account(db, 0, delta->client_name, &account);
+        if (found <= 0) {
+            /* Gone (renamed or deleted): Java findClientByName finds nothing and drops the bytes. */
+            rc = found;
+            continue;
+        }
+        if (delta->resource_key == NULL || *delta->resource_key == '\0') {
+            rc = upsert_traffic_usage_on_db(db, &account, usage_date, delta->upload_bytes, delta->download_bytes,
+                                            updated_at);
+            continue;
+        }
+        const char *resource_type = NULL;
+        long long resource_id = 0;
+        char *resource_name = NULL;
+        rc = resolve_traffic_resource(db, &account, delta->resource_key, &resource_type, &resource_id,
+                                      &resource_name);
+        if (rc == 0) {
+            rc = upsert_resource_traffic_usage_on_db(db, &account, resource_type, delta->resource_key, resource_id,
+                                                     resource_name, usage_date, delta->upload_bytes,
+                                                     delta->download_bytes, updated_at);
+        }
+        free(resource_name);
+    }
+    if (rc == 0) {
+        rc = exec_sql(db, "COMMIT");
+    }
+    if (rc != 0 && began) {
+        (void)exec_sql(db, "ROLLBACK");
+    }
     sqlite3_close(db);
     return rc == 0 ? 0 : -1;
 }
@@ -7604,56 +7993,23 @@ int st_storage_record_resource_traffic_usage(const char *path,
                                              long long upload_bytes,
                                              long long download_bytes)
 {
+    char updated_at[ST_INSTANT_CAPACITY];
+    if (traffic_usage_updated_at(updated_at) != 0) {
+        return -1;
+    }
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
         return -1;
     }
-    sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db,
-        "INSERT INTO resource_traffic_usage(client_id, client_name, resource_type, resource_key, resource_id, "
-        "resource_name, usage_date, upload_bytes, download_bytes, updated_at, tenant_id) "
-        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,CURRENT_TIMESTAMP,"
-        "(SELECT tenant_id FROM client_account WHERE client_name = ?2)) "
-        "ON CONFLICT(client_name, resource_type, resource_key, usage_date) DO UPDATE SET "
-        "client_id = COALESCE(resource_traffic_usage.client_id, excluded.client_id), "
-        "tenant_id = COALESCE(resource_traffic_usage.tenant_id, excluded.tenant_id), "
-        "resource_id = COALESCE(resource_traffic_usage.resource_id, excluded.resource_id), "
-        "resource_name = excluded.resource_name, "
-        "upload_bytes = upload_bytes + excluded.upload_bytes, "
-        "download_bytes = download_bytes + excluded.download_bytes, "
-        "updated_at = excluded.updated_at",
-        -1,
-        &stmt,
-        NULL);
-    if (rc == SQLITE_OK) {
-        if (client_id > 0) {
-            sqlite3_bind_int64(stmt, 1, client_id);
-        } else {
-            sqlite3_bind_null(stmt, 1);
-        }
-        sqlite3_bind_text(stmt, 2, client_name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 3, resource_type, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 4, resource_key, -1, SQLITE_TRANSIENT);
-        if (resource_id > 0) {
-            sqlite3_bind_int64(stmt, 5, resource_id);
-        } else {
-            sqlite3_bind_null(stmt, 5);
-        }
-        if (resource_name == NULL) {
-            sqlite3_bind_null(stmt, 6);
-        } else {
-            sqlite3_bind_text(stmt, 6, resource_name, -1, SQLITE_TRANSIENT);
-        }
-        sqlite3_bind_text(stmt, 7, usage_date, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt, 8, upload_bytes);
-        sqlite3_bind_int64(stmt, 9, download_bytes);
-        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
-    } else {
-        rc = -1;
-    }
-    sqlite3_finalize(stmt);
+    /* Java writes the resource's id and name as resolved now: a mapping gone is a NULL id. */
+    traffic_usage_account account;
+    int found = find_traffic_usage_account(db, client_id, client_name, &account);
+    int rc = found < 0 ? -1
+        : found == 0 ? 0
+        : upsert_resource_traffic_usage_on_db(db, &account, resource_type, resource_key, resource_id, resource_name,
+                                              usage_date, upload_bytes, download_bytes, updated_at);
     sqlite3_close(db);
-    return rc == 0 ? 0 : -1;
+    return rc;
 }
 
 int st_storage_list_resource_traffic_usage(const char *path,
@@ -9394,7 +9750,8 @@ int st_storage_report_peer_mesh_session(const char *path,
                 /* Java: every path-report is a keepalive; a traffic report is one when it counts bytes. */
                 "last_keepalive_at=CASE WHEN ?4<>'' OR ?1>0 OR ?2>0 THEN CURRENT_TIMESTAMP "
                 "ELSE last_keepalive_at END,"
-                "updated_at=CURRENT_TIMESTAMP "
+                /* Java applyTraffic returns before touching updatedAt when no byte is counted. */
+                "updated_at=CASE WHEN ?4<>'' OR ?1>0 OR ?2>0 THEN CURRENT_TIMESTAMP ELSE updated_at END "
                 "WHERE id=?8 AND status<>'CLOSED' AND NOT " PEER_SESSION_EXPIRED_SQL,
                 -1, &stmt, NULL);
             if (rc == SQLITE_OK) {
