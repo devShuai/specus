@@ -10,6 +10,7 @@ import com.theshuai.specusserver.httpshare.HttpShareStreamRegistry;
 import com.theshuai.specusserver.session.SessionUtil;
 import io.netty.channel.Channel;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.tomcat.websocket.WsSession;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.BinaryMessage;
@@ -18,6 +19,7 @@ import org.springframework.web.socket.PongMessage;
 import org.springframework.web.socket.PingMessage;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
+import org.springframework.web.socket.adapter.NativeWebSocketSession;
 import org.springframework.web.socket.handler.AbstractWebSocketHandler;
 
 import java.io.ByteArrayOutputStream;
@@ -43,11 +45,14 @@ import java.util.concurrent.TimeoutException;
  *   <li>分配连接内 {@code streamId}，向客户端控制连接发送 {@code OPEN} 帧
  *       （metaData 带 {@code source="ws"} + route/relativePath/rawQuery/headers/body）。</li>
  *   <li>把 {@link WebSocketSession} 注册进 {@link WebSocketStreamRegistry}。</li>
- *   <li>浏览器后续的 WebSocket 帧编码为 {@code SWS2} envelope 后写入 {@code DATA(streamId)}。</li>
+ *   <li>浏览器后续的 WebSocket 消息由容器分段交付（每段至多一个 SWS2 payload），编码为
+ *       {@code SWS2} envelope 后写入 {@code DATA(streamId)}；单条消息至多 16 MiB，超出以 1009 关闭；
+ *       等待 credit 的帧超过 1 MiB 时暂停读取浏览器。</li>
  *   <li>客户端从控制连接回送 {@code DATA(streamId)} 时，由 {@code NatServerHandler} 路由到
  *       {@link WebSocketStreamRegistry#get(String)}，再调用 {@link #writeFrame(String, byte[])}
  *       把载荷还原成 WS 帧写回浏览器。</li>
- *   <li>任一端断开 → {@code FIN(streamId)} 传播到对端。</li>
+ *   <li>任一端断开 → {@code FIN(streamId)} 传播到对端；浏览器不带 CLOSE 断开（1006）时客户端收到
+ *       {@code RST 31}。</li>
  * </ol>
  *
  * <p>{@code SWS2} 显式保留 opcode、FIN、RSV、close code/reason 和 payload 长度。
@@ -57,7 +62,22 @@ import java.util.concurrent.TimeoutException;
 public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
     /** WS 流在 CONNECTED metaData 里的 source 标记。 */
     static final String SOURCE_WS = "ws";
+    /** A WebSocket message, in either direction and however fragmented, carries at most 16 MiB. */
     private static final int MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
+    /**
+     * The container hands each browser message over in parts of at most this many bytes (binary)
+     * or characters (text): one part of a binary message fills one SWS2 frame. Tomcat allocates a
+     * message buffer of its full limit for every session, so the 16 MiB message limit cannot be
+     * that buffer; it is counted here instead.
+     */
+    static final int BROWSER_PART_LIMIT = WebSocketSpecusFrame.MAX_PAYLOAD_BYTES;
+    /** Browser reads pause once this much SWS2 data waits on the stream, and resume at half of it. */
+    static final long BROWSER_PAUSE_BYTES = StreamFlowController.INITIAL_WINDOW_BYTES;
+    /** The RST code of a stream whose browser left without a CLOSE, as on the C and .NET servers. */
+    static final long RST_BROWSER_GONE = 31;
+    private static final String BROWSER_GONE_REASON = "WebSocket browser closed";
+    private static final CloseStatus MESSAGE_TOO_BIG =
+            CloseStatus.TOO_BIG_TO_PROCESS.withReason("WebSocket message too big");
     private static final long DEFAULT_CLOSE_CREDIT_TIMEOUT_MILLIS = 5_000;
 
     private final WebSocketStreamRegistry registry;
@@ -65,6 +85,8 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
     /** channelId → clientName，用于关闭时定位要发 DISCONNECTED 的控制连接。 */
     private final Map<String, String> channelClientNames = new ConcurrentHashMap<>();
     private final Map<String, Integer> channelStreamIds = new ConcurrentHashMap<>();
+    /** channelId → the browser-to-device direction, present while the stream is attached. */
+    private final Map<String, BrowserInbound> browserInbound = new ConcurrentHashMap<>();
     private final Map<Integer, Integer> fragmentOpcodes = new ConcurrentHashMap<>();
     private final Map<Integer, ByteArrayOutputStream> fragmentPayloads = new ConcurrentHashMap<>();
 
@@ -82,6 +104,8 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         int streamId = SpecusStreamIds.next();
         session.getAttributes().put(ATTR_CHANNEL_ID, channelId);
         session.getAttributes().put(ATTR_STREAM_ID, streamId);
+        session.setTextMessageSizeLimit(BROWSER_PART_LIMIT);
+        session.setBinaryMessageSizeLimit(BROWSER_PART_LIMIT);
 
         String clientName = (String) session.getAttributes().get(ATTR_CLIENT_NAME);
         String route = (String) session.getAttributes().get(ATTR_ROUTE);
@@ -102,6 +126,7 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         StreamFlowController.get(controlChannel).open(streamId, null);
         channelClientNames.put(channelId, clientName);
         channelStreamIds.put(channelId, streamId);
+        browserInbound.put(channelId, new BrowserInbound(tomcatSession(session)));
 
         NatMessagePacket connected = new NatMessagePacket();
         connected.setNatMessageType(NatMessageType.OPEN);
@@ -128,9 +153,19 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         });
     }
 
+    /**
+     * Messages arrive in parts of at most {@link #BROWSER_PART_LIMIT} instead of whole: the
+     * container then never buffers a 16 MiB message, and each part is forwarded as it comes.
+     */
+    @Override
+    public boolean supportsPartialMessages() {
+        return true;
+    }
+
     @Override
     protected void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
-        handleAppFrame(session, WebSocketSpecusFrame.OPCODE_TEXT, message.isLast(), 0, 0, message.asBytes());
+        // A part never splits a character, so its UTF-8 bytes are exactly the browser's.
+        forwardBrowserPart(session, WebSocketSpecusFrame.OPCODE_TEXT, message.isLast(), message.asBytes());
     }
 
     @Override
@@ -138,7 +173,7 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         java.nio.ByteBuffer buf = message.getPayload();
         byte[] bytes = new byte[buf.remaining()];
         buf.get(bytes);
-        handleAppFrame(session, WebSocketSpecusFrame.OPCODE_BINARY, message.isLast(), 0, 0, bytes);
+        forwardBrowserPart(session, WebSocketSpecusFrame.OPCODE_BINARY, message.isLast(), bytes);
     }
 
     @Override
@@ -146,11 +181,43 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         ByteBuffer payload = message.getPayload();
         byte[] bytes = new byte[payload.remaining()];
         payload.get(bytes);
-        handleAppFrame(session, WebSocketSpecusFrame.OPCODE_PONG, true, 0, 0, bytes);
+        BrowserInbound inbound = attachedInbound(session);
+        if (inbound != null) {
+            sendToDevice(session, inbound, WebSocketSpecusFrame.OPCODE_PONG, true, bytes);
+        }
     }
 
-    private void handleAppFrame(WebSocketSession session, int opcode, boolean finalFragment,
-                                int rsv, int closeCode, byte[] payload) {
+    /**
+     * Forwards one part of a browser text or binary message. Parts after the first continue the
+     * message; a message past {@link #MAX_MESSAGE_BYTES} (UTF-8 bytes for text, as the other
+     * servers count it) closes the browser with 1009 and ends the stream with the same CLOSE.
+     */
+    private void forwardBrowserPart(WebSocketSession session, int opcode, boolean last, byte[] payload) {
+        BrowserInbound inbound = attachedInbound(session);
+        if (inbound == null) {
+            return;
+        }
+        if (payload.length > MAX_MESSAGE_BYTES - inbound.messageBytes) {
+            String channelId = (String) session.getAttributes().get(ATTR_CHANNEL_ID);
+            log.info("[ws-specus][browser->client] channelId={} refused=message-over-16MiB", channelId);
+            detachBrowser(channelId, MESSAGE_TOO_BIG, true);
+            return;
+        }
+        int frameOpcode = inbound.messageOpen ? WebSocketSpecusFrame.OPCODE_CONTINUATION : opcode;
+        inbound.messageOpen = !last;
+        inbound.messageBytes = last ? 0 : inbound.messageBytes + payload.length;
+        sendToDevice(session, inbound, frameOpcode, last, payload);
+    }
+
+    /** The browser-to-device state of the session's stream, or null once the stream ended. */
+    private BrowserInbound attachedInbound(WebSocketSession session) {
+        String channelId = (String) session.getAttributes().get(ATTR_CHANNEL_ID);
+        // Whatever the container still delivers after the stream ended goes nowhere.
+        return channelId == null ? null : browserInbound.get(channelId);
+    }
+
+    private void sendToDevice(WebSocketSession session, BrowserInbound inbound, int opcode,
+                              boolean finalFragment, byte[] payload) {
         String channelId = (String) session.getAttributes().get(ATTR_CHANNEL_ID);
         Integer streamId = (Integer) session.getAttributes().get(ATTR_STREAM_ID);
         String clientName = (String) session.getAttributes().get(ATTR_CLIENT_NAME);
@@ -162,6 +229,7 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
             closeFromBrowser(channelId);
             return;
         }
+        StreamFlowController flow = StreamFlowController.get(controlChannel);
         int offset = 0;
         boolean first = true;
         do {
@@ -171,10 +239,10 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
             offset += length;
             boolean last = offset == payload.length;
             int chunkOpcode = first ? opcode : WebSocketSpecusFrame.OPCODE_CONTINUATION;
-            byte[] framed = new WebSocketSpecusFrame(chunkOpcode, finalFragment && last,
-                    first ? rsv : 0, first ? closeCode : 0, chunk).encode();
-            StreamFlowController.get(controlChannel).sendAtomic(streamId, framed, null,
-                    () -> closeFromBrowser(channelId));
+            byte[] framed = new WebSocketSpecusFrame(chunkOpcode, finalFragment && last, 0, 0, chunk).encode();
+            inbound.queued(framed.length);
+            flow.sendAtomicAsync(streamId, framed, null, () -> closeFromBrowser(channelId))
+                    .whenComplete((ignored, error) -> inbound.sent(framed.length));
             first = false;
         } while (offset < payload.length);
     }
@@ -182,12 +250,15 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) throws Exception {
         String channelId = (String) session.getAttributes().get(ATTR_CHANNEL_ID);
-        if (channelId == null) {
-            return;
+        try {
+            if (channelId != null) {
+                log.info("[ws-specus][browser-closed] channelId={} status={}", channelId, status);
+                detachBrowser(channelId, status, false);
+            }
+        } finally {
+            // Whatever happened above, a share's slot must not stay taken by a closed WebSocket.
+            releaseShareStream(session);
         }
-        log.info("[ws-specus][browser-closed] channelId={} status={}", channelId, status);
-        detachBrowser(channelId, status, false);
-        releaseShareStream(session);
     }
 
     /**
@@ -195,6 +266,7 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
      * and the browser a close frame with {@code status}. Used when a temporary share ends.
      */
     public void terminate(String channelId, CloseStatus status, String resetReason) {
+        endBrowserInbound(channelId);
         String clientName = channelClientNames.remove(channelId);
         Integer streamId = channelStreamIds.remove(channelId);
         Channel controlChannel = clientName == null || streamId == null
@@ -326,6 +398,7 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         if (channelId == null) {
             return;
         }
+        endBrowserInbound(channelId);
         channelClientNames.remove(channelId);
         channelStreamIds.remove(channelId);
         clearFragmentState(streamId);
@@ -352,7 +425,15 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         detachBrowser(channelId, CloseStatus.SERVER_ERROR, true);
     }
 
+    /**
+     * Ends the stream from the browser side. A close code the wire can carry goes to the device as
+     * SWS2 CLOSE + FIN, a close without code (1005) as a CLOSE without code + FIN. A browser that
+     * left without any CLOSE (1006, also Tomcat's report of a write timeout) or with another code
+     * the wire cannot carry gets the stream reset with {@link #RST_BROWSER_GONE}, as the C and .NET
+     * servers do: there is no close handshake to relay.
+     */
     private void detachBrowser(String channelId, CloseStatus status, boolean closeSession) {
+        endBrowserInbound(channelId);
         String clientName = channelClientNames.remove(channelId);
         Integer streamId = channelStreamIds.remove(channelId);
         Channel controlChannel = clientName == null || streamId == null
@@ -371,14 +452,14 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         }
         if (clientName == null || streamId == null) return;
         if (controlChannel == null || !controlChannel.isActive()) return;
-        byte[] reason = status.getReason() == null
-                ? new byte[0] : status.getReason().getBytes(StandardCharsets.UTF_8);
-        if (reason.length > 123) {
-            reason = java.util.Arrays.copyOf(reason, 123);
-        }
-        byte[] close = new WebSocketSpecusFrame(WebSocketSpecusFrame.OPCODE_CLOSE, true, 0,
-                status.getCode(), reason).encode();
         StreamFlowController flow = StreamFlowController.get(controlChannel);
+        byte[] close = closeFrameFor(status);
+        if (close == null) {
+            log.info("[ws-specus][browser->client] channelId={} streamId={} reset=browser-gone status={}",
+                    channelId, streamId, status);
+            flow.reset(streamId, RST_BROWSER_GONE, BROWSER_GONE_REASON);
+            return;
+        }
         CompletableFuture<Void> sequence = flow.sendAtomicAsync(streamId, close, null, null)
                 .thenCompose(ignored -> flow.finishAsync(streamId, null));
         var timeout = controlChannel.eventLoop().schedule(
@@ -396,6 +477,102 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
                     : "websocket close send failed";
             flow.reset(streamId, 8, resetReason);
         });
+    }
+
+    /** The SWS2 CLOSE that relays {@code status}, or null when it has no close to relay. */
+    private static byte[] closeFrameFor(CloseStatus status) {
+        int code = status.getCode();
+        if (code == CloseStatus.NO_STATUS_CODE.getCode()) {
+            return new WebSocketSpecusFrame(WebSocketSpecusFrame.OPCODE_CLOSE, true, 0, 0, null).encode();
+        }
+        if (!WebSocketSpecusFrame.isSendableCloseCode(code)) {
+            return null;
+        }
+        byte[] reason = status.getReason() == null
+                ? new byte[0] : status.getReason().getBytes(StandardCharsets.UTF_8);
+        if (reason.length > 123) {
+            int length = 123;
+            while (length > 0 && (reason[length] & 0xC0) == 0x80) {
+                length--; // never cut a UTF-8 character in two
+            }
+            reason = java.util.Arrays.copyOf(reason, length);
+        }
+        return new WebSocketSpecusFrame(WebSocketSpecusFrame.OPCODE_CLOSE, true, 0, code, reason).encode();
+    }
+
+    /** The stream no longer takes browser data: reads resume so the container sees the browser leave. */
+    private void endBrowserInbound(String channelId) {
+        BrowserInbound inbound = browserInbound.remove(channelId);
+        if (inbound != null) {
+            inbound.close();
+        }
+    }
+
+    /** Tomcat's own session behind {@code session}, whose reads can be suspended, or null. */
+    private static WsSession tomcatSession(WebSocketSession session) {
+        return session instanceof NativeWebSocketSession nativeSession
+                ? nativeSession.getNativeSession(WsSession.class) : null;
+    }
+
+    /**
+     * The browser-to-device direction of one tunnel WebSocket. The part's place in its message
+     * decides its SWS2 opcode, and the message may carry at most {@link #MAX_MESSAGE_BYTES}. While
+     * more than {@link #BROWSER_PAUSE_BYTES} of SWS2 frames wait on the stream (no device credit, or
+     * a data connection that takes no more), the browser is not read, as control-protocol.md asks
+     * of every upstream; otherwise a browser faster than the device fills the 4 MiB stream queue
+     * and the stream is reset (RST 6) long before a 16 MiB message is through.
+     */
+    private static final class BrowserInbound {
+        /** Suspends and resumes reading the browser; null on a container that cannot. */
+        private final WsSession reads;
+        // The message in progress: only the container thread delivering the browser's messages
+        // touches these.
+        private boolean messageOpen;
+        private long messageBytes;
+        // Shared with the data connection's event loop, which completes the queued frames.
+        private long queuedBytes;
+        private boolean paused;
+        private boolean closed;
+
+        private BrowserInbound(WsSession reads) {
+            this.reads = reads;
+        }
+
+        synchronized void queued(int bytes) {
+            queuedBytes += bytes;
+            if (reads != null && !paused && !closed && queuedBytes >= BROWSER_PAUSE_BYTES) {
+                paused = true;
+                try {
+                    reads.suspend();
+                } catch (RuntimeException e) {
+                    log.debug("[ws-specus] suspending browser reads failed: {}", e.toString());
+                }
+            }
+        }
+
+        /** A queued frame was written to the data connection, or dropped with its stream. */
+        synchronized void sent(int bytes) {
+            queuedBytes -= bytes;
+            if (paused && queuedBytes <= BROWSER_PAUSE_BYTES / 2) {
+                resume();
+            }
+        }
+
+        synchronized void close() {
+            closed = true;
+            if (paused) {
+                resume();
+            }
+        }
+
+        private void resume() {
+            paused = false;
+            try {
+                reads.resume();
+            } catch (RuntimeException e) {
+                log.debug("[ws-specus] resuming browser reads failed: {}", e.toString());
+            }
+        }
     }
 
     private static Throwable unwrap(Throwable error) {
