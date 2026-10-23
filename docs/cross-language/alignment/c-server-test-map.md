@@ -558,7 +558,7 @@ Rate批次结束时，四类连通性中Vector、Resource、Rate三类为候选�
 - `test_turn_wire_details`：Java 的原因短语（`unauthorized`、`stale-nonce`、`bad-message-integrity`、`unsupported-transport`、`allocation-mismatch`、`general-relay-*`、`bad-channel-bind`、`channel-in-use`），每个 TURN 应答都带 SOFTWARE；备用端口上的 TURN 请求回 `400 unsupported-endpoint`，未知方法回 `400 unsupported-method`，C 原先不回应、客户端重传到超时；ChannelData 只在主端口读；Refresh 应答配置的 LIFETIME，allocation 仍按请求的较短值到期。
 - `test_udp_socket_options`：监听与 relay socket 的 `SO_RCVBUF`/`SO_SNDBUF`（取 `max(65507, 配置值)`）与 `IP_TOS`（默认 `0x10`），以及关闭时保持内核默认值；C 原先不读这三项配置。
 - `test_expired_permissions_and_channels_recycled`、`test_channel_rebind_moves_peer`：过期的 permission 与 channel 让出位置，同一对端改绑到新通道号后旧号失效、可另作他用；C 原先 32 个位置用过即不回收，改绑后旧号仍有效。
-- `test_advertised_address_fallback`、`test_relay_settings_parsing`：公网地址写成域名时按 Java `InetAddress.getByName` 解析（取 IPv4），解析不了则 STUN/TURN 不启动；未配置公网地址时广播非通配的绑定地址，否则本机主机名解析出的地址（Java `getLocalHost`），relay 地址跟随主端点；通用中继总数 `<= 0` 即关闭、每地址上限 `<= 0` 即不限，relay 端口范围先限幅再按需互换。
+- `test_advertised_address_fallback`、`test_relay_settings_parsing`：公网地址写成域名时按 Java `InetAddress.getByName` 解析（取 IPv4），解析不了则 STUN/TURN 不启动（`peer_mesh_e2e_tests` 的 "the server runs on when STUN/TURN cannot start" 在真实进程上确认服务照常运行：管理 API 与客户端登录照常应答、配置的端口上没有 STUN 应答、能正常停止；C 原先整个进程退出）；未配置公网地址时广播非通配的绑定地址，否则本机主机名解析出的地址（Java `getLocalHost`），relay 地址跟随主端点；通用中继总数 `<= 0` 即关闭、每地址上限 `<= 0` 即不限，relay 端口范围先限幅再按需互换。
 
 新增的 ctest `stun_turn_scale_tests`（同一分支）覆盖：监听与 relay socket 编号超过 `FD_SETSIZE` 时照常双向转发（原先 `select` 的 `FD_SET` 越界，加固构建直接 abort）；260 个通用中继 allocation 之后第 261 个回 `486`，Peer Mesh allocation 照常成功（原先第 257 个回 `508`）；relay 端口随机起点、不重复分配（原先从范围下限顺序分配）。
 
