@@ -6,7 +6,8 @@
  * does; what the server kept is read back through the management API. This is the path
  * protocol/spec/peer-egress.md describes for egress-report: identity and session bound from the
  * authenticated connection, server-bound envelope fields refused, older snapshots ignored and at
- * most 20 reports per control session per minute.
+ * most 20 reports per control session per minute. A second scenario starts the server with a
+ * STUN/TURN listener that cannot start and checks that the server runs on without it.
  *
  * Usage: specus_c_peer_mesh_e2e_tests <path-to-specus-server-c>
  */
@@ -18,11 +19,15 @@
 #include "json.h"
 #include "protocol.h"
 
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 static void random_nonce(char out[33])
@@ -266,6 +271,54 @@ static int scenario_egress_report(test_server *server)
     return failed;
 }
 
+static int stun_turn_port;
+
+/*
+ * A STUN/TURN listener that cannot start, here because the public address does not resolve, is no
+ * reason to stop the server: Java StunTurnServer.run logs it and the server runs on without
+ * STUN/TURN. The management API and client logins answer, nothing answers STUN on the configured
+ * port, and the server still stops cleanly. C used to exit at startup.
+ */
+static int scenario_without_stun_turn(test_server *server)
+{
+    char *token = admin_token(server);
+    CHECK(token != NULL, "admin login failed without STUN/TURN");
+    int status = 0;
+    char *response = NULL;
+    int overview = http_request(server->admin_port, "GET", "/api/admin/overview", NULL, token, &status, &response);
+    free(response);
+    free(token);
+    CHECK(overview == 0 && status == 200, "management overview without STUN/TURN: status %d", status);
+    CHECK(create_credential(server->db_path, "ck_nostun", "nostun-secret", 2) == 0, "credential not stored");
+    runtime_session client;
+    CHECK(egress_login(server, "ck_nostun", "nostun-secret", "machine-nostun", 0, &client, NULL) == 0,
+          "client login without STUN/TURN");
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    CHECK(fd >= 0, "UDP socket");
+    struct timeval timeout = {0, 500000};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    struct sockaddr_in target;
+    memset(&target, 0, sizeof(target));
+    target.sin_family = AF_INET;
+    target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    target.sin_port = htons((unsigned short)stun_turn_port);
+    uint8_t binding[20] = {0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    uint8_t answer[512];
+    int sent = sendto(fd, binding, sizeof(binding), 0, (struct sockaddr *)&target, sizeof(target)) == (ssize_t)sizeof(binding);
+    ssize_t received = recvfrom(fd, answer, sizeof(answer), 0, NULL, NULL);
+    close(fd);
+    CHECK(sent && received < 0, "a STUN Binding was answered (%zd bytes) although STUN/TURN failed to start", received);
+    char line[128];
+    snprintf(line, sizeof(line), "[peer-mesh] standard STUN/TURN UDP server failed to start on %d", stun_turn_port);
+    FILE *log = fopen(server->log_path, "r");
+    char text[16384] = "";
+    size_t text_len = log == NULL ? 0U : fread(text, 1, sizeof(text) - 1U, log);
+    text[text_len] = '\0';
+    if (log != NULL) fclose(log);
+    CHECK(strstr(text, line) != NULL, "no log line \"%s\"", line);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -283,6 +336,16 @@ int main(int argc, char **argv)
     };
     int failures = run_on_fresh_server("egress-report over a real control connection", scenario_egress_report,
                                        peer_mesh);
+    /* RFC 2606 reserves .invalid: the public address never resolves. */
+    static char port_setting[64];
+    stun_turn_port = pick_free_port();
+    snprintf(port_setting, sizeof(port_setting), "SPECUS_PEER_MESH_STUN_TURN_PORT=%d", stun_turn_port);
+    const char *const unresolvable[] = {
+        "SPECUS_PEER_MESH_ENABLED=true", port_setting, "SPECUS_PEER_MESH_BIND_ADDRESS=127.0.0.1",
+        "SPECUS_PEER_MESH_PUBLIC_ADDRESS=no-such-host.invalid", NULL,
+    };
+    failures += run_on_fresh_server("the server runs on when STUN/TURN cannot start", scenario_without_stun_turn,
+                                    unresolvable);
     if (failures != 0) {
         fprintf(stderr, "%d peer mesh scenario(s) failed\n", failures);
         return 1;
