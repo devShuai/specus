@@ -746,11 +746,15 @@ ctest 或 `scripts/` 下的脚本；逐项对照见
   `admin_http_tests` 与 `public_transfer_tests` 的真实 socket 与并发兑换用例覆盖。
 - 多实例：`SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED=true` 时 C 使用 Redis（`src/public_coordination.c`）实现 presence、
   合并 roster revision、全局名称/peer/容量检查、分布式消息限流、配对码兑换与公开 presign 的共享来源 IP 窗口
-  （[public-transfer-cluster.md](public-transfer-cluster.md) 第 6 节）和 STCE2 Pub/Sub 文本/二进制路由；Redis 不可用时关闭
-  本地发现 socket、两个来源 IP 窗口回 `429`，不回退到进程内 presence/routing/计数；`rediss://` 被拒绝。证据：
-  `public_coordination_tests`（独立 `redis-server`，另起一个进程作为第二个实例）、`public_cluster_codec_tests`（STCE2 共享向量）、
+  （[public-transfer-cluster.md](public-transfer-cluster.md) 第 6 节）和 STCE2 Pub/Sub 文本/二进制路由；与 Java 一样，Redis
+  故障只让遇到它的操作失败（加入回 `coordination unavailable` 并以 1008 关闭、两个来源 IP 窗口回 `429`、名称预检回
+  `409`），遇到故障的 presence 续期周期以 1011 关闭本地发现 socket，不回退到进程内 presence/routing/计数；断开的连接
+  按 Lettuce 的指数退避自动重连并重新订阅，不需重启；`rediss://` 被拒绝。证据：
+  `public_coordination_tests`（独立 `redis-server`，另起一个进程作为第二个实例，并在同一端口重启 Redis）、
+  `public_cluster_codec_tests`（STCE2 共享向量）、
   `public_discovery_cluster_e2e`（两个 C 进程共享 Redis：跨实例 roster revision、名称占用、重复 peer、
-  定向文本、二进制 relay、隐藏 peer 回退与续期、跨实例共享的兑换窗口，以及 Redis 停止后两个实例都失败关闭）和 CI 中的
+  定向文本、二进制 relay、隐藏 peer 回退与续期、跨实例共享的兑换窗口、Redis 停止后两个实例都以 1011 失败关闭，
+  以及 Redis 重启后两个实例自动恢复）和 CI 中的
   `java_c_discovery_interop.sh`（Java reference server 与 C server 共享 Redis：roster、全局名称占用和双向定向信令）。
   Go/.NET server 与 C 的 Redis 混部没有证据。
 - 附件 REST 与对象存储：C 只支持 `SPECUS_OBJECT_STORAGE_PROVIDER=aliyun-oss`（第 4.2 节的 OSS V4 签名，

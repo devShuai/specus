@@ -103,9 +103,14 @@ def frame(kind, payload, group=None, flags=0, revision=0):
 
 
 class WebSocket:
-    def __init__(self, port, token, endpoint):
+    def __init__(self, port, token, endpoint, rcvbuf=0):
         self.endpoint = endpoint
-        self.channel = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.channel = socket.socket()
+        if rcvbuf:
+            # Set before connecting so the window stays small once the reader stops.
+            self.channel.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+        self.channel.settimeout(5)
+        self.channel.connect(("127.0.0.1", port))
         ticket = request(port, "POST", "/api/admin/ws-tickets", {"endpoint": endpoint}, token)["ticket"]
         key = base64.b64encode(secrets.token_bytes(16)).decode()
         self.channel.sendall((f"GET /ws/{endpoint}?ticket={urllib.parse.quote(ticket)} HTTP/1.1\r\n"
@@ -190,9 +195,12 @@ class Fixture:
         self.processes = []
         self.binary = str(Path(binary).resolve())
         self.redis_port = free_port()
-        self.spawn("redis", ["redis-server", "--bind", "127.0.0.1", "--port", str(self.redis_port),
-                              "--protected-mode", "yes", "--save", "", "--appendonly", "no",
-                              "--dir", str(self.directory)])
+        self.start_redis("redis")
+
+    def start_redis(self, name):
+        self.spawn(name, ["redis-server", "--bind", "127.0.0.1", "--port", str(self.redis_port),
+                          "--protected-mode", "yes", "--save", "", "--appendonly", "no",
+                          "--dir", str(self.directory)])
         for _ in range(100):
             try:
                 with socket.create_connection(("127.0.0.1", self.redis_port), timeout=0.2) as channel:
@@ -203,6 +211,11 @@ class Fixture:
                 time.sleep(0.05)
         else:
             raise AssertionError("private Redis did not start")
+
+    def subscribers(self):
+        with contextlib.closing(socket.create_connection(("127.0.0.1", self.redis_port), timeout=3)) as channel:
+            resp_command(channel, "PUBSUB", "NUMSUB", PREFIX + ":events")
+            return resp_read(channel)[1]
 
     def spawn(self, name, command, env=None):
         log = self.stack.enter_context((self.directory / (name + ".log")).open("wb"))
@@ -284,8 +297,8 @@ class Fixture:
         resp_command(channel, "PUBLISH", PREFIX + ":events", raw)
         assert resp_read(channel) >= 2, "both server subscriptions must be live"
 
-    def ws(self, port, token, endpoint="connections"):
-        websocket = WebSocket(port, token, endpoint)
+    def ws(self, port, token, endpoint="connections", rcvbuf=0):
+        websocket = WebSocket(port, token, endpoint, rcvbuf)
         self.stack.callback(websocket.close)
         return websocket
 
@@ -433,6 +446,30 @@ def check(binary):
         bob_ws = fixture.ws(two, login(two, "bob"))
         print("ok unknown revocation reason fails closed", flush=True)
 
+        # A browser that stops reading holds up neither the cluster subscriber nor the other sockets
+        # of its instance (C writes each socket on its own thread, never under the shared lock): 8 MB
+        # of kind 4 frames fill its buffers, and the instance's other admin socket still gets every
+        # frame at once, a socket opened afterwards registers, and a kind 5 revocation closes it.
+        stalled = fixture.ws(one, admin_token, rcvbuf=4096)
+        early_bob = fixture.ws(one, login(one, "bob"))
+        filler = "f" * (200 * 1024)
+        identifiers = [9000 + index for index in range(40)] + [9999]
+        for identifier in identifiers:
+            connection = {"id": identifier, "clientId": 0, "success": False,
+                          "failureReason": filler if identifier != 9999 else "last"}
+            fixture.publish(frame(4, {"tenantId": "default", "type": "created", "connection": connection}))
+        for websocket in admin_ws:
+            assert [websocket.read_json()["connection"]["id"] for _ in identifiers] == identifiers
+        late_bob = fixture.ws(one, login(one, "bob"))
+        late_bob.alive()
+        fixture.publish(frame(5, {"tenantId": "default", "username": "bob", "reason": "disabled"}))
+        for websocket in (early_bob, late_bob, bob_ws):
+            websocket.revoked("account disabled")
+        bob_ws = fixture.ws(two, login(two, "bob"))
+        stalled.close()
+        print("ok a stalled admin socket holds up neither the cluster subscriber nor the instance's others",
+              flush=True)
+
         fixture.stop(fixture.processes[0])
         # The actual device's disconnect is a production ConnectionEvent, not
         # a synthetic Redis frame. Publish failure must still deliver locally.
@@ -446,6 +483,20 @@ def check(binary):
         local_bob.revoked("account disabled")
         bob_ws.alive()  # Documented missed Pub/Sub delivery, not fake remote success.
         print("ok Redis failure preserves local event fallback and committed local revocation", flush=True)
+
+        # Lettuce reconnects on its own: with Redis back on the same port every instance subscribes
+        # again and publishes again, so a committed revocation crosses instances without a restart.
+        fixture.start_redis("redis-restarted")
+        deadline = time.monotonic() + 15
+        while fixture.subscribers() < 3:
+            assert time.monotonic() < deadline, "the three C instances did not subscribe again"
+            time.sleep(0.05)
+        request(one, "PUT", "/api/admin/users/bob", {"enabled": True}, admin_token)
+        remote_bob = fixture.ws(two, login(two, "bob"))
+        request(one, "PUT", "/api/admin/users/bob", {"enabled": False}, admin_token)
+        remote_bob.revoked("account disabled")
+        admin_ws[1].alive()
+        print("ok after Redis returns, revocations cross instances again without a restart", flush=True)
 
 
 def check_interop(binary, java_jar, java_executable):

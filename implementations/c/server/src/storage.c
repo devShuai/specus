@@ -9446,8 +9446,60 @@ int st_storage_close_open_peer_mesh_sessions_visible(const char *path,
     return 0;
 }
 
+/*
+ * Bytes of the longest prefix of text that holds at most max_units UTF-16 code units (a Java
+ * String's length) and fits capacity bytes, never ending inside a UTF-8 sequence.
+ */
+static size_t utf16_capped_prefix(const char *text, size_t max_units, size_t capacity)
+{
+    size_t bytes = 0U;
+    size_t units = 0U;
+    while (text[bytes] != '\0') {
+        unsigned char lead = (unsigned char)text[bytes];
+        size_t width = lead >= 0xf0U ? 4U : lead >= 0xe0U ? 3U : lead >= 0xc0U ? 2U : 1U;
+        for (size_t i = 1U; i < width; ++i) {
+            if (((unsigned char)text[bytes + i] & 0xc0U) != 0x80U) {
+                width = 1U;
+                break;
+            }
+        }
+        size_t cost = width == 4U ? 2U : 1U;
+        if (units + cost > max_units || bytes + width > capacity) {
+            break;
+        }
+        bytes += width;
+        units += cost;
+    }
+    return bytes;
+}
+
 int st_storage_record_http_exchange(const char *path, const st_storage_http_exchange_record *record)
 {
+    if (record == NULL) {
+        return -1;
+    }
+    /*
+     * As long as the request head allows, a target is longer than what Java keeps: relativePath
+     * goes to a 1024-character column and rawQuery is capped at 2048 characters. Both stores read
+     * them back into buffers of that size, so they are capped here, before either is written.
+     */
+    st_storage_http_exchange_record capped = *record;
+    char relative_path[sizeof(((st_storage_http_exchange *)NULL)->relative_path)];
+    char raw_query[sizeof(((st_storage_http_exchange *)NULL)->raw_query)];
+    if (record->relative_path != NULL) {
+        size_t len = utf16_capped_prefix(record->relative_path, ST_HTTP_EXCHANGE_PATH_CHARS,
+                                         sizeof(relative_path) - 1U);
+        memcpy(relative_path, record->relative_path, len);
+        relative_path[len] = '\0';
+        capped.relative_path = relative_path;
+    }
+    if (record->raw_query != NULL) {
+        size_t len = utf16_capped_prefix(record->raw_query, ST_HTTP_EXCHANGE_QUERY_CHARS, sizeof(raw_query) - 1U);
+        memcpy(raw_query, record->raw_query, len);
+        raw_query[len] = '\0';
+        capped.raw_query = raw_query;
+    }
+    record = &capped;
     if (st_elasticsearch_traffic_enabled_current()) {
         return st_elasticsearch_record_http(record);
     }
@@ -9501,8 +9553,9 @@ int st_storage_record_http_exchange(const char *path, const st_storage_http_exch
         }
         bind_nullable_text_limit(stmt, 6, record->resource_name == NULL ? record->route : record->resource_name, 511);
         bind_nullable_text_limit(stmt, 7, record->method == NULL ? "" : record->method, 15);
-        bind_nullable_text_limit(stmt, 8, record->relative_path == NULL ? "/" : record->relative_path, 1023);
-        bind_nullable_text_limit(stmt, 9, record->raw_query, 2047);
+        bind_nullable_text_limit(stmt, 8, record->relative_path == NULL ? "/" : record->relative_path,
+                                 (int)sizeof(relative_path) - 1);
+        bind_nullable_text_limit(stmt, 9, record->raw_query, (int)sizeof(raw_query) - 1);
         sqlite3_bind_int(stmt, 10, record->status_code);
         sqlite3_bind_int(stmt, 11, record->success ? 1 : 0);
         bind_nullable_text_limit(stmt, 12, record->error, 2047);
