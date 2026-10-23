@@ -1,8 +1,8 @@
 /*
  * Slow readers of the management WebSockets (/ws/connections, /ws/client-messages) against Java's
  * ConnectionEventsWebSocketHandler and ClientMessagesWebSocketHandler on Tomcat, whose blocking
- * send gives up on a message after 20 s (BLOCKING_SEND_TIMEOUT, left at its default) and closes
- * that session, 1001 "Write timeout", and no other:
+ * send gives each 8 KiB block of a message 20 s (BLOCKING_SEND_TIMEOUT, left at its default) and,
+ * when one is not written in time, closes that session, 1001 "Write timeout", and no other:
  *
  *   1. A real specus-server-c: an administrator's client-messages socket stops reading while a
  *      client sends it 12 MB. The client's control session goes on, and the other management
@@ -15,6 +15,13 @@
  *   3. A real server: admin-to-client writes in flight are bounded at 64 per socket. Past that a
  *      command is answered failed / target-write-failed at once, where Java would queue it (a
  *      documented platform difference); the 64 fail when the target's connection does.
+ *   4. In process: a browser's CLOSE goes ahead of the frames still queued for it, which are
+ *      dropped, as Tomcat sends it between whatever other senders wait for.
+ *   5. In process: a message queued for several stalled sockets counts once against the bound on
+ *      all queued frames (64 MiB), and past that bound a socket with a backlog is closed while one
+ *      that keeps up still gets the next message.
+ *   6. In process: a browser that reads slowly but steadily keeps its socket through a message that
+ *      takes longer than 20 s, since every 8 KiB has its own 20 s.
  *
  *   management_ws_backpressure_tests <specus-server-c>
  */
@@ -30,6 +37,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -47,6 +55,8 @@
 #define SEND_TIMEOUT_MS 20000LL
 /* A receive buffer this small makes the server's writes block soon after the reader stops. */
 #define STALLED_RCVBUF 4096
+/* A segment size this small also keeps the server's send buffer, sized from it, near 46 KB. */
+#define NARROW_MSS 1000
 #define STALL_MESSAGES 200
 #define MESSAGE_CHARS 60000U
 #define RITA_PASSWORD "rita-backpressure-password-2026"
@@ -85,6 +95,9 @@ static int ws_send_frame(int fd, uint8_t opcode, const uint8_t *data, size_t len
     return rc;
 }
 
+/* The payload length of the last frame ws_read_frame read in full. */
+static uint64_t ws_last_payload_len = 0U;
+
 /*
  * Reads one server frame: 1 with its opcode and payload (NUL-terminated, cut to out_len - 1 bytes),
  * 0 when none started before the timeout, -1 when the connection ended or broke off mid-frame.
@@ -106,6 +119,7 @@ static int ws_read_frame(int fd, int timeout_ms, uint8_t *opcode, char *out, siz
         len = 0U;
         for (size_t i = 0; i < extended_len; ++i) len = (len << 8) | extended[i];
     }
+    ws_last_payload_len = len;
     size_t kept = 0U;
     while (len > 0U) {
         uint8_t chunk[16384];
@@ -184,9 +198,10 @@ static int ws_ends_within(int fd, int timeout_ms)
 /*
  * A loopback connection, with the given receive buffer when rcvbuf > 0. It is set before connecting
  * so the window stays small: a reader that stops then holds the sender's writes for good, where a
- * larger buffer would now and then free room and let a write trickle on.
+ * larger buffer would now and then free room and let a write trickle on. With mss > 0 the segment
+ * size is capped as well, which keeps the server's send buffer small (NARROW_MSS).
  */
-static int connect_with_rcvbuf(int port, int rcvbuf)
+static int connect_with_rcvbuf(int port, int rcvbuf, int mss)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in address;
@@ -195,6 +210,7 @@ static int connect_with_rcvbuf(int port, int rcvbuf)
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     address.sin_port = htons((uint16_t)port);
     if (fd < 0 || (rcvbuf > 0 && setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) != 0)
+        || (mss > 0 && setsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof(mss)) != 0)
         || connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
         if (fd >= 0) close(fd);
         return -1;
@@ -222,7 +238,7 @@ static char *management_login(int port, const char *username, const char *passwo
  * Opens /ws/<endpoint> with a fresh ticket over connect_with_rcvbuf; for client-messages the hello
  * is read within hello_ms. The socket, or -1.
  */
-static int ws_open(int port, const char *token, const char *endpoint, int rcvbuf, int hello_ms)
+static int ws_open_ex(int port, const char *token, const char *endpoint, int rcvbuf, int mss, int hello_ms)
 {
     char request_body[64];
     snprintf(request_body, sizeof(request_body), "{\"endpoint\":\"%s\"}", endpoint);
@@ -241,7 +257,7 @@ static int ws_open(int port, const char *token, const char *endpoint, int rcvbuf
              "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
              endpoint, ticket);
     free(ticket);
-    int fd = connect_with_rcvbuf(port, rcvbuf);
+    int fd = connect_with_rcvbuf(port, rcvbuf, mss);
     if (fd < 0 || send_all(fd, (const uint8_t *)request, strlen(request)) != 0) {
         if (fd >= 0) close(fd);
         return -1;
@@ -262,6 +278,17 @@ static int ws_open(int port, const char *token, const char *endpoint, int rcvbuf
         return -1;
     }
     return fd;
+}
+
+static int ws_open(int port, const char *token, const char *endpoint, int rcvbuf, int hello_ms)
+{
+    return ws_open_ex(port, token, endpoint, rcvbuf, 0, hello_ms);
+}
+
+/* A socket whose reader can hold the server's writes with little in between (NARROW_MSS). */
+static int ws_open_narrow(int port, const char *token, const char *endpoint)
+{
+    return ws_open_ex(port, token, endpoint, STALLED_RCVBUF, NARROW_MSS, IO_TIMEOUT_MS);
 }
 
 static int log_contains(const test_server *server, const char *needle)
@@ -466,26 +493,40 @@ static long long event_id(const char *text)
     return at == NULL ? -1 : strtoll(at + strlen("\"connection\":{\"id\":"), NULL, 10);
 }
 
-static int test_backlog_bound(void)
+/* The in-process listener of scenarios 2 and 4-6, its database and the accounts they sign in as. */
+#define IN_PROCESS_SECRET "ws-backlog-jwt-secret-long-enough-2026"
+#define BUDGET_USERS 5
+static char in_process_dir[] = "/tmp/specus-c-ws-backlog-XXXXXX";
+static char in_process_db[256];
+static int in_process_port = -1;
+static char flood_token[1024];
+static char budget_tokens[BUDGET_USERS][1024];
+
+static int start_in_process_listener(void)
 {
-    char dir[] = "/tmp/specus-c-ws-backlog-XXXXXX";
-    CHECK(mkdtemp(dir) != NULL, "temporary directory");
-    char path[256];
-    snprintf(path, sizeof(path), "%s/backlog.db", dir);
-    static const char secret[] = "ws-backlog-jwt-secret-long-enough-2026";
+    CHECK(mkdtemp(in_process_dir) != NULL, "temporary directory");
+    snprintf(in_process_db, sizeof(in_process_db), "%s/backlog.db", in_process_dir);
     setenv("SPECUS_ENV", "test", 1);
     setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
-    setenv("SPECUS_DATABASE_PATH", path, 1);
-    setenv("SPECUS_AUTH_JWT_SECRET", secret, 1);
+    setenv("SPECUS_DATABASE_PATH", in_process_db, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", IN_PROCESS_SECRET, 1);
     st_storage_management_user user;
-    CHECK(st_storage_init(path, 0) == 0
-              && st_storage_create_management_user(path, "flood-admin", "default", "unused-password-hash", "ADMIN", 1,
-                                                   &user) == 0,
-          "account");
-    char token[1024];
-    CHECK(st_security_issue_local_token("flood-admin", "default", "ADMIN", secret, 600, token, sizeof(token)) == 0,
-          "token");
-    /* The listener thread outlives this function. */
+    CHECK(st_storage_init(in_process_db, 0) == 0
+              && st_storage_create_management_user(in_process_db, "flood-admin", "default", "unused-password-hash",
+                                                   "ADMIN", 1, &user) == 0
+              && st_security_issue_local_token("flood-admin", "default", "ADMIN", IN_PROCESS_SECRET, 600, flood_token,
+                                               sizeof(flood_token)) == 0,
+          "flood-admin");
+    for (int i = 0; i < BUDGET_USERS; ++i) {
+        char name[32];
+        snprintf(name, sizeof(name), "budget-%d", i);
+        CHECK(st_storage_create_management_user(in_process_db, name, "default", "unused-password-hash", "USER", 1,
+                                                &user) == 0
+                  && st_security_issue_local_token(name, "default", "USER", IN_PROCESS_SECRET, 600, budget_tokens[i],
+                                                   sizeof(budget_tokens[i])) == 0,
+              "%s", name);
+    }
+    /* The listener thread outlives every function here. */
     static st_admin_server server;
     memset(&server, 0, sizeof(server));
     server.fd = -1;
@@ -494,7 +535,14 @@ static int test_backlog_bound(void)
     CHECK(st_admin_server_start(&server, 0, "") == 0
               && getsockname(server.fd, (struct sockaddr *)&address, &address_len) == 0,
           "listener");
-    int port = ntohs(address.sin_port);
+    in_process_port = ntohs(address.sin_port);
+    return 0;
+}
+
+static int test_backlog_bound(void)
+{
+    int port = in_process_port;
+    const char *token = flood_token;
     int reader = ws_open(port, token, "connections", 0, 0);
     int stalled = ws_open(port, token, "connections", STALLED_RCVBUF, 0);
     CHECK(reader >= 0 && ws_ping_answered(reader) && stalled >= 0 && ws_ping_answered(stalled), "sockets");
@@ -554,8 +602,6 @@ static int test_backlog_bound(void)
     int reader_open = ws_ping_answered(reader);
     close(reader);
     close(stalled);
-    unlink(path);
-    rmdir(dir);
     CHECK(ended && (close_code == 0 || close_code == 1001),
           "the stalled socket must end, unbroken (after %lld events, close %d)", delivered, close_code);
     CHECK(delivered > 0 && delivered < FLOOD_EVENTS - 4096, "the stalled socket got %lld events", delivered);
@@ -583,7 +629,7 @@ static int scenario_in_flight_bound(test_server *server)
     harness_login_environment_extra = "";
     CHECK(logged_in == 0, "client login");
     /* The target never reads its control connection again: the server's writes to it block. */
-    target = connect_with_rcvbuf(server->control_port, STALLED_RCVBUF);
+    target = connect_with_rcvbuf(server->control_port, STALLED_RCVBUF, 0);
     int command_id = 0;
     int success = 0;
     CHECK(target >= 0 && send_login_request(target, &runtime, "control") == 0
@@ -648,6 +694,217 @@ static int scenario_in_flight_bound(test_server *server)
     return 0;
 }
 
+/* ------------------------------------------------------------------------------------------- */
+/* 4. The browser's CLOSE goes ahead of the backlog, in process                                 */
+
+#define CLOSE_AHEAD_EVENTS 200LL
+
+static int test_close_ahead(void)
+{
+    int fd = ws_open_narrow(in_process_port, flood_token, "connections");
+    CHECK(fd >= 0 && ws_ping_answered(fd), "socket");
+    /* About 200 KB of events: some 40 KB fit the socket's buffers, the rest waits in its queue. */
+    for (long long id = 1; id <= CLOSE_AHEAD_EVENTS; ++id) flood_event(id);
+    /* A browser closes 1001 when its page goes away, and then reads what is still coming. */
+    static const uint8_t going_away[2] = {0x03U, 0xe9U};
+    long long started = monotonic_ms();
+    CHECK(ws_send_frame(fd, 0x8U, going_away, sizeof(going_away)) == 0, "close");
+    long long received = 0;
+    int ended = 0;
+    int close_code = 0;
+    char text[8192];
+    for (;;) {
+        uint8_t opcode = 0U;
+        int rc = ws_read_frame(fd, IO_TIMEOUT_MS, &opcode, text, sizeof(text));
+        if (rc == 0) break;
+        if (rc < 0) {
+            ended = 1;
+            break;
+        }
+        if (opcode == 0x8U) {
+            close_code = ((uint8_t)text[0] << 8) | (uint8_t)text[1];
+            ended = ws_ends_within(fd, IO_TIMEOUT_MS);
+            break;
+        }
+        if (opcode == 0x1U) ++received;
+    }
+    long long elapsed = monotonic_ms() - started;
+    close(fd);
+    CHECK(ended && (close_code == 0 || close_code == 1001),
+          "the socket must end after the browser's CLOSE (close %d)", close_code);
+    CHECK(received < CLOSE_AHEAD_EVENTS / 2, "the CLOSE waited behind %lld of the %lld queued events", received,
+          CLOSE_AHEAD_EVENTS);
+    CHECK(elapsed < 3000, "the socket took %lld ms to end after the browser's CLOSE", elapsed);
+    return 0;
+}
+
+/* ------------------------------------------------------------------------------------------- */
+/* 5. Shared frames and the bound on all queued frames, in process                              */
+
+#define SHARED_SOCKETS 6
+#define LARGE_MESSAGE_CHARS (7U * 1024U * 1024U)
+
+static int deliver_to(const char *username, const char *message)
+{
+    char target[64];
+    snprintf(target, sizeof(target), "admin:%s", username);
+    return st_admin_deliver_client_message_to_admin("default", "budget-client", target, message);
+}
+
+/* Reads the next text frame within the timeout; 1 when it carries the message starting with unit. */
+static int expect_message_of(int fd, char unit, size_t chars)
+{
+    char text[256];
+    char needle[24];
+    snprintf(needle, sizeof(needle), "\"message\":\"%c%c%c%c", unit, unit, unit, unit);
+    uint8_t opcode = 0U;
+    return ws_read_frame(fd, IO_TIMEOUT_MS, &opcode, text, sizeof(text)) == 1 && opcode == 0x1U
+        && contains(text, needle) && ws_last_payload_len > chars;
+}
+
+static int test_shared_frames_and_budget(void)
+{
+    char *first = repeated('a', LARGE_MESSAGE_CHARS);
+    char *second = repeated('b', LARGE_MESSAGE_CHARS);
+    CHECK(first != NULL && second != NULL, "messages");
+
+    /* Six stalled sockets of one administrator get two 7 MiB messages and a small one: 14 MiB is
+     * queued for each, held once, so the 64 MiB bound on all queued frames is not reached (six
+     * copies would make 84 MiB) and every socket gets all three. */
+    int shared[SHARED_SOCKETS];
+    int opened = 1;
+    for (int i = 0; i < SHARED_SOCKETS; ++i) opened = (shared[i] = ws_open_narrow(in_process_port, flood_token,
+                                                                                    "client-messages")) >= 0 && opened;
+    CHECK(opened, "shared sockets");
+    CHECK(deliver_to("flood-admin", first) == 0 && deliver_to("flood-admin", second) == 0
+              && deliver_to("flood-admin", "cccc small") == 0,
+          "shared deliveries");
+    int all_three = 1;
+    for (int i = 0; i < SHARED_SOCKETS; ++i) {
+        all_three = all_three && expect_message_of(shared[i], 'a', LARGE_MESSAGE_CHARS)
+            && expect_message_of(shared[i], 'b', LARGE_MESSAGE_CHARS) && expect_message_of(shared[i], 'c', 4U);
+        close(shared[i]);
+    }
+    CHECK(all_three, "a socket was closed although the frames queued for six sockets are held once");
+
+    /* Five users with a stalled socket each get two 7 MiB messages of their own: 70 MiB of distinct
+     * frames. The next message for the first finds a backlog while all queued frames exceed 64 MiB
+     * and closes that socket, its own 7 MiB well within 16 MiB, while the same user's socket that
+     * keeps up gets it. */
+    int stalled[BUDGET_USERS];
+    opened = 1;
+    for (int i = 0; i < BUDGET_USERS; ++i) opened = (stalled[i] = ws_open_narrow(in_process_port, budget_tokens[i],
+                                                                                 "client-messages")) >= 0 && opened;
+    int keeping_up = ws_open(in_process_port, budget_tokens[0], "client-messages", 0, IO_TIMEOUT_MS);
+    CHECK(opened && keeping_up >= 0, "budget sockets");
+    char user[32];
+    int delivered = 1;
+    for (int i = 0; delivered && i < BUDGET_USERS; ++i) {
+        snprintf(user, sizeof(user), "budget-%d", i);
+        delivered = deliver_to(user, first) == 0;
+    }
+    /* Each writer takes its first message up before the second, which then fits any queue. */
+    sleep_ms(300);
+    for (int i = 0; delivered && i < BUDGET_USERS; ++i) {
+        snprintf(user, sizeof(user), "budget-%d", i);
+        delivered = deliver_to(user, second) == 0;
+        if (i == 0) {
+            delivered = delivered && expect_message_of(keeping_up, 'a', LARGE_MESSAGE_CHARS)
+                && expect_message_of(keeping_up, 'b', LARGE_MESSAGE_CHARS);
+        }
+    }
+    CHECK(delivered, "budget deliveries");
+    CHECK(deliver_to("budget-0", "cccc over the bound") == 0, "delivery past the bound");
+    int kept_up = expect_message_of(keeping_up, 'c', 4U);
+    /* The stalled socket ends after what its buffers held, before the second message. */
+    long long frames = 0;
+    int ended = 0;
+    int close_code = 0;
+    for (;;) {
+        char text[256];
+        uint8_t opcode = 0U;
+        int rc = ws_read_frame(stalled[0], IO_TIMEOUT_MS, &opcode, text, sizeof(text));
+        if (rc == 0) break;
+        if (rc < 0) {
+            ended = 1;
+            break;
+        }
+        if (opcode == 0x8U) {
+            close_code = ((uint8_t)text[0] << 8) | (uint8_t)text[1];
+            ended = ws_ends_within(stalled[0], IO_TIMEOUT_MS);
+            break;
+        }
+        ++frames;
+    }
+    for (int i = 0; i < BUDGET_USERS; ++i) close(stalled[i]);
+    close(keeping_up);
+    free(first);
+    free(second);
+    CHECK(kept_up, "the socket that keeps up must get the message past the bound");
+    CHECK(ended && frames < 2 && (close_code == 0 || close_code == 1001),
+          "past the bound on all queued frames the stalled socket must be closed (%lld frames, close %d)", frames,
+          close_code);
+    return 0;
+}
+
+/* ------------------------------------------------------------------------------------------- */
+/* 6. A slow but steady reader, in process                                                      */
+
+#define SLOW_MESSAGE_CHARS 320000U
+/* 1200 bytes every 100 ms, about 12 KB/s: the message takes over 20 s, each 8 KiB under one. */
+#define SLOW_READ_BYTES 1200U
+#define SLOW_READ_INTERVAL_MS 100
+
+static int test_slow_reader_kept(void)
+{
+    int fd = ws_open_narrow(in_process_port, flood_token, "client-messages");
+    char *message = repeated('z', SLOW_MESSAGE_CHARS);
+    size_t capacity = SLOW_MESSAGE_CHARS + 4096U;
+    uint8_t *frame = (uint8_t *)malloc(capacity);
+    CHECK(fd >= 0 && message != NULL && frame != NULL, "socket");
+    long long started = monotonic_ms();
+    int delivered = st_admin_deliver_client_message_to_admin("default", "slow-reader-client", "admin:flood-admin",
+                                                             message) == 0;
+    free(message);
+    size_t have = 0U;
+    size_t need = 0U;
+    int broken = !delivered;
+    while (!broken && monotonic_ms() < started + 60000LL) {
+        size_t want = SLOW_READ_BYTES;
+        if (need > 0U && need - have < want) want = need - have;
+        if (capacity - have < want) want = capacity - have;
+        ssize_t got = recv(fd, frame + have, want, MSG_DONTWAIT);
+        if (got == 0 || (got < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+            broken = 1;
+            break;
+        }
+        if (got > 0) have += (size_t)got;
+        /* The JSON is longer than 65535 bytes: a 10-byte header with a 64-bit length. */
+        if (need == 0U && have >= 10U) {
+            uint64_t len = 0U;
+            for (size_t i = 2U; i < 10U; ++i) len = (len << 8) | frame[i];
+            need = (frame[1] & 0x7fU) == 127U && len <= capacity - 10U ? (size_t)len + 10U : capacity + 1U;
+            if (need > capacity) {
+                broken = 1;
+                break;
+            }
+        }
+        if (need > 0U && have >= need) break;
+        sleep_ms(SLOW_READ_INTERVAL_MS);
+    }
+    long long elapsed = monotonic_ms() - started;
+    size_t z_count = 0U;
+    for (size_t i = 10U; i < have; ++i) z_count += frame[i] == 'z';
+    int open = !broken && ws_ping_answered(fd);
+    close(fd);
+    free(frame);
+    CHECK(!broken && need > 0U && have >= need && z_count == SLOW_MESSAGE_CHARS,
+          "the slow reader was dropped after %zu of %zu bytes (%lld ms)", have, need, elapsed);
+    CHECK(elapsed > SEND_TIMEOUT_MS, "the message took %lld ms, within a single 20 s timeout", elapsed);
+    CHECK(open, "the slow reader's socket must stay open");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -660,10 +917,24 @@ int main(int argc, char **argv)
     int failed = run_on_fresh_server("a stalled client-messages reader holds up no one and is closed after 20 s",
                                      scenario_stalled_reader, NULL);
     failed |= run_on_fresh_server("64 admin-to-client writes in flight per socket", scenario_in_flight_bound, NULL);
-    /* In process, and last: on failure its broadcaster may be stuck for good. */
-    int backlog_failed = test_backlog_bound();
-    printf("%s a connections reader 4096 frames behind is closed at once\n", backlog_failed ? "FAIL" : "ok  ");
-    failed |= backlog_failed;
+    /* In process, and last: on failure a broadcaster may be stuck for good. */
+    static const struct {
+        int (*run)(void);
+        const char *name;
+    } in_process[] = {
+        {test_backlog_bound, "a connections reader 4096 frames behind is closed at once"},
+        {test_close_ahead, "the browser's CLOSE goes ahead of what is queued"},
+        {test_shared_frames_and_budget, "queued frames are held once and bounded at 64 MiB in all"},
+        {test_slow_reader_kept, "a slow but steady reader keeps its socket past 20 s"},
+    };
+    int listener_failed = start_in_process_listener();
+    for (size_t i = 0; i < sizeof(in_process) / sizeof(in_process[0]); ++i) {
+        int case_failed = listener_failed || in_process[i].run();
+        printf("%s %s\n", case_failed ? "FAIL" : "ok  ", in_process[i].name);
+        failed |= case_failed;
+    }
+    unlink(in_process_db);
+    rmdir(in_process_dir);
     if (failed) return 1;
     printf("management WebSocket backpressure tests passed\n");
     return 0;

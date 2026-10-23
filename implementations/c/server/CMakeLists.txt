@@ -241,9 +241,11 @@ add_test(NAME client_messages_tests
     COMMAND specus_c_client_messages_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(client_messages_tests PROPERTIES TIMEOUT 120)
 
-# Slow management WebSocket readers against Java's 20 s Tomcat send timeout: a stalled socket holds
-# up no other socket, control session or revocation, and is closed after the timeout or once 4096
-# frames wait behind it; admin-to-client writes in flight per socket. A real server and in process.
+# Slow management WebSocket readers against Java's Tomcat send timeout (20 s per 8 KiB): a stalled
+# socket holds up no other socket, control session or revocation, and is closed after the timeout,
+# once 4096 frames wait behind it or past 64 MiB queued in all; a slow but steady reader is kept; a
+# browser's CLOSE goes ahead of the backlog; admin-to-client writes in flight per socket. A real
+# server and in process.
 add_executable(specus_c_management_ws_backpressure_tests tests/management_ws_backpressure_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_management_ws_backpressure_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_management_ws_backpressure_tests PRIVATE -Wall -Wextra -Wpedantic)

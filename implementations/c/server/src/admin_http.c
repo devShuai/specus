@@ -86,22 +86,29 @@
 #define ST_ADMIN_WS_CLOSE_INTERNAL_ERROR 1011U
 /*
  * Java's management handlers send with Tomcat's blocking send and leave its timeout at the default
- * (org.apache.tomcat.websocket.BLOCKING_SEND_TIMEOUT, 20 s): a message not written within it ends
- * the session with CLOSE 1001 "Write timeout", which, like a revocation's 1008, gets Tomcat's
- * abnormal close send budget (ABNORMAL_SESSION_CLOSE_SEND_TIMEOUT, 50 ms) before the connection
- * is closed.
+ * (org.apache.tomcat.websocket.BLOCKING_SEND_TIMEOUT, 20 s). Tomcat encodes a text message in
+ * blocks of its 8 KiB buffer and gives each block a fresh timeout, so a browser that reads slowly
+ * may take any time over a message as long as each 8 KiB goes out within 20 s. When one does not,
+ * the session ends with CLOSE 1001 "Write timeout", which, like any CLOSE other than 1000 (a
+ * revocation's 1008, say), gets Tomcat's abnormal close send budget
+ * (ABNORMAL_SESSION_CLOSE_SEND_TIMEOUT, 50 ms) before the connection is closed.
  */
 #define ST_ADMIN_WS_SEND_TIMEOUT_MS 20000LL
+#define ST_ADMIN_WS_SEND_BLOCK_BYTES (8U * 1024U)
 #define ST_ADMIN_WS_ABNORMAL_CLOSE_SEND_MS 50LL
 /* How often a blocked management socket writer checks whether its time was cut short. */
 #define ST_ADMIN_WS_WRITE_POLL_MS 50LL
 /*
  * Each management socket has its own writer, so a stalled browser holds up nothing but itself;
- * Java needs no queue because its sender blocks instead. The backlog behind a writer is bounded:
- * past either limit the socket is closed 1001 as a timed-out one is.
+ * Java needs no queue because its sender blocks instead. The backlog behind a writer is bounded,
+ * per socket and, since a frame is shared by every socket it is queued for, over all frames still
+ * to be sent: past a limit a socket with a backlog is closed 1001 as a timed-out one is.
  */
 #define ST_ADMIN_WS_MAX_QUEUED_FRAMES 4096U
 #define ST_ADMIN_WS_MAX_QUEUED_BYTES (16U * 1024U * 1024U)
+#define ST_ADMIN_WS_MAX_TOTAL_QUEUED_BYTES (64U * 1024U * 1024U)
+/* The writer only copies frames to the socket; the default 8 MiB stack is not needed. */
+#define ST_ADMIN_WS_WRITER_STACK_BYTES (256U * 1024U)
 
 static int admin_base64_decode_alloc(const char *encoded, uint8_t **out, size_t *out_len);
 static const char *admin_reason_phrase(int status);
@@ -160,13 +167,23 @@ typedef struct {
     int oidc_bearer;
 } st_admin_context;
 
-/* One frame, header and payload, waiting for a management socket's writer. */
+/*
+ * One frame, header and payload, shared by every management socket it is queued for, so that a
+ * broadcast or a large client message is held once however many sockets still have to send it.
+ * refs is guarded by admin_ws_frames_lock.
+ */
 typedef struct admin_ws_frame {
-    struct admin_ws_frame *next;
+    size_t refs;
     size_t len;
     uint8_t opcode;
     uint8_t bytes[];
 } admin_ws_frame;
+
+/* A socket's place in line for a frame. */
+typedef struct admin_ws_queued {
+    struct admin_ws_queued *next;
+    admin_ws_frame *frame;
+} admin_ws_queued;
 
 typedef struct st_admin_ws_client {
     int fd;
@@ -179,15 +196,16 @@ typedef struct st_admin_ws_client {
     size_t pending_message_writes;
     pthread_cond_t pending_cond;
     /*
-     * Only the writer thread writes the socket, frame by frame from this queue (out_lock), each
-     * within ST_ADMIN_WS_SEND_TIMEOUT_MS; it shuts the socket down after a CLOSE or when it gives
-     * up. Nobody else waits on the socket, least of all with admin_ws_lock held.
+     * Only the writer thread writes the socket, frame by frame from this queue (out_lock), with
+     * ST_ADMIN_WS_SEND_TIMEOUT_MS for each ST_ADMIN_WS_SEND_BLOCK_BYTES; it shuts the socket down
+     * after a CLOSE or when it gives up. Nobody else waits on the socket, least of all with
+     * admin_ws_lock held.
      */
     pthread_t writer;
     pthread_mutex_t out_lock;
     pthread_cond_t out_cond;
-    admin_ws_frame *out_head;
-    admin_ws_frame *out_tail;
+    admin_ws_queued *out_head;
+    admin_ws_queued *out_tail;
     size_t out_frames;
     size_t out_bytes;
     /* Nothing more may be queued: a CLOSE is queued or sent, or the writer gave up. */
@@ -293,6 +311,10 @@ static void admin_direct_ws_share_cut(st_admin_direct_ws_stream *stream);
 static pthread_mutex_t admin_direct_ws_ref_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t admin_ws_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_ws_client *admin_ws_clients = NULL;
+/* Guards admin_ws_frame.refs and the bytes of all management frames some socket has yet to send;
+ * taken last, after admin_ws_lock and a socket's out_lock. */
+static pthread_mutex_t admin_ws_frames_lock = PTHREAD_MUTEX_INITIALIZER;
+static size_t admin_ws_frame_bytes = 0U;
 static void admin_ws_revoke_identity(const char *tenant_id, const char *username, const char *reason);
 static pthread_mutex_t admin_nat_control_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_nat_control_handler admin_nat_control_handler = NULL;
@@ -17410,6 +17432,7 @@ void st_admin_direct_ws_release(st_admin_direct_ws_stream *stream)
     }
 }
 
+/* A frame with one reference, the caller's; NULL when it cannot be built. */
 static admin_ws_frame *admin_ws_frame_new(uint8_t opcode, const uint8_t *payload, size_t payload_len)
 {
     if (payload == NULL) {
@@ -17424,86 +17447,161 @@ static admin_ws_frame *admin_ws_frame_new(uint8_t opcode, const uint8_t *payload
     if (frame == NULL) {
         return NULL;
     }
-    frame->next = NULL;
+    frame->refs = 1U;
     frame->len = header_len + payload_len;
     frame->opcode = opcode;
     memcpy(frame->bytes, header, header_len);
     if (payload_len > 0U) {
         memcpy(frame->bytes + header_len, payload, payload_len);
     }
+    pthread_mutex_lock(&admin_ws_frames_lock);
+    admin_ws_frame_bytes += frame->len;
+    pthread_mutex_unlock(&admin_ws_frames_lock);
     return frame;
 }
 
-/* Frees what waits for the writer; out_lock held, or the writer gone. */
+static void admin_ws_frame_hold(admin_ws_frame *frame)
+{
+    pthread_mutex_lock(&admin_ws_frames_lock);
+    ++frame->refs;
+    pthread_mutex_unlock(&admin_ws_frames_lock);
+}
+
+/* Drops one reference; the last one frees the frame. */
+static void admin_ws_frame_release(admin_ws_frame *frame)
+{
+    if (frame == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&admin_ws_frames_lock);
+    int last = --frame->refs == 0U;
+    if (last) {
+        admin_ws_frame_bytes -= frame->len;
+    }
+    pthread_mutex_unlock(&admin_ws_frames_lock);
+    if (last) {
+        free(frame);
+    }
+}
+
+/* The bytes of all frames some management socket still has to send. */
+static size_t admin_ws_frames_total(void)
+{
+    pthread_mutex_lock(&admin_ws_frames_lock);
+    size_t total = admin_ws_frame_bytes;
+    pthread_mutex_unlock(&admin_ws_frames_lock);
+    return total;
+}
+
+/* Lets go of what waits for the writer; out_lock held, or the writer gone. */
 static void admin_ws_drop_queue(st_admin_ws_client *client)
 {
     while (client->out_head != NULL) {
-        admin_ws_frame *frame = client->out_head;
-        client->out_head = frame->next;
-        free(frame);
+        admin_ws_queued *queued = client->out_head;
+        client->out_head = queued->next;
+        admin_ws_frame_release(queued->frame);
+        free(queued);
     }
     client->out_tail = NULL;
     client->out_frames = 0U;
     client->out_bytes = 0U;
 }
 
-/* out_lock held. A CLOSE is the last frame the socket gets. */
-static void admin_ws_append_locked(st_admin_ws_client *client, admin_ws_frame *frame)
+/* Puts the socket in line for the frame, with a reference of its own; out_lock held. A CLOSE is the
+ * last frame the socket gets. */
+static int admin_ws_append_locked(st_admin_ws_client *client, admin_ws_frame *frame)
 {
-    if (client->out_tail == NULL) {
-        client->out_head = frame;
-    } else {
-        client->out_tail->next = frame;
+    admin_ws_queued *queued = (admin_ws_queued *)malloc(sizeof(*queued));
+    if (queued == NULL) {
+        return -1;
     }
-    client->out_tail = frame;
+    admin_ws_frame_hold(frame);
+    queued->frame = frame;
+    queued->next = NULL;
+    if (client->out_tail == NULL) {
+        client->out_head = queued;
+    } else {
+        client->out_tail->next = queued;
+    }
+    client->out_tail = queued;
     ++client->out_frames;
     client->out_bytes += frame->len;
     if (frame->opcode == 0x8U) {
         client->out_closed = 1;
     }
     pthread_cond_signal(&client->out_cond);
+    return 0;
 }
 
 /*
- * Ends the socket out of turn (out_lock held): what is still queued is dropped and CLOSE
- * code/reason becomes the last frame. As Tomcat gives a CLOSE other than 1000, the writer has
- * ST_ADMIN_WS_ABNORMAL_CLOSE_SEND_MS to send it, the frame it may be in the middle of included,
- * and otherwise just ends the connection.
+ * Ends the socket's output out of turn (out_lock held): what is still queued is dropped and a CLOSE
+ * with this payload becomes the next frame after the one being written, as Tomcat sends a CLOSE
+ * ahead of whatever other senders wait for. A code other than 1000 gets
+ * ST_ADMIN_WS_ABNORMAL_CLOSE_SEND_MS for the frame in progress and the CLOSE, after which the
+ * connection just ends; 1000 (or no code) the usual send timeout.
  */
-static void admin_ws_abort_locked(st_admin_ws_client *client, uint16_t code, const char *reason)
+static void admin_ws_close_out_locked(st_admin_ws_client *client, const uint8_t *payload, size_t payload_len)
 {
     if (client->out_closed) {
         return;
     }
     admin_ws_drop_queue(client);
-    uint8_t payload[125];
-    size_t payload_len = admin_ws_close_payload(code, reason, payload);
-    admin_ws_frame *frame = admin_ws_frame_new(0x8U, payload, payload_len);
-    client->out_abort_ms = admin_monotonic_ms() + ST_ADMIN_WS_ABNORMAL_CLOSE_SEND_MS;
-    client->out_closed = 1;
-    if (frame != NULL) {
-        admin_ws_append_locked(client, frame);
+    if (payload_len >= 2U && admin_read_u16_be(payload) != 1000U) {
+        long long abort_ms = admin_monotonic_ms() + ST_ADMIN_WS_ABNORMAL_CLOSE_SEND_MS;
+        if (client->out_abort_ms == 0 || client->out_abort_ms > abort_ms) {
+            client->out_abort_ms = abort_ms;
+        }
     }
+    admin_ws_frame *frame = admin_ws_frame_new(0x8U, payload, payload_len);
+    if (frame != NULL) {
+        (void)admin_ws_append_locked(client, frame);
+        admin_ws_frame_release(frame);
+    }
+    client->out_closed = 1;
     pthread_cond_signal(&client->out_cond);
 }
 
+/* admin_ws_close_out_locked with code and reason (a revocation's 1008, a full queue's 1001). */
+static void admin_ws_abort_locked(st_admin_ws_client *client, uint16_t code, const char *reason)
+{
+    uint8_t payload[125];
+    size_t payload_len = admin_ws_close_payload(code, reason, payload);
+    admin_ws_close_out_locked(client, payload, payload_len);
+}
+
+/* A CLOSE from the reading side: the answer to the browser's, or the refusal of its input. */
+static void admin_ws_send_close(st_admin_ws_client *client, const uint8_t *payload, size_t payload_len)
+{
+    pthread_mutex_lock(&client->out_lock);
+    admin_ws_close_out_locked(client, payload, payload_len);
+    pthread_mutex_unlock(&client->out_lock);
+}
+
 /*
- * Writes bytes for the writer thread without waiting past deadline_ms, or past out_abort_ms, which
- * may be set meanwhile: 0 once written, -1 on a socket error, -2 when the deadline passed first,
- * -3 when the abort time did. *written counts the bytes that went out.
+ * Writes bytes for the writer thread: each block_bytes (when nonzero) has timeout_ms from the end of
+ * the one before, as each of Tomcat's encoder blocks has, and nothing waits past out_abort_ms,
+ * which may be set meanwhile. 0 once written, -1 on a socket error, -2 when a block timed out, -3
+ * when the abort time passed. *written counts the bytes that went out.
  */
 static int admin_ws_write_bounded(st_admin_ws_client *client,
                                   const uint8_t *data,
                                   size_t len,
-                                  long long deadline_ms,
+                                  long long timeout_ms,
+                                  size_t block_bytes,
                                   size_t *written)
 {
+    long long deadline_ms = admin_monotonic_ms() + timeout_ms;
+    size_t block_end = block_bytes;
     size_t offset = 0U;
     int rc = 0;
     while (offset < len) {
         ssize_t sent = send(client->fd, data + offset, len - offset, MSG_DONTWAIT | MSG_NOSIGNAL);
         if (sent > 0) {
             offset += (size_t)sent;
+            if (block_bytes > 0U && offset >= block_end) {
+                deadline_ms = admin_monotonic_ms() + timeout_ms;
+                block_end = offset - offset % block_bytes + block_bytes;
+            }
             continue;
         }
         if (sent < 0 && errno == EINTR) {
@@ -17540,10 +17638,11 @@ static int admin_ws_write_bounded(st_admin_ws_client *client,
 }
 
 /*
- * The only writer of a management socket. A frame not written within ST_ADMIN_WS_SEND_TIMEOUT_MS
- * ends the connection as Tomcat's failed blocking send ends the session: a CLOSE 1001 "Write
- * timeout" with the abnormal close budget, then the connection is shut down. The CLOSE is skipped
- * after part of a frame went out, where it would only corrupt the stream.
+ * The only writer of a management socket. An 8 KiB block not written within
+ * ST_ADMIN_WS_SEND_TIMEOUT_MS ends the connection as Tomcat's failed blocking send ends the
+ * session: a CLOSE 1001 "Write timeout" with the abnormal close budget, then the connection is
+ * shut down. The CLOSE is skipped after part of a frame went out, where it would only corrupt the
+ * stream.
  */
 static void *admin_ws_writer_thread(void *arg)
 {
@@ -17553,27 +17652,29 @@ static void *admin_ws_writer_thread(void *arg)
         while (client->out_head == NULL && !client->out_stop && !client->out_closed) {
             pthread_cond_wait(&client->out_cond, &client->out_lock);
         }
-        admin_ws_frame *frame = client->out_head;
-        if (frame == NULL) {
+        admin_ws_queued *queued = client->out_head;
+        if (queued == NULL) {
             /* Aborted without a CLOSE to send (it could not be built): the connection just ends. */
             if (!client->out_stop) {
                 shutdown(client->fd, SHUT_RDWR);
             }
             break;
         }
-        client->out_head = frame->next;
+        admin_ws_frame *frame = queued->frame;
+        client->out_head = queued->next;
         if (client->out_head == NULL) {
             client->out_tail = NULL;
         }
         --client->out_frames;
         client->out_bytes -= frame->len;
         pthread_mutex_unlock(&client->out_lock);
+        free(queued);
 
         size_t written = 0U;
-        int rc = admin_ws_write_bounded(client, frame->bytes, frame->len,
-                                        admin_monotonic_ms() + ST_ADMIN_WS_SEND_TIMEOUT_MS, &written);
+        int rc = admin_ws_write_bounded(client, frame->bytes, frame->len, ST_ADMIN_WS_SEND_TIMEOUT_MS,
+                                        ST_ADMIN_WS_SEND_BLOCK_BYTES, &written);
         int close_sent = rc == 0 && frame->opcode == 0x8U;
-        free(frame);
+        admin_ws_frame_release(frame);
         if (rc == 0 && !close_sent) {
             pthread_mutex_lock(&client->out_lock);
             continue;
@@ -17587,9 +17688,8 @@ static void *admin_ws_writer_thread(void *arg)
                 admin_ws_frame *timeout_close = admin_ws_frame_new(0x8U, payload, payload_len);
                 if (timeout_close != NULL) {
                     (void)admin_ws_write_bounded(client, timeout_close->bytes, timeout_close->len,
-                                                 admin_monotonic_ms() + ST_ADMIN_WS_ABNORMAL_CLOSE_SEND_MS,
-                                                 &written);
-                    free(timeout_close);
+                                                 ST_ADMIN_WS_ABNORMAL_CLOSE_SEND_MS, 0U, &written);
+                    admin_ws_frame_release(timeout_close);
                 }
             }
         }
@@ -17620,7 +17720,14 @@ static st_admin_ws_client *admin_ws_add(int fd,
     pthread_cond_init(&client->pending_cond, NULL);
     pthread_mutex_init(&client->out_lock, NULL);
     pthread_cond_init(&client->out_cond, NULL);
-    if (pthread_create(&client->writer, NULL, admin_ws_writer_thread, client) != 0) {
+    pthread_attr_t writer_attr;
+    int started = pthread_attr_init(&writer_attr) == 0;
+    if (started) {
+        (void)pthread_attr_setstacksize(&writer_attr, ST_ADMIN_WS_WRITER_STACK_BYTES);
+        started = pthread_create(&client->writer, &writer_attr, admin_ws_writer_thread, client) == 0;
+        pthread_attr_destroy(&writer_attr);
+    }
+    if (!started) {
         pthread_cond_destroy(&client->out_cond);
         pthread_mutex_destroy(&client->out_lock);
         pthread_cond_destroy(&client->pending_cond);
@@ -17672,39 +17779,48 @@ static void admin_ws_remove(st_admin_ws_client *client)
 }
 
 /*
- * Queues one frame for the socket's writer; -1 when the socket takes nothing more. A frame past
- * the backlog limits closes the socket (1001) instead, but an empty queue takes any one frame, so
- * every single message can go out, as Java sends it.
+ * Puts the socket in line for a frame, which may be queued for other sockets too; -1 when the
+ * socket takes nothing more. A socket whose backlog is past its own limits, or that has a backlog
+ * while all frames still to be sent exceed ST_ADMIN_WS_MAX_TOTAL_QUEUED_BYTES, is closed (1001)
+ * instead. An empty queue takes any one frame, so a socket that keeps up gets every message, as
+ * Java sends it.
  */
-static int admin_ws_send_frame(st_admin_ws_client *client,
-                               uint8_t opcode,
-                               const uint8_t *payload,
-                               size_t payload_len)
+static int admin_ws_enqueue(st_admin_ws_client *client, admin_ws_frame *frame)
 {
-    admin_ws_frame *frame = admin_ws_frame_new(opcode, payload, payload_len);
     int rc = -1;
     size_t backlog_frames = 0U;
     size_t backlog_bytes = 0U;
     pthread_mutex_lock(&client->out_lock);
-    if (frame == NULL || client->out_closed) {
-        free(frame);
+    if (client->out_closed) {
+        rc = -1;
     } else if (client->out_frames > 0U
                && (client->out_frames >= ST_ADMIN_WS_MAX_QUEUED_FRAMES
                    || client->out_bytes > ST_ADMIN_WS_MAX_QUEUED_BYTES
-                   || frame->len > ST_ADMIN_WS_MAX_QUEUED_BYTES - client->out_bytes)) {
+                   || frame->len > ST_ADMIN_WS_MAX_QUEUED_BYTES - client->out_bytes
+                   || admin_ws_frames_total() > ST_ADMIN_WS_MAX_TOTAL_QUEUED_BYTES)) {
         backlog_frames = client->out_frames;
         backlog_bytes = client->out_bytes;
-        free(frame);
         admin_ws_abort_locked(client, ST_ADMIN_WS_CLOSE_GOING_AWAY, "Send queue full");
     } else {
-        admin_ws_append_locked(client, frame);
-        rc = 0;
+        rc = admin_ws_append_locked(client, frame);
     }
     pthread_mutex_unlock(&client->out_lock);
     if (backlog_frames > 0U) {
         fprintf(stderr, "[admin] %s WebSocket of %s/%s: %zu frames (%zu bytes) unsent; closing it\n",
                 client->endpoint, client->tenant_id, client->username, backlog_frames, backlog_bytes);
     }
+    return rc;
+}
+
+/* Queues one frame for this socket alone; -1 as admin_ws_enqueue. */
+static int admin_ws_send_frame(st_admin_ws_client *client,
+                               uint8_t opcode,
+                               const uint8_t *payload,
+                               size_t payload_len)
+{
+    admin_ws_frame *frame = admin_ws_frame_new(opcode, payload, payload_len);
+    int rc = frame == NULL ? -1 : admin_ws_enqueue(client, frame);
+    admin_ws_frame_release(frame);
     return rc;
 }
 
@@ -18083,7 +18199,8 @@ typedef int (*admin_ws_text_handler)(st_admin_ws_client *client, const char *tex
  * reassembled from its fragments, may hold at most max_chars UTF-16 code units (1009 otherwise) of
  * valid UTF-8 (1007 otherwise); binary closes 1003; unmasked frames, set RSV bits, broken
  * fragmentation and fragmented or oversized control frames close 1002; pings are answered and a
- * close is echoed. Each text message goes to on_text, or is dropped when it is NULL.
+ * close is echoed. Each text message goes to on_text, or is dropped when it is NULL. These CLOSE
+ * frames go ahead of anything still queued for the socket (admin_ws_send_close).
  */
 static void admin_drain_text_websocket(st_admin_ws_client *client, size_t max_chars, admin_ws_text_handler on_text)
 {
@@ -18117,7 +18234,7 @@ static void admin_drain_text_websocket(st_admin_ws_client *client, size_t max_ch
         int protocol_error = rsv != 0U || (control_frame && (!fin || payload_len > 125U));
         if (protocol_error || too_large) {
             uint8_t close_payload[2] = {0x03U, too_large ? 0xf1U : 0xeaU};
-            (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
+            admin_ws_send_close(client, close_payload, sizeof(close_payload));
             break;
         }
         uint8_t mask[4] = {0U, 0U, 0U, 0U};
@@ -18132,7 +18249,7 @@ static void admin_drain_text_websocket(st_admin_ws_client *client, size_t max_ch
          * is read first, so that the close is not cut off by unread input. */
         if (!masked) {
             uint8_t close_payload[2] = {0x03U, 0xeaU};
-            (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
+            admin_ws_send_close(client, close_payload, sizeof(close_payload));
             free(payload);
             break;
         }
@@ -18142,11 +18259,11 @@ static void admin_drain_text_websocket(st_admin_ws_client *client, size_t max_ch
         if (opcode == 0x8U) {
             if (payload_len == 1U) {
                 uint8_t close_payload[2] = {0x03U, 0xeaU};
-                (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
+                admin_ws_send_close(client, close_payload, sizeof(close_payload));
                 free(payload);
                 break;
             }
-            (void)admin_ws_send_frame(client, 0x8U, payload, payload_len <= 125U ? (size_t)payload_len : 0U);
+            admin_ws_send_close(client, payload, payload_len <= 125U ? (size_t)payload_len : 0U);
             free(payload);
             break;
         }
@@ -18162,14 +18279,14 @@ static void admin_drain_text_websocket(st_admin_ws_client *client, size_t max_ch
         /* TextWebSocketHandler refuses binary messages with 1003. */
         if (opcode == 0x2U) {
             uint8_t close_payload[2] = {0x03U, 0xebU};
-            (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
+            admin_ws_send_close(client, close_payload, sizeof(close_payload));
             free(payload);
             break;
         }
         if ((opcode == 0x1U && fragment_active) || (opcode == 0x0U && !fragment_active)
             || (opcode != 0x0U && opcode != 0x1U)) {
             uint8_t close_payload[2] = {0x03U, 0xeaU};
-            (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
+            admin_ws_send_close(client, close_payload, sizeof(close_payload));
             free(payload);
             break;
         }
@@ -18184,7 +18301,7 @@ static void admin_drain_text_websocket(st_admin_ws_client *client, size_t max_ch
             int utf8_rc = admin_utf8_utf16_units(text, fragmented.len, max_chars, NULL);
             if (utf8_rc != 0) {
                 uint8_t close_payload[2] = {0x03U, utf8_rc == -2 ? 0xf1U : 0xefU};
-                (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
+                admin_ws_send_close(client, close_payload, sizeof(close_payload));
                 break;
             }
             if (on_text != NULL && on_text(client, (const char *)text, fragmented.len) != 0) {
@@ -18202,7 +18319,7 @@ static int admin_client_messages_text(st_admin_ws_client *client, const char *te
     /* The command is read as a C string; a NUL inside it cannot belong to JSON text. */
     if (memchr(text, '\0', len) != NULL) {
         uint8_t close_payload[2] = {0x03U, 0xefU};
-        (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
+        admin_ws_send_close(client, close_payload, sizeof(close_payload));
         return -1;
     }
     admin_handle_client_message_command(client, text);
@@ -18516,7 +18633,13 @@ int st_admin_deliver_client_message_to_admin(const char *tenant_id,
         return -1;
     }
 
-    /* Only queued here, for each socket's writer: a stalled browser holds up no one else. */
+    /* One frame for every session, only queued here for each socket's writer: a stalled browser
+     * holds up no one else. */
+    admin_ws_frame *frame = admin_ws_frame_new(0x1U, (const uint8_t *)builder.data, builder.len);
+    free(builder.data);
+    if (frame == NULL) {
+        return -1;
+    }
     int delivered = 0;
     pthread_mutex_lock(&admin_ws_lock);
     for (st_admin_ws_client *client = admin_ws_clients; client != NULL; client = client->next) {
@@ -18526,12 +18649,12 @@ int st_admin_deliver_client_message_to_admin(const char *tenant_id,
             || strcmp(client->username, username) != 0) {
             continue;
         }
-        if (admin_ws_send_frame(client, 0x1U, (const uint8_t *)builder.data, builder.len) == 0) {
+        if (admin_ws_enqueue(client, frame) == 0) {
             delivered = 1;
         }
     }
     pthread_mutex_unlock(&admin_ws_lock);
-    free(builder.data);
+    admin_ws_frame_release(frame);
     return delivered ? 0 : -1;
 }
 
@@ -18544,16 +18667,19 @@ static void admin_ws_broadcast_connection_local(const char *event_tenant, long l
     if (client_id > 0 && database_path != NULL
         && st_storage_get_client(database_path, client_id, &owner) == 0
         && strcmp(owner.tenant_id, event_tenant) == 0) owner_loaded = 1;
-    /* Only queued here, for each socket's writer: neither a control session nor the cluster
-     * subscriber waits on a browser. */
+    /* One frame for every subscriber, only queued here for each socket's writer: neither a control
+     * session nor the cluster subscriber waits on a browser. */
+    admin_ws_frame *frame = admin_ws_frame_new(0x1U, payload, payload_len);
+    if (frame == NULL) return;
     pthread_mutex_lock(&admin_ws_lock);
     for (st_admin_ws_client *client = admin_ws_clients; client != NULL; client = client->next) {
         if (client->closing || strcmp(client->endpoint, "connections") != 0
             || strcmp(client->tenant_id, event_tenant) != 0) continue;
         if (!client->admin && (!owner_loaded || strcmp(client->username, owner.owner_username) != 0)) continue;
-        (void)admin_ws_send_frame(client, 0x1U, payload, payload_len);
+        (void)admin_ws_enqueue(client, frame);
     }
     pthread_mutex_unlock(&admin_ws_lock);
+    admin_ws_frame_release(frame);
 }
 
 /* Decode identity strings without accepting escaped NUL or nested lookalike fields. */
