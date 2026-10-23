@@ -2678,31 +2678,30 @@ static int direct_ws_data(void *ctx, const char *channel_id, const uint8_t *payl
     return rc;
 }
 
-/* The browser side is done with client DATA of a WebSocket stream: its credit goes back. */
-static void direct_ws_credit(void *ctx, const char *channel_id, size_t bytes)
+/*
+ * The browser side is done with client DATA of a WebSocket stream: its credit goes back. The
+ * stream was opened on the client's active data connection (direct_ws_open), so that one is looked
+ * at alone, without taking every session's map_lock; once another data connection replaced it, the
+ * stream is being closed with its old one and the credit has nowhere to go.
+ */
+static void direct_ws_credit(void *ctx, const char *client_name, const char *channel_id, size_t bytes)
 {
     (void)ctx;
-    specus_session *target_session = NULL;
-    uint32_t stream_id = 0U;
     pthread_mutex_lock(&active_session_lock);
-    for (specus_session *session = active_sessions; session != NULL; session = session->active_next) {
-        pthread_mutex_lock(&session->map_lock);
-        ws_conn *conn = find_ws_conn_locked(session, channel_id);
-        if (conn != NULL) {
-            ++session->references;
-            target_session = session;
-            stream_id = conn->stream_id;
-        }
-        pthread_mutex_unlock(&session->map_lock);
-        if (target_session != NULL) {
-            break;
-        }
-    }
+    specus_session *session = active_data_session_acquire_locked(client_name);
     pthread_mutex_unlock(&active_session_lock);
-    if (target_session != NULL) {
-        (void)send_window_update(target_session, stream_id, bytes);
-        session_reference_release(target_session);
+    if (session == NULL) {
+        return;
     }
+    pthread_mutex_lock(&session->map_lock);
+    ws_conn *conn = find_ws_conn_locked(session, channel_id);
+    int mapped = conn != NULL;
+    uint32_t stream_id = mapped ? conn->stream_id : 0U;
+    pthread_mutex_unlock(&session->map_lock);
+    if (mapped) {
+        (void)send_window_update(session, stream_id, bytes);
+    }
+    session_reference_release(session);
 }
 
 static void direct_ws_close(void *ctx, const char *channel_id, uint32_t reset_code, const char *reason)

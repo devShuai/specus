@@ -149,11 +149,15 @@ typedef void (*st_admin_direct_ws_close_handler)(void *ctx,
                                                  const char *reason);
 /*
  * Gives the client back bytes of NAT credit for client-to-browser DATA it sent on the stream, once
- * the browser side wrote that DATA to the browser or dropped it (a WINDOW_UPDATE). It does nothing
- * for a stream that is no longer mapped. Called with no lock of the browser side held, from the
- * stream's writer thread, its admin thread or the thread that delivered the DATA.
+ * the browser side wrote that DATA to the browser or dropped it (a WINDOW_UPDATE). client_name is
+ * the request's, so the data connection can be found without searching every session. It does
+ * nothing for a stream that is no longer mapped. Called with no lock of the browser side held,
+ * from the stream's writer thread, its admin thread or the thread that delivered the DATA.
  */
-typedef void (*st_admin_direct_ws_credit_handler)(void *ctx, const char *channel_id, size_t bytes);
+typedef void (*st_admin_direct_ws_credit_handler)(void *ctx,
+                                                  const char *client_name,
+                                                  const char *channel_id,
+                                                  size_t bytes);
 /*
  * Reloads a client's routes into its connections and sends it a NAT_CONTROL: 0 when sent, -1 when the
  * client is offline or its control connection cannot be written, ST_ADMIN_NAT_CONTROL_NOT_SENT when its
@@ -261,6 +265,7 @@ int st_admin_server_start_with_forwarder(st_admin_server *server,
                                          const char *static_root,
                                          st_admin_direct_http_forwarder forwarder,
                                          void *forwarder_ctx);
+/* Route WebSockets also need st_admin_set_direct_ws_credit_handler (below) to keep flowing. */
 int st_admin_server_start_with_handlers(st_admin_server *server,
                                         int port,
                                         const char *static_root,
@@ -271,6 +276,11 @@ int st_admin_server_start_with_handlers(st_admin_server *server,
                                         st_admin_direct_ws_close_handler ws_close,
                                         void *ws_ctx);
 void st_admin_set_nat_control_handler(st_admin_nat_control_handler handler, void *ctx);
+/*
+ * Required by every embedder that serves route WebSockets (st_admin_server_start_with_handlers with
+ * a ws_data handler): client-to-browser DATA is credited back only through this handler, so without
+ * it each stream silently stops once the client used its 1 MiB window.
+ */
 void st_admin_set_direct_ws_credit_handler(st_admin_direct_ws_credit_handler handler, void *ctx);
 void st_admin_set_client_runtime_status_handler(st_admin_client_runtime_status_handler handler,
                                                 void *ctx);

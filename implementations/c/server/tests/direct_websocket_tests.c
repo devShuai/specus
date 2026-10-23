@@ -493,11 +493,12 @@ static int client_take_credit(size_t bytes)
 }
 
 /* main.c's direct_ws_credit: the WINDOW_UPDATE for client DATA the browser side is done with. */
-static void fake_ws_credit(void *ctx, const char *channel_id, size_t bytes)
+static void fake_ws_credit(void *ctx, const char *client_name, const char *channel_id, size_t bytes)
 {
     (void)ctx;
     pthread_mutex_lock(&nat.lock);
-    if (nat.stream != NULL && strcmp(channel_id, nat.channel_id) == 0) {
+    /* The client the browser asked for, by which main.c finds the data connection. */
+    if (nat.stream != NULL && strcmp(channel_id, nat.channel_id) == 0 && strcmp(client_name, "Demo client") == 0) {
         nat.client_credit += bytes;
         nat.credited += bytes;
         pthread_cond_broadcast(&nat.cond);
@@ -1625,11 +1626,12 @@ static int test_close_credit_timeout(void)
 #define ENVELOPE_BYTES (MAX_CHUNK + ST_ADMIN_SWS2_HEADER_BYTES)
 
 /*
- * Opens a session whose browser reads nothing, and has the client fill its window with 16 binary
- * frames (frame i all 'a' + i). The client's thread hands each one over at once, the browser side
- * only queueing it, and gets no credit back for what the browser does not read.
+ * Opens a session whose browser reads nothing, and has the client send it binary frames of 64 KiB
+ * (frame i all 'a' + i), 16 of them filling its window. The client's thread hands each one over at
+ * once, the browser side only queueing it, and gets no credit back for what the browser does not
+ * read.
  */
-static int open_stalled(int *fd_out)
+static int open_stalled_with(int *fd_out, size_t envelopes)
 {
     narrow_browser = 1;
     int rc = session_open(fd_out);
@@ -1637,7 +1639,7 @@ static int open_stalled(int *fd_out)
     if (rc != 0) return 1;
     static uint8_t chunk[MAX_CHUNK];
     long long started = now_ms();
-    for (size_t i = 0U; i < WINDOW_ENVELOPES; ++i) {
+    for (size_t i = 0U; i < envelopes; ++i) {
         memset(chunk, (int)('a' + i), sizeof(chunk));
         CHECK(client_send(0x2U, 1, 0U, 0U, chunk, MAX_CHUNK) == ST_ADMIN_DIRECT_WS_ACCEPTED, "frame %zu refused", i);
     }
@@ -1649,6 +1651,11 @@ static int open_stalled(int *fd_out)
     pthread_mutex_unlock(&nat.lock);
     CHECK(credited <= 4U * ENVELOPE_BYTES, "%zu bytes credited back for a browser that reads nothing", credited);
     return 0;
+}
+
+static int open_stalled(int *fd_out)
+{
+    return open_stalled_with(fd_out, WINDOW_ENVELOPES);
 }
 
 /* Reads past whatever reached the browser: 0 once its connection ended within timeout_ms. */
@@ -1760,6 +1767,87 @@ static int test_stalled_browser_close_ahead(void)
     return session_finish(fd);
 }
 
+static int test_stalled_browser_pong_before_queued_close(void)
+{
+    /*
+     * The client's CLOSE waits behind 15 frames the browser has not read: the browser's PING is
+     * still answered right after the frame being written (RFC 6455 5.5.2, as Tomcat's reader
+     * answers between the messages being sent), and the CLOSE stays the last frame.
+     */
+    int fd;
+    if (open_stalled_with(&fd, WINDOW_ENVELOPES - 1U) != 0) return 1;
+    CHECK(client_send(0x8U, 1, 0U, 1000U, "done", 4U) == ST_ADMIN_DIRECT_WS_ACCEPTED, "client CLOSE refused");
+    CHECK(browser_send(fd, 1, 0U, 0x9U, "p", 1U) == 0, "browser ping failed");
+    sleep_ms(200);
+    size_t data_frames = 0U;
+    long pong_at = -1;
+    for (;;) {
+        ws_frame frame;
+        CHECK(browser_read(fd, &frame) == 0, "browser read ended after %zu frames", data_frames);
+        uint8_t opcode = frame.opcode;
+        int ok;
+        if (opcode == 0xAU) {
+            ok = pong_at < 0 && frame.len == 1U && frame.payload[0] == 'p';
+            pong_at = (long)data_frames;
+        } else if (opcode == 0x8U) {
+            ok = data_frames == WINDOW_ENVELOPES - 1U && frame.len == 6U && get_u16(frame.payload) == 1000U
+                && memcmp(frame.payload + 2U, "done", 4U) == 0;
+        } else {
+            ok = opcode == 0x2U && frame.len == MAX_CHUNK && frame.payload[0] == (uint8_t)('a' + data_frames);
+            ++data_frames;
+        }
+        free(frame.payload);
+        CHECK(ok, "unexpected frame (opcode %u) after %zu data frames", opcode, data_frames);
+        if (opcode == 0x8U) break;
+    }
+    CHECK(pong_at >= 0 && pong_at <= 4, "the PONG came after %ld of %u queued frames", pong_at,
+          WINDOW_ENVELOPES - 1U);
+    CHECK(browser_send_close(fd, 1000U, "done") == 0, "browser close reply failed");
+    if (expect_envelope(0U, 0x8U, 1, 1000U, "done", 4U) != 0) return 1;
+    if (expect_nat_end(1, 0U) != 0) return 1;
+    if (browser_expect_eof(fd) != 0) return 1;
+    return session_finish(fd);
+}
+
+static int test_failed_close_answer_keeps_fin(void)
+{
+    /*
+     * A browser that reads nothing pings until the PONGs fill its connection, sends CLOSE and then
+     * resets the connection, so neither the PONG being written nor the answer to its CLOSE can go
+     * out. Its CLOSE still goes to the client and the stream still ends with FIN: a frame the server
+     * makes itself failing is not a browser write failure (RST 31), as when the old synchronous
+     * answer failed.
+     */
+    int fd;
+    narrow_browser = 1;
+    int opened = session_open(&fd);
+    narrow_browser = 0;
+    if (opened != 0) return 1;
+    pthread_mutex_lock(&nat.lock);
+    nat.hold_close = 1;
+    pthread_mutex_unlock(&nat.lock);
+    /* 125-byte PINGs in small bursts, so the PONGs (some replaced while queued) add up to far more
+     * than the about 50 KB the narrow connection holds. */
+    uint8_t ping[125];
+    memset(ping, 'p', sizeof(ping));
+    for (int i = 0; i < 3000; ++i) {
+        CHECK(browser_send(fd, 1, 0U, 0x9U, ping, sizeof(ping)) == 0, "browser ping %d failed", i);
+        if (i % 50 == 49) sleep_ms(1);
+    }
+    CHECK(browser_send_close(fd, 1000U, "bye") == 0, "browser close failed");
+    CHECK(nat_wait_close_held(WAIT_MS) == 0, "browser CLOSE never reached the client");
+    struct linger reset = {.l_onoff = 1, .l_linger = 0};
+    CHECK(setsockopt(fd, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset)) == 0, "linger");
+    close(fd);
+    /* Meanwhile the writer meets the reset connection, while the reading thread waits here. */
+    sleep_ms(300);
+    nat_release_close();
+    if (expect_envelope(0U, 0x8U, 1, 1000U, "bye", 3U) != 0) return 1;
+    if (expect_nat_end(1, 0U) != 0) return 1;
+    CHECK(nat_envelope_count() == 1U, "a PING reached the client");
+    return session_finish(-1);
+}
+
 static int test_client_window_overrun(void)
 {
     /* A client that sends past its window while the browser reads nothing is reset with RST 6 once
@@ -1847,6 +1935,8 @@ int main(void)
         {"a stalled browser's stream ends at once", test_stalled_browser_aborts},
         {"a stalled browser's PING is answered ahead of the queue", test_stalled_browser_pong_ahead},
         {"a stalled browser's CLOSE goes ahead of the queue", test_stalled_browser_close_ahead},
+        {"a stalled browser's PING is answered ahead of a queued CLOSE", test_stalled_browser_pong_before_queued_close},
+        {"a failed answer to the browser's CLOSE keeps the stream's FIN", test_failed_close_answer_keeps_fin},
         {"a client overrunning its window gets RST 6", test_client_window_overrun},
     };
     for (size_t i = 0U; i < sizeof(tests) / sizeof(tests[0]); ++i) {
