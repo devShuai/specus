@@ -3,6 +3,7 @@ package directhttp
 import (
 	"context"
 	"errors"
+	"net"
 	"sync"
 	"time"
 
@@ -17,6 +18,10 @@ const (
 	wsMaxMessageBytes = 16 * 1024 * 1024
 	// Browser close must not hold the HTTP handler forever while the client withholds credit.
 	wsCloseSendTimeout = 5 * time.Second
+	// wsResetBrowserGone 是浏览器没有可转发的 CLOSE 就离开（1006 等）时复位流的 RST 码，与 C/Java/.NET 一致。
+	wsResetBrowserGone    uint32 = 31
+	wsBrowserGoneReason          = "WebSocket browser closed"
+	wsMessageTooBigReason        = "WebSocket message too big"
 )
 
 var errWSSpecusClosed = errors.New("WS 隧道已关闭")
@@ -27,22 +32,27 @@ type WSSendFunc func(frame []byte) error
 // WSFinishFunc 通知客户端流结束（FIN）。
 type WSFinishFunc func() error
 
+// WSResetFunc 以 RST(code, reason) 复位客户端侧的流。
+type WSResetFunc func(code uint32, reason string) error
+
 // WSClosedFunc 在隧道关闭后从 wsStreams 注销。
 type WSClosedFunc func(*WebSocketSpecus)
 
 // WebSocketSpecus 是 HTTP 直转通道的一条浏览器侧 WebSocket 隧道，对齐 Java WebSocketSpecusHandler：
 // 浏览器 WS 消息 -> SWS2 -> DATA(streamID) 发往客户端；客户端回送的 DATA(streamID) 经
-// WriteFrame 还原成 WS 消息写回浏览器；任一端断开时 CLOSE+FIN 传播到对端。
+// WriteFrame 还原成 WS 消息写回浏览器；任一端断开时 CLOSE+FIN 传播到对端，
+// 浏览器不带 CLOSE 断开时客户端收到 RST 31。
 type WebSocketSpecus struct {
 	conn       *websocket.Conn
 	streamID   uint32
 	clientName string
 	sendData   WSSendFunc
 	finish     WSFinishFunc
+	reset      WSResetFunc
 	onClosed   WSClosedFunc
 
 	writeMu    sync.Mutex // 对齐 Java synchronized(session)，串行化浏览器侧写
-	notifyOnce sync.Once  // 浏览器->客户端方向的 CLOSE+FIN 只发一次（对齐 Java detachBrowser first-wins）
+	notifyOnce sync.Once  // 浏览器->客户端方向的 CLOSE+FIN（或 RST）只发一次（对齐 Java detachBrowser first-wins）
 	closeOnce  sync.Once
 	done       chan struct{}
 
@@ -58,11 +68,11 @@ type WebSocketSpecus struct {
 }
 
 func NewWebSocketSpecus(conn *websocket.Conn, streamID uint32, clientName string,
-	sendData WSSendFunc, finish WSFinishFunc, onClosed WSClosedFunc) *WebSocketSpecus {
+	sendData WSSendFunc, finish WSFinishFunc, reset WSResetFunc, onClosed WSClosedFunc) *WebSocketSpecus {
 	conn.SetReadLimit(int64(wsMaxMessageBytes))
 	return &WebSocketSpecus{
 		conn: conn, streamID: streamID, clientName: clientName,
-		sendData: sendData, finish: finish, onClosed: onClosed,
+		sendData: sendData, finish: finish, reset: reset, onClosed: onClosed,
 		done: make(chan struct{}), notifyWindow: make(chan struct{}, 1),
 		sendCredit: wsInitialWindowBytes, fragmentOpcode: -1,
 	}
@@ -80,14 +90,7 @@ func (t *WebSocketSpecus) ReadLoop(ctx context.Context) {
 	for {
 		typ, payload, err := t.conn.ReadMessage()
 		if err != nil {
-			code := websocket.CloseInternalServerErr
-			reason := ""
-			var closeErr *websocket.CloseError
-			if errors.As(err, &closeErr) {
-				code = closeErr.Code
-				reason = closeErr.Text
-			}
-			t.closeFromBrowser(code, reason)
+			t.closeFromBrowser(browserReadClose(err))
 			return
 		}
 		opcode := sws2OpcodeBinary
@@ -99,6 +102,26 @@ func (t *WebSocketSpecus) ReadLoop(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// browserReadClose 把读浏览器失败换算成交给 closeFromBrowser 的关闭码与原因（对齐 C/Java）：
+// 浏览器的 CLOSE 用它的关闭码（不带码为 1005）；不带 CLOSE 的断开在 gorilla 里是 1006（EOF），
+// 连接被复位等网络错误同样记为 1006；超过 16 MiB 的消息 gorilla 已以 1009 关闭浏览器，
+// 客户端收到同一关闭码。本端关闭连接（隧道已结束或请求上下文结束）与 gorilla 判定的协议错误
+// 仍按 1011 处理。
+func browserReadClose(err error) (int, string) {
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return closeErr.Code, closeErr.Text
+	}
+	if errors.Is(err, websocket.ErrReadLimit) {
+		return websocket.CloseMessageTooBig, wsMessageTooBigReason
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && !errors.Is(err, net.ErrClosed) {
+		return websocket.CloseAbnormalClosure, ""
+	}
+	return websocket.CloseInternalServerErr, ""
 }
 
 // sendAppFrame 把一条 WS 消息切成 maxSWS2Payload 的 SWS2 帧，后续分片用 CONTINUATION
@@ -219,7 +242,9 @@ func (t *WebSocketSpecus) CloseFromClient() {
 }
 
 // closeFromBrowser 浏览器侧关闭或写失败：向客户端发 SWS2 CLOSE + FIN 后关闭会话
-// （对齐 Java detachBrowser；close reason 截断到 123 字节）。
+// （对齐 Java detachBrowser）。浏览器 CLOSE 不带码（1005）时转为不带码的 CLOSE + FIN；
+// 浏览器不带 CLOSE 就断开（1006）或关闭码不得上线（1004/1015）时没有可转发的关闭握手，
+// 与 C/Java/.NET 一样以 RST 31 结束流，不发 FIN。
 func (t *WebSocketSpecus) closeFromBrowser(code int, reason string) {
 	ctx, cancel := context.WithTimeout(context.Background(), wsCloseSendTimeout)
 	defer cancel()
@@ -228,18 +253,33 @@ func (t *WebSocketSpecus) closeFromBrowser(code int, reason string) {
 
 func (t *WebSocketSpecus) closeFromBrowserContext(ctx context.Context, code int, reason string) {
 	t.notifyOnce.Do(func() {
-		reasonBytes := []byte(reason)
-		if len(reasonBytes) > sws2MaxCloseReasonBytes {
-			reasonBytes = reasonBytes[:sws2MaxCloseReasonBytes]
+		frame, ok := browserCloseFrame(code, reason)
+		if !ok {
+			_ = t.reset(wsResetBrowserGone, wsBrowserGoneReason)
+			return
 		}
-		if frame, err := encodeSWS2(sws2OpcodeClose, true, 0, uint16(code), reasonBytes); err == nil {
-			if t.takeSendCredit(ctx, len(frame)) {
-				_ = t.sendData(frame)
-			}
+		if t.takeSendCredit(ctx, len(frame)) {
+			_ = t.sendData(frame)
 		}
 		_ = t.finish()
 	})
 	t.Close()
+}
+
+// browserCloseFrame 编码转发浏览器关闭的 SWS2 CLOSE：1005 编为不带码的 CLOSE，可上线的关闭码
+// 带上截断到 123 字节（不拆开 UTF-8 字符）的原因；其余关闭码没有可转发的 CLOSE，返回 false。
+func browserCloseFrame(code int, reason string) ([]byte, bool) {
+	var frame []byte
+	var err error
+	switch {
+	case code == websocket.CloseNoStatusReceived:
+		frame, err = encodeSWS2(sws2OpcodeClose, true, 0, 0, nil)
+	case isSendableCloseCode(code):
+		frame, err = encodeSWS2(sws2OpcodeClose, true, 0, uint16(code), truncateCloseReason(reason))
+	default:
+		return nil, false
+	}
+	return frame, err == nil
 }
 
 // Close 关闭浏览器会话并注销流（对齐 Java closeAll 的 GOING_AWAY），幂等。
