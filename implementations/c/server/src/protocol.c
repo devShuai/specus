@@ -313,6 +313,8 @@ int st_protocol_decode_login_request(const uint8_t *body, size_t body_len, st_lo
         || reader_nullable_long(&reader, &request->client_session_id) != 0
         || reader_string(&reader, &request->access_token) != 0
         || reader_string(&reader, &request->connection_role) != 0
+        /* A null role (marker 0) is refused like an unknown one, as Java's login handler does. */
+        || request->connection_role == NULL
         || (strcmp(request->connection_role, ST_CONNECTION_ROLE_CONTROL) != 0
             && strcmp(request->connection_role, ST_CONNECTION_ROLE_DATA) != 0)) {
         st_login_request_free(request);
