@@ -19,11 +19,16 @@
  *
  * Usage: specus_c_http_connector_tests <path-to-specus-server-c>
  */
+/* prlimit, to narrow a running server's descriptor limit. */
+#define _GNU_SOURCE
 #define main st_prior_nat_stream_test_entry
 #include "nat_stream_tests.c"
 #undef main
 #include "admin_http.h"
 #include "http_share.h"
+
+#include <dirent.h>
+#include <sys/stat.h>
 
 /* ------------------------------------------------------------------------------------------- */
 /* Helpers                                                                                       */
@@ -60,6 +65,22 @@ static long long ended_after(int fd, int timeout_ms, size_t *bytes)
         }
         *bytes += (size_t)received;
     }
+}
+
+/*
+ * The next NAT frame if one starts arriving within wait_ms: 1 with *message, 0 when closed, -1 when
+ * none came. Unlike next_nat_frame with a short deadline, a frame that arrives just as the wait runs
+ * out is read whole rather than cut after its header, which would leave the rest of the connection
+ * unreadable.
+ */
+static int next_frame_when_ready(int fd, int wait_ms, st_nat_message *message)
+{
+    struct pollfd ready = {.fd = fd, .events = POLLIN, .revents = 0};
+    int polled = poll(&ready, 1, wait_ms);
+    if (polled < 0 && errno == EINTR) {
+        return -1;
+    }
+    return polled > 0 ? next_nat_frame(fd, monotonic_ms() + IO_TIMEOUT_MS, message) : -1;
 }
 
 /* Nothing arrives on fd within ms. */
@@ -315,7 +336,7 @@ static int check_stalled_reader(test_server *server, client_pair *pair)
             sent += DATA_CHUNK;
         }
         st_nat_message message;
-        int rc = next_nat_frame(pair->data, monotonic_ms() + 200, &message);
+        int rc = next_frame_when_ready(pair->data, 200, &message);
         if (rc == 0) {
             failed = 1;
         } else if (rc == 1) {
@@ -343,6 +364,196 @@ static int check_stalled_reader(test_server *server, client_pair *pair)
               && exchange_of(server, "/stalled-reader", "success", "1") == 0
               && exchange_of(server, "/stalled-reader", "error", "") == 0,
           "the abandoned exchange must be recorded as Java records a client abort");
+    return expect_data_connection_served(server, pair);
+}
+
+/*
+ * Upgrade headers alone do not take a request out of the connection timeout: one that no WebSocket
+ * handler takes (here a static file) is answered under it like any other, so a caller that stops
+ * reading the answer is dropped about 1 s later. The listener used to drop the timeouts on the
+ * headers alone, and such a caller held the thread for as long as it pleased.
+ */
+static int test_upgrade_headers_keep_timeout(void)
+{
+    test_server server;
+    if (server_prepare(&server) != 0) {
+        return 1;
+    }
+    char static_root[400];
+    char big_file[460];
+    snprintf(static_root, sizeof(static_root), "%s/static", server.dir);
+    snprintf(big_file, sizeof(big_file), "%s/big.bin", static_root);
+    enum { BIG = 32 * 1024 * 1024 };
+    int failed = mkdir(static_root, 0700) != 0;
+    FILE *file = failed ? NULL : fopen(big_file, "wb");
+    char *block = (char *)calloc(1U, 1024U * 1024U);
+    for (int i = 0; file != NULL && block != NULL && i < BIG / (1024 * 1024); ++i) {
+        failed = failed || fwrite(block, 1U, 1024U * 1024U, file) != 1024U * 1024U;
+    }
+    failed = failed || file == NULL || block == NULL;
+    if (file != NULL) {
+        fclose(file);
+    }
+    free(block);
+    char root_assignment[460];
+    snprintf(root_assignment, sizeof(root_assignment), "SPECUS_STATIC_ROOT=%s", static_root);
+    server.extra_env[0] = root_assignment;
+    server.extra_env[1] = "SERVER_TOMCAT_CONNECTION_TIMEOUT=1s";
+    int started = !failed && server_start(&server) == 0;
+    failed = !started;
+    size_t received = 0U;
+    long long ended = -1;
+    if (started) {
+        static const char request[] =
+            "GET /big.bin HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"
+            "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        int small = 4096;
+        struct sockaddr_in address;
+        memset(&address, 0, sizeof(address));
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons((uint16_t)server.admin_port);
+        if (fd >= 0 && setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)) == 0
+            && connect(fd, (struct sockaddr *)&address, sizeof(address)) == 0
+            && send_all(fd, (const uint8_t *)request, sizeof(request) - 1U) == 0) {
+            sleep_ms(4000);
+            ended = ended_after(fd, 20000, &received);
+        }
+        close_fd(&fd);
+        failed = ended < 0 || received >= (size_t)BIG;
+        printf("     the caller read %zu of %d bytes after stalling 4 s\n", received, BIG);
+        if (failed) {
+            fprintf(stderr, "FAIL a request with upgrade headers that no WebSocket took was answered without the "
+                            "connection timeout (ended=%lld, %zu bytes)\n", ended, received);
+        }
+    }
+    if (server.pid > 0 && server_stop(&server, 20000) != 0) {
+        failed = 1;
+    }
+    unlink(big_file);
+    rmdir(static_root);
+    server_cleanup(&server, failed);
+    printf("%s upgrade headers alone keep the connection timeout\n", failed ? "FAIL" : "ok  ");
+    return failed;
+}
+
+/*
+ * A route WebSocket's browser that stops reading: the server's blocking write to it gives up after
+ * Tomcat's 20 s WebSocket send timeout and the client's stream is reset with RST 31. The listener
+ * used to take every timeout off an upgraded socket, so the write waited for good.
+ */
+static int check_route_websocket_send_timeout(test_server *server, client_pair *pair)
+{
+    char client[768];
+    char request[1536];
+    url_encode(pair->runtime.client_name, client, sizeof(client));
+    int len = snprintf(request, sizeof(request),
+                       "GET /http/%s/%s/socket HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n"
+                       "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                       "Sec-WebSocket-Version: 13\r\n\r\n",
+                       client, ROUTE);
+    int browser = socket(AF_INET, SOCK_STREAM, 0);
+    int small = 4096;
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons((uint16_t)server->admin_port);
+    int connected = browser >= 0 && setsockopt(browser, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)) == 0
+        && connect(browser, (struct sockaddr *)&address, sizeof(address)) == 0
+        && send_all(browser, (const uint8_t *)request, (size_t)len) == 0;
+    if (!connected) {
+        close_fd(&browser);
+    }
+    CHECK(connected, "WebSocket browser");
+    uint32_t stream_id = 0U;
+    CHECK(expect_http_open(pair->data, &stream_id) == 0, "no WebSocket OPEN reached the client");
+    uint8_t payload[ST_ADMIN_SWS2_MAX_PAYLOAD];
+    memset(payload, 'w', sizeof(payload));
+    st_admin_sws2_frame frame = {.opcode = 0x2U, .fin = 1, .rsv = 0U, .close_code = 0U,
+                                 .payload = payload, .payload_len = sizeof(payload)};
+    size_t encoded_len = 0U;
+    uint8_t *encoded = st_admin_sws2_encode(&frame, &encoded_len);
+    CHECK(encoded != NULL, "SWS2 envelope");
+    uint64_t credit = INITIAL_WINDOW;
+    long long last_credit = monotonic_ms();
+    long long give_up = last_credit + 60000;
+    int reset = 0;
+    uint32_t code = 0U;
+    int failed = 0;
+    while (!reset && !failed && monotonic_ms() < give_up) {
+        while (!failed && credit >= encoded_len) {
+            failed = send_nat(pair->data, ST_NAT_DATA, 0U, stream_id, 0U, NULL, encoded, encoded_len) != 0;
+            credit -= encoded_len;
+        }
+        st_nat_message message;
+        int rc = next_frame_when_ready(pair->data, 200, &message);
+        if (rc == 0) {
+            failed = 1;
+        } else if (rc == 1) {
+            if (message.stream_id == stream_id && message.type == ST_NAT_WINDOW_UPDATE) {
+                credit += message.value;
+                last_credit = monotonic_ms();
+            } else if (message.stream_id == stream_id && message.type == ST_NAT_RST) {
+                reset = 1;
+                code = message.value;
+            }
+            st_nat_message_free(&message);
+        }
+    }
+    long long stalled_for = monotonic_ms() - last_credit;
+    free(encoded);
+    close_fd(&browser);
+    printf("     the WebSocket was reset %lld ms after its last credit\n", stalled_for);
+    CHECK(!failed, "the data connection failed while the WebSocket streamed");
+    CHECK(reset && code == ST_ADMIN_DIRECT_WS_RST_BROWSER_GONE,
+          "a WebSocket browser that stops reading must get its stream reset with RST 31 (reset=%d code=%u)", reset,
+          code);
+    CHECK(stalled_for >= 18000 && stalled_for <= 35000,
+          "the reset must come about Tomcat's 20 s send timeout after the writes stopped (%lld ms)", stalled_for);
+    return expect_data_connection_served(server, pair);
+}
+
+/*
+ * The data connection fails under an upload: the client granted the window for a 16 MiB body but
+ * reads nothing, so the server's write to the data connection stalls past
+ * SPECUS_CONTROL_WRITE_TIMEOUT_SECONDS (1 s here) and fails. Like a data connection lost under the
+ * stream, that answers 502 "HTTP 转发请求失败" and is recorded as "control channel closed". A
+ * failed write used to be lost (the packet is freed whether or not it went out), and the caller
+ * got "客户端不在线" unless the session's own teardown happened to fail the stream first.
+ */
+static int check_upload_write_failure(test_server *server, client_pair *pair)
+{
+    CHECK(enable_route_capture(server, pair) == 0, "route detail capture");
+    char client[768];
+    char head[1536];
+    url_encode(pair->runtime.client_name, client, sizeof(client));
+    int len = snprintf(head, sizeof(head),
+                       "POST /http/%s/%s/stuck-upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: %u\r\n"
+                       "Connection: close\r\n\r\n",
+                       client, ROUTE, REQUEST_BODY_LIMIT);
+    int browser = browser_raw(server, head, (size_t)len);
+    CHECK(browser >= 0, "upload");
+    uint8_t *body = (uint8_t *)calloc(1U, REQUEST_BODY_LIMIT);
+    int uploaded = body != NULL && send_all(browser, body, REQUEST_BODY_LIMIT) == 0;
+    free(body);
+    CHECK(uploaded, "the 16 MiB body");
+    uint32_t stream_id = 0U;
+    CHECK(expect_http_open(pair->data, &stream_id) == 0, "no request OPEN for the upload");
+    /* The whole body may go out now; nothing more is read from the data connection. */
+    CHECK(send_nat(pair->data, ST_NAT_WINDOW_UPDATE, 0U, stream_id, REQUEST_BODY_LIMIT - INITIAL_WINDOW, NULL, NULL,
+                   0U) == 0,
+          "window for the body");
+    static const char reset_answer[] = "{\"error\":\"" ST_ADMIN_DIRECT_HTTP_RESET_BODY "\"}";
+    CHECK(expect_browser_status_within(browser, 20000, 502, reset_answer, -1) == 0,
+          "a data connection whose write failed under the upload must answer the reset");
+    close_fd(&browser);
+    CHECK(exchange_of(server, "/stuck-upload", "status_code", "502") == 0
+              && exchange_of(server, "/stuck-upload", "error", "control channel closed") == 0,
+          "the failed upload's record");
+    close_fd(&pair->data);
+    CHECK(login_data(server, pair) == 0, "data re-login");
     return expect_data_connection_served(server, pair);
 }
 
@@ -415,27 +626,56 @@ static int test_connection_limit(test_server *server)
 
 /*
  * A failed accept (here: the server out of descriptors) must not end the listener, as it does not
- * end Tomcat's acceptor, which pauses and tries again. The server runs with a soft limit of 64
- * descriptors while 100 connections are opened; once they are closed, a request is served again.
+ * end Tomcat's acceptor, which pauses and tries again. Once started, the server's soft descriptor
+ * limit is set 16 above what it holds, and 100 connections are opened; once they are closed, a
+ * request is served again.
  * The old listener thread returned on the first failed accept, and the management listener with
  * every route and share was gone until the process restarted.
  */
+/* Descriptors a process has open now, -1 when they cannot be listed. */
+static int open_descriptors(pid_t pid)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%ld/fd", (long)pid);
+    DIR *fds = opendir(path);
+    if (fds == NULL) {
+        return -1;
+    }
+    int count = 0;
+    for (struct dirent *entry = readdir(fds); entry != NULL; entry = readdir(fds)) {
+        count += entry->d_name[0] != '.';
+    }
+    closedir(fds);
+    return count;
+}
+
 static int test_accept_failure_recovers(void)
 {
-    struct rlimit saved;
-    if (getrlimit(RLIMIT_NOFILE, &saved) != 0) {
-        return 1;
-    }
     test_server server;
     if (server_prepare(&server) != 0) {
         return 1;
     }
-    struct rlimit low = saved;
-    low.rlim_cur = 64;
-    int limited = setrlimit(RLIMIT_NOFILE, &low) == 0;
-    int started = limited && server_start(&server) == 0;
-    (void)setrlimit(RLIMIT_NOFILE, &saved);
-    int failed = !started;
+    int started = server_start(&server) == 0;
+    /*
+     * Room for 16 descriptors beyond what the started server holds (the harness's readiness probe
+     * is gone by now), so the 100 connections below run it out whatever it opened at startup.
+     */
+    if (started) {
+        sleep_ms(300);
+    }
+    int open = started ? open_descriptors(server.pid) : -1;
+    struct rlimit low = {.rlim_cur = (rlim_t)(open + 16), .rlim_max = 0};
+    struct rlimit current;
+    int limited = open > 0 && prlimit(server.pid, RLIMIT_NOFILE, NULL, &current) == 0;
+    if (limited) {
+        low.rlim_max = current.rlim_max;
+        limited = prlimit(server.pid, RLIMIT_NOFILE, &low, NULL) == 0;
+    }
+    if (started && !limited) {
+        fprintf(stderr, "FAIL cannot limit the server's descriptors (%d open)\n", open);
+    }
+    int failed = !started || !limited;
+    started = started && limited;
     enum { FLOOD = 100 };
     int fds[FLOOD];
     for (size_t i = 0U; i < FLOOD; ++i) {
@@ -456,7 +696,7 @@ static int test_accept_failure_recovers(void)
             fprintf(stderr, "FAIL the listener did not serve again after running out of descriptors\n");
         }
     }
-    if (started && server_stop(&server, 20000) != 0) {
+    if (server.pid > 0 && server_stop(&server, 20000) != 0) {
         failed = 1;
     }
     server_cleanup(&server, failed);
@@ -795,35 +1035,48 @@ static const char *const connection_timeout_env[] = {
     "SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED=true", NULL
 };
 
-static const char *const connection_limit_env[] = {"SERVER_TOMCAT_MAXCONNECTIONS=2", NULL};
+/* Spring's number binding: whitespace anywhere is dropped and 0x, 0X or # is hexadecimal. */
+static const char *const connection_limit_env[] = {"SERVER_TOMCAT_MAXCONNECTIONS= 0x 2 ", NULL};
 
 static const char *const failure_answer_env[] = {
     "SPECUS_CONTROL_READ_IDLE_SECONDS=900", "SPECUS_HTTP_TIMEOUT_MS=1000",
     "SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED=true", NULL
 };
 
-/* An unusable connection timeout refuses the start, as Spring's binding failure does. */
-static int test_invalid_connection_timeout(void)
+static const char *const upload_write_failure_env[] = {
+    "SPECUS_CONTROL_READ_IDLE_SECONDS=900", "SPECUS_CONTROL_WRITE_TIMEOUT_SECONDS=1",
+    "SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED=true", NULL
+};
+
+/*
+ * A server.tomcat value that does not bind refuses the start, as Spring's binding failure does: a
+ * duration that is neither simple nor ISO-8601, and an int that is no Integer.valueOf or
+ * Integer.decode (a second sign, a sign after the hexadecimal prefix, only blanks, overflow).
+ */
+static int test_invalid_connector_settings(void)
 {
-    static const char *const values[] = {"60 s", "1x", "PT", "P1DT", "s"};
+    static const char *const assignments[] = {
+        "SERVER_TOMCAT_CONNECTION_TIMEOUT=60 s", "SERVER_TOMCAT_CONNECTION_TIMEOUT=1x",
+        "SERVER_TOMCAT_CONNECTION_TIMEOUT=PT", "SERVER_TOMCAT_CONNECTION_TIMEOUT=P1DT",
+        "SERVER_TOMCAT_CONNECTION_TIMEOUT=s", "SERVER_TOMCAT_MAX_CONNECTIONS=--5",
+        "SERVER_TOMCAT_MAX_CONNECTIONS=0x-5", "SERVER_TOMCAT_ACCEPT_COUNT=  ", "SERVER_TOMCAT_ACCEPTCOUNT=2147483648"
+    };
     int failures = 0;
-    for (size_t i = 0U; i < sizeof(values) / sizeof(values[0]); ++i) {
+    for (size_t i = 0U; i < sizeof(assignments) / sizeof(assignments[0]); ++i) {
         test_server server;
         if (server_prepare(&server) != 0) {
             return 1;
         }
-        char assignment[64];
-        snprintf(assignment, sizeof(assignment), "SERVER_TOMCAT_CONNECTION_TIMEOUT=%s", values[i]);
-        server.extra_env[0] = assignment;
+        server.extra_env[0] = assignments[i];
         int started = server_start(&server) == 0;
         if (started) {
-            fprintf(stderr, "FAIL the server started with SERVER_TOMCAT_CONNECTION_TIMEOUT=%s\n", values[i]);
+            fprintf(stderr, "FAIL the server started with %s\n", assignments[i]);
             ++failures;
             (void)server_stop(&server, 20000);
         }
         server_cleanup(&server, 0);
     }
-    printf("%s an unusable server.tomcat.connection-timeout refuses the start\n", failures == 0 ? "ok  " : "FAIL");
+    printf("%s unusable server.tomcat settings refuse the start\n", failures == 0 ? "ok  " : "FAIL");
     return failures != 0;
 }
 
@@ -865,9 +1118,15 @@ int main(int argc, char **argv)
                              run_current_check, connection_timeout_env);
     failures += run_scenario("connection timeout leaves an idle WebSocket open", test_websocket_outlives_timeout,
                              connection_timeout_env);
+    if (selected("upgrade headers alone keep the connection timeout")) {
+        failures += test_upgrade_headers_keep_timeout();
+    }
+    current_check = check_route_websocket_send_timeout;
+    failures += run_scenario("a route WebSocket write gives up after Tomcat's 20 s send timeout", run_current_check,
+                             connection_timeout_env);
     failures += run_scenario("connection timeout in ISO-8601", test_iso_connection_timeout, iso_timeout_env);
-    if (selected("connection timeout refuses")) {
-        failures += test_invalid_connection_timeout();
+    if (selected("unusable server.tomcat settings refuse the start")) {
+        failures += test_invalid_connector_settings();
     }
     failures += run_scenario("max-connections holds further connections in the backlog", test_connection_limit,
                              connection_limit_env);
@@ -887,6 +1146,9 @@ int main(int argc, char **argv)
     current_check = check_connection_lost_answer;
     failures += run_scenario("a stream lost with its data connection answers 502 HTTP 转发请求失败",
                              run_current_check, failure_answer_env);
+    current_check = check_upload_write_failure;
+    failures += run_scenario("a data connection write that fails under an upload answers 502 HTTP 转发请求失败",
+                             run_current_check, upload_write_failure_env);
     current_check = check_share_cut_before_head;
     failures += run_scenario("a share cut before the head resets with RST 8 and is recorded", run_current_check,
                              share_env);
