@@ -1587,6 +1587,11 @@ static int session_send_packet(specus_session *session, st_buffer *packet)
     return rc;
 }
 
+/*
+ * The data connection went away: every pending stream fails, as Java NatServerHandler.channelInactive
+ * resets its exchanges with code 9 ("control channel closed"), which the public caller hears as the
+ * stream reset it is, not as a client that was never online.
+ */
 static void direct_pending_fail_all(specus_session *session, const char *message)
 {
     pthread_mutex_lock(&session->direct_lock);
@@ -1595,6 +1600,7 @@ static void direct_pending_fail_all(specus_session *session, const char *message
             free(pending->error);
             pending->error = dup_string(message);
             pending->error_len = pending->error == NULL ? 0U : strlen(pending->error);
+            pending->reset_code = 9U;
             pending->done = 1;
             pthread_cond_broadcast(&pending->cond);
         }
@@ -1857,6 +1863,7 @@ static int process_direct_http_message(specus_session *session, const st_nat_mes
         free(pending->error);
         pending->error = dup_string(reset_reason);
         pending->error_len = pending->error == NULL ? 0U : strlen(pending->error);
+        pending->reset_code = reset_code;
         pending->done = 1;
         pending->reset = 1;
         pthread_cond_broadcast(&pending->cond);
@@ -2001,10 +2008,13 @@ static void active_session_close_data_locked(specus_session *control)
     }
 }
 
-/* Hands a client RST reason to the sink for server-side logging; it never reaches the caller. */
-static int direct_report_client_reset(const st_admin_direct_http_sink *sink,
-                                      uint32_t code,
-                                      const char *reason, size_t reason_len)
+/*
+ * Hands the reason a stream was reset for (the client's RST, this server's own, or the data
+ * connection lost under it) to the sink for server-side logging; it never reaches the caller.
+ */
+static int direct_report_reset(const st_admin_direct_http_sink *sink,
+                               uint32_t code,
+                               const char *reason, size_t reason_len)
 {
     if (sink->on_reset_bytes != NULL) {
         sink->on_reset_bytes(sink->ctx, code, reason, reason_len);
@@ -2397,6 +2407,8 @@ static int direct_http_forward(void *ctx,
         sink->bind_cancel(sink->ctx, direct_pending_cancel, &cancel);
     }
 
+    /* A frame that could not be written to the data connection, which is going away with it. */
+    int write_failed = 0;
     char *request_json = json_http_request(request);
     if (request_json == NULL) {
         goto failed;
@@ -2406,6 +2418,7 @@ static int direct_http_forward(void *ctx,
                                                        request_json, NULL, 0U);
     free(request_json);
     if (packet.data == NULL || session_send_packet(session, &packet) != 0) {
+        write_failed = packet.data != NULL;
         goto failed;
     }
     opened = 1;
@@ -2441,6 +2454,7 @@ static int direct_http_forward(void *ctx,
                                                 pending.stream_id, 0U,
                                                 NULL, request->body + offset, chunk_len);
         if (packet.data == NULL || session_send_packet(session, &packet) != 0) {
+            write_failed = packet.data != NULL;
             goto failed;
         }
         offset += chunk_len;
@@ -2455,6 +2469,7 @@ static int direct_http_forward(void *ctx,
                                             fin_json, NULL, 0U);
     free(fin_json);
     if (packet.data == NULL || session_send_packet(session, &packet) != 0) {
+        write_failed = packet.data != NULL;
         goto failed;
     }
 
@@ -2484,7 +2499,6 @@ static int direct_http_forward(void *ctx,
             pending_error = (char *)malloc(pending_error_len + 1U);
             if (pending_error != NULL) memcpy(pending_error, pending.error, pending_error_len + 1U);
         }
-        int client_reset = pending.client_reset;
         uint32_t reset_code = pending.reset_code;
         pthread_mutex_unlock(&session->direct_lock);
 
@@ -2497,12 +2511,17 @@ static int direct_http_forward(void *ctx,
             break;
         }
         if (result != 0) {
-            send_reset(session, pending.stream_id, 30U, "HTTP response header timeout");
+            /* Java: exchange.awaitResponseHead times out, 504, cancelHttpStream with its message. */
+            send_reset(session, pending.stream_id, ST_ADMIN_DIRECT_HTTP_LOCAL_RESET_CODE,
+                       ST_ADMIN_DIRECT_HTTP_TIMEOUT_TEXT);
             break;
         }
         if (pending_error != NULL) {
-            result = client_reset
-                ? direct_report_client_reset(sink, reset_code, pending_error, pending_error_len) : -1;
+            /*
+             * The client's RST, this server's own reset of a frame it could not take, or the data
+             * connection gone: all are a stream reset to Java, 502 "HTTP 转发请求失败" before the head.
+             */
+            result = direct_report_reset(sink, reset_code, pending_error, pending_error_len);
             free(pending_error);
             break;
         }
@@ -2511,6 +2530,9 @@ static int direct_http_forward(void *ctx,
             break;
         }
 
+        /* A response frame this server cannot use (Java cancels it), or a caller it cannot write to. */
+        const char *local_reset = NULL;
+        int downstream_failed = 0;
         if (event->type == ST_NAT_OPEN) {
             int status_code = 0;
             char **headers = NULL;
@@ -2522,10 +2544,12 @@ static int direct_http_forward(void *ctx,
                                             &headers, &headers_len) == 0
                 && optional_string_array(event->meta_json, "trailerNames",
                                          &trailer_names, &trailer_names_len) == 0;
-            if (!valid || sink->on_headers(sink->ctx, status_code,
-                                            headers, headers_len,
-                                            trailer_names, trailer_names_len) != 0) {
-                result = -4;
+            if (!valid) {
+                local_reset = "invalid HTTP response headers";
+            } else if (sink->on_headers(sink->ctx, status_code,
+                                        headers, headers_len,
+                                        trailer_names, trailer_names_len) != 0) {
+                downstream_failed = 1;
             } else {
                 delivered_head = 1;
             }
@@ -2533,20 +2557,22 @@ static int direct_http_forward(void *ctx,
             st_json_free_string_array(trailer_names, trailer_names_len);
         } else if (event->type == ST_NAT_DATA) {
             if (!delivered_head || sink->on_data(sink->ctx, event->data, event->data_len) != 0) {
-                result = -4;
+                downstream_failed = 1;
             } else {
                 pthread_mutex_lock(&session->direct_lock);
                 if (event->data_len > pending.receive_outstanding
                     || pending.receive_credit > ST_STREAM_MAX_WINDOW - event->data_len) {
-                    result = -1;
+                    local_reset = "HTTP DATA is invalid for the stream state";
                 } else {
                     pending.receive_outstanding -= event->data_len;
                     pending.receive_credit += event->data_len;
                 }
                 pthread_mutex_unlock(&session->direct_lock);
-                if (result == 0
+                if (local_reset == NULL
                     && send_window_update(session, pending.stream_id, event->data_len) != 0) {
-                    result = -1;
+                    /* The data connection failed; its teardown fails the stream the same way. */
+                    result = direct_report_reset(sink, 9U, "control channel closed",
+                                                 strlen("control channel closed"));
                 }
             }
         } else if (event->type == ST_NAT_FIN) {
@@ -2558,15 +2584,33 @@ static int direct_http_forward(void *ctx,
                 trailers = NULL;
                 trailers_len = 0;
             }
+            /* Both directions already ended: a caller gone at the very end needs no RST any more. */
             result = delivered_head && sink->on_end(sink->ctx, trailers, trailers_len) == 0
-                ? 0 : -4;
+                ? 0 : ST_ADMIN_DIRECT_HTTP_DOWNSTREAM_FAILED;
             st_json_free_string_array(trailers, trailers_len);
             direct_event_free(event);
             break;
         }
         direct_event_free(event);
+        if (downstream_failed) {
+            /*
+             * Java: writing the caller failed or timed out (Tomcat's ClientAbortException), so it
+             * cancels the stream with RST 8 and answers nothing more.
+             */
+            send_reset(session, pending.stream_id, ST_ADMIN_DIRECT_HTTP_LOCAL_RESET_CODE, "HTTP downstream closed");
+            result = ST_ADMIN_DIRECT_HTTP_DOWNSTREAM_FAILED;
+            break;
+        }
+        if (local_reset != NULL) {
+            pthread_mutex_lock(&session->direct_lock);
+            pending.reset = 1;
+            pthread_mutex_unlock(&session->direct_lock);
+            send_reset(session, pending.stream_id, ST_ADMIN_DIRECT_HTTP_LOCAL_RESET_CODE, local_reset);
+            result = direct_report_reset(sink, ST_ADMIN_DIRECT_HTTP_LOCAL_RESET_CODE, local_reset,
+                                         strlen(local_reset));
+            break;
+        }
         if (result != 0) {
-            send_reset(session, pending.stream_id, 31U, "HTTP downstream closed");
             break;
         }
     }
@@ -2592,14 +2636,24 @@ failed:
     if (failed_cancelled && opened && !failed_reset) {
         send_reset(session, pending.stream_id, ST_ADMIN_HTTP_SHARE_RESET_CODE, ST_ADMIN_HTTP_SHARE_RESET_REASON);
     } else if (upload_timed_out && !failed_reset) {
-        send_reset(session, pending.stream_id, 30U, "HTTP request body timeout");
+        /* Java: the window for a body chunk did not come in time, 504 and cancelHttpStream. */
+        send_reset(session, pending.stream_id, ST_ADMIN_DIRECT_HTTP_LOCAL_RESET_CODE, ST_ADMIN_DIRECT_HTTP_TIMEOUT_TEXT);
     }
     direct_pending_retire(session, &pending);
-    /* A client RST while the request body was still uploading is reported like one after it. */
+    /*
+     * A reset while the request body was still uploading is reported like one after it. An OPEN
+     * that could not be written is Java's onReset(7, "HTTP OPEN write failed"); a later frame that
+     * could not be written means the data connection is going away under the stream.
+     */
     int failed_result = failed_cancelled ? ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED
         : upload_timed_out ? -2
-        : pending.client_reset && pending.error != NULL
-        ? direct_report_client_reset(sink, pending.reset_code, pending.error, pending.error_len) : -1;
+        : pending.error != NULL
+        ? direct_report_reset(sink, pending.reset_code, pending.error, pending.error_len)
+        : write_failed && !opened
+        ? direct_report_reset(sink, 7U, "HTTP OPEN write failed", strlen("HTTP OPEN write failed"))
+        : write_failed
+        ? direct_report_reset(sink, 9U, "control channel closed", strlen("control channel closed"))
+        : -1;
     free(pending.error);
     pthread_cond_destroy(&pending.cond);
     session_reference_release(session);
@@ -5195,7 +5249,7 @@ static int process_nat_message(specus_session *session, const st_nat_message *me
 
 static void session_shutdown(specus_session *session)
 {
-    direct_pending_fail_all(session, "control connection closed");
+    direct_pending_fail_all(session, "control channel closed");
 
     pthread_mutex_lock(&session->send_lock);
     if (session->control_fd >= 0) {
@@ -5679,7 +5733,7 @@ static void *client_thread(void *arg)
         break;
     }
 
-    direct_pending_fail_all(session, "control connection closed");
+    direct_pending_fail_all(session, "control channel closed");
 
     pthread_mutex_lock(&active_session_lock);
     const char *displaced_reason = session->displaced_reason;

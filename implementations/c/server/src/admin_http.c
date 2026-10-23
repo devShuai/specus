@@ -15857,20 +15857,28 @@ static void record_direct_http_refusal(int fd,
     free(route);
 }
 
+/* Whether an exchange of this client's route would be recorded, so a refused body is worth capturing. */
+static int admin_route_detail_captured(const char *client_name, const char *route)
+{
+    const char *database_path = admin_database_path();
+    if (!st_traffic_capture_enabled() || database_path == NULL) {
+        return 0;
+    }
+    st_storage_http_route http_route;
+    return st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) == 0
+        && st_storage_get_http_route_by_client_route(database_path, client_name, route, &http_route) == 0
+        && http_route.detail_capture_enabled;
+}
+
 /* Whether a refused request on this /http/ path would be recorded, so its body is worth capturing. */
 static int admin_direct_route_captured(const char *path)
 {
     char *client_name = NULL;
     char *route = NULL;
-    const char *database_path = admin_database_path();
-    if (!st_traffic_capture_enabled() || database_path == NULL
-        || admin_parse_direct_route_identity(path, &client_name, &route) != 0) {
+    if (!st_traffic_capture_enabled() || admin_parse_direct_route_identity(path, &client_name, &route) != 0) {
         return 0;
     }
-    st_storage_http_route http_route;
-    int captured = st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) == 0
-        && st_storage_get_http_route_by_client_route(database_path, client_name, route, &http_route) == 0
-        && http_route.detail_capture_enabled;
+    int captured = admin_route_detail_captured(client_name, route);
     free(client_name);
     free(route);
     return captured;
@@ -19523,21 +19531,41 @@ static void admin_forward_direct_http(st_admin_server *server,
      */
     record_direct_http_traffic(client_name, route, (long long)request_body_sent,
                                (long long)sink_state.response_bytes);
-    if (rc == 0) {
-        record_direct_http_exchange(client_name, route, &direct, &sink_state.response,
-                                    sink_state.response_bytes, sink_state.response_externalized,
-                                    remote_address, elapsed_ms);
+    if (rc == 0 || rc == ST_ADMIN_DIRECT_HTTP_DOWNSTREAM_FAILED) {
+        /*
+         * A caller that went away or stopped reading is Java's client abort: the exchange is recorded
+         * with the client's status and what it sent so far, and without a failure.
+         */
+        if (sink_state.response.status_code != 0) {
+            record_direct_http_exchange(client_name, route, &direct, &sink_state.response,
+                                        sink_state.response_bytes, sink_state.response_externalized,
+                                        remote_address, elapsed_ms);
+        }
     } else if (rc == ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED) {
-        /* The share ended mid-exchange: the public connection was already shut down. */
+        /*
+         * The share ended mid-exchange and the public connection was already shut down
+         * (temporary-http-share.md 6.6: the response is aborted, not answered). Java records it with
+         * the reason; before the response head it answers and records 502.
+         */
+        if (!sink_state.started) {
+            record_direct_http_failure(client_name, route, &direct, 502, ST_ADMIN_DIRECT_HTTP_RESET_BODY,
+                                       ST_ADMIN_HTTP_SHARE_RESET_REASON, remote_address, started_ms);
+        } else {
+            free(sink_state.response.error);
+            sink_state.response.error = admin_dup_string(ST_ADMIN_HTTP_SHARE_RESET_REASON);
+            record_direct_http_exchange(client_name, route, &direct, &sink_state.response,
+                                        sink_state.response_bytes, sink_state.response_externalized,
+                                        remote_address, elapsed_ms);
+        }
     } else {
         int status = rc == -2 ? 504 : rc == -3 ? 404 : 502;
-        const char *message = rc == -2 ? "direct http response timeout"
+        const char *message = rc == -2 ? ST_ADMIN_DIRECT_HTTP_TIMEOUT_TEXT
             : rc == -3 ? "direct http route is not configured"
             : rc == ST_ADMIN_DIRECT_HTTP_STREAM_RESET ? ST_ADMIN_DIRECT_HTTP_RESET_BODY
             /* The stream could not be created, answered as Java HttpSpecusController does. */
             : rc == ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT ? "HTTP 流创建失败"
             : ADMIN_ROUTE_CLIENT_OFFLINE_TEXT;
-        /* direct_sink_on_reset logged the client's RST reason; it is never echoed to the caller. */
+        /* direct_sink_on_reset logged the RST reason; it is never echoed to the caller. */
         const char *failure = rc == ST_ADMIN_DIRECT_HTTP_STREAM_RESET && sink_state.reset_reason[0] != '\0'
             ? sink_state.reset_reason : message;
         if (!sink_state.started) {
@@ -20391,13 +20419,57 @@ static int admin_read_request_body(int fd,
     return 0;
 }
 
+/*
+ * The record of a share request refused for its body (Java ShareRelay through relay()'s finally):
+ * a Content-Length over the limit is refused before anything about the request was taken, so it is
+ * recorded without headers or body; a chunked body over it is refused while forwarding, with the
+ * headers the device would have got (no share cookie) and the body's first 64 KiB.
+ */
+static void record_http_share_body_refusal(int fd,
+                                           const char *method,
+                                           const char *request,
+                                           const admin_share_admission *admission,
+                                           int chunked,
+                                           const admin_body_refusal *refusal,
+                                           long long started_ms)
+{
+    char **headers = NULL;
+    size_t headers_len = 0U;
+    char *raw_query = admin_encode_raw_query_for_forwarding(admission->raw_query);
+    if (raw_query == NULL
+        || (chunked && (admin_share_forward_headers(request, &headers, &headers_len) != 0
+                        || st_upstream_browser_headers_rewrite(headers, headers_len,
+                                                               admission->target_base_url) != 0))) {
+        free_header_array(headers, headers_len);
+        free(raw_query);
+        return;
+    }
+    st_direct_http_request refused = {
+        .request_method = (char *)method,
+        .route = (char *)admission->route,
+        .relative_path = admission->relative_path,
+        .raw_query = raw_query,
+        .headers = headers,
+        .headers_len = headers_len,
+        .body = chunked ? (const uint8_t *)refusal->prefix : NULL,
+        .body_len = chunked ? refusal->prefix_len : 0U
+    };
+    char remote_address[128];
+    admin_fd_remote_text(fd, remote_address);
+    record_direct_http_failure(admission->client_name, admission->route, &refused, 413, "HTTP 请求体超过限制",
+                               NULL, remote_address, started_ms);
+    free_header_array(headers, headers_len);
+    free(raw_query);
+}
+
 /* One request under /http-share/: admission, then the body, then the route's forwarding. */
 static void handle_http_share_client(st_admin_server *server,
                                      int fd,
                                      const char *method,
                                      const char *path,
                                      const char *request,
-                                     size_t len)
+                                     size_t len,
+                                     long long started_ms)
 {
     admin_share_admission admission;
     if (!admit_http_share_request(fd, method, path, request, &admission)) {
@@ -20416,8 +20488,15 @@ static void handle_http_share_client(st_admin_server *server,
         size_t received_trailers_len = 0U;
         admin_request_trailers trailers;
         memset(&trailers, 0, sizeof(trailers));
+        admin_body_refusal refusal;
+        memset(&refusal, 0, sizeof(refusal));
+        /* Only a chunked body is read before Java refuses it, so only that one leaves its start. */
+        char *transfer_encoding = admin_extract_header_value(request, "Transfer-Encoding");
+        int chunked = transfer_encoding != NULL;
+        free(transfer_encoding);
+        refusal.capture = chunked && admin_route_detail_captured(admission.client_name, admission.route);
         if (admin_read_request_body(fd, request, len, path, &body, &body_len, &body_buffer,
-                                    &received_trailers, &received_trailers_len, NULL) == 0) {
+                                    &received_trailers, &received_trailers_len, &refusal) == 0) {
             /* No Basic gate on a share: an Authorization trailer belongs to the target as well. */
             if (admin_request_trailers_collect(request, 0, received_trailers, received_trailers_len,
                                                &trailers) != 0) {
@@ -20426,7 +20505,10 @@ static void handle_http_share_client(st_admin_server *server,
                 forward_http_share_request(server, fd, method, request, (const uint8_t *)body, body_len,
                                            &trailers, &admission);
             }
+        } else if (refusal.too_large) {
+            record_http_share_body_refusal(fd, method, request, &admission, chunked, &refusal, started_ms);
         }
+        free(refusal.prefix);
         admin_request_trailers_free(&trailers);
         free_header_array(received_trailers, received_trailers_len);
         free(body_buffer);
@@ -20635,7 +20717,7 @@ static void handle_client(st_admin_server *server, int fd)
     }
     admin_acknowledge_expectation(fd, request);
     if (strncmp(path, ST_HTTP_SHARE_PATH_ROOT, strlen(ST_HTTP_SHARE_PATH_ROOT)) == 0) {
-        handle_http_share_client(server, fd, method, path, request, (size_t)len);
+        handle_http_share_client(server, fd, method, path, request, (size_t)len, started_ms);
         close(fd);
         return;
     }

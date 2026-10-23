@@ -85,8 +85,25 @@ typedef struct {
 #define ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT (-6)
 /* Forwarder result once sink->bind_cancel's canceller ran: the NAT stream was reset. */
 #define ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED (-7)
+/*
+ * Forwarder result when the sink could not hand the response to the public caller (it went away,
+ * or stopped reading for longer than the connection timeout): the NAT stream was reset with
+ * ST_ADMIN_DIRECT_HTTP_LOCAL_RESET_CODE and nothing more can be answered. Java records such a
+ * client abort with the client's status and no failure.
+ */
+#define ST_ADMIN_DIRECT_HTTP_DOWNSTREAM_FAILED (-8)
+/*
+ * Java NatServerHandler.cancelHttpStream: every stream this server ends on its own (a timeout, the
+ * public caller gone, an unusable response frame, an ended share) is reset with 8.
+ */
+#define ST_ADMIN_DIRECT_HTTP_LOCAL_RESET_CODE 8U
+/*
+ * The public body of a 504 and the RST reason when the response head or the window for a request
+ * body chunk did not come in time: Java answers its TimeoutException, which has no message.
+ */
+#define ST_ADMIN_DIRECT_HTTP_TIMEOUT_TEXT "TimeoutException"
 /* The NAT RST code and reason that end the in-flight streams of a temporary HTTP share. */
-#define ST_ADMIN_HTTP_SHARE_RESET_CODE 31U
+#define ST_ADMIN_HTTP_SHARE_RESET_CODE ST_ADMIN_DIRECT_HTTP_LOCAL_RESET_CODE
 #define ST_ADMIN_HTTP_SHARE_RESET_REASON "HTTP share ended"
 #define ST_ADMIN_LOG_REASON_MAX_CODE_POINTS 256U
 
@@ -100,10 +117,13 @@ size_t st_admin_log_safe_reason(const char *reason, char *out, size_t out_len);
 size_t st_admin_log_safe_reason_n(const char *reason, size_t reason_len, char *out, size_t out_len);
 
 /*
- * Forwards one Direct HTTP request: 0 once the response was relayed, -2 when the response head
- * timed out, -3 when the route is not configured for the client, ST_ADMIN_DIRECT_HTTP_STREAM_RESET
- * or ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT as above, and any other negative value when the client is
- * offline or the stream failed.
+ * Forwards one Direct HTTP request: 0 once the response was relayed, -2 when the response head or
+ * the window for a request body chunk timed out, -3 when the route is not configured for the
+ * client, ST_ADMIN_DIRECT_HTTP_STREAM_RESET (the client reset the stream, this server reset it for
+ * a frame it could not take, or the data connection went away under it, the reason reported to
+ * sink->on_reset), ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT, ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED or
+ * ST_ADMIN_DIRECT_HTTP_DOWNSTREAM_FAILED as above, and any other negative value when the client is
+ * offline.
  */
 typedef int (*st_admin_direct_http_forwarder)(void *ctx,
                                               const char *client_name,
