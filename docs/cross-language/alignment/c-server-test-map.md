@@ -530,6 +530,8 @@ Rate批次结束时，四类连通性中Vector、Resource、Rate三类为候选�
 | `nat_stream_tests`「WINDOW_UPDATE beyond 16 MiB closes the data connection for an unknown stream」（NAT-BP-12） | 对从未打开的流发值为 16 MiB + 1 的 WINDOW_UPDATE：data 连接被关闭，控制连接保持，重新登录 data 连接后照常服务（值不超过 16 MiB 的仍被忽略，见既有的 `check_unknown_streams`） | 被忽略，data 连接不关 |
 | `nat_stream_tests`「credit after the server's TCP FIN is ignored」 | 公网对端半关闭、服务端发出 FIN 后，客户端对该流连发两个 16 MiB 的 WINDOW_UPDATE：data 连接保持、该流没有 RST；客户端随后的 DATA 与 FIN 照常到达公网对端 | 第一个 16 MiB 就累计越界，data 连接被关闭 |
 
+`stream_fd_lifetime_tests`、`nat_public_tcp_tests` 与全部 `nat_stream_tests` 另在本机 WSL 以 ThreadSanitizer 和 ASan/UBSan 构建运行，全部通过且没有任何报告（WSL 内核的 ASLR 熵需要 `setarch -R` 才能跑 TSan）。TSan 构建需加 `-fno-hoist-adjacent-loads`：否则 GCC 把 `record_tcp_frame` 两个方向相邻字段的读取提到分支之前，读写两个线程各自的偏移被报为竞争；这在 `origin/main` 上同样出现，不是本项引入的。`origin/main` 在同一 TSan 运行里还报出 `session_shutdown` 的数据竞争（它关闭监听描述符时监听线程正在 accept），本项之后不再出现。
+
 ## 历史表的读法与限制
 
 - **覆盖**：保留历史记录的类级评估标签，不是本轮逐断言完整覆盖的结论。部分历史“覆盖”行仍列有“未断言／未测”项；以说明中的缺口为准，这些断言仍需补证，不能据标签勾选当前验收项。
