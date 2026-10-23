@@ -621,6 +621,16 @@ target_compile_definitions(specus_c_traffic_usage_tests PRIVATE
 add_test(NAME traffic_usage_tests COMMAND specus_c_traffic_usage_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(traffic_usage_tests PROPERTIES TIMEOUT 120)
 
+# The public listener's Tomcat connector limits and the answers of failed route requests, on a real
+# server process (connection timeout, max connections, 100-continue, 504/502 and RST 8).
+add_executable(specus_c_http_connector_tests tests/http_connector_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_http_connector_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_http_connector_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_http_connector_tests PRIVATE
+    ST_CONNECTIVITY_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/")
+add_test(NAME http_connector_tests COMMAND specus_c_http_connector_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(http_connector_tests PROPERTIES TIMEOUT 180)
+
 # TCP_INFO observes a real kernel reset before releasing the held login. These observers
 # belong only to this test server; specus-server-c does not link or enable them.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
