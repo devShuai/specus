@@ -103,9 +103,14 @@ def frame(kind, payload, group=None, flags=0, revision=0):
 
 
 class WebSocket:
-    def __init__(self, port, token, endpoint):
+    def __init__(self, port, token, endpoint, rcvbuf=0):
         self.endpoint = endpoint
-        self.channel = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.channel = socket.socket()
+        if rcvbuf:
+            # Set before connecting so the window stays small once the reader stops.
+            self.channel.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+        self.channel.settimeout(5)
+        self.channel.connect(("127.0.0.1", port))
         ticket = request(port, "POST", "/api/admin/ws-tickets", {"endpoint": endpoint}, token)["ticket"]
         key = base64.b64encode(secrets.token_bytes(16)).decode()
         self.channel.sendall((f"GET /ws/{endpoint}?ticket={urllib.parse.quote(ticket)} HTTP/1.1\r\n"
@@ -284,8 +289,8 @@ class Fixture:
         resp_command(channel, "PUBLISH", PREFIX + ":events", raw)
         assert resp_read(channel) >= 2, "both server subscriptions must be live"
 
-    def ws(self, port, token, endpoint="connections"):
-        websocket = WebSocket(port, token, endpoint)
+    def ws(self, port, token, endpoint="connections", rcvbuf=0):
+        websocket = WebSocket(port, token, endpoint, rcvbuf)
         self.stack.callback(websocket.close)
         return websocket
 
@@ -432,6 +437,30 @@ def check(binary):
         bob_ws.revoked("account revoked")
         bob_ws = fixture.ws(two, login(two, "bob"))
         print("ok unknown revocation reason fails closed", flush=True)
+
+        # A browser that stops reading holds up neither the cluster subscriber nor the other sockets
+        # of its instance (C writes each socket on its own thread, never under the shared lock): 8 MB
+        # of kind 4 frames fill its buffers, and the instance's other admin socket still gets every
+        # frame at once, a socket opened afterwards registers, and a kind 5 revocation closes it.
+        stalled = fixture.ws(one, admin_token, rcvbuf=4096)
+        early_bob = fixture.ws(one, login(one, "bob"))
+        filler = "f" * (200 * 1024)
+        identifiers = [9000 + index for index in range(40)] + [9999]
+        for identifier in identifiers:
+            connection = {"id": identifier, "clientId": 0, "success": False,
+                          "failureReason": filler if identifier != 9999 else "last"}
+            fixture.publish(frame(4, {"tenantId": "default", "type": "created", "connection": connection}))
+        for websocket in admin_ws:
+            assert [websocket.read_json()["connection"]["id"] for _ in identifiers] == identifiers
+        late_bob = fixture.ws(one, login(one, "bob"))
+        late_bob.alive()
+        fixture.publish(frame(5, {"tenantId": "default", "username": "bob", "reason": "disabled"}))
+        for websocket in (early_bob, late_bob, bob_ws):
+            websocket.revoked("account disabled")
+        bob_ws = fixture.ws(two, login(two, "bob"))
+        stalled.close()
+        print("ok a stalled admin socket holds up neither the cluster subscriber nor the instance's others",
+              flush=True)
 
         fixture.stop(fixture.processes[0])
         # The actual device's disconnect is a production ConnectionEvent, not
