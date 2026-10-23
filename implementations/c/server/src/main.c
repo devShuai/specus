@@ -2137,7 +2137,8 @@ static void displace_session_locked(specus_session *session, const char *reason)
  * client's next REGISTER for the same port would otherwise race that and fail to bind. Shutting a
  * listening socket down takes it out of LISTEN, which with SO_REUSEADDR already frees the port;
  * the descriptor itself is left to the listener thread, which closes it once accept() fails, so
- * no descriptor is closed under a thread still blocked on it.
+ * no descriptor is closed under a thread still blocked on it. A connection its accept() returned
+ * meanwhile is refused (start_external_conn), not published to the connection that is going away.
  */
 static void release_session_listeners(specus_session *session)
 {
@@ -2146,6 +2147,7 @@ static void release_session_listeners(specus_session *session)
         if (listener->fd >= 0) {
             shutdown(listener->fd, SHUT_RDWR);
         }
+        listener->done = 1;
     }
     pthread_mutex_unlock(&session->map_lock);
 }
@@ -4971,11 +4973,12 @@ static void *external_conn_thread(void *arg)
     return NULL;
 }
 
-static int start_external_conn(specus_session *session,
+static int start_external_conn(specus_listener *listener,
                                int fd,
-                               int port,
                                const struct sockaddr_storage *remote)
 {
+    specus_session *session = listener->session;
+    int port = listener->port;
     external_conn *conn = (external_conn *)calloc(1, sizeof(*conn));
     if (conn == NULL) {
         close(fd);
@@ -4999,10 +5002,13 @@ static int start_external_conn(specus_session *session,
     }
 
     pthread_mutex_lock(&session->map_lock);
-    if (try_count_external_connection(conn) != 0) {
+    /* accept() may return a connection just as the listener is stopped (UNREGISTER, a newer login
+     * of the client, the connection's end): Java's closed server channel takes none any more. */
+    int stopped = !session->active || listener->done;
+    if (stopped || try_count_external_connection(conn) != 0) {
         pthread_mutex_unlock(&session->map_lock);
-        fprintf(stderr, "[nat] reject external connection on port=%d client=%s: limit reached\n",
-                port, session->config.client_name);
+        fprintf(stderr, "[nat] reject external connection on port=%d client=%s: %s\n",
+                port, session->config.client_name, stopped ? "listener stopped" : "limit reached");
         close(fd);
         pthread_cond_destroy(&conn->flow_cond);
         pthread_mutex_destroy(&conn->flow_lock);
@@ -5065,7 +5071,7 @@ static void *listener_thread(void *arg)
         }
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        start_external_conn(session, fd, listener->port, &remote);
+        start_external_conn(listener, fd, &remote);
     }
 
     pthread_mutex_lock(&session->map_lock);
@@ -5134,6 +5140,12 @@ static int start_specus_listener(specus_session *session, int port, char *reason
     return 0;
 }
 
+/*
+ * UNREGISTER: shutting the listening socket down ends its accept() and frees the port at once
+ * (see release_session_listeners). Its descriptor stays open until the listener thread, which may
+ * be about to call accept() on it, has ended: closed now, the number could already name another
+ * socket, a listener of another client's port included, by the time that accept() runs.
+ */
 static void stop_specus_listener(specus_session *session, int port)
 {
     pthread_mutex_lock(&session->map_lock);
@@ -5141,8 +5153,6 @@ static void stop_specus_listener(specus_session *session, int port)
         if (!listener->done && listener->port == port) {
             if (listener->fd >= 0) {
                 shutdown(listener->fd, SHUT_RDWR);
-                close(listener->fd);
-                listener->fd = -1;
             }
             listener->done = 1;
         }
@@ -5420,12 +5430,12 @@ static void session_shutdown(specus_session *session)
 
     pthread_mutex_lock(&session->map_lock);
     session->active = 0;
+    /* Each listener thread closes its own descriptor once its accept() has returned. */
     for (specus_listener *listener = session->listeners; listener != NULL; listener = listener->next) {
         if (listener->fd >= 0) {
             shutdown(listener->fd, SHUT_RDWR);
-            close(listener->fd);
-            listener->fd = -1;
         }
+        listener->done = 1;
     }
     for (external_conn *conn = session->conns; conn != NULL; conn = conn->next) {
         close_conn_locked(conn);
@@ -5452,6 +5462,10 @@ static void session_shutdown(specus_session *session)
     specus_listener *listener = session->listeners;
     while (listener != NULL) {
         specus_listener *next = listener->next;
+        /* Its thread closed it as it ended; a safety net only. */
+        if (listener->fd >= 0) {
+            close(listener->fd);
+        }
         free(listener);
         listener = next;
     }

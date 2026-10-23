@@ -15,7 +15,10 @@ static int observed_create(pthread_t *thread, const pthread_attr_t *attr,
  * between the copy and the call could reach whatever socket got that number next, another
  * stream's included. Only this executable holds the libc boundaries, each hold modelling a worker
  * descheduled right before its real socket call; the server code is main.c unchanged. Adapted
- * from the stream scenarios of the socket lifetime fixture in codex/c-connection-rate-limit.
+ * from the socket lifetime fixture in codex/c-connection-rate-limit (339467d), whose listener
+ * scenarios are the LATE_ACCEPT ones: a listener's descriptor was closed by whoever stopped it
+ * (UNREGISTER, the connection's end) while its thread could still be in accept() on that number,
+ * and a connection accepted as the listener stopped was still published.
  */
 #define main specus_server_entry_for_stream_fd_lifetime
 #define recv held_recv
@@ -40,6 +43,9 @@ enum {
     FAIL_WRITER,        /* the writer thread cannot be started */
     FAIL_READER,        /* the reader thread cannot be started */
     HOLD_READER_START,  /* the reader is reserved but not yet started when the stream is stopped */
+    LATE_ACCEPT_AFTER_STOP,     /* accept() returned a connection, then UNREGISTER stopped the listener */
+    LATE_ACCEPT_AFTER_RELEASE,  /* the same, the listener released by a newer login of the client */
+    LATE_ACCEPT_DURING_SHUTDOWN, /* the same, the data connection ending */
     SCENARIOS
 };
 
@@ -51,7 +57,14 @@ static struct {
     int held;
     int released;
     int creation_failed;
+    unsigned int worker_creations;
 } fixture = {.lock = PTHREAD_MUTEX_INITIALIZER, .accepted_fd = -1};
+
+static int late_accept_scenario(int scenario)
+{
+    return scenario == LATE_ACCEPT_AFTER_STOP || scenario == LATE_ACCEPT_AFTER_RELEASE
+        || scenario == LATE_ACCEPT_DURING_SHUTDOWN;
+}
 
 static void hold_locked(void)
 {
@@ -83,6 +96,8 @@ static int held_accept(int fd, struct sockaddr *address, socklen_t *length)
         pthread_mutex_lock(&fixture.lock);
         fixture.accepted_fd = result;
         pthread_cond_broadcast(&fixture.changed);
+        /* The listener thread descheduled between accept() and publishing the stream. */
+        if (late_accept_scenario(fixture.scenario) && !fixture.released) hold_locked();
         pthread_mutex_unlock(&fixture.lock);
     }
     return result;
@@ -92,6 +107,7 @@ static int observed_create(pthread_t *thread, const pthread_attr_t *attr,
                            void *(*start)(void *), void *arg)
 {
     pthread_mutex_lock(&fixture.lock);
+    if (start == external_writer_thread || start == external_conn_thread) ++fixture.worker_creations;
     int fail = (fixture.scenario == FAIL_WRITER && start == external_writer_thread)
         || (fixture.scenario == FAIL_READER && start == external_conn_thread);
     if (fail) {
@@ -141,12 +157,65 @@ static external_conn *published_stream(specus_session *session)
     return NULL;
 }
 
+static void *shutdown_session(void *arg)
+{
+    session_shutdown((specus_session *)arg);
+    return NULL;
+}
+
+/* session_shutdown has stopped the session's listeners and streams (and may be waiting on them). */
+static void wait_inactive(specus_session *session)
+{
+    struct timespec pause = {.tv_nsec = 1000000L};
+    for (int i = 0; i < 10000; ++i) {
+        pthread_mutex_lock(&session->map_lock);
+        int inactive = !session->active;
+        pthread_mutex_unlock(&session->map_lock);
+        if (inactive) return;
+        nanosleep(&pause, NULL);
+    }
+    REQUIRE(0, "the session did not begin to shut down");
+}
+
+/*
+ * The listener's accept() has returned a connection and its thread is held before publishing it
+ * while the listener is stopped. The descriptor must stay open (the thread will call accept() on
+ * it again) and the late connection must be refused, not handed to workers.
+ */
+static void run_late_accept(specus_session *session, int scenario, int listener_fd, int accepted_fd)
+{
+    pthread_t shutdown_thread;
+    if (scenario == LATE_ACCEPT_AFTER_STOP) {
+        stop_specus_listener(session, 0);
+    } else if (scenario == LATE_ACCEPT_AFTER_RELEASE) {
+        release_session_listeners(session);
+    } else {
+        REQUIRE(pthread_create(&shutdown_thread, NULL, shutdown_session, session) == 0, "shutdown thread");
+        wait_inactive(session);
+    }
+    REQUIRE(fcntl(listener_fd, F_GETFD) >= 0,
+            "listener descriptor closed while its thread may still call accept() on it");
+    release_fixture();
+    if (scenario == LATE_ACCEPT_DURING_SHUTDOWN) {
+        pthread_join(shutdown_thread, NULL);
+    } else {
+        session_shutdown(session);
+    }
+    pthread_mutex_lock(&fixture.lock);
+    unsigned int created = fixture.worker_creations;
+    pthread_mutex_unlock(&fixture.lock);
+    REQUIRE(created == 0U, "a connection accepted as its listener stopped was published to workers");
+    REQUIRE(fcntl(listener_fd, F_GETFD) < 0 && errno == EBADF, "listener descriptor leaked");
+    REQUIRE(fcntl(accepted_fd, F_GETFD) < 0 && errno == EBADF, "the refused connection's descriptor leaked");
+}
+
 static void run_scenario(int scenario)
 {
     alarm(20);
     fixture.scenario = scenario;
     fixture.accepted_fd = -1;
     fixture.held = fixture.released = fixture.creation_failed = 0;
+    fixture.worker_creations = 0U;
     specus_session session = {0};
     int control[2];
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, control) == 0, "control socketpair");
@@ -164,9 +233,10 @@ static void run_scenario(int scenario)
     char reason[256];
     REQUIRE(start_specus_listener(&session, 0, reason, sizeof(reason)) == 0, "start a real listener");
     specus_listener *listener = session.listeners;
+    int listener_fd = listener->fd;
     struct sockaddr_in address;
     socklen_t length = sizeof(address);
-    REQUIRE(getsockname(listener->fd, (struct sockaddr *)&address, &length) == 0, "listener address");
+    REQUIRE(getsockname(listener_fd, (struct sockaddr *)&address, &length) == 0, "listener address");
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     int peer = socket(AF_INET, SOCK_STREAM, 0);
     REQUIRE(peer >= 0 && connect(peer, (struct sockaddr *)&address, length) == 0, "public connection");
@@ -183,6 +253,18 @@ static void run_scenario(int scenario)
     int accepted_fd = fixture.accepted_fd;
     REQUIRE(accepted_fd >= 0, "accept observed a real socket");
 
+    if (late_accept_scenario(scenario)) {
+        run_late_accept(&session, scenario, listener_fd, accepted_fd);
+        REQUIRE(global_external_connections == 0, "active connection accounting leaked");
+        close(peer);
+        close(control[1]);
+        pthread_mutex_destroy(&session.send_lock);
+        pthread_mutex_destroy(&session.map_lock);
+        pthread_mutex_destroy(&session.direct_lock);
+        alarm(0);
+        printf("ok   stream fd lifetime scenario %d\n", scenario);
+        return;
+    }
     if (scenario == HOLD_READER_START) {
         /* The reader is reserved but descheduled before it starts; the writer exits meanwhile. */
         external_conn *conn = published_stream(&session);

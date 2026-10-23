@@ -502,6 +502,16 @@ Rate批次结束时，四类连通性中Vector、Resource、Rate三类为候选�
 
 `nat_stream_tests` 的 `check_http_configured_limits` 随之把两种超时的 RST 码从 30 改为 8。转发响应时 sink 自身的失败（例如内存不足）不再按客户端中断处理，而是在尚未发出字节时答 502 并记 `HTTP response could not be relayed`；这条只能靠注入内存分配失败触发，没有 ctest，经代码审阅确认。C 与 Java 仍不同的地方：访客中断时 RST 的原因文本，C 为 `HTTP downstream closed`，Java 为 Tomcat 异常的文本（例如 `java.net.SocketTimeoutException`）；上传阶段 data 连接断开或写失败时，Java 的正文是异常文本 `control channel closed`，C 答 `HTTP 转发请求失败`（明细同为 `control channel closed`）；分享在上传阶段被切断时，Java 的明细原因是 `stream reset`，C 记 `HTTP share ended`；请求体整体读入后才开流（停住的请求体答 400，设备看不到这个请求）、每个连接一个线程而没有 200 线程的排队、每条 data 连接 1024 个 pending 流、单帧 64 KiB、64 MiB 响应上限、分享在响应头之前被切断时中断而不答 502，都列在 [API 盘点](c-server-api-inventory.md) 第 8 节。媒体采集结束时 C 等在途分片传完、multipart 完成后才关闭访客连接，Java 把完成也放在后台（浏览器已收到 chunked 结尾）；第 7 节 `HttpMediaCaptureServiceTests` 一行的对照不受影响。
 
+## 公网 TCP 连接：回收、监听与 Netty 选项（2026-10-23增量）
+
+#35 第 45 项的 NAT TCP 部分（NAT-BP-01、05、06、07、08、12 与 #301 的监听描述符修正）。Java 没有覆盖这些行为的测试类，本节以 Java 源码为准：`NatServerHandler`（外部连接的 `closeFuture`、计数与 REGISTER）、`RemoteSpecusHandler`、`StreamFlowController`、`TcpServer`、`NettyServer`、`NettyServerProperties` 与 `application.yml` 的 `specus.netty.*`，以及 Netty 4.2 的 `ServerBootstrapAcceptor`（accept 抛出 IOException 时停读 1 s 后恢复）和 OpenJDK 的 `Net.accept`（`ECONNABORTED` 当场重试）。“原实现上的结果”一列是把测试程序放到 `origin/main` `61590af` 的服务端源码上构建运行的结果。
+
+| C 测试 | 断言 | 原实现上的结果 |
+| --- | --- | --- |
+| `stream_fd_lifetime_tests` 场景 5 LATE_ACCEPT_AFTER_STOP（引用 `main.c`，只在测试程序里拦 libc 边界） | 监听线程的 accept 刚返回一个连接、尚未发布时，UNREGISTER 停止该监听：监听描述符在线程结束前保持打开；放行后这个迟到的连接被关闭，没有起任何读写线程；监听描述符与连接描述符最终都关闭，外部连接计数归零 | 监听描述符当场被关闭 |
+| `stream_fd_lifetime_tests` 场景 6 LATE_ACCEPT_AFTER_RELEASE | 同上，监听由同一客户端的新登录释放（`release_session_listeners`） | 迟到的连接被发布，起了读写线程 |
+| `stream_fd_lifetime_tests` 场景 7 LATE_ACCEPT_DURING_SHUTDOWN | 同上，data 连接结束（`session_shutdown` 在另一线程里等监听线程） | 监听描述符当场被关闭 |
+
 ## 历史表的读法与限制
 
 - **覆盖**：保留历史记录的类级评估标签，不是本轮逐断言完整覆盖的结论。部分历史“覆盖”行仍列有“未断言／未测”项；以说明中的缺口为准，这些断言仍需补证，不能据标签勾选当前验收项。
