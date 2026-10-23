@@ -211,7 +211,26 @@ typedef struct {
     st_admin_direct_ws_close_handler direct_ws_close;
     void *direct_http_ctx;
     void *direct_ws_ctx;
+    /* The connector limits it was started with (st_admin_set_connector_limits). */
+    int connection_timeout_ms;
+    int max_connections;
 } st_admin_server;
+
+/*
+ * Tomcat's connector limits, which the Java server runs with Spring Boot's defaults
+ * (server.tomcat.connection-timeout, max-connections, accept-count):
+ *   - connection_timeout_ms (Tomcat 60000) bounds every blocking read and write of a request and its
+ *     answer: a caller that sends nothing, or stops sending its body or reading the answer, for that
+ *     long is dropped. 0 or less: no timeout. An upgraded WebSocket is not subject to it.
+ *   - max_connections (8192) sockets at most are accepted and not closed yet (counted over the
+ *     process, which runs one listener); more wait in the listen backlog of accept_count (100).
+ *     0 or less keeps the default, as Spring Boot does.
+ * Takes effect for listeners started afterwards.
+ */
+#define ST_ADMIN_DEFAULT_CONNECTION_TIMEOUT_MS 60000
+#define ST_ADMIN_DEFAULT_MAX_CONNECTIONS 8192
+#define ST_ADMIN_DEFAULT_ACCEPT_COUNT 100
+void st_admin_set_connector_limits(int connection_timeout_ms, int max_connections, int accept_count);
 
 int st_admin_build_response(const char *method, const char *path, char *out, size_t out_len);
 int st_admin_build_response_with_body(const char *method,

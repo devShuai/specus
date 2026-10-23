@@ -100,6 +100,10 @@ typedef struct {
     int64_t http_timeout_ms;
     int64_t http_max_request_body;
     int admin_port;
+    /* server.tomcat.connection-timeout, max-connections and accept-count of the admin listener. */
+    int admin_connection_timeout_ms;
+    int admin_max_connections;
+    int admin_accept_count;
     char static_root[512];
     char database_path[512];
     /*
@@ -433,6 +437,217 @@ static int env_i64_range(const char *name, int64_t default_value, int64_t min_va
         return -1;
     }
     *out = (int64_t)parsed;
+    return 0;
+}
+
+/*
+ * The environment variable Spring Boot binds a server.tomcat.* property from: the canonical name (the
+ * dash dropped) when it is set, else the legacy one that keeps the dash as an underscore.
+ */
+static const char *spring_env_name(const char *canonical, const char *legacy)
+{
+    return getenv(canonical) != NULL ? canonical : legacy;
+}
+
+/* Long.parseLong of [start, end): an optional sign and ASCII digits, nothing else, no overflow. */
+static int java_parse_long(const char *start, const char *end, int64_t *out)
+{
+    int negative = start < end && *start == '-';
+    if (start < end && (*start == '-' || *start == '+')) {
+        ++start;
+    }
+    if (start == end) {
+        return -1;
+    }
+    int64_t value = 0;
+    for (; start < end; ++start) {
+        if (*start < '0' || *start > '9'
+            || __builtin_mul_overflow(value, 10, &value)
+            || (negative ? __builtin_sub_overflow(value, (int64_t)(*start - '0'), &value)
+                         : __builtin_add_overflow(value, (int64_t)(*start - '0'), &value))) {
+            return -1;
+        }
+    }
+    *out = value;
+    return 0;
+}
+
+/* java.time.Duration.toMillis of seconds and nanos (0 <= nanos < 10^9): truncated toward zero. */
+static int java_duration_to_millis(int64_t seconds, int64_t nanos, int64_t *millis)
+{
+    if (seconds < 0) {
+        seconds += 1;
+        nanos -= 1000000000LL;
+    }
+    int64_t whole = 0;
+    if (__builtin_mul_overflow(seconds, 1000, &whole) || __builtin_add_overflow(whole, nanos / 1000000LL, millis)) {
+        return -1;
+    }
+    return 0;
+}
+
+/* java.time.Duration.parse ([-+]PnDTnHnMn.nS, any case) as milliseconds; -1 when it fails. */
+static int java_parse_iso_duration_ms(const char *text, int64_t *millis)
+{
+    const char *cursor = text;
+    int negate = *cursor == '-';
+    if (*cursor == '-' || *cursor == '+') {
+        ++cursor;
+    }
+    if (*cursor != 'P' && *cursor != 'p') {
+        return -1;
+    }
+    ++cursor;
+    static const char designators[] = "DHMS";
+    static const int64_t unit_seconds[] = {86400, 3600, 60, 1};
+    int64_t seconds = 0;
+    int64_t nanos = 0;
+    int parts = 0;
+    int in_time = 0;
+    size_t next = 0U;
+    while (*cursor != '\0') {
+        if ((*cursor == 'T' || *cursor == 't') && !in_time) {
+            in_time = 1;
+            next = 1U;
+            ++cursor;
+            /* A T must be followed by at least one time part. */
+            if (*cursor == '\0') {
+                return -1;
+            }
+            continue;
+        }
+        const char *number = cursor;
+        if (*cursor == '-' || *cursor == '+') {
+            ++cursor;
+        }
+        while (*cursor >= '0' && *cursor <= '9') {
+            ++cursor;
+        }
+        const char *number_end = cursor;
+        const char *fraction = NULL;
+        const char *fraction_end = NULL;
+        if (*cursor == '.' || *cursor == ',') {
+            fraction = ++cursor;
+            while (*cursor >= '0' && *cursor <= '9') {
+                ++cursor;
+            }
+            fraction_end = cursor;
+            if (fraction_end - fraction > 9 || (*cursor != 'S' && *cursor != 's')) {
+                return -1;
+            }
+        }
+        char designator = (char)(*cursor >= 'a' && *cursor <= 'z' ? *cursor - 'a' + 'A' : *cursor);
+        const char *found = designator == '\0' ? NULL : strchr(designators, designator);
+        if (found == NULL) {
+            return -1;
+        }
+        size_t index = (size_t)(found - designators);
+        /* Days only before T, hours, minutes and seconds only after it, each once and in order. */
+        if (index < next || (index == 0U) == (in_time != 0)) {
+            return -1;
+        }
+        int64_t value = 0;
+        int64_t part = 0;
+        if (java_parse_long(number, number_end, &value) != 0
+            || __builtin_mul_overflow(value, unit_seconds[index], &part)
+            || __builtin_add_overflow(seconds, part, &seconds)) {
+            return -1;
+        }
+        if (fraction != NULL) {
+            int64_t fraction_nanos = 0;
+            for (const char *digit = fraction; digit < fraction_end; ++digit) {
+                fraction_nanos = fraction_nanos * 10 + (*digit - '0');
+            }
+            for (long width = (long)(fraction_end - fraction); width < 9; ++width) {
+                fraction_nanos *= 10;
+            }
+            nanos = *number == '-' ? -fraction_nanos : fraction_nanos;
+        }
+        next = index + 1U;
+        ++parts;
+        ++cursor;
+    }
+    if (parts == 0) {
+        return -1;
+    }
+    /* Duration.ofSeconds(seconds, nanos), then negated() when the text started with '-'. */
+    int64_t carry = nanos < 0 ? -1 : 0;
+    if (__builtin_add_overflow(seconds, carry, &seconds)) {
+        return -1;
+    }
+    nanos -= carry * 1000000000LL;
+    if (negate) {
+        if (nanos != 0) {
+            if (__builtin_add_overflow(seconds, 1, &seconds)) {
+                return -1;
+            }
+            nanos = 1000000000LL - nanos;
+        }
+        if (seconds == INT64_MIN) {
+            return -1;
+        }
+        seconds = -seconds;
+    }
+    return java_duration_to_millis(seconds, nanos, millis);
+}
+
+/*
+ * A Duration as Spring Boot binds server.tomcat.connection-timeout (StringToDurationConverter,
+ * DurationStyle.detect, no unit annotation, so milliseconds by default), handed to Tomcat as
+ * TomcatWebServerFactoryCustomizer does: (int) Duration.toMillis(). The simple style is an optional
+ * sign, ASCII digits and an optional unit of ns, us, ms, s, m, h or d in any case; anything that
+ * starts with P after an optional sign is ISO-8601. Anything else, or a value Duration cannot hold,
+ * fails the binding and with it the start, as in Java; unset or empty keeps default_ms.
+ */
+static int env_spring_duration_ms(const char *name, int default_ms, int *out)
+{
+    const char *value = getenv(name);
+    if (value == NULL || *value == '\0') {
+        *out = default_ms;
+        return 0;
+    }
+    int64_t millis = 0;
+    const char *after_sign = value + (*value == '-' || *value == '+' ? 1 : 0);
+    int parsed = -1;
+    if (*after_sign == 'P' || *after_sign == 'p') {
+        parsed = java_parse_iso_duration_ms(value, &millis);
+    } else {
+        const char *digits_end = after_sign;
+        while (*digits_end >= '0' && *digits_end <= '9') {
+            ++digits_end;
+        }
+        size_t unit_len = strlen(digits_end);
+        int64_t amount = 0;
+        int unit_letters = 1;
+        for (size_t i = 0U; i < unit_len; ++i) {
+            unit_letters = unit_letters && isalpha((unsigned char)digits_end[i]);
+        }
+        static const struct {
+            const char *suffix;
+            int64_t multiply;
+            int64_t divide;
+        } units[] = {{"", 1, 1}, {"ns", 1, 1000000}, {"us", 1, 1000}, {"ms", 1, 1}, {"s", 1000, 1},
+                     {"m", 60000, 1}, {"h", 3600000, 1}, {"d", 86400000, 1}};
+        if (digits_end > after_sign && unit_len <= 2U && unit_letters
+            && java_parse_long(value, digits_end, &amount) == 0) {
+            char suffix[3] = {0};
+            for (size_t i = 0U; i < unit_len; ++i) {
+                suffix[i] = (char)tolower((unsigned char)digits_end[i]);
+            }
+            for (size_t i = 0U; i < sizeof(units) / sizeof(units[0]); ++i) {
+                if (strcmp(units[i].suffix, suffix) == 0) {
+                    parsed = __builtin_mul_overflow(amount, units[i].multiply, &millis) ? -1 : 0;
+                    millis /= units[i].divide;
+                    break;
+                }
+            }
+        }
+    }
+    if (parsed != 0) {
+        fprintf(stderr, "invalid %s; expected a duration such as 60000, 60s or PT60S\n", name);
+        return -1;
+    }
+    *out = (int)(int32_t)(uint32_t)(uint64_t)millis;
     return 0;
 }
 
@@ -901,7 +1116,14 @@ static int load_config(server_config *config)
         || env_int_range("SPECUS_ADMIN_PORT", 0, 0, 65535, &config->admin_port) != 0
         || env_i64_range("SPECUS_HTTP_TIMEOUT_MS", 30000, INT64_MIN, INT64_MAX, &config->http_timeout_ms) != 0
         || env_i64_range("SPECUS_HTTP_MAX_REQUEST_BODY_SIZE", ST_HTTP_MAX_REQUEST_BODY, INT_MIN, INT_MAX,
-                         &config->http_max_request_body) != 0) {
+                         &config->http_max_request_body) != 0
+        /* The Java server's Tomcat connector, as Spring Boot binds server.tomcat.* from the environment. */
+        || env_spring_duration_ms(spring_env_name("SERVER_TOMCAT_CONNECTIONTIMEOUT", "SERVER_TOMCAT_CONNECTION_TIMEOUT"),
+                                  ST_ADMIN_DEFAULT_CONNECTION_TIMEOUT_MS, &config->admin_connection_timeout_ms) != 0
+        || env_int_range(spring_env_name("SERVER_TOMCAT_MAXCONNECTIONS", "SERVER_TOMCAT_MAX_CONNECTIONS"),
+                         ST_ADMIN_DEFAULT_MAX_CONNECTIONS, INT_MIN, INT_MAX, &config->admin_max_connections) != 0
+        || env_int_range(spring_env_name("SERVER_TOMCAT_ACCEPTCOUNT", "SERVER_TOMCAT_ACCEPT_COUNT"),
+                         ST_ADMIN_DEFAULT_ACCEPT_COUNT, INT_MIN, INT_MAX, &config->admin_accept_count) != 0) {
         return -1;
     }
     /* Java's body limit filter takes a negative limit as 0: any body at all is too large. A
@@ -5723,6 +5945,8 @@ int main(void)
         .ctx = NULL,
     };
     st_admin_set_connectivity_device(&connectivity_device);
+    st_admin_set_connector_limits(config.admin_connection_timeout_ms, config.admin_max_connections,
+                                  config.admin_accept_count);
     if (config.admin_port > 0
         && st_admin_server_start_with_handlers(&admin_server,
                                                config.admin_port,

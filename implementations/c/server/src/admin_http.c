@@ -14266,6 +14266,41 @@ static int send_all(int fd, const char *buffer, size_t len)
     return 0;
 }
 
+/* The connector limits listeners start with (st_admin_set_connector_limits); Tomcat's by default. */
+static int admin_connector_timeout_ms = ST_ADMIN_DEFAULT_CONNECTION_TIMEOUT_MS;
+static int admin_connector_max_connections = ST_ADMIN_DEFAULT_MAX_CONNECTIONS;
+static int admin_connector_accept_count = ST_ADMIN_DEFAULT_ACCEPT_COUNT;
+
+void st_admin_set_connector_limits(int connection_timeout_ms, int max_connections, int accept_count)
+{
+    admin_connector_timeout_ms = connection_timeout_ms;
+    admin_connector_max_connections = max_connections > 0 ? max_connections : ST_ADMIN_DEFAULT_MAX_CONNECTIONS;
+    admin_connector_accept_count = accept_count > 0 ? accept_count : ST_ADMIN_DEFAULT_ACCEPT_COUNT;
+}
+
+/*
+ * Tomcat's connectionTimeout on an accepted socket: a blocking read or write that makes no progress
+ * for that long fails (NioSocketWrapper restarts the clock whenever something was written; each
+ * send and recv here gets the whole timeout again). 0 or less takes the timeouts off again, as for a
+ * WebSocket once its upgrade is under way: Tomcat has no idle timeout for one either.
+ */
+static void admin_socket_set_timeouts(int fd, int timeout_ms)
+{
+    struct timeval timeout = {0, 0};
+    if (timeout_ms > 0) {
+        timeout.tv_sec = timeout_ms / 1000;
+        timeout.tv_usec = (suseconds_t)(timeout_ms % 1000) * 1000;
+    }
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+}
+
+/* Whether a socket call failed because the connection timeout ran out. */
+static int admin_socket_timed_out(void)
+{
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+}
+
 static int hex_nibble(char value)
 {
     if (value >= '0' && value <= '9') {
@@ -20370,6 +20405,8 @@ static void handle_http_share_client(st_admin_server *server,
         return;
     }
     if (admission.upgrade) {
+        /* Past the HTTP request the WebSocket keeps its own timing; Tomcat does not idle one out. */
+        admin_socket_set_timeouts(fd, 0);
         forward_http_share_websocket(server, fd, method, request, &admission);
     } else {
         const char *body = NULL;
@@ -20396,6 +20433,36 @@ static void handle_http_share_client(st_admin_server *server,
     }
     admin_share_stream_unregister(&admission.stream);
     free(admission.relative_path);
+}
+
+/*
+ * Tomcat answers "Expect: 100-continue" on an HTTP/1.1 request (Http11Processor.prepareExpectation,
+ * the value trimmed, any case) with its interim "HTTP/1.1 100 " as soon as the request is mapped
+ * (StandardContextValve, continueResponseTiming "immediately", the default): before any filter, the
+ * route gate or a handler has looked at it. The caller then sends its body at once rather than after
+ * its own expect timeout (curl waits 1 s), or for good when it never sends without the 100.
+ */
+static void admin_acknowledge_expectation(int fd, const char *request)
+{
+    const char *line_end = strstr(request, "\r\n");
+    static const char version[] = " HTTP/1.1";
+    if (line_end == NULL || (size_t)(line_end - request) < sizeof(version) - 1U
+        || memcmp(line_end - (sizeof(version) - 1U), version, sizeof(version) - 1U) != 0) {
+        return;
+    }
+    char *expect = admin_extract_header_value(request, "Expect");
+    if (expect != NULL && admin_ascii_casecmp(expect, "100-continue") == 0) {
+        static const char interim[] = "HTTP/1.1 100 \r\n\r\n";
+        (void)send_all(fd, interim, sizeof(interim) - 1U);
+    }
+    free(expect);
+}
+
+/* What every WebSocket handler of this listener takes for an upgrade request. */
+static int admin_request_is_websocket_upgrade(const char *request)
+{
+    return admin_header_value_contains_token_ci(request, "Connection", "Upgrade")
+        && admin_header_value_equals_ci(request, "Upgrade", "websocket");
 }
 
 /* RFC 9110 tchar: what a method or header name is made of. */
@@ -20535,6 +20602,11 @@ static void handle_client(st_admin_server *server, int fd)
                             sizeof(request) - 1U - (size_t)len,
                             0);
         if (more <= 0) {
+            /* Tomcat drops a connection whose request head stalls past the timeout without a word. */
+            if (more < 0 && admin_socket_timed_out()) {
+                close(fd);
+                return;
+            }
             send_text_http_error(fd, 400, "HTTP request headers are incomplete");
             close(fd);
             return;
@@ -20561,6 +20633,7 @@ static void handle_client(st_admin_server *server, int fd)
             return;
         }
     }
+    admin_acknowledge_expectation(fd, request);
     if (strncmp(path, ST_HTTP_SHARE_PATH_ROOT, strlen(ST_HTTP_SHARE_PATH_ROOT)) == 0) {
         handle_http_share_client(server, fd, method, path, request, (size_t)len);
         close(fd);
@@ -20619,6 +20692,10 @@ static void handle_client(st_admin_server *server, int fd)
     char request_remote_address[ST_CLIENT_ADDRESS_MAX_LEN];
     admin_request_client_address(fd, request, request_remote_address);
 
+    if (admin_request_is_websocket_upgrade(request)) {
+        /* Past the HTTP request the WebSocket keeps its own timing; Tomcat does not idle one out. */
+        admin_socket_set_timeouts(fd, 0);
+    }
     if (st_public_discovery_handle_websocket(fd,
                                              method,
                                              path,
@@ -20856,6 +20933,23 @@ static void handle_client(st_admin_server *server, int fd)
     close(fd);
 }
 
+/*
+ * Accepted sockets not closed yet. Process-wide rather than in st_admin_server, whose owner may let
+ * it go (a test's stack frame) while a connection thread is still finishing.
+ */
+static pthread_mutex_t admin_connections_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t admin_connections_cond = PTHREAD_COND_INITIALIZER;
+static int admin_open_connections;
+
+/* A socket of the listener was closed: one more may be accepted. */
+static void admin_connection_closed(void)
+{
+    pthread_mutex_lock(&admin_connections_lock);
+    --admin_open_connections;
+    pthread_cond_broadcast(&admin_connections_cond);
+    pthread_mutex_unlock(&admin_connections_lock);
+}
+
 static void *admin_client_thread(void *arg)
 {
     st_admin_client_args *client = (st_admin_client_args *)arg;
@@ -20863,24 +20957,59 @@ static void *admin_client_thread(void *arg)
     int fd = client->fd;
     free(client);
     handle_client(server, fd);
+    admin_connection_closed();
     return NULL;
 }
 
+/*
+ * Tomcat's acceptor: it takes a connection only while fewer than maxConnections are open (LimitLatch),
+ * so the rest wait in the listen backlog, and a failed accept never ends it. Running out of
+ * descriptors or memory pauses it a little, up to Tomcat's 1.6 s, instead of spinning; an accept that
+ * failed for the caller's connection alone (reset before it was taken) is just skipped.
+ */
 static void *admin_thread(void *arg)
 {
     st_admin_server *server = (st_admin_server *)arg;
     printf("[admin] listening on 0.0.0.0:%d\n", server->port);
+    const int listener = server->fd;
+    const int timeout_ms = server->connection_timeout_ms;
+    const int max_connections = server->max_connections;
+    int error_delay_ms = 0;
     for (;;) {
-        int fd = accept(server->fd, NULL, NULL);
-        if (fd < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            break;
+        pthread_mutex_lock(&admin_connections_lock);
+        while (admin_open_connections >= max_connections) {
+            pthread_cond_wait(&admin_connections_cond, &admin_connections_lock);
         }
+        ++admin_open_connections;
+        pthread_mutex_unlock(&admin_connections_lock);
+        int fd = accept(listener, NULL, NULL);
+        if (fd < 0) {
+            int accept_errno = errno;
+            admin_connection_closed();
+            if (accept_errno == EBADF || accept_errno == EINVAL || accept_errno == ENOTSOCK) {
+                break;
+            }
+            /* accept(2): a network error of the pending connection itself is reported here too. */
+            int this_connection_only = accept_errno == EINTR || accept_errno == ECONNABORTED
+                || accept_errno == EPROTO || accept_errno == ENOPROTOOPT || accept_errno == ENETDOWN
+                || accept_errno == ENETUNREACH || accept_errno == EHOSTDOWN || accept_errno == EHOSTUNREACH
+                || accept_errno == EPERM;
+            if (!this_connection_only) {
+                error_delay_ms = error_delay_ms == 0 ? 50 : error_delay_ms * 2 > 1600 ? 1600 : error_delay_ms * 2;
+                fprintf(stderr, "[admin] accept failed: %s; retrying in %d ms\n", strerror(accept_errno),
+                        error_delay_ms);
+                struct timespec pause = {error_delay_ms / 1000, (long)(error_delay_ms % 1000) * 1000000L};
+                while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {
+                }
+            }
+            continue;
+        }
+        error_delay_ms = 0;
+        admin_socket_set_timeouts(fd, timeout_ms);
         st_admin_client_args *client = (st_admin_client_args *)malloc(sizeof(*client));
         if (client == NULL) {
             close(fd);
+            admin_connection_closed();
             continue;
         }
         client->server = server;
@@ -20890,6 +21019,7 @@ static void *admin_thread(void *arg)
             perror("admin client pthread_create");
             close(fd);
             free(client);
+            admin_connection_closed();
             continue;
         }
         pthread_detach(worker);
@@ -20938,6 +21068,8 @@ int st_admin_server_start_with_handlers(st_admin_server *server,
     server->direct_ws_data = ws_data;
     server->direct_ws_close = ws_close;
     server->direct_ws_ctx = ws_ctx;
+    server->connection_timeout_ms = admin_connector_timeout_ms;
+    server->max_connections = admin_connector_max_connections;
     server->fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server->fd < 0) {
         perror("admin socket");
@@ -20957,7 +21089,8 @@ int st_admin_server_start_with_handlers(st_admin_server *server,
         server->fd = -1;
         return -1;
     }
-    if (listen(server->fd, 64) != 0) {
+    /* Tomcat hands acceptCount to the listening socket as its backlog. */
+    if (listen(server->fd, admin_connector_accept_count) != 0) {
         perror("admin listen");
         close(server->fd);
         server->fd = -1;
