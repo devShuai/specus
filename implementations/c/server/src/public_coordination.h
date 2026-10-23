@@ -95,10 +95,12 @@ int st_public_coordination_enabled(void);
  */
 int st_public_coordination_validate_config(void);
 /*
- * Startup connects the command, publish and subscribe connections (PING and SUBSCRIBE must
- * succeed, as Java requires). Afterwards a lost connection is re-established in the background
- * (Pub/Sub, with SUBSCRIBE replayed) or by the next command, with Lettuce's exponential delay;
- * while a connection is down its operations fail without affecting the others.
+ * Startup reads SPECUS_PUBLIC_TRANSFER_REDIS_URI as Lettuce's RedisURI (redis_uri.h: TCP, TLS,
+ * Unix socket, or a master found through Sentinels) and connects the command, publish and
+ * subscribe connections (PING and SUBSCRIBE must succeed, as Java requires). Afterwards a lost
+ * connection is re-established in the background (Pub/Sub, with SUBSCRIBE replayed) or by the next
+ * command, with Lettuce's exponential delay, asking the Sentinels again each time; while a
+ * connection is down its operations fail without affecting the others.
  */
 int st_public_coordination_initialize(st_public_cluster_event_handler handler, void *context);
 void st_public_coordination_shutdown(void);
