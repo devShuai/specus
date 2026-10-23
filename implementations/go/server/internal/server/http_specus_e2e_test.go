@@ -9,8 +9,11 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 
 	"github.com/devShuai/specus/implementations/go/server/internal/auth"
 	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
@@ -113,6 +116,74 @@ func TestHTTPDataChannelStreamsFragmentedResponse(t *testing.T) {
 	}
 	if err := <-clientErr; err != nil {
 		t.Fatalf("HTTP data client: %v", err)
+	}
+}
+
+// TestRouteWebSocketBrowserDropResetsDeviceStream: a browser that leaves a route WebSocket without a
+// CLOSE has no close handshake to relay (1006 never goes on the wire), so the device's stream ends
+// with RST 31 "WebSocket browser closed", as on the C, Java and .NET servers, and not with FIN.
+func TestRouteWebSocketBrowserDropResetsDeviceStream(t *testing.T) {
+	app, port := startTestApp(t)
+	account, err := app.db.FindClientByName(context.Background(), DemoClientName)
+	if err != nil || account == nil {
+		t.Fatalf("load demo client: account=%+v err=%v", account, err)
+	}
+	now := time.Now().UTC()
+	if err := app.db.InsertHTTPRoute(context.Background(), store.HTTPRouteMapping{
+		ID: auth.NewClientID(), TenantID: account.TenantID, ClientID: account.ID, ClientName: account.ClientName,
+		Route: "live", TargetBaseURL: "http://127.0.0.1:8080", Enabled: true, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("insert HTTP route: %v", err)
+	}
+	controlConn, dataConn, dataReader := loginHTTPTestChannels(t, app, port)
+	defer controlConn.Close()
+	defer dataConn.Close()
+	_, management := newHTTPTestServer(t, app)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	browser, _, err := websocket.Dial(ctx,
+		"ws"+strings.TrimPrefix(management.URL, "http")+"/http/Demo%20client/live/socket", nil)
+	if err != nil {
+		t.Fatalf("browser WebSocket dial: %v", err)
+	}
+	defer browser.CloseNow()
+
+	_ = dataConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	nextMessage := func() protocol.NatMessage {
+		t.Helper()
+		for {
+			packet, err := readProtocolPacket(dataReader)
+			if err != nil {
+				t.Fatalf("read data channel: %v", err)
+			}
+			if message, ok := packet.(protocol.NatMessage); ok {
+				return message
+			}
+		}
+	}
+	var streamID uint32
+	for streamID == 0 {
+		if message := nextMessage(); message.Type == protocol.NatOpen && fmt.Sprint(message.Metadata["source"]) == "ws" {
+			streamID = message.StreamID
+		}
+	}
+
+	// Close the TCP connection without a close handshake.
+	if err := browser.CloseNow(); err != nil {
+		t.Fatalf("drop browser connection: %v", err)
+	}
+	for {
+		message := nextMessage()
+		if message.StreamID != streamID {
+			continue
+		}
+		if message.Type != protocol.NatRST || message.Value != 31 ||
+			fmt.Sprint(message.Metadata["reason"]) != "WebSocket browser closed" {
+			t.Fatalf("stream end = type %d value %d metadata %v data %q, want RST 31 %q",
+				message.Type, message.Value, message.Metadata, message.Data, "WebSocket browser closed")
+		}
+		return
 	}
 }
 

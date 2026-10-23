@@ -2,6 +2,8 @@ package directhttp
 
 import (
 	"context"
+	"encoding/binary"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,7 +24,14 @@ type wsHarness struct {
 	browser  *websocket.Conn
 	frames   chan []byte
 	finishes atomic.Int32
+	resets   chan wsReset
 	closed   chan *WebSocketSpecus
+}
+
+// wsReset 是隧道发给客户端的一次 RST。
+type wsReset struct {
+	code   uint32
+	reason string
 }
 
 func newWSHarness(t *testing.T) *wsHarness {
@@ -30,7 +39,52 @@ func newWSHarness(t *testing.T) *wsHarness {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
 	serverConn, browser := dialWSPair(t, ctx)
-	h := &wsHarness{browser: browser, frames: make(chan []byte, 16), closed: make(chan *WebSocketSpecus, 1)}
+	h := attachWSHarness(serverConn)
+	h.browser = browser
+	t.Cleanup(func() {
+		// 先断开浏览器侧，避免 specus.Close 的关闭握手空等对端回包。
+		h.browser.CloseNow()
+		h.specus.Close()
+	})
+	return h
+}
+
+// newGorillaBrowserWSHarness 同 newWSHarness，但浏览器侧是 gorilla 客户端，测试可以直接写
+// 原始帧、发不带码的 CLOSE，或不经关闭握手断开底层 TCP 连接。
+func newGorillaBrowserWSHarness(t *testing.T) (*wsHarness, *gorillaws.Conn) {
+	t.Helper()
+	accepted := make(chan *gorillaws.Conn, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&gorillaws.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
+		if err == nil {
+			accepted <- conn
+		}
+	}))
+	t.Cleanup(server.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	browser, _, err := gorillaws.DefaultDialer.DialContext(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("gorilla dial failed: %v", err)
+	}
+	var serverConn *gorillaws.Conn
+	select {
+	case serverConn = <-accepted:
+	case <-ctx.Done():
+		t.Fatalf("accept timed out: %v", ctx.Err())
+	}
+	h := attachWSHarness(serverConn)
+	t.Cleanup(func() {
+		_ = browser.Close()
+		h.specus.Close()
+	})
+	return h, browser
+}
+
+// attachWSHarness 在服务器侧连接上建立隧道，记录它发给客户端的 SWS2 DATA、FIN 与 RST。
+func attachWSHarness(serverConn *gorillaws.Conn) *wsHarness {
+	h := &wsHarness{frames: make(chan []byte, 16), resets: make(chan wsReset, 1),
+		closed: make(chan *WebSocketSpecus, 1)}
 	h.specus = NewWebSocketSpecus(serverConn, 7, "Demo client",
 		func(frame []byte) error {
 			h.frames <- frame
@@ -40,13 +94,58 @@ func newWSHarness(t *testing.T) *wsHarness {
 			h.finishes.Add(1)
 			return nil
 		},
+		func(code uint32, reason string) error {
+			h.resets <- wsReset{code: code, reason: reason}
+			return nil
+		},
 		func(specus *WebSocketSpecus) { h.closed <- specus })
-	t.Cleanup(func() {
-		// 先断开浏览器侧，避免 specus.Close 的关闭握手空等对端回包。
-		h.browser.CloseNow()
-		h.specus.Close()
-	})
 	return h
+}
+
+// awaitClosed 等隧道关闭；此时发给客户端的 CLOSE、FIN 或 RST 都已发出。
+func (h *wsHarness) awaitClosed(t *testing.T) {
+	t.Helper()
+	select {
+	case <-h.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("specus did not close")
+	}
+}
+
+// expectBrowserGoneReset 断言流以 RST 31 结束，客户端既没收到 SWS2 CLOSE 也没收到 FIN。
+func (h *wsHarness) expectBrowserGoneReset(t *testing.T) {
+	t.Helper()
+	h.awaitClosed(t)
+	select {
+	case reset := <-h.resets:
+		if reset.code != 31 || reset.reason != "WebSocket browser closed" {
+			t.Fatalf("RST = %d %q, want 31 %q", reset.code, reset.reason, "WebSocket browser closed")
+		}
+	default:
+		t.Fatalf("stream was not reset; FIN count %d, %d SWS2 frames", h.finishes.Load(), len(h.frames))
+	}
+	if h.finishes.Load() != 0 || len(h.frames) != 0 {
+		t.Fatalf("reset stream also got FIN count %d and %d SWS2 frames", h.finishes.Load(), len(h.frames))
+	}
+}
+
+// expectCloseAndFin 断言客户端收到一帧 SWS2 CLOSE(code, reason) 后是 FIN，流没有被复位。
+func (h *wsHarness) expectCloseAndFin(t *testing.T, code uint16, reason string) {
+	t.Helper()
+	frame := h.nextFrame(t)
+	if frame.opcode != sws2OpcodeClose || frame.closeCode != code || string(frame.payload) != reason {
+		t.Fatalf("frame = opcode %d code %d reason %q, want CLOSE %d %q",
+			frame.opcode, frame.closeCode, frame.payload, code, reason)
+	}
+	h.awaitClosed(t)
+	if h.finishes.Load() != 1 {
+		t.Fatalf("FIN count = %d, want 1", h.finishes.Load())
+	}
+	select {
+	case reset := <-h.resets:
+		t.Fatalf("stream ended with CLOSE + FIN was also reset: %+v", reset)
+	default:
+	}
 }
 
 // dialWSPair 在 httptest 服务器上完成一次 WS 握手，返回服务器侧与浏览器侧连接。
@@ -118,7 +217,7 @@ func TestServeWebSocketOpenDataCloseLifecycle(t *testing.T) {
 				func() error {
 					finishes.Add(1)
 					return nil
-				}, nil), nil
+				}, noWSReset, nil), nil
 		}, time.Second, 1024, 1024, nil, &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{
 			ClientEnabled: true, Enabled: true, AuthEnabled: true, AuthUsername: "ws-user", AuthPasswordHash: auth.HashToken("ws-password"),
 		}}, nil, store.TrafficDetailOptions{})
@@ -368,7 +467,7 @@ func TestWSSpecusWritesPingAndPongPayloadsToBrowser(t *testing.T) {
 	defer browser.CloseNow()
 	serverConn := <-accepted
 	specus := NewWebSocketSpecus(serverConn, 11, "client", func([]byte) error { return nil },
-		func() error { return nil }, nil)
+		func() error { return nil }, noWSReset, nil)
 	defer specus.Close()
 	go func() {
 		for {
@@ -399,7 +498,7 @@ func TestServeWebSocketAutoRepliesToPingAndForwardsBrowserPongPayload(t *testing
 			return NewWebSocketSpecus(conn, 12, clientName, func(frame []byte) error {
 				frames <- frame
 				return nil
-			}, func() error { return nil }, nil), nil
+			}, func() error { return nil }, noWSReset, nil), nil
 		}, time.Second, 1024, 1024, nil, &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{ClientEnabled: true, Enabled: true}},
 		nil, store.TrafficDetailOptions{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -587,4 +686,95 @@ func TestWSSpecusBrowserCloseStopsWaitingWhenClientWithholdsCredit(t *testing.T)
 	case <-time.After(time.Second):
 		t.Fatal("specus did not close after credit timeout")
 	}
+}
+
+// noWSReset 给不关心 RST 的测试填 NewWebSocketSpecus 的 reset 回调。
+func noWSReset(uint32, string) error { return nil }
+
+// TestWSSpecusBrowserDropWithoutCloseResetsStream 浏览器不经关闭握手断开 TCP（gorilla 报 1006）：
+// 1006 不得上线，没有可转发的 CLOSE，客户端收到 RST 31 而不是 FIN（对齐 C/Java/.NET）。
+func TestWSSpecusBrowserDropWithoutCloseResetsStream(t *testing.T) {
+	h, browser := newGorillaBrowserWSHarness(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go h.specus.ReadLoop(ctx)
+
+	if err := browser.NetConn().Close(); err != nil {
+		t.Fatalf("close browser TCP connection: %v", err)
+	}
+
+	h.expectBrowserGoneReset(t)
+}
+
+// TestWSSpecusBrowserConnectionResetResetsStream 浏览器连接被复位（读到网络错误而不是 CloseError）
+// 同样是不带 CLOSE 的离开：客户端收到 RST 31，而不是 CLOSE 1011 + FIN。
+func TestWSSpecusBrowserConnectionResetResetsStream(t *testing.T) {
+	h, browser := newGorillaBrowserWSHarness(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go h.specus.ReadLoop(ctx)
+
+	tcp, ok := browser.NetConn().(*net.TCPConn)
+	if !ok {
+		t.Fatalf("browser connection is %T, want *net.TCPConn", browser.NetConn())
+	}
+	if err := tcp.SetLinger(0); err != nil {
+		t.Fatalf("SetLinger(0): %v", err)
+	}
+	if err := tcp.Close(); err != nil {
+		t.Fatalf("reset browser TCP connection: %v", err)
+	}
+
+	h.expectBrowserGoneReset(t)
+}
+
+// TestWSSpecusBrowserCloseWithoutCodeSendsCodelessClose 浏览器 CLOSE 不带关闭码（gorilla 报 1005）：
+// 客户端收到不带码、不带原因的 SWS2 CLOSE，随后 FIN。
+func TestWSSpecusBrowserCloseWithoutCodeSendsCodelessClose(t *testing.T) {
+	h, browser := newGorillaBrowserWSHarness(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go h.specus.ReadLoop(ctx)
+
+	if err := browser.WriteControl(gorillaws.CloseMessage, nil, webSocketWriteDeadline(ctx)); err != nil {
+		t.Fatalf("browser CLOSE without code: %v", err)
+	}
+
+	h.expectCloseAndFin(t, 0, "")
+}
+
+// TestWSSpecusOversizedBrowserMessageClosesWith1009 浏览器消息超过 16 MiB：gorilla 读到帧头即以
+// 1009 关闭浏览器，客户端收到同一关闭码的 SWS2 CLOSE + FIN（对齐 C/Java），而不是 1011。
+func TestWSSpecusOversizedBrowserMessageClosesWith1009(t *testing.T) {
+	h, browser := newGorillaBrowserWSHarness(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go h.specus.ReadLoop(ctx)
+
+	// 一个声明 16 MiB + 1 字节的二进制帧头（FIN、MASK、64 位长度、掩码），不必真的发出负载。
+	header := []byte{0x82, 0x80 | 127}
+	header = binary.BigEndian.AppendUint64(header, wsMaxMessageBytes+1)
+	header = append(header, 1, 2, 3, 4)
+	if _, err := browser.NetConn().Write(header); err != nil {
+		t.Fatalf("write oversized frame header: %v", err)
+	}
+
+	h.expectCloseAndFin(t, gorillaws.CloseMessageTooBig, "WebSocket message too big")
+	_ = browser.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, _, err := browser.ReadMessage(); !gorillaws.IsCloseError(err, gorillaws.CloseMessageTooBig) {
+		t.Fatalf("browser read = %v, want CLOSE 1009", err)
+	}
+}
+
+// TestWSSpecusTruncatesCloseReasonOnRuneBoundary 转发给客户端的关闭原因截断到 123 字节时
+// 不拆开 UTF-8 字符：第 123 字节落在一个汉字中间，就只保留它之前的完整字符。
+func TestWSSpecusTruncatesCloseReasonOnRuneBoundary(t *testing.T) {
+	h := newWSHarness(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	reason := "a" + strings.Repeat("你", 50) // 151 字节，字节 121..123 是第 41 个汉字
+	h.specus.closeFromBrowserContext(ctx, gorillaws.CloseNormalClosure, reason)
+
+	h.expectCloseAndFin(t, gorillaws.CloseNormalClosure, "a"+strings.Repeat("你", 40))
 }
