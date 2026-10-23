@@ -235,10 +235,10 @@ H-4 / H-5 / H-7 仍按打洞审计文档列为 OPEN，待基线数据确认对�
 
 ## 运行指标（Micrometer 与 actuator 指标端点）
 
-Java server 的运行指标在 Micrometer 里，经 Spring Boot Actuator 的 `GET /actuator/metrics` 与 `/actuator/metrics/{requiredMetricName}` 读出（JSON）；没有 Prometheus 端点，web 默认只发布 health，`MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE` 含 `metrics` 时才有这两个路由，不要 token。C server 自 `feat/c-server-metrics` 起在管理监听器上提供同样的两个路由与同样的发布规则，只含 Java 自己注册的 16 个指标（Spring Boot 自带的 JVM、Tomcat、HikariCP 等指标没有）。Go、.NET 的主服务没有这组指标（独立 STUN 服务的 `/metrics` 是另一套，与此无关）。各指标在 C 与 Java 里计数的事件相同：
+Java server 的运行指标在 Micrometer 里，经 Spring Boot Actuator 的 `GET /actuator/metrics` 与 `/actuator/metrics/{requiredMetricName}` 读出（JSON）；没有 Prometheus 端点，web 默认只发布 health，`MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE` 含 `metrics` 时才有这两个路由，不要 token；`MANAGEMENT_ENDPOINT_METRICS_ACCESS` 等访问控制为 none 时没有，管理端口、基路径或路径映射另设时 Java 把端点挪走、C 不提供（API 盘点第 7 节末表）。C server 自 `feat/c-server-metrics` 起在管理监听器上提供同样的两个路由与同样的发布规则，只含 Java 自己注册的 16 个指标（Spring Boot 自带的 JVM、Tomcat、HikariCP 等指标没有）。Go、.NET 的主服务没有这组指标（独立 STUN 服务的 `/metrics` 是另一套，与此无关）。各指标在 C 与 Java 里计数的事件相同：
 
 - `specus.control.preauth.oversize.rejected`：登录前声明长度超过 16 KiB 的帧，只看长度字段、先于其余帧头检查。
-- `specus.control.protocol.rejected{reason}`：编解码拒绝的帧，原因同 Java `ProtocolException.Reason`（`invalid_magic`、`unsupported_version`、`unsupported_serializer`、`unknown_command`、`invalid_length`、`malformed_body`）。Java 的这 6 个计数器因 `DecoderException` 包装实际恒为 0，C 按原因计数（API 盘点第 8 节）。
+- `specus.control.protocol.rejected{reason}`：编解码拒绝的帧，原因同 Java `ProtocolException.Reason`（`invalid_magic`、`unsupported_version`、`unsupported_serializer`、`unknown_command`、`invalid_length`、`malformed_body`）。Java 原先因 `DecoderException` 包装让这 6 个计数器恒为 0，自 #340 起已与 C 一致，按原因计数；C 不解码的心跳、登出正文与 NAT 元数据 JSON 不计（API 盘点第 8 节）。
 - `specus.control.plaintext.deployment.rejected`：生产环境拒绝自签或不受信的明文部署，计数后进程退出。`specus.control.tls.mode{mode}` 恒为 1，标签为 `file`、`self_signed`、`terminated_upstream` 或 `disabled`；`specus.control.tls.certificate.expiry.epoch.seconds` 为 file 模式证书的 notAfter（C 的 PKCS#12 与 PEM 都取叶证书），其余模式为 0。
 - `specus.peer_mesh.turn.general_relay.quota.rejected`、`.destination.forbidden`、`.bytes`、`.quota.closed`：通用 TURN（`public-transfer` 凭证）的分配配额拒绝、目的地址策略拒绝（每个被拒的请求一次）、双向转发且未超字节配额的字节、超配额关闭（每个分配一次）。
 - `specus.peer_mesh.turn.relay.send.failures`：发不出去的中继数据报（四个转发方向）。`.queue.depth`、`.queue.high.water`、`.queue.dropped` 在 C 恒为 0：C 同步转发，没有 Java 的 relay 工作队列。

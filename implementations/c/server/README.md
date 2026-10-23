@@ -135,6 +135,13 @@ Additional runtime knobs:
 | `SPECUS_PRODUCT_METRICS_ALLOWED` | `true` | Deployment switch `productMetrics.allowed` of opt-in product metrics. `false` (any value other than `true`/`1`/`yes`) keeps every tenant off: settings read `enabled: false`, enabling answers `409 PRODUCT_METRICS_NOT_ALLOWED`, ingest answers `collecting: false` and milestones are ignored. |
 | `MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE` | unset (Spring Boot's `health`) | Spring Boot's `management.endpoints.web.exposure.include`. The metrics routes exist only while it lists `metrics` (or `*`); entries are comma-separated and trimmed, dashes are dropped and ids compare by their lowercase letters and digits. An entry Spring would refuse (empty, a character outside `[a-zA-Z0-9.-]`, or starting with a digit or an uppercase letter) stops the start, as it stops Java's. |
 | `MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_EXCLUDE` | unset | `management.endpoints.web.exposure.exclude`, read the same way; it wins over the include list. |
+| `MANAGEMENT_ENDPOINT_METRICS_ACCESS` | unset (`unrestricted`) | `management.endpoint.metrics.access`: `none` removes the metrics routes, `read-only` and `unrestricted` keep them (Spring's lenient enum: `READ_ONLY`, `Read-Only` and `readOnly` are the same). The deprecated `MANAGEMENT_ENDPOINT_METRICS_ENABLED` (Spring booleans: true/on/yes/1, false/off/no/0) stands for it; setting both, or a value Spring cannot convert, stops the start, as in Java. |
+| `MANAGEMENT_ENDPOINTS_ACCESS_DEFAULT` | unset (`unrestricted`) | `management.endpoints.access.default`, used when the metrics endpoint has no access of its own; `MANAGEMENT_ENDPOINTS_ENABLEDBYDEFAULT` (also read as `..._ENABLED_BY_DEFAULT`) is its deprecated boolean form, and setting both stops the start. |
+| `MANAGEMENT_ENDPOINTS_ACCESS_MAXPERMITTED` | unset (`unrestricted`) | `management.endpoints.access.max-permitted` (also read as `..._MAX_PERMITTED`): `none` removes the metrics routes whatever else is set. |
+| `MANAGEMENT_SERVER_PORT` | unset | `management.server.port`. Java serves the actuator on the main port only when this is unset or equals the server port; C compares it with `SPECUS_ADMIN_PORT`. A negative value (actuator off), `0` or another port moves the endpoint off the main listener in Java, and C, which opens no second port, then serves it nowhere. A value Spring cannot read as an Integer stops the start. |
+| `MANAGEMENT_SERVER_ADDRESS` | unset | `management.server.address`. Java refuses to start when it is set without a management port of its own, and so does C; with another port it belongs to the port C does not open. |
+| `MANAGEMENT_ENDPOINTS_WEB_BASEPATH` | unset (`/actuator`) | `management.endpoints.web.base-path` (also read as `..._BASE_PATH`). Any other base path (one trailing `/` dropped; empty is the root) moves the endpoint in Java and takes it away in C; a value that is not empty and does not start with `/` stops the start. |
+| `MANAGEMENT_ENDPOINTS_WEB_PATHMAPPING_METRICS` | unset (`metrics`) | `management.endpoints.web.path-mapping.metrics` (also read as `..._PATH_MAPPING_METRICS`); any other mapping takes the endpoint away in C, as it moves it in Java. |
 | `SPECUS_PEER_MESH_ENABLED` | `false` | Enables Java-shaped Peer Mesh login/control behaviour and starts the built-in STUN/TURN UDP listener. When the listener cannot start (port taken, public address unresolvable, strict RFC 5780 mode with an incomplete configuration) the server logs `[peer-mesh] standard STUN/TURN UDP server failed to start on <port>` and runs on without it, as Java does. |
 | `SPECUS_PEER_MESH_PUBLIC_ADDRESS` | unset | Public address advertised for the built-in STUN/TURN service and relay candidates: an IPv4 literal or a name, resolved at startup to its first IPv4 address as Java's `InetAddress.getByName` does. A name that does not resolve keeps the STUN/TURN listener from starting. Unset, as in Java, the listener's bind address is advertised unless it is `0.0.0.0`, and then the address this host's name resolves to; on Debian and Ubuntu that is usually `127.0.1.1` from `/etc/hosts`, which no other host can reach (Java behaves the same), so set this whenever clients relay from elsewhere. |
 | `SPECUS_PEER_MESH_BIND_ADDRESS` | `0.0.0.0` | Bind address for the built-in STUN/TURN UDP listener and the relay sockets. |
@@ -542,10 +549,14 @@ has no Prometheus registry, so there is no `/actuator/prometheus` on either side
 server registers itself; the JVM, Tomcat, HikariCP and Spring meters Spring Boot adds have no C
 counterpart. A meter's answer has Jackson's alphabetical fields, values written as Java's
 `Double.toString` writes them, `tag=key:value` filtering, Spring's `Accept` negotiation (v3, v2 or plain
-JSON, otherwise `406`) and Spring's `Content-Disposition: inline;filename=f.txt` on a dotted name.
+JSON, ranges sorted by specificity first, otherwise `406`) and Spring's
+`Content-Disposition: inline;filename=f.txt` when the name's extension is not on Spring's safe list
+(`.json` or `.txt` get no header). The access and placement settings below are read as Java reads them;
+where Java would move the endpoint to another port or path, C does not serve it at all.
 C counts the same events as Java (`src/metrics.c`); where it cannot or does not (the TURN relay queue
-meters stay 0 because C relays synchronously, `specus.control.protocol.rejected` counts in C while
-Java's handler never sees the wrapped exception) the API inventory's section 8 says why.
+meters stay 0 because C relays synchronously; frame bodies C does not decode, such as heartbeat
+bodies, are not counted in `specus.control.protocol.rejected`, which Java counts by reason since #340)
+the API inventory's section 8 says why.
 `tests/metrics_tests.c` compares the answers with the Java server's, and
 `tests/metrics_endpoint_tests.c` reads them from a real process after refused control frames, TURN
 quota and policy refusals, relayed bytes and a Peer Mesh relay batch.
