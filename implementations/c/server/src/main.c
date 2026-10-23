@@ -20,6 +20,7 @@
 #include "tls_transport.h"
 #include "traffic_capture.h"
 #include "traffic_usage.h"
+#include "unicode_java21.h"
 #include "workbench.h"
 
 #include <arpa/inet.h>
@@ -43,6 +44,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <utf8proc.h>
 
 #define ST_CHANNEL_ID_SIZE 64U
 #define ST_IO_BUFFER_SIZE 16384U
@@ -651,6 +653,69 @@ static int env_spring_duration_ms(const char *name, int default_ms, int *out)
     return 0;
 }
 
+/*
+ * An int as Spring Boot binds server.tomcat.max-connections and accept-count from the environment
+ * (StringToNumberConverterFactory, NumberUtils.parseNumber): every Java whitespace character is
+ * dropped; after an optional '-', a 0x, 0X or # prefix reads Integer.decode's hexadecimal, anything
+ * else Integer.valueOf (an optional sign and digits, Character.digit's digits of any script).
+ * Overflow or anything else fails the binding and with it the start; unset or empty keeps
+ * default_value.
+ */
+static int env_spring_int(const char *name, int default_value, int *out)
+{
+    const char *value = getenv(name);
+    if (value == NULL || *value == '\0') {
+        *out = default_value;
+        return 0;
+    }
+    size_t len = strlen(value);
+    int32_t *points = (int32_t *)malloc((len + 1U) * sizeof(*points));
+    size_t count = 0U;
+    int valid = points != NULL;
+    for (size_t offset = 0U; valid && offset < len;) {
+        utf8proc_int32_t point = 0;
+        utf8proc_ssize_t width = utf8proc_iterate((const utf8proc_uint8_t *)value + offset,
+                                                  (utf8proc_ssize_t)(len - offset), &point);
+        valid = width > 0;
+        if (valid && !st_unicode_java21_whitespace(point)) {
+            points[count++] = point;
+        }
+        offset += valid ? (size_t)width : 0U;
+    }
+    size_t index = 0U;
+    int negative = valid && count > 0U && points[0] == '-';
+    int radix = 10;
+    if (valid && count > (size_t)negative + 1U && points[negative] == '0'
+        && (points[negative + 1] == 'x' || points[negative + 1] == 'X')) {
+        radix = 16;
+        index = (size_t)negative + 2U;
+    } else if (valid && count > (size_t)negative && points[negative] == '#') {
+        radix = 16;
+        index = (size_t)negative + 1U;
+    } else if (valid && count > 0U && (points[0] == '-' || points[0] == '+')) {
+        index = 1U;
+    }
+    /* Integer.decode allows no second sign after the prefix; valueOf needs a digit. */
+    valid = valid && index < count && points[index] != '-' && points[index] != '+';
+    long long magnitude = 0;
+    long long limit = negative ? -(long long)INT_MIN : (long long)INT_MAX;
+    for (size_t i = index; valid && i < count; ++i) {
+        int digit = st_unicode_java21_digit(points[i], radix);
+        valid = digit >= 0;
+        if (valid) {
+            magnitude = magnitude * radix + digit;
+            valid = magnitude <= limit;
+        }
+    }
+    free(points);
+    if (!valid) {
+        fprintf(stderr, "invalid %s; expected an int\n", name);
+        return -1;
+    }
+    *out = negative ? (int)-magnitude : (int)magnitude;
+    return 0;
+}
+
 static int copy_config_string(char *dest, size_t dest_len, const char *name, const char *value)
 {
     if (value == NULL || *value == '\0') {
@@ -1120,10 +1185,10 @@ static int load_config(server_config *config)
         /* The Java server's Tomcat connector, as Spring Boot binds server.tomcat.* from the environment. */
         || env_spring_duration_ms(spring_env_name("SERVER_TOMCAT_CONNECTIONTIMEOUT", "SERVER_TOMCAT_CONNECTION_TIMEOUT"),
                                   ST_ADMIN_DEFAULT_CONNECTION_TIMEOUT_MS, &config->admin_connection_timeout_ms) != 0
-        || env_int_range(spring_env_name("SERVER_TOMCAT_MAXCONNECTIONS", "SERVER_TOMCAT_MAX_CONNECTIONS"),
-                         ST_ADMIN_DEFAULT_MAX_CONNECTIONS, INT_MIN, INT_MAX, &config->admin_max_connections) != 0
-        || env_int_range(spring_env_name("SERVER_TOMCAT_ACCEPTCOUNT", "SERVER_TOMCAT_ACCEPT_COUNT"),
-                         ST_ADMIN_DEFAULT_ACCEPT_COUNT, INT_MIN, INT_MAX, &config->admin_accept_count) != 0) {
+        || env_spring_int(spring_env_name("SERVER_TOMCAT_MAXCONNECTIONS", "SERVER_TOMCAT_MAX_CONNECTIONS"),
+                          ST_ADMIN_DEFAULT_MAX_CONNECTIONS, &config->admin_max_connections) != 0
+        || env_spring_int(spring_env_name("SERVER_TOMCAT_ACCEPTCOUNT", "SERVER_TOMCAT_ACCEPT_COUNT"),
+                          ST_ADMIN_DEFAULT_ACCEPT_COUNT, &config->admin_accept_count) != 0) {
         return -1;
     }
     /* Java's body limit filter takes a negative limit as 0: any body at all is too large. A
