@@ -20,6 +20,7 @@
 #include "tls_transport.h"
 #include "traffic_capture.h"
 #include "traffic_usage.h"
+#include "unicode_java21.h"
 #include "workbench.h"
 
 #include <arpa/inet.h>
@@ -43,6 +44,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <utf8proc.h>
 
 #define ST_CHANNEL_ID_SIZE 64U
 #define ST_IO_BUFFER_SIZE 16384U
@@ -100,6 +102,10 @@ typedef struct {
     int64_t http_timeout_ms;
     int64_t http_max_request_body;
     int admin_port;
+    /* server.tomcat.connection-timeout, max-connections and accept-count of the admin listener. */
+    int admin_connection_timeout_ms;
+    int admin_max_connections;
+    int admin_accept_count;
     char static_root[512];
     char database_path[512];
     /*
@@ -439,6 +445,280 @@ static int env_i64_range(const char *name, int64_t default_value, int64_t min_va
         return -1;
     }
     *out = (int64_t)parsed;
+    return 0;
+}
+
+/*
+ * The environment variable Spring Boot binds a server.tomcat.* property from: the canonical name (the
+ * dash dropped) when it is set, else the legacy one that keeps the dash as an underscore.
+ */
+static const char *spring_env_name(const char *canonical, const char *legacy)
+{
+    return getenv(canonical) != NULL ? canonical : legacy;
+}
+
+/* Long.parseLong of [start, end): an optional sign and ASCII digits, nothing else, no overflow. */
+static int java_parse_long(const char *start, const char *end, int64_t *out)
+{
+    int negative = start < end && *start == '-';
+    if (start < end && (*start == '-' || *start == '+')) {
+        ++start;
+    }
+    if (start == end) {
+        return -1;
+    }
+    int64_t value = 0;
+    for (; start < end; ++start) {
+        if (*start < '0' || *start > '9'
+            || __builtin_mul_overflow(value, 10, &value)
+            || (negative ? __builtin_sub_overflow(value, (int64_t)(*start - '0'), &value)
+                         : __builtin_add_overflow(value, (int64_t)(*start - '0'), &value))) {
+            return -1;
+        }
+    }
+    *out = value;
+    return 0;
+}
+
+/* java.time.Duration.toMillis of seconds and nanos (0 <= nanos < 10^9): truncated toward zero. */
+static int java_duration_to_millis(int64_t seconds, int64_t nanos, int64_t *millis)
+{
+    if (seconds < 0) {
+        seconds += 1;
+        nanos -= 1000000000LL;
+    }
+    int64_t whole = 0;
+    if (__builtin_mul_overflow(seconds, 1000, &whole) || __builtin_add_overflow(whole, nanos / 1000000LL, millis)) {
+        return -1;
+    }
+    return 0;
+}
+
+/* java.time.Duration.parse ([-+]PnDTnHnMn.nS, any case) as milliseconds; -1 when it fails. */
+static int java_parse_iso_duration_ms(const char *text, int64_t *millis)
+{
+    const char *cursor = text;
+    int negate = *cursor == '-';
+    if (*cursor == '-' || *cursor == '+') {
+        ++cursor;
+    }
+    if (*cursor != 'P' && *cursor != 'p') {
+        return -1;
+    }
+    ++cursor;
+    static const char designators[] = "DHMS";
+    static const int64_t unit_seconds[] = {86400, 3600, 60, 1};
+    int64_t seconds = 0;
+    int64_t nanos = 0;
+    int parts = 0;
+    int in_time = 0;
+    size_t next = 0U;
+    while (*cursor != '\0') {
+        if ((*cursor == 'T' || *cursor == 't') && !in_time) {
+            in_time = 1;
+            next = 1U;
+            ++cursor;
+            /* A T must be followed by at least one time part. */
+            if (*cursor == '\0') {
+                return -1;
+            }
+            continue;
+        }
+        const char *number = cursor;
+        if (*cursor == '-' || *cursor == '+') {
+            ++cursor;
+        }
+        while (*cursor >= '0' && *cursor <= '9') {
+            ++cursor;
+        }
+        const char *number_end = cursor;
+        const char *fraction = NULL;
+        const char *fraction_end = NULL;
+        if (*cursor == '.' || *cursor == ',') {
+            fraction = ++cursor;
+            while (*cursor >= '0' && *cursor <= '9') {
+                ++cursor;
+            }
+            fraction_end = cursor;
+            if (fraction_end - fraction > 9 || (*cursor != 'S' && *cursor != 's')) {
+                return -1;
+            }
+        }
+        char designator = (char)(*cursor >= 'a' && *cursor <= 'z' ? *cursor - 'a' + 'A' : *cursor);
+        const char *found = designator == '\0' ? NULL : strchr(designators, designator);
+        if (found == NULL) {
+            return -1;
+        }
+        size_t index = (size_t)(found - designators);
+        /* Days only before T, hours, minutes and seconds only after it, each once and in order. */
+        if (index < next || (index == 0U) == (in_time != 0)) {
+            return -1;
+        }
+        int64_t value = 0;
+        int64_t part = 0;
+        if (java_parse_long(number, number_end, &value) != 0
+            || __builtin_mul_overflow(value, unit_seconds[index], &part)
+            || __builtin_add_overflow(seconds, part, &seconds)) {
+            return -1;
+        }
+        if (fraction != NULL) {
+            int64_t fraction_nanos = 0;
+            for (const char *digit = fraction; digit < fraction_end; ++digit) {
+                fraction_nanos = fraction_nanos * 10 + (*digit - '0');
+            }
+            for (long width = (long)(fraction_end - fraction); width < 9; ++width) {
+                fraction_nanos *= 10;
+            }
+            nanos = *number == '-' ? -fraction_nanos : fraction_nanos;
+        }
+        next = index + 1U;
+        ++parts;
+        ++cursor;
+    }
+    if (parts == 0) {
+        return -1;
+    }
+    /* Duration.ofSeconds(seconds, nanos), then negated() when the text started with '-'. */
+    int64_t carry = nanos < 0 ? -1 : 0;
+    if (__builtin_add_overflow(seconds, carry, &seconds)) {
+        return -1;
+    }
+    nanos -= carry * 1000000000LL;
+    if (negate) {
+        if (nanos != 0) {
+            if (__builtin_add_overflow(seconds, 1, &seconds)) {
+                return -1;
+            }
+            nanos = 1000000000LL - nanos;
+        }
+        if (seconds == INT64_MIN) {
+            return -1;
+        }
+        seconds = -seconds;
+    }
+    return java_duration_to_millis(seconds, nanos, millis);
+}
+
+/*
+ * A Duration as Spring Boot binds server.tomcat.connection-timeout (StringToDurationConverter,
+ * DurationStyle.detect, no unit annotation, so milliseconds by default), handed to Tomcat as
+ * TomcatWebServerFactoryCustomizer does: (int) Duration.toMillis(). The simple style is an optional
+ * sign, ASCII digits and an optional unit of ns, us, ms, s, m, h or d in any case; anything that
+ * starts with P after an optional sign is ISO-8601. Anything else, or a value Duration cannot hold,
+ * fails the binding and with it the start, as in Java; unset or empty keeps default_ms.
+ */
+static int env_spring_duration_ms(const char *name, int default_ms, int *out)
+{
+    const char *value = getenv(name);
+    if (value == NULL || *value == '\0') {
+        *out = default_ms;
+        return 0;
+    }
+    int64_t millis = 0;
+    const char *after_sign = value + (*value == '-' || *value == '+' ? 1 : 0);
+    int parsed = -1;
+    if (*after_sign == 'P' || *after_sign == 'p') {
+        parsed = java_parse_iso_duration_ms(value, &millis);
+    } else {
+        const char *digits_end = after_sign;
+        while (*digits_end >= '0' && *digits_end <= '9') {
+            ++digits_end;
+        }
+        size_t unit_len = strlen(digits_end);
+        int64_t amount = 0;
+        int unit_letters = 1;
+        for (size_t i = 0U; i < unit_len; ++i) {
+            unit_letters = unit_letters && isalpha((unsigned char)digits_end[i]);
+        }
+        static const struct {
+            const char *suffix;
+            int64_t multiply;
+            int64_t divide;
+        } units[] = {{"", 1, 1}, {"ns", 1, 1000000}, {"us", 1, 1000}, {"ms", 1, 1}, {"s", 1000, 1},
+                     {"m", 60000, 1}, {"h", 3600000, 1}, {"d", 86400000, 1}};
+        if (digits_end > after_sign && unit_len <= 2U && unit_letters
+            && java_parse_long(value, digits_end, &amount) == 0) {
+            char suffix[3] = {0};
+            for (size_t i = 0U; i < unit_len; ++i) {
+                suffix[i] = (char)tolower((unsigned char)digits_end[i]);
+            }
+            for (size_t i = 0U; i < sizeof(units) / sizeof(units[0]); ++i) {
+                if (strcmp(units[i].suffix, suffix) == 0) {
+                    parsed = __builtin_mul_overflow(amount, units[i].multiply, &millis) ? -1 : 0;
+                    millis /= units[i].divide;
+                    break;
+                }
+            }
+        }
+    }
+    if (parsed != 0) {
+        fprintf(stderr, "invalid %s; expected a duration such as 60000, 60s or PT60S\n", name);
+        return -1;
+    }
+    *out = (int)(int32_t)(uint32_t)(uint64_t)millis;
+    return 0;
+}
+
+/*
+ * An int as Spring Boot binds server.tomcat.max-connections and accept-count from the environment
+ * (StringToNumberConverterFactory, NumberUtils.parseNumber): every Java whitespace character is
+ * dropped; after an optional '-', a 0x, 0X or # prefix reads Integer.decode's hexadecimal, anything
+ * else Integer.valueOf (an optional sign and digits, Character.digit's digits of any script).
+ * Overflow or anything else fails the binding and with it the start; unset or empty keeps
+ * default_value.
+ */
+static int env_spring_int(const char *name, int default_value, int *out)
+{
+    const char *value = getenv(name);
+    if (value == NULL || *value == '\0') {
+        *out = default_value;
+        return 0;
+    }
+    size_t len = strlen(value);
+    int32_t *points = (int32_t *)malloc((len + 1U) * sizeof(*points));
+    size_t count = 0U;
+    int valid = points != NULL;
+    for (size_t offset = 0U; valid && offset < len;) {
+        utf8proc_int32_t point = 0;
+        utf8proc_ssize_t width = utf8proc_iterate((const utf8proc_uint8_t *)value + offset,
+                                                  (utf8proc_ssize_t)(len - offset), &point);
+        valid = width > 0;
+        if (valid && !st_unicode_java21_whitespace(point)) {
+            points[count++] = point;
+        }
+        offset += valid ? (size_t)width : 0U;
+    }
+    size_t index = 0U;
+    int negative = valid && count > 0U && points[0] == '-';
+    int radix = 10;
+    if (valid && count > (size_t)negative + 1U && points[negative] == '0'
+        && (points[negative + 1] == 'x' || points[negative + 1] == 'X')) {
+        radix = 16;
+        index = (size_t)negative + 2U;
+    } else if (valid && count > (size_t)negative && points[negative] == '#') {
+        radix = 16;
+        index = (size_t)negative + 1U;
+    } else if (valid && count > 0U && (points[0] == '-' || points[0] == '+')) {
+        index = 1U;
+    }
+    /* Integer.decode allows no second sign after the prefix; valueOf needs a digit. */
+    valid = valid && index < count && points[index] != '-' && points[index] != '+';
+    long long magnitude = 0;
+    long long limit = negative ? -(long long)INT_MIN : (long long)INT_MAX;
+    for (size_t i = index; valid && i < count; ++i) {
+        int digit = st_unicode_java21_digit(points[i], radix);
+        valid = digit >= 0;
+        if (valid) {
+            magnitude = magnitude * radix + digit;
+            valid = magnitude <= limit;
+        }
+    }
+    free(points);
+    if (!valid) {
+        fprintf(stderr, "invalid %s; expected an int\n", name);
+        return -1;
+    }
+    *out = negative ? (int)-magnitude : (int)magnitude;
     return 0;
 }
 
@@ -907,7 +1187,14 @@ static int load_config(server_config *config)
         || env_int_range("SPECUS_ADMIN_PORT", 0, 0, 65535, &config->admin_port) != 0
         || env_i64_range("SPECUS_HTTP_TIMEOUT_MS", 30000, INT64_MIN, INT64_MAX, &config->http_timeout_ms) != 0
         || env_i64_range("SPECUS_HTTP_MAX_REQUEST_BODY_SIZE", ST_HTTP_MAX_REQUEST_BODY, INT_MIN, INT_MAX,
-                         &config->http_max_request_body) != 0) {
+                         &config->http_max_request_body) != 0
+        /* The Java server's Tomcat connector, as Spring Boot binds server.tomcat.* from the environment. */
+        || env_spring_duration_ms(spring_env_name("SERVER_TOMCAT_CONNECTIONTIMEOUT", "SERVER_TOMCAT_CONNECTION_TIMEOUT"),
+                                  ST_ADMIN_DEFAULT_CONNECTION_TIMEOUT_MS, &config->admin_connection_timeout_ms) != 0
+        || env_spring_int(spring_env_name("SERVER_TOMCAT_MAXCONNECTIONS", "SERVER_TOMCAT_MAX_CONNECTIONS"),
+                          ST_ADMIN_DEFAULT_MAX_CONNECTIONS, &config->admin_max_connections) != 0
+        || env_spring_int(spring_env_name("SERVER_TOMCAT_ACCEPTCOUNT", "SERVER_TOMCAT_ACCEPT_COUNT"),
+                          ST_ADMIN_DEFAULT_ACCEPT_COUNT, &config->admin_accept_count) != 0) {
         return -1;
     }
     /* Java's body limit filter takes a negative limit as 0: any body at all is too large. A
@@ -1371,6 +1658,11 @@ static int session_send_packet(specus_session *session, st_buffer *packet)
     return rc;
 }
 
+/*
+ * The data connection went away: every pending stream fails, as Java NatServerHandler.channelInactive
+ * resets its exchanges with code 9 ("control channel closed"), which the public caller hears as the
+ * stream reset it is, not as a client that was never online.
+ */
 static void direct_pending_fail_all(specus_session *session, const char *message)
 {
     pthread_mutex_lock(&session->direct_lock);
@@ -1379,6 +1671,7 @@ static void direct_pending_fail_all(specus_session *session, const char *message
             free(pending->error);
             pending->error = dup_string(message);
             pending->error_len = pending->error == NULL ? 0U : strlen(pending->error);
+            pending->reset_code = 9U;
             pending->done = 1;
             pthread_cond_broadcast(&pending->cond);
         }
@@ -1641,6 +1934,7 @@ static int process_direct_http_message(specus_session *session, const st_nat_mes
         free(pending->error);
         pending->error = dup_string(reset_reason);
         pending->error_len = pending->error == NULL ? 0U : strlen(pending->error);
+        pending->reset_code = reset_code;
         pending->done = 1;
         pending->reset = 1;
         pthread_cond_broadcast(&pending->cond);
@@ -1785,10 +2079,13 @@ static void active_session_close_data_locked(specus_session *control)
     }
 }
 
-/* Hands a client RST reason to the sink for server-side logging; it never reaches the caller. */
-static int direct_report_client_reset(const st_admin_direct_http_sink *sink,
-                                      uint32_t code,
-                                      const char *reason, size_t reason_len)
+/*
+ * Hands the reason a stream was reset for (the client's RST, this server's own, or the data
+ * connection lost under it) to the sink for server-side logging; it never reaches the caller.
+ */
+static int direct_report_reset(const st_admin_direct_http_sink *sink,
+                               uint32_t code,
+                               const char *reason, size_t reason_len)
 {
     if (sink->on_reset_bytes != NULL) {
         sink->on_reset_bytes(sink->ctx, code, reason, reason_len);
@@ -2190,6 +2487,8 @@ static int direct_http_forward(void *ctx,
         sink->bind_cancel(sink->ctx, direct_pending_cancel, &cancel);
     }
 
+    /* A frame that could not be written to the data connection, which is going away with it. */
+    int write_failed = 0;
     char *request_json = json_http_request(request);
     if (request_json == NULL) {
         goto failed;
@@ -2198,7 +2497,12 @@ static int direct_http_forward(void *ctx,
                                                        pending.stream_id, 0U,
                                                        request_json, NULL, 0U);
     free(request_json);
-    if (packet.data == NULL || session_send_packet(session, &packet) != 0) {
+    if (packet.data == NULL) {
+        goto failed;
+    }
+    /* session_send_packet frees the packet whether or not it went out. */
+    if (session_send_packet(session, &packet) != 0) {
+        write_failed = 1;
         goto failed;
     }
     opened = 1;
@@ -2233,7 +2537,11 @@ static int direct_http_forward(void *ctx,
         packet = st_protocol_encode_nat_message(ST_NAT_DATA, 0U,
                                                 pending.stream_id, 0U,
                                                 NULL, request->body + offset, chunk_len);
-        if (packet.data == NULL || session_send_packet(session, &packet) != 0) {
+        if (packet.data == NULL) {
+            goto failed;
+        }
+        if (session_send_packet(session, &packet) != 0) {
+            write_failed = 1;
             goto failed;
         }
         offset += chunk_len;
@@ -2247,7 +2555,11 @@ static int direct_http_forward(void *ctx,
                                             pending.stream_id, 0U,
                                             fin_json, NULL, 0U);
     free(fin_json);
-    if (packet.data == NULL || session_send_packet(session, &packet) != 0) {
+    if (packet.data == NULL) {
+        goto failed;
+    }
+    if (session_send_packet(session, &packet) != 0) {
+        write_failed = 1;
         goto failed;
     }
 
@@ -2277,7 +2589,6 @@ static int direct_http_forward(void *ctx,
             pending_error = (char *)malloc(pending_error_len + 1U);
             if (pending_error != NULL) memcpy(pending_error, pending.error, pending_error_len + 1U);
         }
-        int client_reset = pending.client_reset;
         uint32_t reset_code = pending.reset_code;
         pthread_mutex_unlock(&session->direct_lock);
 
@@ -2290,12 +2601,17 @@ static int direct_http_forward(void *ctx,
             break;
         }
         if (result != 0) {
-            send_reset(session, pending.stream_id, 30U, "HTTP response header timeout");
+            /* Java: exchange.awaitResponseHead times out, 504, cancelHttpStream with its message. */
+            send_reset(session, pending.stream_id, ST_ADMIN_DIRECT_HTTP_LOCAL_RESET_CODE,
+                       ST_ADMIN_DIRECT_HTTP_TIMEOUT_TEXT);
             break;
         }
         if (pending_error != NULL) {
-            result = client_reset
-                ? direct_report_client_reset(sink, reset_code, pending_error, pending_error_len) : -1;
+            /*
+             * The client's RST, this server's own reset of a frame it could not take, or the data
+             * connection gone: all are a stream reset to Java, 502 "HTTP 转发请求失败" before the head.
+             */
+            result = direct_report_reset(sink, reset_code, pending_error, pending_error_len);
             free(pending_error);
             break;
         }
@@ -2304,6 +2620,9 @@ static int direct_http_forward(void *ctx,
             break;
         }
 
+        /* A response frame this server cannot use (Java cancels it), or a caller it cannot write to. */
+        const char *local_reset = NULL;
+        int downstream_failed = 0;
         if (event->type == ST_NAT_OPEN) {
             int status_code = 0;
             char **headers = NULL;
@@ -2315,10 +2634,12 @@ static int direct_http_forward(void *ctx,
                                             &headers, &headers_len) == 0
                 && optional_string_array(event->meta_json, "trailerNames",
                                          &trailer_names, &trailer_names_len) == 0;
-            if (!valid || sink->on_headers(sink->ctx, status_code,
-                                            headers, headers_len,
-                                            trailer_names, trailer_names_len) != 0) {
-                result = -4;
+            if (!valid) {
+                local_reset = "invalid HTTP response headers";
+            } else if (sink->on_headers(sink->ctx, status_code,
+                                        headers, headers_len,
+                                        trailer_names, trailer_names_len) != 0) {
+                downstream_failed = 1;
             } else {
                 delivered_head = 1;
             }
@@ -2326,20 +2647,22 @@ static int direct_http_forward(void *ctx,
             st_json_free_string_array(trailer_names, trailer_names_len);
         } else if (event->type == ST_NAT_DATA) {
             if (!delivered_head || sink->on_data(sink->ctx, event->data, event->data_len) != 0) {
-                result = -4;
+                downstream_failed = 1;
             } else {
                 pthread_mutex_lock(&session->direct_lock);
                 if (event->data_len > pending.receive_outstanding
                     || pending.receive_credit > ST_STREAM_MAX_WINDOW - event->data_len) {
-                    result = -1;
+                    local_reset = "HTTP DATA is invalid for the stream state";
                 } else {
                     pending.receive_outstanding -= event->data_len;
                     pending.receive_credit += event->data_len;
                 }
                 pthread_mutex_unlock(&session->direct_lock);
-                if (result == 0
+                if (local_reset == NULL
                     && send_window_update(session, pending.stream_id, event->data_len) != 0) {
-                    result = -1;
+                    /* The data connection failed; its teardown fails the stream the same way. */
+                    result = direct_report_reset(sink, 9U, "control channel closed",
+                                                 strlen("control channel closed"));
                 }
             }
         } else if (event->type == ST_NAT_FIN) {
@@ -2351,15 +2674,33 @@ static int direct_http_forward(void *ctx,
                 trailers = NULL;
                 trailers_len = 0;
             }
+            /* Both directions already ended: a caller gone at the very end needs no RST any more. */
             result = delivered_head && sink->on_end(sink->ctx, trailers, trailers_len) == 0
-                ? 0 : -4;
+                ? 0 : ST_ADMIN_DIRECT_HTTP_DOWNSTREAM_FAILED;
             st_json_free_string_array(trailers, trailers_len);
             direct_event_free(event);
             break;
         }
         direct_event_free(event);
+        if (downstream_failed) {
+            /*
+             * Java: writing the caller failed or timed out (Tomcat's ClientAbortException), so it
+             * cancels the stream with RST 8 and answers nothing more.
+             */
+            send_reset(session, pending.stream_id, ST_ADMIN_DIRECT_HTTP_LOCAL_RESET_CODE, "HTTP downstream closed");
+            result = ST_ADMIN_DIRECT_HTTP_DOWNSTREAM_FAILED;
+            break;
+        }
+        if (local_reset != NULL) {
+            pthread_mutex_lock(&session->direct_lock);
+            pending.reset = 1;
+            pthread_mutex_unlock(&session->direct_lock);
+            send_reset(session, pending.stream_id, ST_ADMIN_DIRECT_HTTP_LOCAL_RESET_CODE, local_reset);
+            result = direct_report_reset(sink, ST_ADMIN_DIRECT_HTTP_LOCAL_RESET_CODE, local_reset,
+                                         strlen(local_reset));
+            break;
+        }
         if (result != 0) {
-            send_reset(session, pending.stream_id, 31U, "HTTP downstream closed");
             break;
         }
     }
@@ -2385,14 +2726,24 @@ failed:
     if (failed_cancelled && opened && !failed_reset) {
         send_reset(session, pending.stream_id, ST_ADMIN_HTTP_SHARE_RESET_CODE, ST_ADMIN_HTTP_SHARE_RESET_REASON);
     } else if (upload_timed_out && !failed_reset) {
-        send_reset(session, pending.stream_id, 30U, "HTTP request body timeout");
+        /* Java: the window for a body chunk did not come in time, 504 and cancelHttpStream. */
+        send_reset(session, pending.stream_id, ST_ADMIN_DIRECT_HTTP_LOCAL_RESET_CODE, ST_ADMIN_DIRECT_HTTP_TIMEOUT_TEXT);
     }
     direct_pending_retire(session, &pending);
-    /* A client RST while the request body was still uploading is reported like one after it. */
+    /*
+     * A reset while the request body was still uploading is reported like one after it. An OPEN
+     * that could not be written is Java's onReset(7, "HTTP OPEN write failed"); a later frame that
+     * could not be written means the data connection is going away under the stream.
+     */
     int failed_result = failed_cancelled ? ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED
         : upload_timed_out ? -2
-        : pending.client_reset && pending.error != NULL
-        ? direct_report_client_reset(sink, pending.reset_code, pending.error, pending.error_len) : -1;
+        : pending.error != NULL
+        ? direct_report_reset(sink, pending.reset_code, pending.error, pending.error_len)
+        : write_failed && !opened
+        ? direct_report_reset(sink, 7U, "HTTP OPEN write failed", strlen("HTTP OPEN write failed"))
+        : write_failed
+        ? direct_report_reset(sink, 9U, "control channel closed", strlen("control channel closed"))
+        : -1;
     free(pending.error);
     pthread_cond_destroy(&pending.cond);
     session_reference_release(session);
@@ -5051,7 +5402,7 @@ static int process_nat_message(specus_session *session, const st_nat_message *me
 
 static void session_shutdown(specus_session *session)
 {
-    direct_pending_fail_all(session, "control connection closed");
+    direct_pending_fail_all(session, "control channel closed");
 
     pthread_mutex_lock(&session->send_lock);
     if (session->control_fd >= 0) {
@@ -5539,7 +5890,7 @@ static void *client_thread(void *arg)
         break;
     }
 
-    direct_pending_fail_all(session, "control connection closed");
+    direct_pending_fail_all(session, "control channel closed");
 
     pthread_mutex_lock(&active_session_lock);
     const char *displaced_reason = session->displaced_reason;
@@ -5808,6 +6159,8 @@ int main(void)
         .ctx = NULL,
     };
     st_admin_set_connectivity_device(&connectivity_device);
+    st_admin_set_connector_limits(config.admin_connection_timeout_ms, config.admin_max_connections,
+                                  config.admin_accept_count);
     if (config.admin_port > 0
         && st_admin_server_start_with_handlers(&admin_server,
                                                config.admin_port,
