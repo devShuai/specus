@@ -10,6 +10,7 @@
 
 #include <ctype.h>
 #include <curl/curl.h>
+#include <errno.h>
 #include <limits.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
@@ -974,37 +975,20 @@ static int media_add_part(st_media_capture_session *session, int number, const c
     return 0;
 }
 
-/*
- * Java's upload executor runs uploadThreads part uploads at a time over all captures; a part beyond
- * that waits for one to finish. The forwarding thread never runs one itself.
- */
-static pthread_mutex_t media_upload_slots_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t media_upload_slots_cond = PTHREAD_COND_INITIALIZER;
-static int media_uploads_running;
-
-typedef struct {
+typedef struct st_media_part_upload {
     st_media_capture_session *session;
     int number;
     uint8_t *data;
     size_t len;
+    struct st_media_part_upload *next;
 } st_media_part_upload;
 
-static void *media_part_upload_thread(void *arg)
+/* Uploads one part and hands its outcome to its capture. */
+static void media_run_part_upload(st_media_part_upload *job)
 {
-    st_media_part_upload *job = (st_media_part_upload *)arg;
     st_media_capture_session *session = job->session;
-    pthread_mutex_lock(&media_upload_slots_lock);
-    while (media_uploads_running >= session->cfg.upload_threads) {
-        pthread_cond_wait(&media_upload_slots_cond, &media_upload_slots_lock);
-    }
-    ++media_uploads_running;
-    pthread_mutex_unlock(&media_upload_slots_lock);
     char etag[512];
     int uploaded = media_s3_upload_part(session, job->number, job->data, job->len, etag) == 0;
-    pthread_mutex_lock(&media_upload_slots_lock);
-    --media_uploads_running;
-    pthread_cond_broadcast(&media_upload_slots_cond);
-    pthread_mutex_unlock(&media_upload_slots_lock);
     free(job->data);
     /* The last touch of the session: once in flight drops, its owner may free it. */
     pthread_mutex_lock(&session->upload_lock);
@@ -1015,7 +999,97 @@ static void *media_part_upload_thread(void *arg)
     pthread_cond_broadcast(&session->upload_cond);
     pthread_mutex_unlock(&session->upload_lock);
     free(job);
-    return NULL;
+}
+
+/*
+ * Java's upload executor (HttpMediaCaptureService): uploadThreads workers, started as parts come and
+ * gone after 30 s without one (allowCoreThreadTimeOut), a queue of
+ * max(uploadThreads, uploadThreads * maxInflightParts * 4) parts, and beyond that the caller uploads
+ * the part itself (CallerRunsPolicy). So however many captures run, the threads and the parts
+ * waiting in memory stay bounded.
+ */
+#define ST_MEDIA_UPLOAD_WORKER_IDLE_SECONDS 30
+static pthread_mutex_t media_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t media_pool_cond;
+static pthread_once_t media_pool_once = PTHREAD_ONCE_INIT;
+static st_media_part_upload *media_pool_head;
+static st_media_part_upload *media_pool_tail;
+static size_t media_pool_queued;
+static int media_pool_workers;
+
+static void media_pool_init(void)
+{
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&media_pool_cond, &attr);
+    pthread_condattr_destroy(&attr);
+}
+
+static void *media_pool_worker(void *arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&media_pool_lock);
+    for (;;) {
+        while (media_pool_head == NULL) {
+            struct timespec deadline;
+            clock_gettime(CLOCK_MONOTONIC, &deadline);
+            deadline.tv_sec += ST_MEDIA_UPLOAD_WORKER_IDLE_SECONDS;
+            if (pthread_cond_timedwait(&media_pool_cond, &media_pool_lock, &deadline) == ETIMEDOUT
+                && media_pool_head == NULL) {
+                --media_pool_workers;
+                pthread_mutex_unlock(&media_pool_lock);
+                return NULL;
+            }
+        }
+        st_media_part_upload *job = media_pool_head;
+        media_pool_head = job->next;
+        if (media_pool_head == NULL) media_pool_tail = NULL;
+        --media_pool_queued;
+        pthread_mutex_unlock(&media_pool_lock);
+        media_run_part_upload(job);
+        pthread_mutex_lock(&media_pool_lock);
+    }
+}
+
+static void media_pool_submit(st_media_part_upload *job)
+{
+    pthread_once(&media_pool_once, media_pool_init);
+    long long threads = job->session->cfg.upload_threads;
+    long long capacity = threads * (long long)job->session->cfg.max_inflight_parts * 4LL;
+    if (capacity < threads) capacity = threads;
+    pthread_mutex_lock(&media_pool_lock);
+    if ((long long)media_pool_queued >= capacity) {
+        pthread_mutex_unlock(&media_pool_lock);
+        media_run_part_upload(job);
+        return;
+    }
+    if (media_pool_workers < threads) {
+        pthread_attr_t attr;
+        pthread_t thread;
+        int started = pthread_attr_init(&attr) == 0;
+        if (started) {
+            (void)pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+            (void)pthread_attr_setstacksize(&attr, 512U * 1024U);
+            started = pthread_create(&thread, &attr, media_pool_worker, NULL) == 0;
+            pthread_attr_destroy(&attr);
+        }
+        if (started) {
+            ++media_pool_workers;
+        } else if (media_pool_workers == 0) {
+            /* No worker at all to take it: upload it here rather than lose the part. */
+            pthread_mutex_unlock(&media_pool_lock);
+            media_run_part_upload(job);
+            return;
+        }
+    }
+    job->next = NULL;
+    if (media_pool_tail == NULL) media_pool_head = job;
+    else media_pool_tail->next = job;
+    media_pool_tail = job;
+    ++media_pool_queued;
+    pthread_cond_signal(&media_pool_cond);
+    pthread_mutex_unlock(&media_pool_lock);
 }
 
 /*
@@ -1049,21 +1123,10 @@ static int media_submit_part(st_media_capture_session *session)
     job->number = ++session->next_part_number;
     job->data = session->part_buffer;
     job->len = session->part_len;
+    job->next = NULL;
     session->part_buffer = next_buffer;
     session->part_len = 0U;
-    pthread_attr_t attr;
-    pthread_t thread;
-    int started = pthread_attr_init(&attr) == 0;
-    if (started) {
-        (void)pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-        (void)pthread_attr_setstacksize(&attr, 512U * 1024U);
-        started = pthread_create(&thread, &attr, media_part_upload_thread, job) == 0;
-        pthread_attr_destroy(&attr);
-    }
-    if (!started) {
-        /* No thread to be had: upload it here rather than lose the part. */
-        (void)media_part_upload_thread(job);
-    }
+    media_pool_submit(job);
     return 0;
 }
 
