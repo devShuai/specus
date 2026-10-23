@@ -45,6 +45,9 @@ typedef struct {
     long long retention_seconds;
     long long live_window_seconds;
     size_t manifest_max_bytes;
+    /* Java maxInflightParts and uploadThreads (MediaCaptureProperties, each at least 1). */
+    int max_inflight_parts;
+    int upload_threads;
 } st_media_config;
 
 typedef struct {
@@ -90,9 +93,21 @@ struct st_media_capture_session {
     uint8_t *manifest_buffer;
     size_t manifest_len;
     int manifest_dropped;
+    /* Uploaded parts in the order their uploads finished; sorted by number before completion. */
     st_media_completed_part *parts;
     size_t parts_len;
     size_t parts_cap;
+    /*
+     * Java CaptureSession uploads full parts on its upload executor while the response goes on:
+     * upload_lock guards parts, uploads_in_flight and upload_failed once uploads_ready is set (the
+     * capture got as far as its multipart upload). next_part_number is the forwarder's alone.
+     */
+    int uploads_ready;
+    pthread_mutex_t upload_lock;
+    pthread_cond_t upload_cond;
+    int uploads_in_flight;
+    int upload_failed;
+    int next_part_number;
 };
 
 static int g_media_ready;
@@ -150,6 +165,10 @@ static st_media_config media_load_config(void)
     long long manifest_limit = media_env_i64("SPECUS_MEDIA_CAPTURE_MANIFEST_MAX_BYTES", 16LL * 1024LL * 1024LL);
     if (manifest_limit < 1LL) manifest_limit = 16LL * 1024LL * 1024LL;
     cfg.manifest_max_bytes = (size_t)manifest_limit;
+    long long inflight = media_env_i64("SPECUS_MEDIA_CAPTURE_MAX_INFLIGHT_PARTS", 4LL);
+    cfg.max_inflight_parts = inflight < 1LL ? 1 : inflight > INT_MAX ? INT_MAX : (int)inflight;
+    long long threads = media_env_i64("SPECUS_MEDIA_CAPTURE_UPLOAD_THREADS", 4LL);
+    cfg.upload_threads = threads < 1LL ? 1 : threads > INT_MAX ? INT_MAX : (int)threads;
     return cfg;
 }
 
@@ -955,15 +974,117 @@ static int media_add_part(st_media_capture_session *session, int number, const c
     return 0;
 }
 
-static int media_flush_part(st_media_capture_session *session)
+/*
+ * Java's upload executor runs uploadThreads part uploads at a time over all captures; a part beyond
+ * that waits for one to finish. The forwarding thread never runs one itself.
+ */
+static pthread_mutex_t media_upload_slots_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t media_upload_slots_cond = PTHREAD_COND_INITIALIZER;
+static int media_uploads_running;
+
+typedef struct {
+    st_media_capture_session *session;
+    int number;
+    uint8_t *data;
+    size_t len;
+} st_media_part_upload;
+
+static void *media_part_upload_thread(void *arg)
+{
+    st_media_part_upload *job = (st_media_part_upload *)arg;
+    st_media_capture_session *session = job->session;
+    pthread_mutex_lock(&media_upload_slots_lock);
+    while (media_uploads_running >= session->cfg.upload_threads) {
+        pthread_cond_wait(&media_upload_slots_cond, &media_upload_slots_lock);
+    }
+    ++media_uploads_running;
+    pthread_mutex_unlock(&media_upload_slots_lock);
+    char etag[512];
+    int uploaded = media_s3_upload_part(session, job->number, job->data, job->len, etag) == 0;
+    pthread_mutex_lock(&media_upload_slots_lock);
+    --media_uploads_running;
+    pthread_cond_broadcast(&media_upload_slots_cond);
+    pthread_mutex_unlock(&media_upload_slots_lock);
+    free(job->data);
+    /* The last touch of the session: once in flight drops, its owner may free it. */
+    pthread_mutex_lock(&session->upload_lock);
+    if (!uploaded || media_add_part(session, job->number, etag) != 0) {
+        session->upload_failed = 1;
+    }
+    --session->uploads_in_flight;
+    pthread_cond_broadcast(&session->upload_cond);
+    pthread_mutex_unlock(&session->upload_lock);
+    free(job);
+    return NULL;
+}
+
+/*
+ * Java CaptureSession.submitPart: hands the full part buffer to an upload of its own and goes on
+ * with a fresh one. Only maxInflightParts parts of a capture are in flight; the forwarding thread
+ * waits here for one of them beyond that (Java's Semaphore), and a failed upload fails the capture.
+ */
+static int media_submit_part(st_media_capture_session *session)
 {
     if (session->part_len == 0U) return 0;
-    char etag[512];
-    int number = (int)session->parts_len + 1;
-    if (media_s3_upload_part(session, number, session->part_buffer, session->part_len, etag) != 0
-        || media_add_part(session, number, etag) != 0) return -1;
+    pthread_mutex_lock(&session->upload_lock);
+    while (session->uploads_in_flight >= session->cfg.max_inflight_parts && !session->upload_failed) {
+        pthread_cond_wait(&session->upload_cond, &session->upload_lock);
+    }
+    int failed = session->upload_failed || session->next_part_number >= (int)ST_MEDIA_MAX_PARTS;
+    if (!failed) ++session->uploads_in_flight;
+    pthread_mutex_unlock(&session->upload_lock);
+    if (failed) return -1;
+    st_media_part_upload *job = (st_media_part_upload *)malloc(sizeof(*job));
+    uint8_t *next_buffer = (uint8_t *)malloc(session->cfg.part_size);
+    if (job == NULL || next_buffer == NULL) {
+        free(job);
+        free(next_buffer);
+        pthread_mutex_lock(&session->upload_lock);
+        --session->uploads_in_flight;
+        pthread_cond_broadcast(&session->upload_cond);
+        pthread_mutex_unlock(&session->upload_lock);
+        return -1;
+    }
+    job->session = session;
+    job->number = ++session->next_part_number;
+    job->data = session->part_buffer;
+    job->len = session->part_len;
+    session->part_buffer = next_buffer;
     session->part_len = 0U;
+    pthread_attr_t attr;
+    pthread_t thread;
+    int started = pthread_attr_init(&attr) == 0;
+    if (started) {
+        (void)pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        (void)pthread_attr_setstacksize(&attr, 512U * 1024U);
+        started = pthread_create(&thread, &attr, media_part_upload_thread, job) == 0;
+        pthread_attr_destroy(&attr);
+    }
+    if (!started) {
+        /* No thread to be had: upload it here rather than lose the part. */
+        (void)media_part_upload_thread(job);
+    }
     return 0;
+}
+
+/* Waits until no part of the capture is in flight; -1 when one of them failed. */
+static int media_wait_uploads(st_media_capture_session *session)
+{
+    if (!session->uploads_ready) return 0;
+    pthread_mutex_lock(&session->upload_lock);
+    while (session->uploads_in_flight > 0) {
+        pthread_cond_wait(&session->upload_cond, &session->upload_lock);
+    }
+    int failed = session->upload_failed;
+    pthread_mutex_unlock(&session->upload_lock);
+    return failed ? -1 : 0;
+}
+
+static int media_part_number_order(const void *left, const void *right)
+{
+    int a = ((const st_media_completed_part *)left)->number;
+    int b = ((const st_media_completed_part *)right)->number;
+    return (a > b) - (a < b);
 }
 
 /*
@@ -1313,6 +1434,9 @@ st_media_capture_session *st_media_capture_open(const char *database_path,
         session = NULL;
         goto cleanup;
     }
+    pthread_mutex_init(&session->upload_lock, NULL);
+    pthread_cond_init(&session->upload_cond, NULL);
+    session->uploads_ready = 1;
     if (session->manifest) {
         session->manifest_buffer = (uint8_t *)malloc(session->cfg.manifest_max_bytes + 1U);
         if (session->manifest_buffer == NULL) session->manifest_dropped = 1;
@@ -1347,7 +1471,7 @@ int st_media_capture_append(st_media_capture_session *session,
         session->part_len += copy;
         data += copy;
         data_len -= copy;
-        if (session->part_len == session->cfg.part_size && media_flush_part(session) != 0) {
+        if (session->part_len == session->cfg.part_size && media_submit_part(session) != 0) {
             session->failed = 1;
             return -1;
         }
@@ -1361,11 +1485,16 @@ static void media_finish(st_media_capture_session *session, int accept_partial, 
 {
     if (session == NULL || session->terminal) return;
     session->terminal = 1;
-    if (session->failed || session->captured_bytes == 0LL || media_flush_part(session) != 0) {
+    /* The last part goes up with the others still in flight; completion waits for all of them. */
+    int failed = session->failed || session->captured_bytes == 0LL || media_submit_part(session) != 0;
+    failed = media_wait_uploads(session) != 0 || failed;
+    if (failed) {
         (void)media_s3_abort(session);
         media_db_mark_failed(session, session->captured_bytes == 0LL ? "媒体响应正文为空" : "RustFS part upload failed");
         return;
     }
+    /* Uploads finish in any order; CompleteMultipartUpload lists the parts in ascending order. */
+    qsort(session->parts, session->parts_len, sizeof(session->parts[0]), media_part_number_order);
     char object_etag[512];
     if (media_s3_complete(session, object_etag) != 0) {
         (void)media_s3_abort(session);
@@ -1433,6 +1562,8 @@ void st_media_capture_fail(st_media_capture_session *session, const char *reason
         return;
     }
     session->terminal = 1;
+    /* Java abortForFailure aborts once the parts in flight are done. */
+    (void)media_wait_uploads(session);
     (void)media_s3_abort(session);
     media_db_mark_failed(session, reason);
 }
@@ -1452,6 +1583,11 @@ void st_media_capture_free(st_media_capture_session *session)
 {
     if (session == NULL) return;
     if (!session->terminal) st_media_capture_fail(session, "媒体响应中断");
+    if (session->uploads_ready) {
+        (void)media_wait_uploads(session);
+        pthread_cond_destroy(&session->upload_cond);
+        pthread_mutex_destroy(&session->upload_lock);
+    }
     free(session->part_buffer);
     free(session->manifest_buffer);
     free(session->parts);
