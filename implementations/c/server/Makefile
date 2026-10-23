@@ -126,6 +126,9 @@ SESSION_REFERENCE_SERVER := $(BUILD_DIR)/specus_c_session_reference_server
 SESSION_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_session_reference_tests
 TESTS += $(CONTROL_WRITE_REFERENCE_TESTS)
 ALL_TESTS += $(CONTROL_WRITE_REFERENCE_TESTS) $(SESSION_REFERENCE_SERVER) $(SESSION_REFERENCE_TESTS)
+STREAM_FD_LIFETIME_TESTS := $(BUILD_DIR)/specus_c_stream_fd_lifetime_tests
+TESTS += $(STREAM_FD_LIFETIME_TESTS)
+ALL_TESTS += $(STREAM_FD_LIFETIME_TESTS)
 HTTP_LOG_REASON_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_http_log_reason_reference_tests
 HTTP_RESET_REASON_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_http_reset_reason_reference_tests
 TESTS += $(HTTP_LOG_REASON_REFERENCE_TESTS)
@@ -201,6 +204,9 @@ $(SERVER): $(CORE_OBJS) src/main.c | $(BUILD_DIR)
 
 $(CONTROL_WRITE_REFERENCE_TESTS): $(CORE_OBJS) src/main.c tests/control_write_reference_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/control_write_reference_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(STREAM_FD_LIFETIME_TESTS): $(CORE_OBJS) src/main.c tests/stream_fd_lifetime_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/stream_fd_lifetime_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/session_reference_main.o: src/main.c tests/session_reference_recv.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -include tests/session_reference_recv.h -Dst_peer_mesh_push_on_logout=st_fixture_peer_logout -Dst_product_metrics_milestone=st_fixture_milestone -c $< -o $@

@@ -586,6 +586,13 @@ target_compile_options(specus_c_control_write_reference_tests PRIVATE -Wall -Wex
 add_test(NAME control_write_reference_tests COMMAND specus_c_control_write_reference_tests)
 set_tests_properties(control_write_reference_tests PROPERTIES TIMEOUT 30)
 
+# A stopped TCP stream keeps its descriptor until neither worker can still recv/send on it.
+add_executable(specus_c_stream_fd_lifetime_tests tests/stream_fd_lifetime_tests.c)
+target_link_libraries(specus_c_stream_fd_lifetime_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_stream_fd_lifetime_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME stream_fd_lifetime_tests COMMAND specus_c_stream_fd_lifetime_tests)
+set_tests_properties(stream_fd_lifetime_tests PROPERTIES TIMEOUT 60)
+
 # Only this object aliases the three observation points. The helper forwards real I/O, registry
 # and metrics calls; the ordinary specus-server-c target above never links this helper.
 add_library(specus_c_session_reference_main OBJECT src/main.c)
