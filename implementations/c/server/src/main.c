@@ -2157,6 +2157,11 @@ static int direct_http_forward(void *ctx,
         if (chunk_len > 64U * 1024U) {
             chunk_len = 64U * 1024U;
         }
+        /* Java counts a chunk once it has read it from the caller, before it waits for the window
+         * to send it, so a chunk the stream ended under is counted too (HttpSpecusController). */
+        if (sink->request_body_sent != NULL) {
+            *sink->request_body_sent = offset + chunk_len;
+        }
         pthread_mutex_lock(&session->direct_lock);
         while (pending.error == NULL && !pending.done && !pending.cancelled && pending.send_credit < chunk_len) {
             pthread_cond_wait(&pending.cond, &session->direct_lock);
@@ -2174,9 +2179,6 @@ static int direct_http_forward(void *ctx,
             goto failed;
         }
         offset += chunk_len;
-        if (sink->request_body_sent != NULL) {
-            *sink->request_body_sent = offset;
-        }
     }
     int fin_failed = 0;
     char *fin_json = json_http_request_fin(request, &fin_failed);
@@ -4386,6 +4388,9 @@ static void *external_writer_thread(void *arg)
             conn->queued_write_bytes -= chunk->len;
             pthread_mutex_unlock(&conn->write_lock);
 
+            /* Client to public is the client's upload, counted before it is written, whether or not
+             * that succeeds (Java RemoteSpecusHandler.writeFromClient). */
+            record_tcp_traffic(session, conn->port, (long long)chunk->len, 0);
             /* Captured before it is forwarded, as Java does, so capture order is relay order. */
             record_tcp_frame(session, conn, "CLIENT_TO_PUBLIC", chunk->data, chunk->len);
             int fd;
@@ -4411,8 +4416,6 @@ static void *external_writer_thread(void *arg)
                 }
                 break;
             }
-            /* Client to public is the client's upload (Java RemoteSpecusHandler.writeFromClient). */
-            record_tcp_traffic(session, conn->port, (long long)chunk->len, 0);
             if (send_window_update(session, conn->stream_id, chunk->len) != 0) {
                 free(chunk->data);
                 free(chunk);
@@ -4462,6 +4465,9 @@ static void *external_conn_thread(void *arg)
         }
         ssize_t read_len = recv(fd, buffer, sizeof(buffer), 0);
         if (read_len > 0) {
+            /* Public to client is the client's download, counted once read and before it is
+             * forwarded, whether or not that succeeds (Java RemoteSpecusHandler.channelRead). */
+            record_tcp_traffic(session, conn->port, 0, (long long)read_len);
             if (consume_send_credit(conn, (size_t)read_len) != 0) {
                 break;
             }
@@ -4470,8 +4476,6 @@ static void *external_conn_thread(void *arg)
             if (send_data(session, conn->stream_id, buffer, (size_t)read_len) != 0) {
                 break;
             }
-            /* Public to client is the client's download (Java RemoteSpecusHandler.channelRead). */
-            record_tcp_traffic(session, conn->port, 0, (long long)read_len);
             continue;
         }
         if (read_len < 0 && errno == EINTR) {

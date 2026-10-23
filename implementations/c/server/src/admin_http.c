@@ -19062,8 +19062,9 @@ static void admin_forward_direct_http(st_admin_server *server,
     }
     /*
      * Java relay() counts in its finally block whatever the outcome: a reset, a timeout, a public
-     * caller that went away or a share that ended still count the request body bytes that reached
-     * the client and the response bytes it sent. Nothing moved, nothing is counted.
+     * caller that went away or a share that ended still count the request body bytes read from
+     * the caller (each chunk once read, before it waits for the window) and the response bytes the
+     * client sent. Nothing moved, nothing is counted.
      */
     record_direct_http_traffic(client_name, route, (long long)request_body_sent,
                                (long long)sink_state.response_bytes);

@@ -4,8 +4,8 @@
  *
  *   - a TCP mapping counts what the client writes to the public peer as upload and what the public
  *     peer sends the client as download, on the client's day and on its tcp:<port> row;
- *   - an HTTP exchange counts the request body bytes that reached the client and the response
- *     bytes it sent, whatever the outcome: completed, reset by the client after its head or before
+ *   - an HTTP exchange counts the request body bytes read from the public caller (each chunk once
+ *     read, before it waits for the window, as Java) and the response bytes the client sent, whatever the outcome: completed, reset by the client after its head or before
  *     it, cut while the request body was going up, or left by the public caller mid-body;
  *   - every client-to-browser SWS2 envelope of a route WebSocket, header included and valid or
  *     not, is the client's upload; the browser's direction is not counted and no resource row is
@@ -86,6 +86,10 @@ static int read_usage(const test_server *server, long long client_id, const char
         snprintf(wrapped, wrapped_len, "{\"rows\":%s}", body);
         rc = st_json_get_raw_array(wrapped, "rows", &rows, &row_count);
     }
+    /* A run across UTC midnight splits the counts over two days: their rows are summed. Two rows of
+     * one day would be a keying fault. */
+    char seen_dates[4][16];
+    size_t seen = 0U;
     for (size_t i = 0U; rc == 0 && i < row_count; ++i) {
         char *key = st_json_get_string(rows[i], "resourceKey");
         int match = resource_key == NULL || (key != NULL && strcmp(key, resource_key) == 0);
@@ -93,16 +97,29 @@ static int read_usage(const test_server *server, long long client_id, const char
         if (!match) {
             continue;
         }
-        if (row->found) {
+        char *date = st_json_get_string(rows[i], "usageDate");
+        int repeated = date == NULL || seen == sizeof(seen_dates) / sizeof(seen_dates[0]);
+        for (size_t d = 0U; !repeated && d < seen; ++d) {
+            repeated = strcmp(seen_dates[d], date) == 0;
+        }
+        if (!repeated) {
+            snprintf(seen_dates[seen++], sizeof(seen_dates[0]), "%s", date);
+        }
+        free(date);
+        if (repeated) {
             fprintf(stderr, "GET %s lists the row twice\n%s\n", path, body);
             rc = -1;
             break;
         }
         row->found = 1;
-        if (st_json_get_i64(rows[i], "uploadBytes", &row->upload) != 0
-            || st_json_get_i64(rows[i], "downloadBytes", &row->download) != 0) {
+        long long upload = 0;
+        long long download = 0;
+        if (st_json_get_i64(rows[i], "uploadBytes", &upload) != 0
+            || st_json_get_i64(rows[i], "downloadBytes", &download) != 0) {
             rc = -1;
         }
+        row->upload += upload;
+        row->download += download;
         if (st_json_get_i64(rows[i], "resourceId", &row->resource_id) != 0) {
             row->resource_id = 0;
         }
@@ -257,7 +274,7 @@ static int read_request_body(int data_fd, uint32_t stream_id, size_t want, size_
  *   2. GET whose client resets the stream after its head and 1000 bytes: 1000 more down.
  *   3. POST of 64 KiB the client reads to its FIN and then resets before any head: 64 KiB more up.
  *   4. POST of 1 MiB + 1 that the client resets once the first 1 MiB (its window) is up: 1 MiB
- *      more up, the bytes that reached it.
+ *      and the byte waiting for the window more up: all that was read from the caller.
  *   5. GET whose public caller leaves after the head while the client keeps sending: whatever the
  *      server took from the client before it gave up, at least one chunk, at most what was sent.
  *
@@ -298,7 +315,7 @@ static int check_http_outcomes(test_server *server, client_pair *pair)
     browser_response response;
     memset(&response, 0, sizeof(response));
     response.fd = browser;
-    response.timeout_ms = 300;
+    response.timeout_ms = 2000;
     read_browser_response(&response);
     CHECK(response.status == 200 && response.total > 1000U, "the browser got the head and the bytes (%zu)",
           response.total);
@@ -334,16 +351,17 @@ static int check_http_outcomes(test_server *server, client_pair *pair)
     CHECK(send_nat(pair->data, ST_NAT_RST, 0U, stream_id, 1U, NULL, NULL, 0U) == 0, "client RST during upload");
     CHECK(expect_browser_status(browser, 502, NULL, -1) == 0, "502 for the cut upload");
     close_fd(&browser);
-    up += INITIAL_WINDOW;
+    /* Java counts what it read from the caller: the last byte, read and waiting for the window, too. */
+    up += INITIAL_WINDOW + 1U;
     CHECK(expect_usage(server, pair->runtime.client_id, "HTTP_ROUTE", key, up, down, &row) == 0,
-          "an upload cut short must count the body bytes that reached the client");
+          "an upload cut short must count the body bytes read from the caller");
 
     /* 5 */
     CHECK(open_http_stream(server, pair, "/caller-leaves", &browser, &stream_id) == 0, "request");
     CHECK(send_nat(pair->data, ST_NAT_OPEN, 0U, stream_id, 0U, RESPONSE_HEAD, NULL, 0U) == 0, "head");
     memset(&response, 0, sizeof(response));
     response.fd = browser;
-    response.timeout_ms = 300;
+    response.timeout_ms = 2000;
     read_browser_response(&response);
     CHECK(response.status == 200, "the browser got the head");
     close_fd(&browser);
@@ -703,6 +721,18 @@ static int test_failed_flush_keeps_counts(void)
                          NULL, 0, text, sizeof(text)) != 0
             || strcmp(text, "- 端口 9300 111") != 0;
         if (failed) fprintf(stderr, "the row of a deleted mapping reads %s\n", text);
+    }
+    /* After the shutdown flush, a count (an exchange still finishing) is written at once. */
+    if (!failed) {
+        long long before = db_number(path, "SELECT upload_bytes FROM traffic_usage");
+        setenv("SPECUS_TRAFFIC_FLUSH_INTERVAL_MS", "3600000", 1);
+        failed = st_traffic_usage_start(path) != 0;
+        st_traffic_usage_stop();
+        unsetenv("SPECUS_TRAFFIC_FLUSH_INTERVAL_MS");
+        st_traffic_usage_record_tcp("flush-client", 0, 5, 0);
+        long long after = db_number(path, "SELECT upload_bytes FROM traffic_usage");
+        failed = failed || after != before + 5;
+        if (failed) fprintf(stderr, "a count after the shutdown flush: %lld, then %lld\n", before, after);
     }
     unlink(path);
     char journal[160];

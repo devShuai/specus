@@ -27,7 +27,10 @@ int st_traffic_usage_flush(const char *database_path);
  * flush. Nothing starts without a database. -1 when the thread cannot be started.
  */
 int st_traffic_usage_start(const char *database_path);
-/* Stops the periodic flush and flushes once more (Java flushBeforeShutdown). */
+/*
+ * Stops the periodic flush and flushes once more (Java flushBeforeShutdown). Bytes counted after
+ * it, by an exchange still finishing while the process shuts down, are written as they come.
+ */
 void st_traffic_usage_stop(void);
 
 #endif

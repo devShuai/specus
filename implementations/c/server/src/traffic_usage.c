@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,6 +43,12 @@ static struct {
     long long interval_ms;
     char database_path[512];
 } flusher = {.lock = PTHREAD_MUTEX_INITIALIZER};
+/*
+ * Set once the periodic flush has stopped. The admin listener is never stopped, so an exchange
+ * still finishing during shutdown counts after the last flush: such a late count is written at
+ * once instead of waiting for a flush that will not come.
+ */
+static atomic_int late_writes;
 
 static uint64_t hash_text(uint64_t hash, const char *text, size_t len)
 {
@@ -129,6 +136,9 @@ void st_traffic_usage_record_tcp(const char *client_name, int listen_port, long 
         snprintf(port, sizeof(port), "%d", listen_port);
         record_counter(client_name, "tcp:", port, upload_bytes, download_bytes);
     }
+    if (atomic_load(&late_writes)) {
+        (void)st_traffic_usage_flush(flusher.database_path);
+    }
 }
 
 void st_traffic_usage_record_http(const char *client_name, const char *route, long long upload_bytes,
@@ -139,6 +149,9 @@ void st_traffic_usage_record_http(const char *client_name, const char *route, lo
     }
     record_counter(client_name, "", "", upload_bytes, download_bytes);
     record_counter(client_name, "http:", route == NULL ? "" : route, upload_bytes, download_bytes);
+    if (atomic_load(&late_writes)) {
+        (void)st_traffic_usage_flush(flusher.database_path);
+    }
 }
 
 /* Takes every counter out of the table, as one list. */
@@ -319,5 +332,7 @@ void st_traffic_usage_stop(void)
     flusher.started = 0;
     pthread_cond_destroy(&flusher.wake);
     pthread_mutex_unlock(&flusher.lock);
+    /* Whatever is counted from here on is written as it comes; what came before, by this flush. */
+    atomic_store(&late_writes, 1);
     (void)st_traffic_usage_flush(flusher.database_path);
 }

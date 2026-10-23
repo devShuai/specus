@@ -424,7 +424,7 @@ UTC days is added to its client's `yyyy-MM` row and deleted in the same transact
 shapes for daily client traffic and per-resource traffic. When `SPECUS_DATABASE_PATH` is set, the
 C server counts traffic as Java's `TrafficUsageService` does: TCP mapping bytes (client to public
 as upload, public to client as download) on the client's day and as `TCP_SPECUS` resources keyed
-`tcp:18080`; the request body bytes that reached the client and the response bytes it sent of
+`tcp:18080`; the request body bytes read from the caller and the response bytes the client sent of
 every Direct HTTP or share exchange, whatever its outcome, as `HTTP_ROUTE` resources keyed
 `http:api`; and the client's route WebSocket envelopes as its upload, without a resource row. The
 counts are kept in memory and written in one transaction every `SPECUS_TRAFFIC_FLUSH_INTERVAL_MS`,

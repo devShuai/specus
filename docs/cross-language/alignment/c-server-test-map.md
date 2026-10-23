@@ -15,7 +15,7 @@ Java 没有 `TrafficUsageService` 的专门测试类，本节以 Java 源码为�
 | 差异 | C 修正 | 测试与旧代码上的失败 |
 | --- | --- | --- |
 | TCP 映射方向相反 | 客户端写往公网的字节记上传、公网发来的记下载，与 Java、Go、.NET 相同 | 新 ctest `traffic_usage_tests`「TCP traffic」：真实进程，公网发 3000 字节、客户端回 700 字节，经 `/api/admin/traffic` 与 `/traffic/resources` 断言日行与 `tcp:<port>` 行都是 700/3000、行名为映射；旧代码读到 3000/700 |
-| HTTP 交换只在完整成功时记账 | 流打开后不论结局都记：上传为实际作为 NAT DATA 送到客户端的请求体字节（转发器经新的 `request_body_sent` 回报），下载为客户端发来的响应字节；去掉客户端须启用的条件。分块请求超限的 413 在开流前拒绝、一个字节都没转发，仍记 0，不属于本项 | 同一 ctest「HTTP traffic counted on every outcome」：完整成功、头后 RST、头前 RST（64 KiB 已上传）、上传到 1 MiB 窗口时 RST、公网调用方读完头即离开五种结局逐个断言路由行与日行的累计值；旧代码在第二种上就停在只记了第一种 |
+| HTTP 交换只在完整成功时记账 | 流打开后不论结局都记：上传为从公网调用方读到的请求体字节：与 Java `relay()` 相同，每块读入即计，不等它拿到窗口发出（转发器经新的 `request_body_sent` 回报），下载为客户端发来的响应字节；去掉客户端须启用的条件。分块请求超限的 413 在开流前拒绝、一个字节都没转发，仍记 0，不属于本项 | 同一 ctest「HTTP traffic counted on every outcome」：完整成功、头后 RST、头前 RST（64 KiB 已上传）、上传到 1 MiB 窗口时 RST、公网调用方读完头即离开五种结局逐个断言路由行与日行的累计值；旧代码在第二种上就停在只记了第一种 |
 | 客户端到浏览器的 WebSocket 字节不计 | `process_ws_data` 对每个非空 DATA 记客户端日上传（整个 SWS2 封装，含 12 字节头，校验前计入），端口 0 不写资源行；浏览器方向不计 | 同一 ctest「WebSocket envelopes」：3 个 100 字节载荷的封装记 336，浏览器发的 2 帧不计，再发 20 字节非法封装（RST 30）后为 356，资源列表为空；旧代码没有这一行 |
 | resourceId 粘滞、HTTP 行名被截断 | upsert 写 `resource_id = excluded.resource_id`；行名为完整的 `route -> targetBaseUrl` | `storage_tests.c:test_traffic_usage_rows`（`tcp:9000` 依次以 id 3、无映射、id 7 写入，断言 3、null、7 与对应名称；旧代码一直是 3）；`traffic_usage_tests`「HTTP route row named」（约 460 字节、含中文的目标地址，断言行名完整；旧代码截到 380 字节、截在字符中间） |
 | `updatedAt` 只到整秒 | 写入 `Instant.now().toString()` 形式（0/3/6/9 位小数） | `test_traffic_usage_rows` 断言带小数且落在写入前后两个时刻之间；`management_crud_tests`「traffic usage lists as Java」改为要求带小数的 Instant；旧代码都是整秒 |
