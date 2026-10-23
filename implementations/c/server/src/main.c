@@ -146,14 +146,12 @@ typedef struct external_conn {
     long long client_to_public_offset;
     long long public_to_client_frame_index;
     long long client_to_public_frame_index;
-    pthread_t thread;
-    int thread_started;
-    pthread_t writer_thread;
-    int writer_thread_started;
     /*
-     * The reader and writer that may still use fd (session->map_lock): reserved before the stream
-     * is published and given back after each one's last socket call, also when its thread could
-     * not be started. A stopped stream keeps fd open until this is 0 (close_conn_fd_locked).
+     * The reader and writer that may still use the stream (session->map_lock): reserved before it
+     * is published and given back after each one's last use, also when its thread could not be
+     * started. A stopped stream keeps fd open until this is 0 (close_conn_fd_locked), and is
+     * taken out of session->conns and freed then (unlink_finished_conn_locked). Both threads are
+     * detached; nobody joins them.
      */
     unsigned int io_workers;
     int done;
@@ -175,11 +173,14 @@ typedef struct external_conn {
     struct external_conn *next;
 } external_conn;
 
+/*
+ * A public port's listener. Its thread is detached and owns fd: it closes it, takes the listener
+ * out of session->listeners and frees it once accept() has returned for good. Others only shut fd
+ * down and set done, under session->map_lock.
+ */
 typedef struct specus_listener {
     int fd;
     int port;
-    pthread_t thread;
-    int thread_started;
     int done;
     specus_session *session;
     struct specus_listener *next;
@@ -249,9 +250,19 @@ struct specus_session {
     pthread_mutex_t map_lock;
     pthread_mutex_t direct_lock;
     pthread_cond_t reference_cond;
+    /* The public TCP streams that are open or still have a worker, and the running listeners. */
     external_conn *conns;
     ws_conn *ws_conns;
     specus_listener *listeners;
+    /*
+     * Listener and stream worker threads of this connection that may still use it (map_lock).
+     * They are detached and free what they own as they end, so a closed public connection or a
+     * stopped port leaves nothing behind while the data connection lives, as a closed Netty
+     * channel leaves nothing in Java. session_shutdown waits on nat_threads_cond for 0; listeners
+     * also pause on it after a failed accept (CLOCK_MONOTONIC, see nat_threads_cond_init).
+     */
+    size_t nat_threads;
+    pthread_cond_t nat_threads_cond;
     direct_http_pending *direct_pending;
     int active;
     /*
@@ -4651,17 +4662,6 @@ static void close_conn_locked(external_conn *conn)
     close_conn_fd_locked(conn);
 }
 
-/* A worker's last use of the stream's socket is over. */
-static void external_worker_finished(external_conn *conn)
-{
-    pthread_mutex_lock(&conn->session->map_lock);
-    if (conn->io_workers > 0U) {
-        --conn->io_workers;
-    }
-    close_conn_fd_locked(conn);
-    pthread_mutex_unlock(&conn->session->map_lock);
-}
-
 static void free_external_write_queue(external_conn *conn)
 {
     external_write_chunk *chunk = conn->write_head;
@@ -4674,6 +4674,117 @@ static void free_external_write_queue(external_conn *conn)
     conn->write_head = NULL;
     conn->write_tail = NULL;
     conn->queued_write_bytes = 0U;
+}
+
+/* A stream nobody can reach any more: unlinked, or never published. */
+static void free_external_conn(external_conn *conn)
+{
+    /* The last worker closed the socket already; a safety net only. */
+    if (conn->fd >= 0) {
+        close(conn->fd);
+    }
+    free_external_write_queue(conn);
+    pthread_cond_destroy(&conn->flow_cond);
+    pthread_mutex_destroy(&conn->flow_lock);
+    pthread_cond_destroy(&conn->write_cond);
+    pthread_mutex_destroy(&conn->write_lock);
+    free(conn);
+}
+
+/*
+ * Takes a stream out of the session once it is stopped and no worker can use it any more, as Java
+ * drops a closed external channel from its maps at once (NatServerHandler, closeFuture). Everything
+ * else reaches a stream only through session->conns under map_lock, so once unlinked it is the
+ * caller's to free, after releasing map_lock. Returns 1 when it was unlinked.
+ */
+static int unlink_finished_conn_locked(external_conn *conn)
+{
+    if (!conn->done || conn->io_workers != 0U) {
+        return 0;
+    }
+    for (external_conn **cursor = &conn->session->conns; *cursor != NULL; cursor = &(*cursor)->next) {
+        if (*cursor == conn) {
+            *cursor = conn->next;
+            conn->next = NULL;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* count listener or worker threads of the session are over, or were never started. */
+static void nat_threads_release_locked(specus_session *session, size_t count)
+{
+    session->nat_threads = session->nat_threads > count ? session->nat_threads - count : 0U;
+    pthread_cond_broadcast(&session->nat_threads_cond);
+}
+
+/* nat_threads_cond times the listeners' pause after a failed accept on CLOCK_MONOTONIC. */
+static int nat_threads_cond_init(specus_session *session)
+{
+    pthread_condattr_t attributes;
+    if (pthread_condattr_init(&attributes) != 0) {
+        return -1;
+    }
+    int rc = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC) == 0
+        && pthread_cond_init(&session->nat_threads_cond, &attributes) == 0 ? 0 : -1;
+    pthread_condattr_destroy(&attributes);
+    return rc;
+}
+
+/* Starts a thread nobody joins; 0, or pthread_create's error. */
+static int start_detached_thread(void *(*start)(void *), void *arg)
+{
+    pthread_attr_t attributes;
+    int rc = pthread_attr_init(&attributes);
+    if (rc != 0) {
+        return rc;
+    }
+    rc = pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+    pthread_t thread;
+    if (rc == 0) {
+        rc = pthread_create(&thread, &attributes, start, arg);
+    }
+    pthread_attr_destroy(&attributes);
+    return rc;
+}
+
+/*
+ * A worker's last use of the stream is over. The last of the two to finish frees a stream that
+ * is stopped; the session itself is not touched once nat_threads is given back.
+ */
+static void external_worker_finished(external_conn *conn)
+{
+    specus_session *session = conn->session;
+    pthread_mutex_lock(&session->map_lock);
+    if (conn->io_workers > 0U) {
+        --conn->io_workers;
+    }
+    close_conn_fd_locked(conn);
+    int unlinked = unlink_finished_conn_locked(conn);
+    nat_threads_release_locked(session, 1U);
+    pthread_mutex_unlock(&session->map_lock);
+    if (unlinked) {
+        free_external_conn(conn);
+    }
+}
+
+/*
+ * Gives back the reservations of workers that could not be started and stops the stream, freeing
+ * it when no started worker is left to do so.
+ */
+static void external_workers_not_started(external_conn *conn, unsigned int count)
+{
+    specus_session *session = conn->session;
+    pthread_mutex_lock(&session->map_lock);
+    conn->io_workers = conn->io_workers > count ? conn->io_workers - count : 0U;
+    close_conn_locked(conn);
+    int unlinked = unlink_finished_conn_locked(conn);
+    nat_threads_release_locked(session, count);
+    pthread_mutex_unlock(&session->map_lock);
+    if (unlinked) {
+        free_external_conn(conn);
+    }
 }
 
 /* Results of queueing client data for the public socket, each answered with its own RST code. */
@@ -5023,32 +5134,28 @@ static int start_external_conn(specus_listener *listener,
     }
     mark_stream_opened_locked(session, conn->stream_id);
     snprintf(conn->channel_id, sizeof(conn->channel_id), "c-%u", conn->stream_id);
-    /* Both workers are reserved before anyone can stop the stream, so its socket outlives them. */
+    /*
+     * Both workers are reserved before anyone can stop the stream, so its socket outlives them,
+     * and so does the stream itself: the reader's reservation keeps it alive (and here) while
+     * the writer may already be running, until the reader is started or given up.
+     */
     conn->io_workers = 2U;
+    session->nat_threads += 2U;
     conn->next = session->conns;
     session->conns = conn;
     pthread_mutex_unlock(&session->map_lock);
 
-    if (pthread_create(&conn->writer_thread, NULL, external_writer_thread, conn) != 0) {
+    if (start_detached_thread(external_writer_thread, conn) != 0) {
         perror("pthread_create");
-        pthread_mutex_lock(&session->map_lock);
-        conn->io_workers -= 2U;
-        close_conn_locked(conn);
-        pthread_mutex_unlock(&session->map_lock);
+        external_workers_not_started(conn, 2U);
         return -1;
     }
-    conn->writer_thread_started = 1;
-    if (pthread_create(&conn->thread, NULL, external_conn_thread, conn) != 0) {
+    /* Once the reader runs, conn is the workers' alone: the last of them to finish frees it. */
+    if (start_detached_thread(external_conn_thread, conn) != 0) {
         perror("pthread_create");
-        pthread_mutex_lock(&session->map_lock);
-        --conn->io_workers;
-        close_conn_locked(conn);
-        pthread_mutex_unlock(&session->map_lock);
-        pthread_join(conn->writer_thread, NULL);
-        conn->writer_thread_started = 0;
+        external_workers_not_started(conn, 1U);
         return -1;
     }
-    conn->thread_started = 1;
     return 0;
 }
 
@@ -5074,15 +5181,24 @@ static void *listener_thread(void *arg)
         start_external_conn(listener, fd, &remote);
     }
 
+    printf("[nat] listener stopped port=%d client=%s\n",
+           listener->port, session->config.client_name);
+    /* No accept() can use the descriptor any more: close it, and let the listener go. */
     pthread_mutex_lock(&session->map_lock);
     if (listener->fd >= 0) {
         close(listener->fd);
         listener->fd = -1;
     }
     listener->done = 1;
+    for (specus_listener **cursor = &session->listeners; *cursor != NULL; cursor = &(*cursor)->next) {
+        if (*cursor == listener) {
+            *cursor = listener->next;
+            break;
+        }
+    }
+    nat_threads_release_locked(session, 1U);
     pthread_mutex_unlock(&session->map_lock);
-    printf("[nat] listener stopped port=%d client=%s\n",
-           listener->port, session->config.client_name);
+    free(listener);
     return NULL;
 }
 
@@ -5124,19 +5240,26 @@ static int start_specus_listener(specus_session *session, int port, char *reason
     }
     listener->next = session->listeners;
     session->listeners = listener;
+    ++session->nat_threads;
     pthread_mutex_unlock(&session->map_lock);
 
-    if (pthread_create(&listener->thread, NULL, listener_thread, listener) != 0) {
+    if (start_detached_thread(listener_thread, listener) != 0) {
         perror("pthread_create");
         pthread_mutex_lock(&session->map_lock);
-        close(listener->fd);
-        listener->fd = -1;
-        listener->done = 1;
+        for (specus_listener **cursor = &session->listeners; *cursor != NULL; cursor = &(*cursor)->next) {
+            if (*cursor == listener) {
+                *cursor = listener->next;
+                break;
+            }
+        }
+        nat_threads_release_locked(session, 1U);
         pthread_mutex_unlock(&session->map_lock);
+        /* Shut down at most, by a stop that found it published; no thread ever used it. */
+        close(fd);
+        free(listener);
         snprintf(reason, reason_len, "failed to start listener thread");
         return -1;
     }
-    listener->thread_started = 1;
     return 0;
 }
 
@@ -5443,45 +5566,29 @@ static void session_shutdown(specus_session *session)
     for (ws_conn *conn = session->ws_conns; conn != NULL; conn = conn->next) {
         st_admin_direct_ws_close(conn->stream);
     }
+    /* Every listener and worker frees what it owns as it ends; the session must outlive them. */
+    pthread_cond_broadcast(&session->nat_threads_cond);
+    while (session->nat_threads > 0U) {
+        pthread_cond_wait(&session->nat_threads_cond, &session->map_lock);
+    }
+    specus_listener *listener = session->listeners;
+    session->listeners = NULL;
+    external_conn *conn = session->conns;
+    session->conns = NULL;
     pthread_mutex_unlock(&session->map_lock);
 
-    for (specus_listener *listener = session->listeners; listener != NULL; listener = listener->next) {
-        if (listener->thread_started) {
-            pthread_join(listener->thread, NULL);
-        }
-    }
-    for (external_conn *conn = session->conns; conn != NULL; conn = conn->next) {
-        if (conn->thread_started) {
-            pthread_join(conn->thread, NULL);
-        }
-        if (conn->writer_thread_started) {
-            pthread_join(conn->writer_thread, NULL);
-        }
-    }
-
-    specus_listener *listener = session->listeners;
+    /* Nothing is left here but what no thread ever ran for; a safety net only. */
     while (listener != NULL) {
         specus_listener *next = listener->next;
-        /* Its thread closed it as it ended; a safety net only. */
         if (listener->fd >= 0) {
             close(listener->fd);
         }
         free(listener);
         listener = next;
     }
-    external_conn *conn = session->conns;
     while (conn != NULL) {
         external_conn *next = conn->next;
-        /* Both workers are joined and the last of them closed the socket; a safety net only. */
-        if (conn->fd >= 0) {
-            close(conn->fd);
-        }
-        free_external_write_queue(conn);
-        pthread_cond_destroy(&conn->flow_cond);
-        pthread_mutex_destroy(&conn->flow_lock);
-        pthread_cond_destroy(&conn->write_cond);
-        pthread_mutex_destroy(&conn->write_lock);
-        free(conn);
+        free_external_conn(conn);
         conn = next;
     }
     ws_conn *ws = session->ws_conns;
@@ -5566,16 +5673,20 @@ static void *client_thread(void *arg)
     pthread_mutex_init(&session->map_lock, NULL);
     pthread_mutex_init(&session->direct_lock, NULL);
     pthread_cond_init(&session->reference_cond, NULL);
+    int nat_cond_ok = nat_threads_cond_init(session) == 0;
     remote_text(&args->remote, args->remote_len, session->remote, sizeof(session->remote));
     free(args);
 
-    if (connection_register(session) != 0) {
+    if (!nat_cond_ok || connection_register(session) != 0) {
         /* Accepted just as the server began to stop: nothing was read, so nothing to record. */
         close(session->control_fd);
         pthread_mutex_destroy(&session->send_lock);
         pthread_mutex_destroy(&session->map_lock);
         pthread_mutex_destroy(&session->direct_lock);
         pthread_cond_destroy(&session->reference_cond);
+        if (nat_cond_ok) {
+            pthread_cond_destroy(&session->nat_threads_cond);
+        }
         free(session);
         return NULL;
     }
@@ -5595,6 +5706,7 @@ static void *client_thread(void *arg)
             pthread_mutex_destroy(&session->map_lock);
             pthread_mutex_destroy(&session->direct_lock);
             pthread_cond_destroy(&session->reference_cond);
+            pthread_cond_destroy(&session->nat_threads_cond);
             free(session);
             return NULL;
         }
@@ -5971,6 +6083,7 @@ static void *client_thread(void *arg)
     pthread_mutex_destroy(&session->map_lock);
     pthread_mutex_destroy(&session->direct_lock);
     pthread_cond_destroy(&session->reference_cond);
+    pthread_cond_destroy(&session->nat_threads_cond);
     free(session);
     return NULL;
 }

@@ -511,6 +511,8 @@ Rate批次结束时，四类连通性中Vector、Resource、Rate三类为候选�
 | `stream_fd_lifetime_tests` 场景 5 LATE_ACCEPT_AFTER_STOP（引用 `main.c`，只在测试程序里拦 libc 边界） | 监听线程的 accept 刚返回一个连接、尚未发布时，UNREGISTER 停止该监听：监听描述符在线程结束前保持打开；放行后这个迟到的连接被关闭，没有起任何读写线程；监听描述符与连接描述符最终都关闭，外部连接计数归零 | 监听描述符当场被关闭 |
 | `stream_fd_lifetime_tests` 场景 6 LATE_ACCEPT_AFTER_RELEASE | 同上，监听由同一客户端的新登录释放（`release_session_listeners`） | 迟到的连接被发布，起了读写线程 |
 | `stream_fd_lifetime_tests` 场景 7 LATE_ACCEPT_DURING_SHUTDOWN | 同上，data 连接结束（`session_shutdown` 在另一线程里等监听线程） | 监听描述符当场被关闭 |
+| `stream_fd_lifetime_tests` 场景 0–4、8 的收尾（NAT-BP-01） | 流不论怎样结束（停在 recv、停在 send、写线程或读线程起不来、读线程启动前被停止、场景 8 两侧正常关闭：公网对端关闭、客户端 FIN 写完），会话存活期间 10 s 内从会话里消失、描述符已关闭、外部连接计数归零；随后 UNREGISTER 停掉的监听同样从会话里消失、描述符已关闭 | 六个场景都失败：流一直留在会话里，直到 data 连接结束（测试为在原实现上编译，只去掉了新条件变量的初始化） |
+| `nat_public_tcp_tests`「closed public connections are released while the data connection lives」（真实进程，新增） | 同一条 data 连接上先关 20 条预热，再先后建立并关闭 300 条公网连接（公网对端关闭、收到 FIN 后客户端回 FIN）：服务端 `/proc/<pid>/maps` 的行数不超过关闭前加 64（实测 236 → 236）；之后新的公网连接照常双向转发 | 306 → 1506，多出 1200 个映射，即每条连接两个未 join 线程的栈与保护页 |
 
 ## 历史表的读法与限制
 

@@ -19,6 +19,10 @@ static int observed_create(pthread_t *thread, const pthread_attr_t *attr,
  * scenarios are the LATE_ACCEPT ones: a listener's descriptor was closed by whoever stopped it
  * (UNREGISTER, the connection's end) while its thread could still be in accept() on that number,
  * and a connection accepted as the listener stopped was still published.
+ *
+ * Every scenario but the LATE_ACCEPT ones then checks that the stream, however it ended, is freed
+ * by its last worker and the stopped listener by its own thread while the session lives on: both
+ * used to stay in the session, with their threads unjoined, until the data connection ended.
  */
 #define main specus_server_entry_for_stream_fd_lifetime
 #define recv held_recv
@@ -46,6 +50,7 @@ enum {
     LATE_ACCEPT_AFTER_STOP,     /* accept() returned a connection, then UNREGISTER stopped the listener */
     LATE_ACCEPT_AFTER_RELEASE,  /* the same, the listener released by a newer login of the client */
     LATE_ACCEPT_DURING_SHUTDOWN, /* the same, the data connection ending */
+    STREAM_FINISHED,    /* both directions of the stream end normally, nothing held */
     SCENARIOS
 };
 
@@ -157,6 +162,44 @@ static external_conn *published_stream(specus_session *session)
     return NULL;
 }
 
+/* Polls the session (map_lock) for up to 10 s; 1 once it holds no stream, or no listener. */
+static int wait_session_lists_empty(specus_session *session, int listeners)
+{
+    struct timespec pause = {.tv_nsec = 1000000L};
+    for (int i = 0; i < 10000; ++i) {
+        pthread_mutex_lock(&session->map_lock);
+        int empty = listeners ? session->listeners == NULL : session->conns == NULL;
+        pthread_mutex_unlock(&session->map_lock);
+        if (empty) return 1;
+        nanosleep(&pause, NULL);
+    }
+    return 0;
+}
+
+static int wait_streams_gone(specus_session *session)
+{
+    return wait_session_lists_empty(session, 0);
+}
+
+static int wait_listeners_gone(specus_session *session)
+{
+    return wait_session_lists_empty(session, 1);
+}
+
+/* Waits until only `left` of the stream's workers may still use it. */
+static void wait_workers(specus_session *session, external_conn *conn, unsigned int left)
+{
+    struct timespec pause = {.tv_nsec = 1000000L};
+    for (int i = 0; i < 10000; ++i) {
+        pthread_mutex_lock(&session->map_lock);
+        unsigned int workers = conn->io_workers;
+        pthread_mutex_unlock(&session->map_lock);
+        if (workers == left) return;
+        nanosleep(&pause, NULL);
+    }
+    REQUIRE(0, "the stream's worker did not finish");
+}
+
 static void *shutdown_session(void *arg)
 {
     session_shutdown((specus_session *)arg);
@@ -230,6 +273,7 @@ static void run_scenario(int scenario)
     pthread_mutex_init(&session.send_lock, NULL);
     pthread_mutex_init(&session.map_lock, NULL);
     pthread_mutex_init(&session.direct_lock, NULL);
+    REQUIRE(nat_threads_cond_init(&session) == 0, "listener and worker condition");
     char reason[256];
     REQUIRE(start_specus_listener(&session, 0, reason, sizeof(reason)) == 0, "start a real listener");
     specus_listener *listener = session.listeners;
@@ -249,8 +293,14 @@ static void run_scenario(int scenario)
         REQUIRE(enqueue_external_write(conn, (const uint8_t *)"payload", 7U, 0) == 0, "queue a public write");
         pthread_mutex_unlock(&session.map_lock);
     }
-    wait_fixture(scenario == FAIL_WRITER || scenario == FAIL_READER);
+    if (scenario == STREAM_FINISHED) {
+        REQUIRE(published_stream(&session) != NULL, "stream publication");
+    } else {
+        wait_fixture(scenario == FAIL_WRITER || scenario == FAIL_READER);
+    }
+    pthread_mutex_lock(&fixture.lock);
     int accepted_fd = fixture.accepted_fd;
+    pthread_mutex_unlock(&fixture.lock);
     REQUIRE(accepted_fd >= 0, "accept observed a real socket");
 
     if (late_accept_scenario(scenario)) {
@@ -261,19 +311,20 @@ static void run_scenario(int scenario)
         pthread_mutex_destroy(&session.send_lock);
         pthread_mutex_destroy(&session.map_lock);
         pthread_mutex_destroy(&session.direct_lock);
+        pthread_cond_destroy(&session.nat_threads_cond);
         alarm(0);
         printf("ok   stream fd lifetime scenario %d\n", scenario);
         return;
     }
     if (scenario == HOLD_READER_START) {
-        /* The reader is reserved but descheduled before it starts; the writer exits meanwhile. */
+        /* The reader is reserved but descheduled before it starts; the writer exits meanwhile. The
+         * reader's reservation keeps the stream (and conn) alive until it has run. */
         external_conn *conn = published_stream(&session);
         REQUIRE(conn != NULL, "reserved stream publication");
         pthread_mutex_lock(&session.map_lock);
         close_conn_locked(conn);
         pthread_mutex_unlock(&session.map_lock);
-        pthread_join(conn->writer_thread, NULL);
-        conn->writer_thread_started = 0;
+        wait_workers(&session, conn, 1U);
         REQUIRE(fcntl(accepted_fd, F_GETFD) >= 0, "descriptor closed before the reserved reader started");
         release_fixture();
     }
@@ -286,27 +337,35 @@ static void run_scenario(int scenario)
         REQUIRE(fcntl(accepted_fd, F_GETFD) >= 0, "stream descriptor closed while a worker is about to use it");
         release_fixture();
     }
-    stop_specus_listener(&session, 0);
-    pthread_join(listener->thread, NULL);
-    listener->thread_started = 0;
-    external_conn *conn = session.conns;
-    REQUIRE(conn != NULL, "the stream stays owned by the session until its cleanup");
-    if (conn->thread_started) {
-        pthread_join(conn->thread, NULL);
-        conn->thread_started = 0;
+    if (scenario == STREAM_FINISHED) {
+        /* Both directions end normally: the public peer closes, the client's FIN is drained. */
+        external_conn *conn = published_stream(&session);
+        REQUIRE(conn != NULL, "stream publication");
+        close(peer);
+        peer = -1;
+        pthread_mutex_lock(&session.map_lock);
+        int finished = session.conns == conn && finish_external_write(conn) == 0;
+        pthread_mutex_unlock(&session.map_lock);
+        REQUIRE(finished, "the client's FIN for the stream");
     }
-    if (conn->writer_thread_started) {
-        pthread_join(conn->writer_thread, NULL);
-        conn->writer_thread_started = 0;
-    }
+    /*
+     * However the stream ended, once its workers are done it is gone from the session and its
+     * descriptor is closed, while the data connection lives on (as a closed Netty channel leaves
+     * nothing in Java's maps). A stopped listener goes the same way.
+     */
+    REQUIRE(wait_streams_gone(&session), "a finished stream stays in the session until the data connection ends");
     REQUIRE(fcntl(accepted_fd, F_GETFD) < 0 && errno == EBADF, "stream descriptor kept after its workers ended");
-    session_shutdown(&session);
     REQUIRE(global_external_connections == 0, "active connection accounting leaked");
-    close(peer);
+    stop_specus_listener(&session, 0);
+    REQUIRE(wait_listeners_gone(&session), "a stopped listener stays in the session until the data connection ends");
+    REQUIRE(fcntl(listener_fd, F_GETFD) < 0 && errno == EBADF, "listener descriptor kept after its thread ended");
+    session_shutdown(&session);
+    if (peer >= 0) close(peer);
     close(control[1]);
     pthread_mutex_destroy(&session.send_lock);
     pthread_mutex_destroy(&session.map_lock);
     pthread_mutex_destroy(&session.direct_lock);
+    pthread_cond_destroy(&session.nat_threads_cond);
     alarm(0);
     printf("ok   stream fd lifetime scenario %d\n", scenario);
 }

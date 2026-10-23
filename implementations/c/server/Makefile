@@ -70,6 +70,7 @@ CLIENT_ROUTE_SCALE_TESTS := $(BUILD_DIR)/specus_c_client_route_scale_tests
 NAT_SIZING_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_nat_sizing_reference_tests
 SQLITE_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_sqlite_reference_tests
 NAT_STREAM_TESTS := $(BUILD_DIR)/specus_c_nat_stream_tests
+NAT_PUBLIC_TCP_TESTS := $(BUILD_DIR)/specus_c_nat_public_tcp_tests
 CONNECTION_ARCHIVE_TESTS := $(BUILD_DIR)/specus_c_connection_archive_tests
 TRAFFIC_DETAIL_API_TESTS := $(BUILD_DIR)/specus_c_traffic_detail_api_tests
 CLIENT_MESSAGES_TESTS := $(BUILD_DIR)/specus_c_client_messages_tests
@@ -101,6 +102,7 @@ TESTS := $(ADMIN_TESTS) $(DIRECT_WEBSOCKET_TESTS) $(CLIENT_ADDRESS_TESTS) $(CLIE
 ALL_TESTS := $(TESTS) $(PUBLIC_COORDINATION_TESTS) $(ELASTICSEARCH_TRAFFIC_TESTS) $(MEDIA_CAPTURE_TESTS) $(SESSION_LIFECYCLE_TESTS) $(SECURITY_RULES_TESTS) $(HTTP_ROUTE_LIFECYCLE_TESTS) $(NAT_STREAM_TESTS) $(PRODUCT_METRICS_TESTS) $(CONNECTION_ARCHIVE_TESTS) $(HTTP_WEBSOCKET_ROUTING_TESTS) $(TRAFFIC_DETAIL_API_TESTS) $(CLIENT_MESSAGES_TESTS) $(MANAGEMENT_WS_BACKPRESSURE_TESTS) $(DIRECT_WEBSOCKET_BACKPRESSURE_TESTS) $(MANAGEMENT_LISTS_TESTS) $(MANAGEMENT_CRUD_TESTS) $(PEER_MESH_API_TESTS) $(MANAGEMENT_OVERVIEW_TESTS)
 ALL_TESTS += $(PEER_MESH_E2E_TESTS) $(CLIENT_ROUTE_SCALE_TESTS)
 ALL_TESTS += $(NAT_SIZING_REFERENCE_TESTS)
+ALL_TESTS += $(NAT_PUBLIC_TCP_TESTS)
 ALL_TESTS += $(SQLITE_REFERENCE_TESTS)
 ALL_TESTS += $(INSTANT_TESTS) $(INSTANT_MIGRATION_TESTS) $(CONNECTION_TIME_REFERENCE_TESTS)
 ALL_TESTS += $(AUTH_EXPIRY_REFERENCE_TESTS)
@@ -359,6 +361,9 @@ $(SQLITE_REFERENCE_TESTS): $(CORE_OBJS) tests/sqlite_reference_tests.c | $(BUILD
 $(NAT_STREAM_TESTS): $(CORE_OBJS) tests/nat_stream_tests.c tests/connectivity_nat_test_cases.h tests/connectivity_nat_complete_cases.h tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DST_CONNECTIVITY_VECTOR_DIR='"../../../protocol/test-vectors/"' tests/nat_stream_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
+$(NAT_PUBLIC_TCP_TESTS): $(CORE_OBJS) tests/nat_public_tcp_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/nat_public_tcp_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
 $(PRODUCT_METRICS_TESTS): $(CORE_OBJS) tests/product_metrics_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/product_metrics_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
@@ -492,6 +497,7 @@ test: all
 	$(HTTP_ROUTE_LIFECYCLE_TESTS) $(SERVER)
 	$(CLIENT_ROUTE_SCALE_TESTS) $(SERVER)
 	$(NAT_STREAM_TESTS) $(SERVER)
+	$(NAT_PUBLIC_TCP_TESTS) $(SERVER)
 	$(CONNECTIVITY_CLOCK_TEST_COMMAND)
 	$(HTTP_TIMEOUT_CLOCK_TEST_COMMAND)
 	$(PRODUCT_METRICS_TESTS) $(SERVER)
