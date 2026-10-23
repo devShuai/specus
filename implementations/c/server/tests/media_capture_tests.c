@@ -15,8 +15,10 @@
 #include "storage.h"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <signal.h>
 #include <sqlite3.h>
 #include <stdint.h>
@@ -652,6 +654,112 @@ static int drain_via_http(const char *path, const upstream_script *script, int *
     }
     close(fd);
     *status = response_status(head);
+    return 0;
+}
+
+/* Threads of this process now. */
+static int thread_count(void)
+{
+    DIR *tasks = opendir("/proc/self/task");
+    if (tasks == NULL) {
+        return -1;
+    }
+    int count = 0;
+    for (struct dirent *entry = readdir(tasks); entry != NULL; entry = readdir(tasks)) {
+        count += entry->d_name[0] != '.';
+    }
+    closedir(tasks);
+    return count;
+}
+
+typedef struct {
+    atomic_int stop;
+    atomic_int peak;
+} thread_sampler;
+
+static void *sample_threads(void *arg)
+{
+    thread_sampler *sampler = (thread_sampler *)arg;
+    while (!atomic_load(&sampler->stop)) {
+        int now = thread_count();
+        if (now > atomic_load(&sampler->peak)) {
+            atomic_store(&sampler->peak, now);
+        }
+        struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000L};
+        nanosleep(&pause, NULL);
+    }
+    return NULL;
+}
+
+/*
+ * Java's upload executor has uploadThreads workers and a bounded queue: with one upload thread
+ * and every part taking 1 s, a capture of three full parts and a tail uploads them one after the
+ * other on that one worker while they wait in the queue, so the process gains no more than the
+ * connection's thread and the worker. Each part used to get a thread of its own waiting for its turn
+ * (four at once here, more with more captures). Runs before any other capture started workers.
+ */
+static int test_part_uploads_share_bounded_workers(void)
+{
+    const size_t part = 5U * 1024U * 1024U;
+    const size_t total = 3U * part + 3U;
+    uint8_t *body = (uint8_t *)malloc(total);
+    if (body == NULL) {
+        return 1;
+    }
+    fill_pattern(body, 0, total);
+    upstream_script script = upstream(200, body, total);
+    upstream_header(&script, "Content-Type: video/mp4");
+    upstream_header(&script, "Content-Length: 15728643");
+    char delay_path[512];
+    char running_path[512];
+    snprintf(delay_path, sizeof(delay_path), "%s/part_delay_ms", g_state_dir);
+    snprintf(running_path, sizeof(running_path), "%s/part_running.log", g_state_dir);
+    (void)unlink(running_path);
+    FILE *delay = fopen(delay_path, "w");
+    if (delay == NULL) {
+        free(body);
+        return 1;
+    }
+    fputs("1000", delay);
+    fclose(delay);
+    setenv("SPECUS_MEDIA_CAPTURE_UPLOAD_THREADS", "1", 1);
+    thread_sampler sampler;
+    atomic_init(&sampler.stop, 0);
+    atomic_init(&sampler.peak, 0);
+    pthread_t sampler_thread;
+    int sampling = pthread_create(&sampler_thread, NULL, sample_threads, &sampler) == 0;
+    struct timespec settle = {.tv_sec = 0, .tv_nsec = 50000000L};
+    nanosleep(&settle, NULL);
+    int baseline = thread_count();
+    int status = 0;
+    size_t received = 0U;
+    int rc = drain_via_http("/one-worker.mp4", &script, &status, &received);
+    atomic_store(&sampler.stop, 1);
+    if (sampling) {
+        pthread_join(sampler_thread, NULL);
+    }
+    unsetenv("SPECUS_MEDIA_CAPTURE_UPLOAD_THREADS");
+    (void)unlink(delay_path);
+    free(body);
+    int peak = 0;
+    FILE *running = fopen(running_path, "r");
+    for (int value = 0; running != NULL && fscanf(running, "%d", &value) == 1;) {
+        peak = value > peak ? value : peak;
+    }
+    if (running != NULL) {
+        fclose(running);
+    }
+    int gained = atomic_load(&sampler.peak) - baseline;
+    printf("     one upload thread: %d part(s) at once, %d thread(s) gained\n", peak, gained);
+    capture_snapshot capture;
+    memset(&capture, 0, sizeof(capture));
+    if (!sampling || baseline <= 0 || rc != 0 || status != 200 || received < total || peak != 1 || gained > 2
+        || capture_of("/one-worker.mp4", 0, &capture) != 0 || strcmp(capture.state, "COMPLETE") != 0
+        || capture.captured != (long long)total) {
+        fprintf(stderr, "bounded upload workers: rc=%d status=%d peak=%d gained=%d state=%s\n", rc, status, peak,
+                gained, capture.state);
+        return 1;
+    }
     return 0;
 }
 
@@ -1735,6 +1843,7 @@ int main(void)
         return 1;
     }
     int (*const tests[])(void) = {
+        test_part_uploads_share_bounded_workers,
         test_large_response_is_a_multipart_upload,
         test_part_uploads_beside_the_response,
         test_streaming_response_without_content_length,
