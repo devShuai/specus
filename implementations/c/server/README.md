@@ -23,6 +23,7 @@ This version implements the v2 core server path:
 - `NAT_CONTROL` push after login, after SQLite mapping/route mutations, and through the manual admin endpoint
 - `/ws/client-messages` with endpoint-bound one-time tickets, admin/client fan-out, online capability checks, and ACL-gated client fallback over the control channel
 - opt-in product metrics (`protocol/spec/product-metrics.md`): `GET/PUT /api/admin/product-metrics/settings`, `DELETE /api/admin/product-metrics/data`, `POST /api/admin/product-metrics/transfer-outcomes` and `GET /api/admin/product-metrics/summary` with the shared tables, closed-schema ingest, per-process UTC-minute limiter and `Cache-Control: private, no-store` on every answer; onboarding milestones from admin user creation, registration verification, password login, credential creation, the control-connection login (`main.c`) and route/mapping creation; the retention sweep runs a minute after start and then hourly in the maintenance thread. OIDC sign-in issues a local session and records `signed_in` like a password login. `product_metrics_tests` replays `protocol/test-vectors/product-metrics-v1.json` through the real request handling
+- the Java server's Micrometer meters (`specus.control.*`, `specus.peer_mesh.turn.*`, `specus.peer_mesh.relay.traffic.*`) and Spring Boot's actuator metrics endpoint, `GET /actuator/metrics` and `GET /actuator/metrics/{requiredMetricName}`, served only when `MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE` names `metrics` (see below)
 - Peer Mesh login configuration, roster, service catalog, offer/answer/candidate/close signalling, persisted session/path/traffic state, management service sharing/import/audit/stats, and immediate roster/catalog refresh after mutations
 - Java-compatible attachment presign/complete/download flows for Aliyun OSS storage (OSS V4 signing; `aliyun-oss` is the only attachment provider), plus route-level HTTP media capture on an S3-compatible store, sparse Range stitching/backfill, ticketed playback, and scheduled expiry cleanup
 - optional Elasticsearch HTTP/TCP detail persistence/query/retention, with SQLite as the default detail backend
@@ -132,6 +133,8 @@ Additional runtime knobs:
 | `SPECUS_AUTH_TOKEN_TTL_SECONDS` | `28800` | Local management Bearer JWT lifetime; values below 60 seconds are normalized to 60. |
 | `SPECUS_TRUSTED_PROXIES` | unset | Comma-separated trusted reverse-proxy CIDRs. Forwarded headers are ignored unless the socket peer matches; trusted chains use right-to-left `X-Forwarded-For` parsing with `X-Real-IP` fallback. |
 | `SPECUS_PRODUCT_METRICS_ALLOWED` | `true` | Deployment switch `productMetrics.allowed` of opt-in product metrics. `false` (any value other than `true`/`1`/`yes`) keeps every tenant off: settings read `enabled: false`, enabling answers `409 PRODUCT_METRICS_NOT_ALLOWED`, ingest answers `collecting: false` and milestones are ignored. |
+| `MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE` | unset (Spring Boot's `health`) | Spring Boot's `management.endpoints.web.exposure.include`. The metrics routes exist only while it lists `metrics` (or `*`); entries are comma-separated and trimmed, dashes are dropped and ids compare by their lowercase letters and digits. An entry Spring would refuse (empty, a character outside `[a-zA-Z0-9.-]`, or starting with a digit or an uppercase letter) stops the start, as it stops Java's. |
+| `MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_EXCLUDE` | unset | `management.endpoints.web.exposure.exclude`, read the same way; it wins over the include list. |
 | `SPECUS_PEER_MESH_ENABLED` | `false` | Enables Java-shaped Peer Mesh login/control behaviour and starts the built-in STUN/TURN UDP listener. When the listener cannot start (port taken, public address unresolvable, strict RFC 5780 mode with an incomplete configuration) the server logs `[peer-mesh] standard STUN/TURN UDP server failed to start on <port>` and runs on without it, as Java does. |
 | `SPECUS_PEER_MESH_PUBLIC_ADDRESS` | unset | Public address advertised for the built-in STUN/TURN service and relay candidates: an IPv4 literal or a name, resolved at startup to its first IPv4 address as Java's `InetAddress.getByName` does. A name that does not resolve keeps the STUN/TURN listener from starting. Unset, as in Java, the listener's bind address is advertised unless it is `0.0.0.0`, and then the address this host's name resolves to; on Debian and Ubuntu that is usually `127.0.1.1` from `/etc/hosts`, which no other host can reach (Java behaves the same), so set this whenever clients relay from elsewhere. |
 | `SPECUS_PEER_MESH_BIND_ADDRESS` | `0.0.0.0` | Bind address for the built-in STUN/TURN UDP listener and the relay sockets. |
@@ -530,6 +533,22 @@ JSON answer is never applied as a page).
 traffic, and for administrators the tenant's open and refused public connections) followed by C's
 `server`, `status` and `tcpMappings`; `/api/admin/metrics` uses the same SQLite plus environment mapping
 snapshot as client auth login, and both count only the current management context's visible TCP mappings.
+It has nothing to do with the Micrometer meters below and keeps `metricsWired: false`.
+
+`GET /actuator/metrics` and `GET /actuator/metrics/{requiredMetricName}` answer as the Java server's
+actuator does when the metrics endpoint is exposed (`MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE`; Java
+has no Prometheus registry, so there is no `/actuator/prometheus` on either side). Like every
+`/actuator` path in Java's `SecurityConfig` they need no token. The names are the 16 meters the Java
+server registers itself; the JVM, Tomcat, HikariCP and Spring meters Spring Boot adds have no C
+counterpart. A meter's answer has Jackson's alphabetical fields, values written as Java's
+`Double.toString` writes them, `tag=key:value` filtering, Spring's `Accept` negotiation (v3, v2 or plain
+JSON, otherwise `406`) and Spring's `Content-Disposition: inline;filename=f.txt` on a dotted name.
+C counts the same events as Java (`src/metrics.c`); where it cannot or does not (the TURN relay queue
+meters stay 0 because C relays synchronously, `specus.control.protocol.rejected` counts in C while
+Java's handler never sees the wrapped exception) the API inventory's section 8 says why.
+`tests/metrics_tests.c` compares the answers with the Java server's, and
+`tests/metrics_endpoint_tests.c` reads them from a real process after refused control frames, TURN
+quota and policy refusals, relayed bytes and a Peer Mesh relay batch.
 
 Requests under `/http/{clientName}/{route}/...` are recognized by the management listener and are
 forwarded to the active runtime session whose `clientName` matches the path and whose `route`
