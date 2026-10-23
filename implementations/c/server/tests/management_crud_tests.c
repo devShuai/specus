@@ -621,6 +621,13 @@ static int test_mappings(void)
                   "{\"error\":\"For input string: \\\"abc\\\"\"}") != 0
         || expect("GET", "/api/admin/specus-mappings?clientId=", NULL, admin_token, 200, "\"listenPort\":21002") != 0
         || strstr(last_body, "\"listenPort\":21001") == NULL || strstr(last_body, "\"listenPort\":21003") != NULL;
+    /* A parameter past the first KiB of the target binds too: the listener used to cut it at 1023 bytes. */
+    char long_path[1400];
+    int long_len = snprintf(long_path, sizeof(long_path), "/api/admin/specus-mappings?pad=");
+    while (long_len < 1200) long_path[long_len++] = 'x';
+    snprintf(long_path + long_len, sizeof(long_path) - (size_t)long_len, "&clientId=abc");
+    failed = failed
+        || expect("GET", long_path, NULL, admin_token, 400, "{\"error\":\"For input string: \\\"abc\\\"\"}") != 0;
     snprintf(path, sizeof(path), "/api/admin/specus-mappings?clientId=%%20%lld%%20", client_a);
     failed = failed || expect("GET", path, NULL, admin_token, 200, "\"listenPort\":21001") != 0
         || strstr(last_body, "\"listenPort\":21002") != NULL;

@@ -19438,23 +19438,25 @@ static int admit_http_share_request(int fd,
     memcpy(admission->share_id, id, ST_HTTP_SHARE_ID_LEN);
     admission->share_id[ST_HTTP_SHARE_ID_LEN] = '\0';
     if (slash == NULL) {
-        /* The cookie path ends with a slash; without it the browser would not send the cookie. */
-        char response[1536];
-        int len = snprintf(response,
-                           sizeof(response),
-                           "HTTP/1.1 308 Permanent Redirect\r\n"
-                           "Location: %s%s/%s%s\r\n"
-                           "Cache-Control: no-store\r\n"
-                           "Content-Length: 0\r\n"
-                           "Connection: close\r\n"
-                           "\r\n",
-                           ST_HTTP_SHARE_PATH_ROOT,
-                           admission->share_id,
-                           query != NULL && query[1] != '\0' ? "?" : "",
-                           query != NULL && query[1] != '\0' ? query + 1 : "");
-        if (len > 0 && (size_t)len < sizeof(response)) {
+        /* The cookie path ends with a slash; without it the browser would not send the cookie. The
+         * query goes along whole, however long the request target was. */
+        static const char redirect_format[] = "HTTP/1.1 308 Permanent Redirect\r\n"
+                                              "Location: %s%s/%s%s\r\n"
+                                              "Cache-Control: no-store\r\n"
+                                              "Content-Length: 0\r\n"
+                                              "Connection: close\r\n"
+                                              "\r\n";
+        const char *separator = query != NULL && query[1] != '\0' ? "?" : "";
+        const char *kept_query = query != NULL && query[1] != '\0' ? query + 1 : "";
+        int len = snprintf(NULL, 0U, redirect_format, ST_HTTP_SHARE_PATH_ROOT, admission->share_id, separator,
+                           kept_query);
+        char *response = len > 0 ? (char *)malloc((size_t)len + 1U) : NULL;
+        if (response != NULL
+            && snprintf(response, (size_t)len + 1U, redirect_format, ST_HTTP_SHARE_PATH_ROOT, admission->share_id,
+                        separator, kept_query) == len) {
             (void)send_all(fd, response, (size_t)len);
         }
+        free(response);
         return 0;
     }
     snprintf(admission->rewrite_prefix, sizeof(admission->rewrite_prefix), "%s%s",
@@ -19798,6 +19800,27 @@ static void admin_capture_refused_body(int fd, const char *received, size_t rece
 }
 
 /*
+ * SPECUS_HTTP_MAX_REQUEST_BODY_SIZE, Java's specus.http.max-request-body-size: the largest body a
+ * route or share request may carry, 16 MiB by default. Java binds it as an int and its body limit
+ * filter takes a negative one as 0. The server refuses to start with a value that is no int, so a
+ * bad one only reaches a listener started without it (tests), which keeps the default.
+ */
+static size_t admin_direct_http_max_body(void)
+{
+    const char *value = getenv("SPECUS_HTTP_MAX_REQUEST_BODY_SIZE");
+    if (value == NULL || *value == '\0') {
+        return ST_ADMIN_MAX_DIRECT_HTTP_BODY;
+    }
+    char *end = NULL;
+    errno = 0;
+    long long parsed = strtoll(value, &end, 10);
+    if (end == value || *end != '\0' || errno != 0 || parsed < INT_MIN || parsed > INT_MAX) {
+        return ST_ADMIN_MAX_DIRECT_HTTP_BODY;
+    }
+    return parsed < 0 ? 0U : (size_t)parsed;
+}
+
+/*
  * Reads the body that follows the header block in request (len bytes received so far), by
  * Content-Length or chunked and within the limit of the path. 0 with the body (in request or in
  * a malloc'd *body_buffer_out) and its length, or -1 once an error answer went out. A chunked
@@ -19825,7 +19848,9 @@ static int admin_read_request_body(int fd,
         body += 4;
         available_body_len = (size_t)(request + len - body);
         size_t max_content_length = admin_path_equals(path, "/api/admin/client-packages")
-            ? st_client_package_max_request_bytes() : ST_ADMIN_MAX_DIRECT_HTTP_BODY;
+            ? st_client_package_max_request_bytes()
+            : strncmp(path, "/http/", 6) == 0 || strncmp(path, ST_HTTP_SHARE_PATH_ROOT, strlen(ST_HTTP_SHARE_PATH_ROOT)) == 0
+            ? admin_direct_http_max_body() : ST_ADMIN_MAX_DIRECT_HTTP_BODY;
         char *transfer_encoding = admin_extract_header_value(request, "Transfer-Encoding");
         if (transfer_encoding != NULL) {
             /*
@@ -20105,8 +20130,10 @@ static void handle_client(st_admin_server *server, int fd)
         request[len] = '\0';
     }
     char method[16] = {0};
-    char path[1024] = {0};
-    if (sscanf(request, "%15s %1023s", method, path) != 2) {
+    /* As long as the head may be: Tomcat takes any request target that fits its 8 KiB header limit,
+     * and a 1 KiB buffer cut longer ones (signed URLs, OAuth callbacks) short without a word. */
+    char path[sizeof(request)] = {0};
+    if (sscanf(request, "%15s %8191s", method, path) != 2) {
         strcpy(method, "");
         strcpy(path, "");
     }

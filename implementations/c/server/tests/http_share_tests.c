@@ -3104,6 +3104,42 @@ static void test_builtin_admin_share(void)
     printf("http: shares of the built-in admin %s\n", ok ? "ok" : "FAILED");
 }
 
+/*
+ * A share link without its trailing slash is redirected with its query, however long: Tomcat takes
+ * any request target within its 8 KiB header limit. The listener used to cut the target at 1023
+ * bytes, and a redirect over 1.5 KiB was not sent at all.
+ */
+static void test_long_target_redirect(void)
+{
+    int ok = 1;
+    enum { QUERY_LEN = 3000 };
+    char query[QUERY_LEN + 1];
+    memcpy(query, "q=", 2U);
+    for (size_t i = 2U; i < QUERY_LEN; ++i) {
+        query[i] = (char)('a' + i % 26U);
+    }
+    query[QUERY_LEN] = '\0';
+    static const char share_id[] = "AbCdEfGhIjKlMnOp";
+    char request[4096];
+    int len = snprintf(request, sizeof(request), "GET /http-share/%s?%s HTTP/1.1\r\nHost: share.test\r\n\r\n",
+                       share_id, query);
+    char *response = (char *)malloc(RESPONSE_CAP);
+    char *location = (char *)malloc(RESPONSE_CAP);
+    char *expected = (char *)malloc(RESPONSE_CAP);
+    snprintf(expected, RESPONSE_CAP, "/http-share/%s/?%s", share_id, query);
+    CHECK(response != NULL && location != NULL && expected != NULL && len > 0 && (size_t)len < sizeof(request)
+              && http_roundtrip(request, (size_t)len, response, RESPONSE_CAP) == 0
+              && response_status(response) == 308
+              && response_header(response, "Location", 0U, location, RESPONSE_CAP)
+              && strcmp(location, expected) == 0,
+          "long target: expected 308 to %.80s... (%zu bytes), got %.200s", expected, strlen(expected),
+          response == NULL ? "" : response);
+    free(expected);
+    free(location);
+    free(response);
+    printf("http: a long share target is redirected whole %s\n", ok ? "ok" : "FAILED");
+}
+
 static char *read_file(const char *path)
 {
     FILE *file = fopen(path, "rb");
@@ -3183,6 +3219,7 @@ int main(void)
     test_local_cascade_cuts_websocket_and_stream();
     test_cascades_from_endpoints();
     test_builtin_admin_share();
+    test_long_target_redirect();
 
     st_http_share_set_clock_for_testing(0);
     device_reset(DEVICE_PLAIN);

@@ -540,9 +540,14 @@ when the 4 MiB client-to-public queue overflows), and `DATA|END_STREAM` is DATA 
 data connection remembers its 1024 most recently closed stream ids so a late `RST` is ignored; an
 `RST` for a stream that was never opened, a `WINDOW_UPDATE` beyond the 16 MiB window and a NAT type a
 client never sends close the data connection. A data connection holds at most 1024 pending HTTP
-streams (the next request gets `502`), and request bodies over 16 MiB get `413`; because every
-request body is read into memory before it is dispatched, that limit holds on the whole management
-listener (the client package upload has its own), where Java limits `/http/**` only.
+streams (the next request gets `502`), and a route or share request body over
+`SPECUS_HTTP_MAX_REQUEST_BODY_SIZE` (Java `specus.http.max-request-body-size`, 16 MiB by default)
+gets `413`; because every request body is read into memory before it is dispatched, the other
+management endpoints keep a fixed 16 MiB limit (the client package upload has its own), where Java
+limits `/http/**` only. `SPECUS_HTTP_TIMEOUT_MS` (Java `specus.http.timeout-ms`, 30000 by default)
+bounds the wait for the response head after the request went up and the wait for the window of each
+request body chunk; either timeout answers `504` and resets the stream (`RST 30`). The request
+target may be as long as the 8 KiB request head allows; it is never cut short.
 Trailers cross as `protocol/spec/http-route.md` sections 3 and 4 require, like Java
 `HttpSpecusController`: the names of the request's `Trailer` headers are declared in `trailerNames`
 (trimmed tokens, no hop-by-hop field, each once, without `Authorization` once the route gate
