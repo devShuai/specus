@@ -15545,7 +15545,12 @@ static const char *admin_reason_phrase(int status)
     }
 }
 
-static int send_direct_http_response(int fd, const st_direct_http_response *response, int include_body)
+/*
+ * Sends a buffered response; -1 on failure, with *write_failed set only when the caller could not be
+ * written to (not when the head could not be built).
+ */
+static int send_direct_http_response(int fd, const st_direct_http_response *response, int include_body,
+                                     int *write_failed)
 {
     if (response->error != NULL && *response->error != '\0') {
         char *escaped = st_json_escape(response->error);
@@ -15567,9 +15572,15 @@ static int send_direct_http_response(int fd, const st_direct_http_response *resp
                                   "Content-Length: %d\r\n"
                                   "\r\n",
                                   body_len);
-        return header_len > 0 && (size_t)header_len < sizeof(header)
-            && send_all(fd, header, (size_t)header_len) == 0
-            && (!include_body || send_all(fd, body, (size_t)body_len) == 0);
+        if (header_len <= 0 || (size_t)header_len >= sizeof(header)) {
+            return -1;
+        }
+        if (send_all(fd, header, (size_t)header_len) != 0
+            || (include_body && send_all(fd, body, (size_t)body_len) != 0)) {
+            *write_failed = 1;
+            return -1;
+        }
+        return 1;
     }
 
     int status = response->status_code <= 0 ? 502 : response->status_code;
@@ -15601,7 +15612,11 @@ static int send_direct_http_response(int fd, const st_direct_http_response *resp
         && (!include_body || response->body_len == 0
             || send_all(fd, (const char *)response->body, response->body_len) == 0);
     free(builder.data);
-    return ok ? 1 : -1;
+    if (!ok) {
+        *write_failed = 1;
+        return -1;
+    }
+    return 1;
 }
 
 static int send_text_http_error(int fd, int status, const char *message)
@@ -16124,7 +16139,19 @@ typedef struct {
     admin_share_stream *share_stream;
     /* The client's RST reason, made log-safe, as the failure of the HTTP detail (never public). */
     char reset_reason[ST_ADMIN_LOG_REASON_MAX_CODE_POINTS * 6U + 32U];
+    /* A write to the public caller failed: it went away or stopped reading past the timeout. */
+    int write_failed;
 } admin_direct_http_sink_state;
+
+/* send_all to the public caller, noting a failure as the caller's (Java's ClientAbortException). */
+static int direct_sink_send(admin_direct_http_sink_state *state, const char *data, size_t len)
+{
+    if (send_all(state->fd, data, len) != 0) {
+        state->write_failed = 1;
+        return -1;
+    }
+    return 0;
+}
 
 /* Returns the length of the valid UTF-8 sequence at text (0 if invalid) and its code point. */
 static size_t admin_log_utf8_sequence(const unsigned char *text, size_t remaining, uint32_t *code_point)
@@ -16512,7 +16539,7 @@ static int direct_sink_start_chunked(admin_direct_http_sink_state *state)
         rc = admin_sb_append(&builder, "\r\n");
     }
     if (rc == 0) {
-        rc = send_all(state->fd, builder.data, builder.len);
+        rc = direct_sink_send(state, builder.data, builder.len);
     }
     free(builder.data);
     if (rc == 0) {
@@ -16530,9 +16557,9 @@ static int direct_sink_send_chunk(admin_direct_http_sink_state *state,
     char prefix[32];
     int prefix_len = snprintf(prefix, sizeof(prefix), "%zx\r\n", data_len);
     return prefix_len > 0 && (size_t)prefix_len < sizeof(prefix)
-        && send_all(state->fd, prefix, (size_t)prefix_len) == 0
-        && send_all(state->fd, (const char *)data, data_len) == 0
-        && send_all(state->fd, "\r\n", 2U) == 0 ? 0 : -1;
+        && direct_sink_send(state, prefix, (size_t)prefix_len) == 0
+        && direct_sink_send(state, (const char *)data, data_len) == 0
+        && direct_sink_send(state, "\r\n", 2U) == 0 ? 0 : -1;
 }
 
 static int direct_sink_append_body(st_direct_http_response *response,
@@ -16644,7 +16671,8 @@ static int direct_sink_on_end(void *ctx, char *const *trailers, size_t trailers_
     if (state->buffer_for_rewrite) {
         (void)admin_rewrite_direct_http_response_with_prefix(state->client_name, state->route,
                                                              state->rewrite_prefix, &state->response);
-        if (send_direct_http_response(state->fd, &state->response, state->include_body) < 0) {
+        if (send_direct_http_response(state->fd, &state->response, state->include_body,
+                                      &state->write_failed) < 0) {
             return -1;
         }
         state->started = 1;
@@ -16652,7 +16680,7 @@ static int direct_sink_on_end(void *ctx, char *const *trailers, size_t trailers_
         st_media_capture_complete(state->media_capture);
         return 0;
     }
-    if (direct_sink_start_chunked(state) != 0 || send_all(state->fd, "0\r\n", 3U) != 0) {
+    if (direct_sink_start_chunked(state) != 0 || direct_sink_send(state, "0\r\n", 3U) != 0) {
         return -1;
     }
     /* Undeclared, hop-by-hop and CR/LF-carrying trailers are dropped (http-route.md section 4). */
@@ -16664,11 +16692,11 @@ static int direct_sink_on_end(void *ctx, char *const *trailers, size_t trailers_
     }
     int rc = 0;
     for (size_t i = 0; rc == 0 && i < declared_len; ++i) {
-        rc = send_all(state->fd, declared[i], strlen(declared[i])) == 0
-            && send_all(state->fd, "\r\n", 2U) == 0 ? 0 : -1;
+        rc = direct_sink_send(state, declared[i], strlen(declared[i])) == 0
+            && direct_sink_send(state, "\r\n", 2U) == 0 ? 0 : -1;
     }
     direct_free_strings(declared, declared_len);
-    if (rc != 0 || send_all(state->fd, "\r\n", 2U) != 0) {
+    if (rc != 0 || direct_sink_send(state, "\r\n", 2U) != 0) {
         return -1;
     }
     state->ended = 1;
@@ -19567,7 +19595,25 @@ static void admin_forward_direct_http(st_admin_server *server,
      */
     record_direct_http_traffic(client_name, route, (long long)request_body_sent,
                                (long long)sink_state.response_bytes);
-    if (rc == 0 || rc == ST_ADMIN_DIRECT_HTTP_DOWNSTREAM_FAILED) {
+    if (rc == ST_ADMIN_DIRECT_HTTP_DOWNSTREAM_FAILED && !sink_state.write_failed) {
+        /*
+         * The sink gave up for a reason of its own (no memory for the head, say), not because the
+         * caller went away: like any other failed relay, a 502 while nothing went out, and a record
+         * of why either way.
+         */
+        static const char not_relayed[] = "HTTP response could not be relayed";
+        if (!sink_state.started) {
+            send_text_http_error(fd, 502, ST_ADMIN_DIRECT_HTTP_RESET_BODY);
+            record_direct_http_failure(client_name, route, &direct, 502, ST_ADMIN_DIRECT_HTTP_RESET_BODY,
+                                       not_relayed, remote_address, started_ms);
+        } else {
+            free(sink_state.response.error);
+            sink_state.response.error = admin_dup_string(not_relayed);
+            record_direct_http_exchange(client_name, route, &direct, &sink_state.response,
+                                        sink_state.response_bytes, sink_state.response_externalized,
+                                        remote_address, elapsed_ms);
+        }
+    } else if (rc == 0 || rc == ST_ADMIN_DIRECT_HTTP_DOWNSTREAM_FAILED) {
         /*
          * A caller that went away or stopped reading is Java's client abort: the exchange is recorded
          * with the client's status and what it sent so far, and without a failure.

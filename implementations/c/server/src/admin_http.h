@@ -86,10 +86,11 @@ typedef struct {
 /* Forwarder result once sink->bind_cancel's canceller ran: the NAT stream was reset. */
 #define ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED (-7)
 /*
- * Forwarder result when the sink could not hand the response to the public caller (it went away,
- * or stopped reading for longer than the connection timeout): the NAT stream was reset with
- * ST_ADMIN_DIRECT_HTTP_LOCAL_RESET_CODE and nothing more can be answered. Java records such a
- * client abort with the client's status and no failure.
+ * Forwarder result when a sink callback failed, mostly because the public caller could not be
+ * written to (it went away, or stopped reading for longer than the connection timeout). The NAT
+ * stream was reset with ST_ADMIN_DIRECT_HTTP_LOCAL_RESET_CODE unless both directions had already
+ * ended (the sink failed on the client's FIN). Java records a client abort with the client's status
+ * and no failure; the sink tells that apart from a failure of its own.
  */
 #define ST_ADMIN_DIRECT_HTTP_DOWNSTREAM_FAILED (-8)
 /*
