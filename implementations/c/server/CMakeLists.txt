@@ -544,12 +544,15 @@ add_test(NAME nat_stream_tests
 set_tests_properties(nat_stream_tests PROPERTIES TIMEOUT 420)
 
 # Public TCP connections of the data connection as Java's NatServerHandler and Netty handle them.
-add_executable(specus_c_nat_public_tcp_tests tests/nat_public_tcp_tests.c tests/server_harness.c)
-target_link_libraries(specus_c_nat_public_tcp_tests PRIVATE specus_c_core)
-target_compile_options(specus_c_nat_public_tcp_tests PRIVATE -Wall -Wextra -Wpedantic)
-add_test(NAME nat_public_tcp_tests
-    COMMAND specus_c_nat_public_tcp_tests $<TARGET_FILE:specus-server-c>)
-set_tests_properties(nat_public_tcp_tests PROPERTIES TIMEOUT 300)
+# The checks read the server back through Linux's sock_diag, prlimit and /proc.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(specus_c_nat_public_tcp_tests tests/nat_public_tcp_tests.c tests/server_harness.c)
+    target_link_libraries(specus_c_nat_public_tcp_tests PRIVATE specus_c_core)
+    target_compile_options(specus_c_nat_public_tcp_tests PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME nat_public_tcp_tests
+        COMMAND specus_c_nat_public_tcp_tests $<TARGET_FILE:specus-server-c>)
+    set_tests_properties(nat_public_tcp_tests PROPERTIES TIMEOUT 300)
+endif()
 
 add_executable(specus_c_storage_tests tests/storage_tests.c)
 target_link_libraries(specus_c_storage_tests PRIVATE specus_c_core)

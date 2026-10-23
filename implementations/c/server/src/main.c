@@ -5333,8 +5333,7 @@ static int accept_retry_at_once(int accept_errno)
 }
 
 /*
- * The control listener's pause after a failed accept (see listener_pause_after_accept_error).
- * Returns 1 when a shutdown was requested meanwhile; the byte stays in the pipe.
+ * Milliseconds on CLOCK_MONOTONIC, which a wall-clock step does not move.
  */
 static long long accept_monotonic_ms(void)
 {
@@ -5343,6 +5342,10 @@ static long long accept_monotonic_ms(void)
     return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000L;
 }
 
+/*
+ * The control listener's pause after a failed accept (see listener_pause_after_accept_error).
+ * Returns 1 when a shutdown was requested meanwhile; the byte stays in the pipe.
+ */
 static int control_accept_pause(int shutdown_fd)
 {
     long long deadline = accept_monotonic_ms() + ST_ACCEPT_ERROR_PAUSE_MS;

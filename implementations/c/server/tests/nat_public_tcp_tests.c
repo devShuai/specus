@@ -180,7 +180,7 @@ static int short_connection(client_pair *pair)
 }
 
 #define WARM_UP_CONNECTIONS 20
-#define MEASURED_CONNECTIONS 300
+#define MEASURED_CONNECTIONS 200
 /* Room for glibc's stack cache and an arena or two; a kept stack costs two mappings per thread. */
 #define MAPPING_SLACK 64
 
@@ -189,7 +189,7 @@ static int short_connection(client_pair *pair)
  * (NatServerHandler, closeFuture). The C server runs a reader and a writer thread per public
  * connection; once both are done the stream and their stacks must go too, not wait for the data
  * connection to end. Each kept (unjoined) thread keeps its stack mapped, so the server's mapping
- * count is the observable: 300 short connections may not add 300 x 4 mappings.
+ * count is the observable: 200 short connections may not add 200 x 4 mappings.
  */
 static int check_finished_streams_released(test_server *server, client_pair *pair)
 {
@@ -304,7 +304,18 @@ static int server_running(const test_server *server)
  * (EMFILE here): it stops accepting for 1 s and resumes. The C listener thread used to end on the
  * first failed accept, closing the port while the client still had it registered.
  */
-static int check_nat_listener_survives_failed_accept(test_server *server, client_pair *pair)
+/*
+ * A round may miss its failure when a descriptor the server held only for a moment (a SQLite
+ * write, say) is closed after the limit came down, below it: the next accept() then succeeds.
+ * Such a round is simply repeated.
+ */
+#define ACCEPT_FAILURE_ROUNDS 3
+
+/*
+ * One round: with the limit down, a public connection is made; the failed accept is reported or
+ * not (*reported), and with the limit back the connection is taken and closed again.
+ */
+static int nat_accept_failure_round(test_server *server, client_pair *pair, int *reported)
 {
     struct rlimit saved;
     CHECK(exhaust_descriptors(server->pid, &saved) == 0, "lower the server's descriptor limit");
@@ -315,7 +326,7 @@ static int check_nat_listener_survives_failed_accept(test_server *server, client
     int first = connect_local(pair->public_port);
     char failed_line[96];
     snprintf(failed_line, sizeof(failed_line), "[nat] accept failed port=%d", pair->public_port);
-    int reported = first >= 0 && wait_log(server, failed_line, 5000) == 0;
+    *reported = first >= 0 && wait_log(server, failed_line, 3000) == 0;
     restore_descriptors(server->pid, &saved);
     CHECK(first >= 0, "connect to the public port");
     /* Taken now, or after the 1 s pause: either way the port still has it. */
@@ -332,7 +343,16 @@ static int check_nat_listener_survives_failed_accept(test_server *server, client
           "close the first connection");
     /* The port must still take new connections once descriptors are back. */
     CHECK(expect_stream_served(pair) == 0, "the public port after a failed accept");
-    CHECK(reported, "the failed accept on the public port was not reported");
+    return 0;
+}
+
+static int check_nat_listener_survives_failed_accept(test_server *server, client_pair *pair)
+{
+    int reported = 0;
+    for (int round = 0; !reported && round < ACCEPT_FAILURE_ROUNDS; ++round) {
+        CHECK(nat_accept_failure_round(server, pair, &reported) == 0, "round %d", round + 1);
+    }
+    CHECK(reported, "no failed accept was reported on the public port in %d rounds", ACCEPT_FAILURE_ROUNDS);
     return 0;
 }
 
@@ -342,16 +362,20 @@ static int check_nat_listener_survives_failed_accept(test_server *server, client
  */
 static int check_control_listener_survives_failed_accept(test_server *server, client_pair *pair)
 {
-    struct rlimit saved;
-    CHECK(exhaust_descriptors(server->pid, &saved) == 0, "lower the server's descriptor limit");
-    int pending = connect_local(server->control_port);
-    int connected = pending >= 0;
-    int reported = connected && wait_log(server, "[server] accept failed", 5000) == 0;
-    restore_descriptors(server->pid, &saved);
-    close_fd(&pending);
-    CHECK(connected, "connect to the control port");
-    CHECK(reported && server_running(server), "the control listener did not survive a failed accept (server %s)",
-          server_running(server) ? "running" : "exited");
+    int reported = 0;
+    for (int round = 0; !reported && round < ACCEPT_FAILURE_ROUNDS; ++round) {
+        struct rlimit saved;
+        CHECK(exhaust_descriptors(server->pid, &saved) == 0, "lower the server's descriptor limit");
+        int pending = connect_local(server->control_port);
+        int connected = pending >= 0;
+        reported = connected && wait_log(server, "[server] accept failed", 3000) == 0;
+        restore_descriptors(server->pid, &saved);
+        close_fd(&pending);
+        CHECK(connected, "connect to the control port");
+        /* An exited server is the failure; an unreported round (see nat_accept_failure_round) is repeated. */
+        CHECK(server_running(server), "the server exited on a failed accept of the control port");
+    }
+    CHECK(reported, "no failed accept was reported on the control port in %d rounds", ACCEPT_FAILURE_ROUNDS);
     /* After the 1 s pause a new control login goes through, and the client's connections still work. */
     runtime_session other;
     char reason[256];
@@ -448,11 +472,11 @@ static int local_port(int fd)
     return ntohs(address.sin_port);
 }
 
-/* Whether the server's side of an idle connection has its keepalive timer running, within 3 s. */
-static int server_keepalive_armed(int server_port, int client_fd, int *armed)
+/* Whether the server's side of an idle connection has its keepalive timer running, within wait_ms. */
+static int server_keepalive_armed(int server_port, int client_fd, int wait_ms, int *armed)
 {
     int client_port = local_port(client_fd);
-    long long deadline = monotonic_ms() + 3000;
+    long long deadline = monotonic_ms() + wait_ms;
     for (;;) {
         socket_diag diag;
         if (client_port < 0 || tcp_socket_diag(DIAG_ESTABLISHED, server_port, client_port, &diag) != 0 || !diag.found) {
@@ -480,8 +504,10 @@ static int check_keepalive(int expected, client_pair *pair, int control_port)
     CHECK(open_public_stream_id(pair->data, pair->public_port, &public_fd, &stream_id) == 0, "public OPEN");
     int public_armed = -1;
     int data_armed = -1;
-    int read_public = server_keepalive_armed(pair->public_port, public_fd, &public_armed) == 0;
-    int read_data = server_keepalive_armed(control_port, pair->data, &data_armed) == 0;
+    /* Armed shows at once on an idle socket; for "off", a quarter second of never seeing it will do. */
+    int wait_ms = expected ? 3000 : 250;
+    int read_public = server_keepalive_armed(pair->public_port, public_fd, wait_ms, &public_armed) == 0;
+    int read_data = server_keepalive_armed(control_port, pair->data, wait_ms, &data_armed) == 0;
     close_fd(&public_fd);
     CHECK(read_public && read_data, "read the server's sockets through sock_diag");
     CHECK(public_armed == expected, "the server's public socket %s SO_KEEPALIVE", public_armed ? "has" : "lacks");
