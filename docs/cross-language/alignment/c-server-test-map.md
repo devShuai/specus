@@ -527,6 +527,8 @@ Rate批次结束时，四类连通性中Vector、Resource、Rate三类为候选�
 | `nat_public_tcp_tests`「the Java limit name wins over the old one, and 0 is no limit」（`SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT=0`、`SPECUS_MAX_PORT_EXTERNAL_CONNECTIONS=1`） | 同一端口三条并发连接都得到 OPEN | 第二条被拒绝 |
 | `nat_public_tcp_tests`「a port takes more than 512 connections under Java's default limit」 | 不设任何上限变量，同一端口 520 条并发公网连接都得到 OPEN（测试进程先把描述符上限提到 4096，服务端继承） | 第 513 条被拒绝 |
 | `management_overview_tests`（既有） | 旧变量名 `SPECUS_MAX_PORT_EXTERNAL_CONNECTIONS=1` 仍然生效，被拒绝的连接计入概览 | 通过 |
+| `nat_stream_tests`「WINDOW_UPDATE beyond 16 MiB closes the data connection for an unknown stream」（NAT-BP-12） | 对从未打开的流发值为 16 MiB + 1 的 WINDOW_UPDATE：data 连接被关闭，控制连接保持，重新登录 data 连接后照常服务（值不超过 16 MiB 的仍被忽略，见既有的 `check_unknown_streams`） | 被忽略，data 连接不关 |
+| `nat_stream_tests`「credit after the server's TCP FIN is ignored」 | 公网对端半关闭、服务端发出 FIN 后，客户端对该流连发两个 16 MiB 的 WINDOW_UPDATE：data 连接保持、该流没有 RST；客户端随后的 DATA 与 FIN 照常到达公网对端 | 第一个 16 MiB 就累计越界，data 连接被关闭 |
 
 ## 历史表的读法与限制
 

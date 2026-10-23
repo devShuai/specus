@@ -5021,7 +5021,12 @@ static int add_send_credit(external_conn *conn, uint32_t credit)
         return -1;
     }
     pthread_mutex_lock(&conn->flow_lock);
-    if (conn->flow_closed || conn->send_credit > ST_STREAM_MAX_WINDOW - credit) {
+    /* Nothing more is sent on a stream whose reader is done: its credit is late and ignored. */
+    if (conn->flow_closed) {
+        pthread_mutex_unlock(&conn->flow_lock);
+        return 0;
+    }
+    if (conn->send_credit > ST_STREAM_MAX_WINDOW - credit) {
         pthread_mutex_unlock(&conn->flow_lock);
         return -1;
     }
@@ -5212,6 +5217,15 @@ static void *external_conn_thread(void *arg)
         break;
     }
 
+    /*
+     * No more DATA goes out on the stream. Java takes it out of StreamFlowController once its FIN
+     * is written, and credit the client sends for it after that is ignored instead of counted
+     * toward the 16 MiB window; so it is here, from before the FIN goes out.
+     */
+    pthread_mutex_lock(&conn->flow_lock);
+    conn->flow_closed = 1;
+    pthread_cond_broadcast(&conn->flow_cond);
+    pthread_mutex_unlock(&conn->flow_lock);
     /* A stream already closed (reset by either side, or its connection shutting down) is over;
      * a FIN after its RST would name a stream the client has already dropped. */
     pthread_mutex_lock(&session->map_lock);
@@ -5699,6 +5713,16 @@ static void process_unregister(specus_session *session, const st_nat_message *me
  */
 static int process_nat_message(specus_session *session, const st_nat_message *message)
 {
+    /*
+     * Java StreamFlowController.onWindowUpdate checks the credit before it looks the stream up: a
+     * WINDOW_UPDATE beyond the 16 MiB window closes the data connection whatever stream it names,
+     * an unknown, finished or abandoned one included. (A credit of 0 never decodes.)
+     */
+    if (message->type == ST_NAT_WINDOW_UPDATE && message->value > ST_STREAM_MAX_WINDOW) {
+        fprintf(stderr, "[nat] WINDOW_UPDATE of %u exceeds the 16 MiB window stream=%u client=%s\n",
+                (unsigned)message->value, message->stream_id, session->config.client_name);
+        return -1;
+    }
     int direct_result = process_direct_http_message(session, message);
     if (direct_result != 0) {
         if (direct_result < 0) {
