@@ -14303,20 +14303,91 @@ int st_admin_resolve_static_path(const char *static_root,
     return 0;
 }
 
+/*
+ * Writes all of buffer. On a socket with a send timeout (SO_SNDTIMEO) it fails, with EAGAIN, once
+ * nothing could be written for that long, the clock restarting whenever something was, as Tomcat's
+ * blocking write does. A plain blocking send would not do that: one that wrote a little and then
+ * stalled returns only when its whole timeout ran out, and the next one waits all of it again.
+ */
 static int send_all(int fd, const char *buffer, size_t len)
 {
+    struct timeval timeout = {0, 0};
+    socklen_t timeout_len = sizeof(timeout);
+    int timeout_ms = -1;
+    if (getsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, &timeout_len) == 0
+        && (timeout.tv_sec > 0 || timeout.tv_usec > 0)) {
+        long long ms = (long long)timeout.tv_sec * 1000LL + timeout.tv_usec / 1000;
+        timeout_ms = ms > INT_MAX ? INT_MAX : ms < 1 ? 1 : (int)ms;
+    }
     size_t offset = 0;
     while (offset < len) {
-        ssize_t sent = send(fd, buffer + offset, len - offset, 0);
+        ssize_t sent = send(fd, buffer + offset, len - offset, timeout_ms < 0 ? 0 : MSG_DONTWAIT);
         if (sent < 0) {
             if (errno == EINTR) {
                 continue;
+            }
+            if (timeout_ms >= 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                struct pollfd writable = {.fd = fd, .events = POLLOUT, .revents = 0};
+                int ready = poll(&writable, 1, timeout_ms);
+                if (ready > 0 || (ready < 0 && errno == EINTR)) {
+                    continue;
+                }
+                errno = EAGAIN;
             }
             return -1;
         }
         offset += (size_t)sent;
     }
     return 0;
+}
+
+/* The connector limits listeners start with (st_admin_set_connector_limits); Tomcat's by default. */
+static int admin_connector_timeout_ms = ST_ADMIN_DEFAULT_CONNECTION_TIMEOUT_MS;
+static int admin_connector_max_connections = ST_ADMIN_DEFAULT_MAX_CONNECTIONS;
+static int admin_connector_accept_count = ST_ADMIN_DEFAULT_ACCEPT_COUNT;
+
+void st_admin_set_connector_limits(int connection_timeout_ms, int max_connections, int accept_count)
+{
+    admin_connector_timeout_ms = connection_timeout_ms;
+    admin_connector_max_connections = max_connections > 0 ? max_connections : ST_ADMIN_DEFAULT_MAX_CONNECTIONS;
+    admin_connector_accept_count = accept_count > 0 ? accept_count : ST_ADMIN_DEFAULT_ACCEPT_COUNT;
+}
+
+/*
+ * Tomcat's connectionTimeout on an accepted socket: a blocking read or write that makes no progress
+ * for that long fails (NioSocketWrapper restarts the clock whenever something was written; each
+ * send and recv here gets the whole timeout again). 0 or less: no timeout.
+ */
+static void admin_socket_set_timeouts(int fd, int timeout_ms)
+{
+    struct timeval timeout = {0, 0};
+    if (timeout_ms > 0) {
+        timeout.tv_sec = timeout_ms / 1000;
+        timeout.tv_usec = (suseconds_t)(timeout_ms % 1000) * 1000;
+    }
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+}
+
+/*
+ * The timeouts of a socket whose request asks for a WebSocket upgrade: Tomcat reads an upgraded
+ * connection without an idle timeout, and its blocking sends give up after 20 s
+ * (org.apache.tomcat.websocket.BLOCKING_SEND_TIMEOUT). A writer with deadlines of its own sends with
+ * MSG_DONTWAIT, which this does not touch.
+ */
+#define ST_ADMIN_WEBSOCKET_BLOCKING_SEND_TIMEOUT_MS 20000
+static void admin_socket_set_websocket_timeouts(int fd)
+{
+    struct timeval no_timeout = {0, 0};
+    struct timeval send_timeout = {ST_ADMIN_WEBSOCKET_BLOCKING_SEND_TIMEOUT_MS / 1000, 0};
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &no_timeout, sizeof(no_timeout));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
+}
+
+/* Whether a socket call failed because the connection timeout ran out. */
+static int admin_socket_timed_out(void)
+{
+    return errno == EAGAIN || errno == EWOULDBLOCK;
 }
 
 static int hex_nibble(char value)
@@ -15527,7 +15598,12 @@ static const char *admin_reason_phrase(int status)
     }
 }
 
-static int send_direct_http_response(int fd, const st_direct_http_response *response, int include_body)
+/*
+ * Sends a buffered response; -1 on failure, with *write_failed set only when the caller could not be
+ * written to (not when the head could not be built).
+ */
+static int send_direct_http_response(int fd, const st_direct_http_response *response, int include_body,
+                                     int *write_failed)
 {
     if (response->error != NULL && *response->error != '\0') {
         char *escaped = st_json_escape(response->error);
@@ -15549,9 +15625,15 @@ static int send_direct_http_response(int fd, const st_direct_http_response *resp
                                   "Content-Length: %d\r\n"
                                   "\r\n",
                                   body_len);
-        return header_len > 0 && (size_t)header_len < sizeof(header)
-            && send_all(fd, header, (size_t)header_len) == 0
-            && (!include_body || send_all(fd, body, (size_t)body_len) == 0);
+        if (header_len <= 0 || (size_t)header_len >= sizeof(header)) {
+            return -1;
+        }
+        if (send_all(fd, header, (size_t)header_len) != 0
+            || (include_body && send_all(fd, body, (size_t)body_len) != 0)) {
+            *write_failed = 1;
+            return -1;
+        }
+        return 1;
     }
 
     int status = response->status_code <= 0 ? 502 : response->status_code;
@@ -15583,7 +15665,11 @@ static int send_direct_http_response(int fd, const st_direct_http_response *resp
         && (!include_body || response->body_len == 0
             || send_all(fd, (const char *)response->body, response->body_len) == 0);
     free(builder.data);
-    return ok ? 1 : -1;
+    if (!ok) {
+        *write_failed = 1;
+        return -1;
+    }
+    return 1;
 }
 
 static int send_text_http_error(int fd, int status, const char *message)
@@ -15875,20 +15961,28 @@ static void record_direct_http_refusal(int fd,
     free(route);
 }
 
+/* Whether an exchange of this client's route would be recorded, so a refused body is worth capturing. */
+static int admin_route_detail_captured(const char *client_name, const char *route)
+{
+    const char *database_path = admin_database_path();
+    if (!st_traffic_capture_enabled() || database_path == NULL) {
+        return 0;
+    }
+    st_storage_http_route http_route;
+    return st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) == 0
+        && st_storage_get_http_route_by_client_route(database_path, client_name, route, &http_route) == 0
+        && http_route.detail_capture_enabled;
+}
+
 /* Whether a refused request on this /http/ path would be recorded, so its body is worth capturing. */
 static int admin_direct_route_captured(const char *path)
 {
     char *client_name = NULL;
     char *route = NULL;
-    const char *database_path = admin_database_path();
-    if (!st_traffic_capture_enabled() || database_path == NULL
-        || admin_parse_direct_route_identity(path, &client_name, &route) != 0) {
+    if (!st_traffic_capture_enabled() || admin_parse_direct_route_identity(path, &client_name, &route) != 0) {
         return 0;
     }
-    st_storage_http_route http_route;
-    int captured = st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) == 0
-        && st_storage_get_http_route_by_client_route(database_path, client_name, route, &http_route) == 0
-        && http_route.detail_capture_enabled;
+    int captured = admin_route_detail_captured(client_name, route);
     free(client_name);
     free(route);
     return captured;
@@ -16098,7 +16192,19 @@ typedef struct {
     admin_share_stream *share_stream;
     /* The client's RST reason, made log-safe, as the failure of the HTTP detail (never public). */
     char reset_reason[ST_ADMIN_LOG_REASON_MAX_CODE_POINTS * 6U + 32U];
+    /* A write to the public caller failed: it went away or stopped reading past the timeout. */
+    int write_failed;
 } admin_direct_http_sink_state;
+
+/* send_all to the public caller, noting a failure as the caller's (Java's ClientAbortException). */
+static int direct_sink_send(admin_direct_http_sink_state *state, const char *data, size_t len)
+{
+    if (send_all(state->fd, data, len) != 0) {
+        state->write_failed = 1;
+        return -1;
+    }
+    return 0;
+}
 
 /* Returns the length of the valid UTF-8 sequence at text (0 if invalid) and its code point. */
 static size_t admin_log_utf8_sequence(const unsigned char *text, size_t remaining, uint32_t *code_point)
@@ -16486,7 +16592,7 @@ static int direct_sink_start_chunked(admin_direct_http_sink_state *state)
         rc = admin_sb_append(&builder, "\r\n");
     }
     if (rc == 0) {
-        rc = send_all(state->fd, builder.data, builder.len);
+        rc = direct_sink_send(state, builder.data, builder.len);
     }
     free(builder.data);
     if (rc == 0) {
@@ -16504,9 +16610,9 @@ static int direct_sink_send_chunk(admin_direct_http_sink_state *state,
     char prefix[32];
     int prefix_len = snprintf(prefix, sizeof(prefix), "%zx\r\n", data_len);
     return prefix_len > 0 && (size_t)prefix_len < sizeof(prefix)
-        && send_all(state->fd, prefix, (size_t)prefix_len) == 0
-        && send_all(state->fd, (const char *)data, data_len) == 0
-        && send_all(state->fd, "\r\n", 2U) == 0 ? 0 : -1;
+        && direct_sink_send(state, prefix, (size_t)prefix_len) == 0
+        && direct_sink_send(state, (const char *)data, data_len) == 0
+        && direct_sink_send(state, "\r\n", 2U) == 0 ? 0 : -1;
 }
 
 static int direct_sink_append_body(st_direct_http_response *response,
@@ -16618,7 +16724,8 @@ static int direct_sink_on_end(void *ctx, char *const *trailers, size_t trailers_
     if (state->buffer_for_rewrite) {
         (void)admin_rewrite_direct_http_response_with_prefix(state->client_name, state->route,
                                                              state->rewrite_prefix, &state->response);
-        if (send_direct_http_response(state->fd, &state->response, state->include_body) < 0) {
+        if (send_direct_http_response(state->fd, &state->response, state->include_body,
+                                      &state->write_failed) < 0) {
             return -1;
         }
         state->started = 1;
@@ -16626,7 +16733,7 @@ static int direct_sink_on_end(void *ctx, char *const *trailers, size_t trailers_
         st_media_capture_complete(state->media_capture);
         return 0;
     }
-    if (direct_sink_start_chunked(state) != 0 || send_all(state->fd, "0\r\n", 3U) != 0) {
+    if (direct_sink_start_chunked(state) != 0 || direct_sink_send(state, "0\r\n", 3U) != 0) {
         return -1;
     }
     /* Undeclared, hop-by-hop and CR/LF-carrying trailers are dropped (http-route.md section 4). */
@@ -16638,11 +16745,11 @@ static int direct_sink_on_end(void *ctx, char *const *trailers, size_t trailers_
     }
     int rc = 0;
     for (size_t i = 0; rc == 0 && i < declared_len; ++i) {
-        rc = send_all(state->fd, declared[i], strlen(declared[i])) == 0
-            && send_all(state->fd, "\r\n", 2U) == 0 ? 0 : -1;
+        rc = direct_sink_send(state, declared[i], strlen(declared[i])) == 0
+            && direct_sink_send(state, "\r\n", 2U) == 0 ? 0 : -1;
     }
     direct_free_strings(declared, declared_len);
-    if (rc != 0 || send_all(state->fd, "\r\n", 2U) != 0) {
+    if (rc != 0 || direct_sink_send(state, "\r\n", 2U) != 0) {
         return -1;
     }
     state->ended = 1;
@@ -17812,9 +17919,12 @@ static void *admin_direct_ws_writer_thread(void *arg)
             credit += unsent_credit + admin_direct_ws_drop_queued_locked(stream, 0);
             admin_direct_ws_drop_socket_locked(stream);
             pthread_mutex_unlock(&stream->send_lock);
-            admin_direct_ws_credit(stream, credit);
             if (client_frame) {
+                /* The stream ends with a reset: credit given back now would only invite DATA that
+                 * crosses the RST and is answered as for an unknown stream (RST 7) ahead of it. */
                 admin_direct_ws_close_flow(stream);
+            } else {
+                admin_direct_ws_credit(stream, credit);
             }
             return NULL;
         }
@@ -19896,21 +20006,59 @@ static void admin_forward_direct_http(st_admin_server *server,
      */
     record_direct_http_traffic(client_name, route, (long long)request_body_sent,
                                (long long)sink_state.response_bytes);
-    if (rc == 0) {
-        record_direct_http_exchange(client_name, route, &direct, &sink_state.response,
-                                    sink_state.response_bytes, sink_state.response_externalized,
-                                    remote_address, elapsed_ms);
+    if (rc == ST_ADMIN_DIRECT_HTTP_DOWNSTREAM_FAILED && !sink_state.write_failed) {
+        /*
+         * The sink gave up for a reason of its own (no memory for the head, say), not because the
+         * caller went away: like any other failed relay, a 502 while nothing went out, and a record
+         * of why either way.
+         */
+        static const char not_relayed[] = "HTTP response could not be relayed";
+        if (!sink_state.started) {
+            send_text_http_error(fd, 502, ST_ADMIN_DIRECT_HTTP_RESET_BODY);
+            record_direct_http_failure(client_name, route, &direct, 502, ST_ADMIN_DIRECT_HTTP_RESET_BODY,
+                                       not_relayed, remote_address, started_ms);
+        } else {
+            free(sink_state.response.error);
+            sink_state.response.error = admin_dup_string(not_relayed);
+            record_direct_http_exchange(client_name, route, &direct, &sink_state.response,
+                                        sink_state.response_bytes, sink_state.response_externalized,
+                                        remote_address, elapsed_ms);
+        }
+    } else if (rc == 0 || rc == ST_ADMIN_DIRECT_HTTP_DOWNSTREAM_FAILED) {
+        /*
+         * A caller that went away or stopped reading is Java's client abort: the exchange is recorded
+         * with the client's status and what it sent so far, and without a failure.
+         */
+        if (sink_state.response.status_code != 0) {
+            record_direct_http_exchange(client_name, route, &direct, &sink_state.response,
+                                        sink_state.response_bytes, sink_state.response_externalized,
+                                        remote_address, elapsed_ms);
+        }
     } else if (rc == ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED) {
-        /* The share ended mid-exchange: the public connection was already shut down. */
+        /*
+         * The share ended mid-exchange and the public connection was already shut down
+         * (temporary-http-share.md 6.6: the response is aborted, not answered). Java records it with
+         * the reason; before the response head it answers and records 502.
+         */
+        if (!sink_state.started) {
+            record_direct_http_failure(client_name, route, &direct, 502, ST_ADMIN_DIRECT_HTTP_RESET_BODY,
+                                       ST_ADMIN_HTTP_SHARE_RESET_REASON, remote_address, started_ms);
+        } else {
+            free(sink_state.response.error);
+            sink_state.response.error = admin_dup_string(ST_ADMIN_HTTP_SHARE_RESET_REASON);
+            record_direct_http_exchange(client_name, route, &direct, &sink_state.response,
+                                        sink_state.response_bytes, sink_state.response_externalized,
+                                        remote_address, elapsed_ms);
+        }
     } else {
         int status = rc == -2 ? 504 : rc == -3 ? 404 : 502;
-        const char *message = rc == -2 ? "direct http response timeout"
+        const char *message = rc == -2 ? ST_ADMIN_DIRECT_HTTP_TIMEOUT_TEXT
             : rc == -3 ? "direct http route is not configured"
             : rc == ST_ADMIN_DIRECT_HTTP_STREAM_RESET ? ST_ADMIN_DIRECT_HTTP_RESET_BODY
             /* The stream could not be created, answered as Java HttpSpecusController does. */
             : rc == ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT ? "HTTP 流创建失败"
             : ADMIN_ROUTE_CLIENT_OFFLINE_TEXT;
-        /* direct_sink_on_reset logged the client's RST reason; it is never echoed to the caller. */
+        /* direct_sink_on_reset logged the RST reason; it is never echoed to the caller. */
         const char *failure = rc == ST_ADMIN_DIRECT_HTTP_STREAM_RESET && sink_state.reset_reason[0] != '\0'
             ? sink_state.reset_reason : message;
         if (!sink_state.started) {
@@ -20764,13 +20912,57 @@ static int admin_read_request_body(int fd,
     return 0;
 }
 
+/*
+ * The record of a share request refused for its body (Java ShareRelay through relay()'s finally):
+ * a Content-Length over the limit is refused before anything about the request was taken, so it is
+ * recorded without headers or body; a chunked body over it is refused while forwarding, with the
+ * headers the device would have got (no share cookie) and the body's first 64 KiB.
+ */
+static void record_http_share_body_refusal(int fd,
+                                           const char *method,
+                                           const char *request,
+                                           const admin_share_admission *admission,
+                                           int chunked,
+                                           const admin_body_refusal *refusal,
+                                           long long started_ms)
+{
+    char **headers = NULL;
+    size_t headers_len = 0U;
+    char *raw_query = admin_encode_raw_query_for_forwarding(admission->raw_query);
+    if (raw_query == NULL
+        || (chunked && (admin_share_forward_headers(request, &headers, &headers_len) != 0
+                        || st_upstream_browser_headers_rewrite(headers, headers_len,
+                                                               admission->target_base_url) != 0))) {
+        free_header_array(headers, headers_len);
+        free(raw_query);
+        return;
+    }
+    st_direct_http_request refused = {
+        .request_method = (char *)method,
+        .route = (char *)admission->route,
+        .relative_path = admission->relative_path,
+        .raw_query = raw_query,
+        .headers = headers,
+        .headers_len = headers_len,
+        .body = chunked ? (const uint8_t *)refusal->prefix : NULL,
+        .body_len = chunked ? refusal->prefix_len : 0U
+    };
+    char remote_address[128];
+    admin_fd_remote_text(fd, remote_address);
+    record_direct_http_failure(admission->client_name, admission->route, &refused, 413, "HTTP 请求体超过限制",
+                               NULL, remote_address, started_ms);
+    free_header_array(headers, headers_len);
+    free(raw_query);
+}
+
 /* One request under /http-share/: admission, then the body, then the route's forwarding. */
 static void handle_http_share_client(st_admin_server *server,
                                      int fd,
                                      const char *method,
                                      const char *path,
                                      const char *request,
-                                     size_t len)
+                                     size_t len,
+                                     long long started_ms)
 {
     admin_share_admission admission;
     if (!admit_http_share_request(fd, method, path, request, &admission)) {
@@ -20778,6 +20970,8 @@ static void handle_http_share_client(st_admin_server *server,
         return;
     }
     if (admission.upgrade) {
+        /* The share's WebSocket handler answers every such request, the upgrade or a refusal. */
+        admin_socket_set_websocket_timeouts(fd);
         forward_http_share_websocket(server, fd, method, request, &admission);
     } else {
         const char *body = NULL;
@@ -20787,8 +20981,15 @@ static void handle_http_share_client(st_admin_server *server,
         size_t received_trailers_len = 0U;
         admin_request_trailers trailers;
         memset(&trailers, 0, sizeof(trailers));
+        admin_body_refusal refusal;
+        memset(&refusal, 0, sizeof(refusal));
+        /* Only a chunked body is read before Java refuses it, so only that one leaves its start. */
+        char *transfer_encoding = admin_extract_header_value(request, "Transfer-Encoding");
+        int chunked = transfer_encoding != NULL;
+        free(transfer_encoding);
+        refusal.capture = chunked && admin_route_detail_captured(admission.client_name, admission.route);
         if (admin_read_request_body(fd, request, len, path, &body, &body_len, &body_buffer,
-                                    &received_trailers, &received_trailers_len, NULL) == 0) {
+                                    &received_trailers, &received_trailers_len, &refusal) == 0) {
             /* No Basic gate on a share: an Authorization trailer belongs to the target as well. */
             if (admin_request_trailers_collect(request, 0, received_trailers, received_trailers_len,
                                                &trailers) != 0) {
@@ -20797,13 +20998,46 @@ static void handle_http_share_client(st_admin_server *server,
                 forward_http_share_request(server, fd, method, request, (const uint8_t *)body, body_len,
                                            &trailers, &admission);
             }
+        } else if (refusal.too_large) {
+            record_http_share_body_refusal(fd, method, request, &admission, chunked, &refusal, started_ms);
         }
+        free(refusal.prefix);
         admin_request_trailers_free(&trailers);
         free_header_array(received_trailers, received_trailers_len);
         free(body_buffer);
     }
     admin_share_stream_unregister(&admission.stream);
     free(admission.relative_path);
+}
+
+/*
+ * Tomcat answers "Expect: 100-continue" on an HTTP/1.1 request (Http11Processor.prepareExpectation,
+ * the value trimmed, any case) with its interim "HTTP/1.1 100 " as soon as the request is mapped
+ * (StandardContextValve, continueResponseTiming "immediately", the default): before any filter, the
+ * route gate or a handler has looked at it. The caller then sends its body at once rather than after
+ * its own expect timeout (curl waits 1 s), or for good when it never sends without the 100.
+ */
+static void admin_acknowledge_expectation(int fd, const char *request)
+{
+    const char *line_end = strstr(request, "\r\n");
+    static const char version[] = " HTTP/1.1";
+    if (line_end == NULL || (size_t)(line_end - request) < sizeof(version) - 1U
+        || memcmp(line_end - (sizeof(version) - 1U), version, sizeof(version) - 1U) != 0) {
+        return;
+    }
+    char *expect = admin_extract_header_value(request, "Expect");
+    if (expect != NULL && admin_ascii_casecmp(expect, "100-continue") == 0) {
+        static const char interim[] = "HTTP/1.1 100 \r\n\r\n";
+        (void)send_all(fd, interim, sizeof(interim) - 1U);
+    }
+    free(expect);
+}
+
+/* What every WebSocket handler of this listener takes for an upgrade request. */
+static int admin_request_is_websocket_upgrade(const char *request)
+{
+    return admin_header_value_contains_token_ci(request, "Connection", "Upgrade")
+        && admin_header_value_equals_ci(request, "Upgrade", "websocket");
 }
 
 /* RFC 9110 tchar: what a method or header name is made of. */
@@ -20943,6 +21177,11 @@ static void handle_client(st_admin_server *server, int fd)
                             sizeof(request) - 1U - (size_t)len,
                             0);
         if (more <= 0) {
+            /* Tomcat drops a connection whose request head stalls past the timeout without a word. */
+            if (more < 0 && admin_socket_timed_out()) {
+                close(fd);
+                return;
+            }
             send_text_http_error(fd, 400, "HTTP request headers are incomplete");
             close(fd);
             return;
@@ -20969,8 +21208,9 @@ static void handle_client(st_admin_server *server, int fd)
             return;
         }
     }
+    admin_acknowledge_expectation(fd, request);
     if (strncmp(path, ST_HTTP_SHARE_PATH_ROOT, strlen(ST_HTTP_SHARE_PATH_ROOT)) == 0) {
-        handle_http_share_client(server, fd, method, path, request, (size_t)len);
+        handle_http_share_client(server, fd, method, path, request, (size_t)len, started_ms);
         close(fd);
         return;
     }
@@ -21027,6 +21267,10 @@ static void handle_client(st_admin_server *server, int fd)
     char request_remote_address[ST_CLIENT_ADDRESS_MAX_LEN];
     admin_request_client_address(fd, request, request_remote_address);
 
+    int websocket_upgrade = admin_request_is_websocket_upgrade(request);
+    if (websocket_upgrade) {
+        admin_socket_set_websocket_timeouts(fd);
+    }
     if (st_public_discovery_handle_websocket(fd,
                                              method,
                                              path,
@@ -21062,6 +21306,10 @@ static void handle_client(st_admin_server *server, int fd)
         free(body_buffer);
         close(fd);
         return;
+    }
+    if (websocket_upgrade) {
+        /* No WebSocket handler took it: whatever answers is under the connection timeout again. */
+        admin_socket_set_timeouts(fd, server->connection_timeout_ms);
     }
     int direct_handled = handle_direct_http_request(server,
                                                     fd,
@@ -21264,6 +21512,23 @@ static void handle_client(st_admin_server *server, int fd)
     close(fd);
 }
 
+/*
+ * Accepted sockets not closed yet. Process-wide rather than in st_admin_server, whose owner may let
+ * it go (a test's stack frame) while a connection thread is still finishing.
+ */
+static pthread_mutex_t admin_connections_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t admin_connections_cond = PTHREAD_COND_INITIALIZER;
+static int admin_open_connections;
+
+/* A socket of the listener was closed: one more may be accepted. */
+static void admin_connection_closed(void)
+{
+    pthread_mutex_lock(&admin_connections_lock);
+    --admin_open_connections;
+    pthread_cond_broadcast(&admin_connections_cond);
+    pthread_mutex_unlock(&admin_connections_lock);
+}
+
 static void *admin_client_thread(void *arg)
 {
     st_admin_client_args *client = (st_admin_client_args *)arg;
@@ -21271,24 +21536,59 @@ static void *admin_client_thread(void *arg)
     int fd = client->fd;
     free(client);
     handle_client(server, fd);
+    admin_connection_closed();
     return NULL;
 }
 
+/*
+ * Tomcat's acceptor: it takes a connection only while fewer than maxConnections are open (LimitLatch),
+ * so the rest wait in the listen backlog, and a failed accept never ends it. Running out of
+ * descriptors or memory pauses it a little, up to Tomcat's 1.6 s, instead of spinning; an accept that
+ * failed for the caller's connection alone (reset before it was taken) is just skipped.
+ */
 static void *admin_thread(void *arg)
 {
     st_admin_server *server = (st_admin_server *)arg;
     printf("[admin] listening on 0.0.0.0:%d\n", server->port);
+    const int listener = server->fd;
+    const int timeout_ms = server->connection_timeout_ms;
+    const int max_connections = server->max_connections;
+    int error_delay_ms = 0;
     for (;;) {
-        int fd = accept(server->fd, NULL, NULL);
-        if (fd < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            break;
+        pthread_mutex_lock(&admin_connections_lock);
+        while (admin_open_connections >= max_connections) {
+            pthread_cond_wait(&admin_connections_cond, &admin_connections_lock);
         }
+        ++admin_open_connections;
+        pthread_mutex_unlock(&admin_connections_lock);
+        int fd = accept(listener, NULL, NULL);
+        if (fd < 0) {
+            int accept_errno = errno;
+            admin_connection_closed();
+            if (accept_errno == EBADF || accept_errno == EINVAL || accept_errno == ENOTSOCK) {
+                break;
+            }
+            /* accept(2): a network error of the pending connection itself is reported here too. */
+            int this_connection_only = accept_errno == EINTR || accept_errno == ECONNABORTED
+                || accept_errno == EPROTO || accept_errno == ENOPROTOOPT || accept_errno == ENETDOWN
+                || accept_errno == ENETUNREACH || accept_errno == EHOSTDOWN || accept_errno == EHOSTUNREACH
+                || accept_errno == EPERM;
+            if (!this_connection_only) {
+                error_delay_ms = error_delay_ms == 0 ? 50 : error_delay_ms * 2 > 1600 ? 1600 : error_delay_ms * 2;
+                fprintf(stderr, "[admin] accept failed: %s; retrying in %d ms\n", strerror(accept_errno),
+                        error_delay_ms);
+                struct timespec pause = {error_delay_ms / 1000, (long)(error_delay_ms % 1000) * 1000000L};
+                while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {
+                }
+            }
+            continue;
+        }
+        error_delay_ms = 0;
+        admin_socket_set_timeouts(fd, timeout_ms);
         st_admin_client_args *client = (st_admin_client_args *)malloc(sizeof(*client));
         if (client == NULL) {
             close(fd);
+            admin_connection_closed();
             continue;
         }
         client->server = server;
@@ -21298,6 +21598,7 @@ static void *admin_thread(void *arg)
             perror("admin client pthread_create");
             close(fd);
             free(client);
+            admin_connection_closed();
             continue;
         }
         pthread_detach(worker);
@@ -21346,6 +21647,8 @@ int st_admin_server_start_with_handlers(st_admin_server *server,
     server->direct_ws_data = ws_data;
     server->direct_ws_close = ws_close;
     server->direct_ws_ctx = ws_ctx;
+    server->connection_timeout_ms = admin_connector_timeout_ms;
+    server->max_connections = admin_connector_max_connections;
     server->fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server->fd < 0) {
         perror("admin socket");
@@ -21365,7 +21668,8 @@ int st_admin_server_start_with_handlers(st_admin_server *server,
         server->fd = -1;
         return -1;
     }
-    if (listen(server->fd, 64) != 0) {
+    /* Tomcat hands acceptCount to the listening socket as its backlog. */
+    if (listen(server->fd, admin_connector_accept_count) != 0) {
         perror("admin listen");
         close(server->fd);
         server->fd = -1;

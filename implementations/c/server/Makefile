@@ -136,6 +136,8 @@ TESTS += $(HTTP_LOG_REASON_REFERENCE_TESTS)
 ALL_TESTS += $(HTTP_LOG_REASON_REFERENCE_TESTS) $(HTTP_RESET_REASON_REFERENCE_TESTS)
 TRAFFIC_USAGE_TESTS := $(BUILD_DIR)/specus_c_traffic_usage_tests
 ALL_TESTS += $(TRAFFIC_USAGE_TESTS)
+HTTP_CONNECTOR_TESTS := $(BUILD_DIR)/specus_c_http_connector_tests
+ALL_TESTS += $(HTTP_CONNECTOR_TESTS)
 
 # This adverse clock view uses Linux's process-local preload, never the host clock.
 ifeq ($(shell uname -s),Linux)
@@ -226,6 +228,9 @@ $(HTTP_RESET_REASON_REFERENCE_TESTS): $(CORE_OBJS) tests/http_reset_reason_refer
 
 $(TRAFFIC_USAGE_TESTS): $(CORE_OBJS) tests/traffic_usage_tests.c tests/nat_stream_tests.c tests/connectivity_nat_test_cases.h tests/connectivity_nat_complete_cases.h tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DST_CONNECTIVITY_VECTOR_DIR='"../../../protocol/test-vectors/"' tests/traffic_usage_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(HTTP_CONNECTOR_TESTS): $(CORE_OBJS) tests/http_connector_tests.c tests/nat_stream_tests.c tests/connectivity_nat_test_cases.h tests/connectivity_nat_complete_cases.h tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DST_CONNECTIVITY_VECTOR_DIR='"../../../protocol/test-vectors/"' tests/http_connector_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 ifeq ($(shell uname -s),Linux)
 $(NAT_PUSH_REFERENCE_SERVER): $(CORE_OBJS) src/main.c tests/nat_push_reference_server.c | $(BUILD_DIR)
@@ -467,6 +472,7 @@ test: all
 	$(SESSION_REFERENCE_TESTS) $(SESSION_REFERENCE_SERVER)
 	$(HTTP_RESET_REASON_REFERENCE_TESTS) $(SERVER)
 	$(TRAFFIC_USAGE_TESTS) $(SERVER)
+	$(HTTP_CONNECTOR_TESTS) $(SERVER)
 	$(CONNECTIVITY_RATE_HTTP_TESTS)
 	$(CONNECTIVITY_RESOURCE_WIRE_TESTS) $(SERVER)
 	$(UNICODE_JAVA21_TESTS) "$(abspath $(UNICODE_JAVA21_VECTORS))"

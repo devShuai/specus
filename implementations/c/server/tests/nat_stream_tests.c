@@ -2116,7 +2116,8 @@ static int check_http_configured_limits(test_server *server, client_pair *pair)
     uint32_t code = 0U;
     long long started = monotonic_ms();
     CHECK(open_http_stream(server, pair, "/slow", &browser, &stream_id) == 0, "request");
-    CHECK(wait_rst(pair->data, stream_id, &code) == 0 && code == 30U, "response head timeout reset (code %u)", code);
+    /* Java cancelHttpStream: RST 8, as for every stream this server ends on its own. */
+    CHECK(wait_rst(pair->data, stream_id, &code) == 0 && code == 8U, "response head timeout reset (code %u)", code);
     long long waited = monotonic_ms() - started;
     CHECK(waited >= 1400 && waited < 4500, "response head timeout after %lld ms, expected about 1500", waited);
     CHECK(expect_browser_status(browser, 504, NULL, -1) == 0, "browser of the request without a response head");
@@ -2129,7 +2130,7 @@ static int check_http_configured_limits(test_server *server, client_pair *pair)
     browser = browser_upload(server, pair, CONFIGURED_BODY_LIMIT, 1);
     CHECK(browser >= 0, "upload");
     CHECK(expect_http_open(pair->data, &stream_id) == 0, "no request OPEN for the upload");
-    CHECK(wait_rst(pair->data, stream_id, &code) == 0 && code == 30U, "upload window timeout reset (code %u)", code);
+    CHECK(wait_rst(pair->data, stream_id, &code) == 0 && code == 8U, "upload window timeout reset (code %u)", code);
     waited = monotonic_ms() - started;
     CHECK(waited >= 1400 && waited < 4500, "upload window timeout after %lld ms, expected about 1500", waited);
     CHECK(expect_browser_status(browser, 504, NULL, -1) == 0, "browser of the stalled upload");

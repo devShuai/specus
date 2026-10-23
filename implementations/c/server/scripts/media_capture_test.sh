@@ -17,6 +17,8 @@ import hashlib
 import http.server
 import os
 import sys
+import threading
+import time
 import urllib.parse
 
 root = sys.argv[1]
@@ -24,6 +26,8 @@ uploads = {}
 parts = {}
 objects = {}
 next_upload = 0
+part_lock = threading.Lock()
+parts_running = 0
 
 def record(name, line):
     # The test binary reads these logs to see which uploads began and which objects were deleted.
@@ -93,6 +97,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if upload_id not in uploads or not number.isdigit():
             self.reply(400)
             return
+        # A test can slow part uploads down (part_delay_ms); part_running.log gets, for every part as
+        # it starts, how many part uploads are running then.
+        global parts_running
+        delay_path = os.path.join(root, "part_delay_ms")
+        delay_ms = 0
+        if os.path.exists(delay_path):
+            with open(delay_path, encoding="ascii") as delay_file:
+                delay_ms = int(delay_file.read().strip() or "0")
+        with part_lock:
+            parts_running += 1
+            record("part_running.log", str(parts_running))
+        time.sleep(delay_ms / 1000.0)
+        with part_lock:
+            parts_running -= 1
         parts[(upload_id, number)] = body
         with open(os.path.join(root, upload_id + "-part-" + number), "wb") as output:
             output.write(body)

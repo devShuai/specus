@@ -85,8 +85,26 @@ typedef struct {
 #define ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT (-6)
 /* Forwarder result once sink->bind_cancel's canceller ran: the NAT stream was reset. */
 #define ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED (-7)
+/*
+ * Forwarder result when a sink callback failed, mostly because the public caller could not be
+ * written to (it went away, or stopped reading for longer than the connection timeout). The NAT
+ * stream was reset with ST_ADMIN_DIRECT_HTTP_LOCAL_RESET_CODE unless both directions had already
+ * ended (the sink failed on the client's FIN). Java records a client abort with the client's status
+ * and no failure; the sink tells that apart from a failure of its own.
+ */
+#define ST_ADMIN_DIRECT_HTTP_DOWNSTREAM_FAILED (-8)
+/*
+ * Java NatServerHandler.cancelHttpStream: every stream this server ends on its own (a timeout, the
+ * public caller gone, an unusable response frame, an ended share) is reset with 8.
+ */
+#define ST_ADMIN_DIRECT_HTTP_LOCAL_RESET_CODE 8U
+/*
+ * The public body of a 504 and the RST reason when the response head or the window for a request
+ * body chunk did not come in time: Java answers its TimeoutException, which has no message.
+ */
+#define ST_ADMIN_DIRECT_HTTP_TIMEOUT_TEXT "TimeoutException"
 /* The NAT RST code and reason that end the in-flight streams of a temporary HTTP share. */
-#define ST_ADMIN_HTTP_SHARE_RESET_CODE 31U
+#define ST_ADMIN_HTTP_SHARE_RESET_CODE ST_ADMIN_DIRECT_HTTP_LOCAL_RESET_CODE
 #define ST_ADMIN_HTTP_SHARE_RESET_REASON "HTTP share ended"
 #define ST_ADMIN_LOG_REASON_MAX_CODE_POINTS 256U
 
@@ -100,10 +118,13 @@ size_t st_admin_log_safe_reason(const char *reason, char *out, size_t out_len);
 size_t st_admin_log_safe_reason_n(const char *reason, size_t reason_len, char *out, size_t out_len);
 
 /*
- * Forwards one Direct HTTP request: 0 once the response was relayed, -2 when the response head
- * timed out, -3 when the route is not configured for the client, ST_ADMIN_DIRECT_HTTP_STREAM_RESET
- * or ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT as above, and any other negative value when the client is
- * offline or the stream failed.
+ * Forwards one Direct HTTP request: 0 once the response was relayed, -2 when the response head or
+ * the window for a request body chunk timed out, -3 when the route is not configured for the
+ * client, ST_ADMIN_DIRECT_HTTP_STREAM_RESET (the client reset the stream, this server reset it for
+ * a frame it could not take, or the data connection went away under it, the reason reported to
+ * sink->on_reset), ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT, ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED or
+ * ST_ADMIN_DIRECT_HTTP_DOWNSTREAM_FAILED as above, and any other negative value when the client is
+ * offline.
  */
 typedef int (*st_admin_direct_http_forwarder)(void *ctx,
                                               const char *client_name,
@@ -222,7 +243,26 @@ typedef struct {
     st_admin_direct_ws_close_handler direct_ws_close;
     void *direct_http_ctx;
     void *direct_ws_ctx;
+    /* The connector limits it was started with (st_admin_set_connector_limits). */
+    int connection_timeout_ms;
+    int max_connections;
 } st_admin_server;
+
+/*
+ * Tomcat's connector limits, which the Java server runs with Spring Boot's defaults
+ * (server.tomcat.connection-timeout, max-connections, accept-count):
+ *   - connection_timeout_ms (Tomcat 60000) bounds every blocking read and write of a request and its
+ *     answer: a caller that sends nothing, or stops sending its body or reading the answer, for that
+ *     long is dropped. 0 or less: no timeout. An upgraded WebSocket is not subject to it.
+ *   - max_connections (8192) sockets at most are accepted and not closed yet (counted over the
+ *     process, which runs one listener); more wait in the listen backlog of accept_count (100).
+ *     0 or less keeps the default, as Spring Boot does.
+ * Takes effect for listeners started afterwards.
+ */
+#define ST_ADMIN_DEFAULT_CONNECTION_TIMEOUT_MS 60000
+#define ST_ADMIN_DEFAULT_MAX_CONNECTIONS 8192
+#define ST_ADMIN_DEFAULT_ACCEPT_COUNT 100
+void st_admin_set_connector_limits(int connection_timeout_ms, int max_connections, int accept_count);
 
 int st_admin_build_response(const char *method, const char *path, char *out, size_t out_len);
 int st_admin_build_response_with_body(const char *method,
