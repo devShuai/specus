@@ -2417,8 +2417,12 @@ static int direct_http_forward(void *ctx,
                                                        pending.stream_id, 0U,
                                                        request_json, NULL, 0U);
     free(request_json);
-    if (packet.data == NULL || session_send_packet(session, &packet) != 0) {
-        write_failed = packet.data != NULL;
+    if (packet.data == NULL) {
+        goto failed;
+    }
+    /* session_send_packet frees the packet whether or not it went out. */
+    if (session_send_packet(session, &packet) != 0) {
+        write_failed = 1;
         goto failed;
     }
     opened = 1;
@@ -2453,8 +2457,11 @@ static int direct_http_forward(void *ctx,
         packet = st_protocol_encode_nat_message(ST_NAT_DATA, 0U,
                                                 pending.stream_id, 0U,
                                                 NULL, request->body + offset, chunk_len);
-        if (packet.data == NULL || session_send_packet(session, &packet) != 0) {
-            write_failed = packet.data != NULL;
+        if (packet.data == NULL) {
+            goto failed;
+        }
+        if (session_send_packet(session, &packet) != 0) {
+            write_failed = 1;
             goto failed;
         }
         offset += chunk_len;
@@ -2468,8 +2475,11 @@ static int direct_http_forward(void *ctx,
                                             pending.stream_id, 0U,
                                             fin_json, NULL, 0U);
     free(fin_json);
-    if (packet.data == NULL || session_send_packet(session, &packet) != 0) {
-        write_failed = packet.data != NULL;
+    if (packet.data == NULL) {
+        goto failed;
+    }
+    if (session_send_packet(session, &packet) != 0) {
+        write_failed = 1;
         goto failed;
     }
 
