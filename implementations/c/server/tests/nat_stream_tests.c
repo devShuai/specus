@@ -1802,7 +1802,9 @@ static int check_heartbeat_response(test_server *server, client_pair *pair)
 
 /*
  * More client data than the 4 MiB client-to-public queue holds resets that stream with RST 6
- * ("stream send queue exceeded", as Java StreamFlowController); the data connection carries on.
+ * ("stream send queue exceeded"); the data connection carries on. The queue is C's own: Java has
+ * none in this direction and stops reading the whole data connection instead (API inventory §8);
+ * the code is that of Java StreamFlowController's overflow in the other direction.
  */
 static int check_tcp_queue_overflow(test_server *server, client_pair *pair)
 {

@@ -5590,7 +5590,12 @@ static void reset_unknown_stream(specus_session *session, uint32_t stream_id,
  * DATA or DATA|END_STREAM for an ordinary TCP stream; an empty DATA|END_STREAM is a bare FIN. A
  * frame the stream cannot take resets only this stream (protocol/spec/control-protocol.md): DATA
  * for an unknown stream or after the client's FIN with RST 7 as in Java and Go, a frame the 4 MiB
- * client-to-public queue cannot hold with RST 6 like Java StreamFlowController's queue overflow.
+ * client-to-public queue cannot hold (or one over the spec's 64 KiB DATA fragment) with RST 6.
+ * That queue is C's own: Java writes client data straight to the public channel and, once it is
+ * not writable, stops reading the whole data connection (RemoteSpecusHandler.writeFromClient),
+ * where C stops only this stream (API inventory §8). RST 6 mirrors the code of Java's queue
+ * overflow in the other direction (StreamFlowController), which a client that keeps to its
+ * window never meets here either.
  */
 static void process_control_data(specus_session *session, const st_nat_message *message)
 {
