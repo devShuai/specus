@@ -110,6 +110,17 @@
 #define ST_ADMIN_WS_MAX_TOTAL_QUEUED_BYTES (64U * 1024U * 1024U)
 /* The writer only copies frames to the socket; the default 8 MiB stack is not needed. */
 #define ST_ADMIN_WS_WRITER_STACK_BYTES (256U * 1024U)
+/*
+ * Client frames queued for a direct WebSocket's writer. Credit is given back only once a frame is
+ * written, so a client that keeps to its 1 MiB window never gets near this; one that does not is
+ * reset with RST 6 like a TCP stream past its 4 MiB queue (Java StreamFlowController's limit).
+ */
+#define ST_ADMIN_DIRECT_WS_MAX_QUEUED_BYTES (4U * 1024U * 1024U)
+/*
+ * While a direct WebSocket's backlog drains, written frames are credited back together once this
+ * much is due (or nothing waits any more): a quarter of the client's window, so it keeps sending.
+ */
+#define ST_ADMIN_DIRECT_WS_CREDIT_BATCH_BYTES (256U * 1024U)
 
 static int admin_base64_decode_alloc(const char *encoded, uint8_t **out, size_t *out_len);
 static const char *admin_reason_phrase(int status);
@@ -229,26 +240,64 @@ typedef struct {
     uint8_t upper;
 } st_admin_utf8_state;
 
+/* A frame for the browser of a direct WebSocket, waiting for its writer. */
+typedef struct admin_direct_ws_out {
+    struct admin_direct_ws_out *next;
+    /* The client DATA bytes it came in, credited back once it is written or dropped. */
+    size_t credit;
+    size_t len;
+    uint8_t opcode;
+    /* Part of a text message: Tomcat sends text in 8 KiB blocks, each with its own send timeout. */
+    uint8_t text;
+    /* A PONG answering the browser, which goes ahead of queued frames as Tomcat's reader sends it. */
+    uint8_t ahead;
+    /* A CLOSE's code, 0 when it has none. */
+    uint16_t close_code;
+    uint8_t bytes[];
+} admin_direct_ws_out;
+
 /*
  * One browser WebSocket bridged to a NAT stream. The admin thread reads the browser and sends
- * SWS2 to the client; the NAT session thread writes the client's SWS2 to the browser. send_lock
- * serialises browser writes together with the close state, so a frame can never follow a CLOSE.
+ * SWS2 to the client; the NAT session thread only queues the client's SWS2 for the browser, and
+ * the stream's writer thread writes it, so a browser that stops reading holds up nothing but
+ * itself. send_lock guards the queue together with the close state, so a frame can never follow
+ * a CLOSE; it is never held across socket I/O.
  */
 struct st_admin_direct_ws_stream {
     int fd;
+    char channel_id[37];
+    char client_name[256];
     pthread_mutex_t send_lock;
-    pthread_cond_t handshake_cond;
     pthread_mutex_t flow_lock;
     pthread_cond_t flow_cond;
     uint64_t send_credit;
-    /* The 101 response is still being written: client frames must wait behind it. */
+    /* The 101 response is still being written: the writer starts once it is out. */
     int handshake_pending;
-    /* Client-to-browser message in progress (0 when none), checked before every write. */
+    /* Client-to-browser message in progress (0 when none), checked before every frame is queued. */
     uint8_t outbound_fragment_opcode;
     size_t outbound_fragment_bytes;
     st_admin_utf8_state outbound_utf8;
-    /* A CLOSE went to the browser; nothing may be written after it. */
+    /* Frames for the browser, in the order the writer sends them. */
+    admin_direct_ws_out *out_head;
+    admin_direct_ws_out *out_tail;
+    /* The client bytes queued or being written that were not credited back yet. */
+    size_t out_credit;
+    pthread_cond_t out_cond;
+    /* When nonzero, the monotonic time past which the writer gives up on what it is sending. */
+    long long out_abort_ms;
+    /* An abort: the writer drops the socket once the CLOSE (if any) is out. */
+    int out_shutdown;
+    /* The admin thread is done with the socket: nothing more is queued, a queued CLOSE still goes. */
+    int out_stop;
+    pthread_t writer;
+    int writer_started;
+    /* A CLOSE is queued for the browser or went to it; nothing may be queued after it. */
     int close_sent;
+    /*
+     * The writer took the CLOSE (it is being written or went out). Until then the browser's PINGs
+     * are still answered, ahead of it.
+     */
+    int close_taken;
     /* Monotonic bound on waiting for the browser's CLOSE reply once close_sent is set (flow_lock). */
     long long close_deadline_ms;
     /* The client's SWS2 CLOSE arrived: it is the client's terminal frame, only FIN may follow. */
@@ -262,7 +311,7 @@ struct st_admin_direct_ws_stream {
      */
     int abort_result;
     int flow_closed;
-    /* The socket must not be touched any more (aborted, or the admin thread is done with it). */
+    /* The socket was dropped, or the admin thread is done with it: nothing more goes to it. */
     int closed;
     /* The temporary HTTP share it was opened through ended: the NAT stream ends with RST. */
     int share_ended;
@@ -310,6 +359,9 @@ static void admin_direct_ws_share_cut(st_admin_direct_ws_stream *stream);
 
 /* Guards st_admin_direct_ws_stream.refs; the stream's own locks die with its last reference. */
 static pthread_mutex_t admin_direct_ws_ref_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t admin_direct_ws_credit_lock = PTHREAD_MUTEX_INITIALIZER;
+static st_admin_direct_ws_credit_handler admin_direct_ws_credit_handler = NULL;
+static void *admin_direct_ws_credit_ctx = NULL;
 static pthread_mutex_t admin_ws_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_ws_client *admin_ws_clients = NULL;
 /* Guards admin_ws_frame.refs and the bytes of all management frames some socket has yet to send;
@@ -8484,7 +8536,8 @@ static void admin_share_stream_unregister(admin_share_stream *stream)
 /*
  * Cuts the matching streams once: one share's (share_id), or every stream whose share has expired
  * (share_id NULL). HTTP gets its NAT stream reset and its socket shut; a WebSocket is closed with
- * 1008 outside the lock, since that writes to a browser that may be slow to read.
+ * 1008 outside the lock. That only queues the CLOSE for the socket's writer, so a browser slow to
+ * read never holds up the maintenance thread or a revocation.
  */
 static void admin_share_cut_matching(const char *share_id, long long now_ms)
 {
@@ -17023,51 +17076,271 @@ static size_t admin_ws_close_payload(uint16_t code, const char *reason, uint8_t 
     return 2U + reason_len;
 }
 
-/* Writes one frame to the browser unless a CLOSE already ended that direction; send_lock held. */
-static int admin_direct_ws_write_locked(st_admin_direct_ws_stream *stream,
-                                        int fin,
-                                        uint8_t opcode,
-                                        const uint8_t *payload,
-                                        size_t payload_len)
+/*
+ * Writes bytes for a WebSocket writer thread: each block_bytes (when nonzero) has timeout_ms from
+ * the end of the one before, as each of Tomcat's encoder blocks has, and nothing waits past
+ * *abort_ms (read under lock), which may be set meanwhile. 0 once written, -1 on a socket error, -2
+ * when a block timed out, -3 when the abort time passed. *written counts the bytes that went out.
+ */
+static int admin_write_bounded(int fd,
+                               pthread_mutex_t *lock,
+                               const long long *abort_at,
+                               const uint8_t *data,
+                               size_t len,
+                               long long timeout_ms,
+                               size_t block_bytes,
+                               size_t *written)
 {
-    if (stream->closed || stream->close_sent || stream->handshake_pending) {
-        return -1;
+    long long deadline_ms = admin_monotonic_ms() + timeout_ms;
+    size_t block_end = block_bytes;
+    size_t offset = 0U;
+    int rc = 0;
+    while (offset < len) {
+        ssize_t sent = send(fd, data + offset, len - offset, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (sent > 0) {
+            offset += (size_t)sent;
+            if (block_bytes > 0U && offset >= block_end) {
+                deadline_ms = admin_monotonic_ms() + timeout_ms;
+                block_end = offset - offset % block_bytes + block_bytes;
+            }
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
+        if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            rc = -1;
+            break;
+        }
+        pthread_mutex_lock(lock);
+        long long abort_ms = *abort_at;
+        pthread_mutex_unlock(lock);
+        long long now = admin_monotonic_ms();
+        if (abort_ms > 0 && now >= abort_ms) {
+            rc = -3;
+            break;
+        }
+        if (now >= deadline_ms) {
+            rc = -2;
+            break;
+        }
+        long long wait_ms = (abort_ms > 0 && abort_ms < deadline_ms ? abort_ms : deadline_ms) - now;
+        if (wait_ms > ST_ADMIN_WS_WRITE_POLL_MS) {
+            wait_ms = ST_ADMIN_WS_WRITE_POLL_MS;
+        }
+        struct pollfd ready = {.fd = fd, .events = POLLOUT, .revents = 0};
+        if (poll(&ready, 1, (int)wait_ms) < 0 && errno != EINTR) {
+            rc = -1;
+            break;
+        }
     }
-    if (admin_send_websocket_frame_ex(stream->fd, fin, 0U, opcode, payload, payload_len) != 0) {
-        return -1;
-    }
-    if (opcode == 0x8U) {
-        /*
-         * The browser now owes a CLOSE reply; waiting for it is bounded like the peers' timeout.
-         * The deadline lives under flow_lock, which is never held across socket I/O, so the
-         * reading thread can check it while this lock is busy with a slow browser write.
-         */
-        stream->close_sent = 1;
-        pthread_mutex_lock(&stream->flow_lock);
-        stream->close_deadline_ms = admin_monotonic_ms() + ST_ADMIN_WS_CLOSE_TIMEOUT_MS;
-        pthread_cond_broadcast(&stream->flow_cond);
-        pthread_mutex_unlock(&stream->flow_lock);
-    }
-    return 0;
+    *written = offset;
+    return rc;
 }
 
-static void admin_direct_ws_close_browser_locked(st_admin_direct_ws_stream *stream,
-                                                 uint16_t code,
-                                                 const char *reason)
+void st_admin_set_direct_ws_credit_handler(st_admin_direct_ws_credit_handler handler, void *ctx)
 {
-    uint8_t payload[125];
-    size_t payload_len = admin_ws_close_payload(code, reason, payload);
-    (void)admin_direct_ws_write_locked(stream, 1, 0x8U, payload, payload_len);
+    pthread_mutex_lock(&admin_direct_ws_credit_lock);
+    admin_direct_ws_credit_handler = handler;
+    admin_direct_ws_credit_ctx = ctx;
+    pthread_mutex_unlock(&admin_direct_ws_credit_lock);
 }
 
-/* Drops the browser socket: the admin thread's read loop sees EOF and finishes. */
-static void admin_direct_ws_abort_locked(st_admin_direct_ws_stream *stream)
+/*
+ * Gives the client back the credit of DATA the browser side is done with. Never called with a lock
+ * of the stream held, nor from the paths that abort a stream: session_shutdown aborts them under
+ * the session's map_lock, which the handler takes, and an aborted stream is reset anyway.
+ */
+static void admin_direct_ws_credit(const st_admin_direct_ws_stream *stream, size_t bytes)
+{
+    if (bytes == 0U) {
+        return;
+    }
+    pthread_mutex_lock(&admin_direct_ws_credit_lock);
+    st_admin_direct_ws_credit_handler handler = admin_direct_ws_credit_handler;
+    void *ctx = admin_direct_ws_credit_ctx;
+    pthread_mutex_unlock(&admin_direct_ws_credit_lock);
+    if (handler != NULL) {
+        handler(ctx, stream->client_name, stream->channel_id, bytes);
+    }
+}
+
+/* One raw frame for the browser; NULL when it cannot be built. */
+static admin_direct_ws_out *admin_direct_ws_out_new(int fin,
+                                                    uint8_t opcode,
+                                                    const uint8_t *payload,
+                                                    size_t payload_len)
+{
+    uint8_t header[10];
+    size_t header_len = admin_websocket_frame_header(fin, 0U, opcode, payload_len, header);
+    admin_direct_ws_out *out = (admin_direct_ws_out *)malloc(sizeof(*out) + header_len + payload_len);
+    if (out == NULL) {
+        return NULL;
+    }
+    memset(out, 0, sizeof(*out));
+    out->len = header_len + payload_len;
+    out->opcode = opcode;
+    memcpy(out->bytes, header, header_len);
+    if (payload_len > 0U) {
+        memcpy(out->bytes + header_len, payload, payload_len);
+    }
+    if (opcode == 0x8U && payload_len >= 2U) {
+        out->close_code = admin_read_u16_be(payload);
+    }
+    return out;
+}
+
+/* send_lock held. */
+static void admin_direct_ws_append_locked(st_admin_direct_ws_stream *stream, admin_direct_ws_out *out)
+{
+    out->next = NULL;
+    if (stream->out_tail == NULL) {
+        stream->out_head = out;
+    } else {
+        stream->out_tail->next = out;
+    }
+    stream->out_tail = out;
+    stream->out_credit += out->credit;
+    pthread_cond_broadcast(&stream->out_cond);
+}
+
+/*
+ * Drops what waits for the writer, except a CLOSE when keep_close is set (nothing is queued after
+ * a CLOSE, so it is the last one). Returns the client bytes the dropped frames came in; send_lock
+ * held.
+ */
+static size_t admin_direct_ws_drop_queued_locked(st_admin_direct_ws_stream *stream, int keep_close)
+{
+    size_t credit = 0U;
+    admin_direct_ws_out *kept = NULL;
+    while (stream->out_head != NULL) {
+        admin_direct_ws_out *out = stream->out_head;
+        stream->out_head = out->next;
+        if (keep_close && out->opcode == 0x8U) {
+            kept = out;
+            continue;
+        }
+        credit += out->credit;
+        free(out);
+    }
+    if (kept != NULL) {
+        kept->next = NULL;
+    }
+    stream->out_head = kept;
+    stream->out_tail = kept;
+    stream->out_credit -= credit;
+    return credit;
+}
+
+/* Drops the browser socket: the admin thread's read loop sees EOF and finishes; send_lock held. */
+static void admin_direct_ws_drop_socket_locked(st_admin_direct_ws_stream *stream)
 {
     if (!stream->closed) {
         stream->closed = 1;
         shutdown(stream->fd, SHUT_RDWR);
     }
-    pthread_cond_broadcast(&stream->handshake_cond);
+    (void)admin_direct_ws_drop_queued_locked(stream, 0);
+    pthread_cond_broadcast(&stream->out_cond);
+}
+
+/*
+ * Queues a CLOSE for the browser; nothing is queued after it. In order it follows what is queued,
+ * as the client's own CLOSE (or the 1001 for its FIN) follows its data in Java, which writes each
+ * frame before reading the next. Ahead it goes right after the frame being written and what else
+ * waits is dropped, as Tomcat sends a CLOSE of its own (an answer, a refusal, a closed session)
+ * between other senders' messages; a CLOSE already queued then goes next instead. Ahead, a code
+ * other than 1000 leaves the frame in progress and the CLOSE ST_ADMIN_WS_ABNORMAL_CLOSE_SEND_MS
+ * (Tomcat's abnormal close budget); with abort the socket is dropped once the CLOSE is out. A
+ * socket still waiting for its 101 is just dropped by an abort. Returns the client bytes of the
+ * dropped frames, for the caller to credit back once send_lock is released; send_lock held.
+ */
+static size_t admin_direct_ws_queue_close_locked(st_admin_direct_ws_stream *stream,
+                                                 const uint8_t *payload,
+                                                 size_t payload_len,
+                                                 int ahead,
+                                                 int abort)
+{
+    if (stream->closed) {
+        return 0U;
+    }
+    if (ahead && abort && stream->handshake_pending) {
+        admin_direct_ws_drop_socket_locked(stream);
+        return 0U;
+    }
+    size_t credit = 0U;
+    if (ahead) {
+        credit = admin_direct_ws_drop_queued_locked(stream, 1);
+        uint16_t code = payload_len >= 2U ? admin_read_u16_be(payload) : 0U;
+        if (code != 0U && code != 1000U) {
+            long long abort_ms = admin_monotonic_ms() + ST_ADMIN_WS_ABNORMAL_CLOSE_SEND_MS;
+            if (stream->out_abort_ms == 0 || stream->out_abort_ms > abort_ms) {
+                stream->out_abort_ms = abort_ms;
+            }
+        }
+    }
+    if (!stream->close_sent && !stream->out_stop) {
+        admin_direct_ws_out *out = admin_direct_ws_out_new(1, 0x8U, payload, payload_len);
+        if (out == NULL) {
+            admin_direct_ws_drop_socket_locked(stream);
+            return credit;
+        }
+        admin_direct_ws_append_locked(stream, out);
+        stream->close_sent = 1;
+    }
+    if (abort) {
+        stream->out_shutdown = 1;
+        pthread_cond_broadcast(&stream->out_cond);
+    }
+    return credit;
+}
+
+static size_t admin_direct_ws_close_browser_locked(st_admin_direct_ws_stream *stream,
+                                                   uint16_t code,
+                                                   const char *reason,
+                                                   int ahead,
+                                                   int abort)
+{
+    uint8_t payload[125];
+    size_t payload_len = admin_ws_close_payload(code, reason, payload);
+    return admin_direct_ws_queue_close_locked(stream, payload, payload_len, ahead, abort);
+}
+
+/*
+ * Answers the browser's PING right after the frame being written, also while a CLOSE still waits
+ * behind queued frames (it stays last), as Tomcat's reader answers between the messages being
+ * sent. Only the latest PING needs an answer (RFC 6455 5.5.3), so a PONG still waiting is replaced:
+ * a browser that pings without reading never has more than one queued. -1 when it cannot be built;
+ * send_lock held.
+ */
+static int admin_direct_ws_queue_pong_locked(st_admin_direct_ws_stream *stream,
+                                             const uint8_t *payload,
+                                             size_t payload_len)
+{
+    if (stream->closed || stream->close_taken || stream->out_stop) {
+        return 0;
+    }
+    admin_direct_ws_out *pong = admin_direct_ws_out_new(1, 0xAU, payload, payload_len);
+    if (pong == NULL) {
+        return -1;
+    }
+    pong->ahead = 1;
+    admin_direct_ws_out *head = stream->out_head;
+    if (head != NULL && head->ahead) {
+        pong->next = head->next;
+        stream->out_head = pong;
+        if (stream->out_tail == head) {
+            stream->out_tail = pong;
+        }
+        free(head);
+    } else {
+        pong->next = head;
+        stream->out_head = pong;
+        if (stream->out_tail == NULL) {
+            stream->out_tail = pong;
+        }
+    }
+    pthread_cond_broadcast(&stream->out_cond);
+    return 0;
 }
 
 static void admin_direct_ws_close_flow(st_admin_direct_ws_stream *stream)
@@ -17076,15 +17349,6 @@ static void admin_direct_ws_close_flow(st_admin_direct_ws_stream *stream)
     stream->flow_closed = 1;
     pthread_cond_broadcast(&stream->flow_cond);
     pthread_mutex_unlock(&stream->flow_lock);
-}
-
-/* Client frames may race the 101 response, so they queue behind it rather than precede it. */
-static int admin_direct_ws_wait_handshake_locked(st_admin_direct_ws_stream *stream)
-{
-    while (stream->handshake_pending && !stream->closed) {
-        pthread_cond_wait(&stream->handshake_cond, &stream->send_lock);
-    }
-    return stream->closed ? -1 : 0;
 }
 
 /* Non-zero once a CLOSE went to the browser: the monotonic bound on waiting for its reply. */
@@ -17152,16 +17416,40 @@ static int admin_direct_ws_consume_send_credit(st_admin_direct_ws_stream *stream
     }
 }
 
+/* Queues a client frame for the writer, carrying the client's credit for it; send_lock held. */
+static int admin_direct_ws_queue_client_frame_locked(st_admin_direct_ws_stream *stream,
+                                                     int fin,
+                                                     uint8_t opcode,
+                                                     int text,
+                                                     const uint8_t *payload,
+                                                     size_t payload_len,
+                                                     size_t credit)
+{
+    admin_direct_ws_out *out = admin_direct_ws_out_new(fin, opcode, payload, payload_len);
+    if (out == NULL) {
+        return ST_ADMIN_DIRECT_WS_BROWSER_FAILED;
+    }
+    out->text = (uint8_t)(text ? 1U : 0U);
+    out->credit = credit;
+    admin_direct_ws_append_locked(stream, out);
+    if (opcode == 0x8U) {
+        stream->close_sent = 1;
+    }
+    return ST_ADMIN_DIRECT_WS_ACCEPTED;
+}
+
 /*
- * Writes one decoded client envelope to the browser as a raw frame. Physical fragmentation is
+ * Queues one decoded client envelope for the browser as a raw frame. Physical fragmentation is
  * kept (the browser reassembles), as the .NET server does, but the message state machine the Go
  * and Java servers apply while reassembling still holds: a continuation needs an open message, a
  * new text/binary frame needs none, and a message stays within 16 MiB. Text must also stay valid
  * UTF-8 across fragments (as .NET checks), since the browser would fail the connection on it.
- * Control frames may sit between fragments. send_lock held.
+ * Control frames may sit between fragments. credit is the client DATA the envelope came in;
+ * send_lock held.
  */
 static int admin_direct_ws_forward_to_browser_locked(st_admin_direct_ws_stream *stream,
-                                                     const st_admin_sws2_frame *frame)
+                                                     const st_admin_sws2_frame *frame,
+                                                     size_t credit)
 {
     if (frame->rsv != 0U) {
         /* No extension is negotiated with the browser, so RFC 6455 requires RSV to stay zero. */
@@ -17182,15 +17470,11 @@ static int admin_direct_ws_forward_to_browser_locked(st_admin_direct_ws_stream *
         }
         /* The client's CLOSE is its terminal frame whether or not the browser can still take it. */
         stream->peer_close_received = 1;
-        return admin_direct_ws_write_locked(stream, 1, 0x8U, payload, payload_len) == 0
-            ? ST_ADMIN_DIRECT_WS_ACCEPTED
-            : ST_ADMIN_DIRECT_WS_BROWSER_FAILED;
+        return admin_direct_ws_queue_client_frame_locked(stream, 1, 0x8U, 0, payload, payload_len, credit);
     }
     if (frame->opcode == 0x9U || frame->opcode == 0xAU) {
-        return admin_direct_ws_write_locked(stream, 1, frame->opcode, frame->payload,
-                                            frame->payload_len) == 0
-            ? ST_ADMIN_DIRECT_WS_ACCEPTED
-            : ST_ADMIN_DIRECT_WS_BROWSER_FAILED;
+        return admin_direct_ws_queue_client_frame_locked(stream, 1, frame->opcode, 0, frame->payload,
+                                                         frame->payload_len, credit);
     }
     int continuation = frame->opcode == 0x0U;
     if (continuation ? stream->outbound_fragment_opcode == 0U : stream->outbound_fragment_opcode != 0U) {
@@ -17212,9 +17496,11 @@ static int admin_direct_ws_forward_to_browser_locked(st_admin_direct_ws_stream *
             || (frame->fin && utf8.need != 0U))) {
         return ST_ADMIN_DIRECT_WS_INVALID;
     }
-    if (admin_direct_ws_write_locked(stream, frame->fin, frame->opcode, frame->payload,
-                                     frame->payload_len) != 0) {
-        return ST_ADMIN_DIRECT_WS_BROWSER_FAILED;
+    int queued = admin_direct_ws_queue_client_frame_locked(stream, frame->fin, frame->opcode,
+                                                           message_opcode == 0x1U, frame->payload,
+                                                           frame->payload_len, credit);
+    if (queued != ST_ADMIN_DIRECT_WS_ACCEPTED) {
+        return queued;
     }
     if (frame->fin) {
         stream->outbound_fragment_opcode = 0U;
@@ -17238,6 +17524,9 @@ uint32_t st_admin_direct_ws_reset_code(int result, const char **reason)
     } else if (result == ST_ADMIN_DIRECT_WS_INVALID) {
         text = "invalid WebSocket SWS2 frame";
         code = ST_ADMIN_DIRECT_WS_RST_INVALID_SWS2;
+    } else if (result == ST_ADMIN_DIRECT_WS_QUEUE_FULL) {
+        text = "stream send queue exceeded";
+        code = ST_ADMIN_DIRECT_WS_RST_QUEUE_EXCEEDED;
     }
     if (reason != NULL) {
         *reason = text;
@@ -17245,17 +17534,26 @@ uint32_t st_admin_direct_ws_reset_code(int result, const char **reason)
     return code;
 }
 
-/* Fails the browser side after a client-side violation, as the .NET server does (1002). */
+/*
+ * Fails the browser side after a client-side violation, as the .NET server does (1002), once what
+ * the client sent before it is written (Java writes each frame before it reads the next). A
+ * client that overran its window gets 1011 as for a reset tunnel, ahead of what it queued. The
+ * browser socket is dropped right after the CLOSE.
+ */
 static void admin_direct_ws_fail_locked(st_admin_direct_ws_stream *stream, int result)
 {
     if (stream->abort_result == ST_ADMIN_DIRECT_WS_ACCEPTED) {
         stream->abort_result = result;
     }
-    if (result != ST_ADMIN_DIRECT_WS_BROWSER_FAILED) {
-        admin_direct_ws_close_browser_locked(stream, ST_ADMIN_WS_CLOSE_PROTOCOL_ERROR,
-                                             "invalid WebSocket frame");
+    if (result == ST_ADMIN_DIRECT_WS_BROWSER_FAILED) {
+        admin_direct_ws_drop_socket_locked(stream);
+    } else if (result == ST_ADMIN_DIRECT_WS_QUEUE_FULL) {
+        (void)admin_direct_ws_close_browser_locked(stream, ST_ADMIN_WS_CLOSE_INTERNAL_ERROR,
+                                                   "WebSocket tunnel reset", 1, 1);
+    } else {
+        (void)admin_direct_ws_close_browser_locked(stream, ST_ADMIN_WS_CLOSE_PROTOCOL_ERROR,
+                                                   "invalid WebSocket frame", 0, 1);
     }
-    admin_direct_ws_abort_locked(stream);
 }
 
 int st_admin_direct_ws_send_framed_payload(st_admin_direct_ws_stream *stream,
@@ -17267,31 +17565,36 @@ int st_admin_direct_ws_send_framed_payload(st_admin_direct_ws_stream *stream,
     }
     st_admin_sws2_frame frame;
     int decoded = st_admin_sws2_decode(payload, payload_len, &frame) == 0;
+    size_t dropped = 0U;
     pthread_mutex_lock(&stream->send_lock);
-    (void)admin_direct_ws_wait_handshake_locked(stream);
     int result;
     if (stream->peer_finished) {
         result = ST_ADMIN_DIRECT_WS_AFTER_FIN;
     } else if (!decoded || stream->peer_close_received) {
         /* A malformed envelope, or anything after the client's own CLOSE. */
         result = ST_ADMIN_DIRECT_WS_INVALID;
-    } else if (stream->closed || stream->close_sent) {
+    } else if (stream->closed || stream->close_sent || stream->out_stop) {
         /*
          * The browser side is already closing, so nothing more may reach it. A client CLOSE here is
          * the tunnel half of a browser-initiated handshake; data still in flight is dropped, as the
-         * Go and Java servers drop it once their browser session is closed.
+         * Go and Java servers drop it once their browser session is closed, and credited back as
+         * Java's processWsData does whatever its write did.
          */
         if (frame.opcode == 0x8U) {
             stream->peer_close_received = 1;
         }
+        dropped = payload_len;
         result = ST_ADMIN_DIRECT_WS_ACCEPTED;
+    } else if (stream->out_credit > ST_ADMIN_DIRECT_WS_MAX_QUEUED_BYTES - payload_len) {
+        result = ST_ADMIN_DIRECT_WS_QUEUE_FULL;
     } else {
-        result = admin_direct_ws_forward_to_browser_locked(stream, &frame);
+        result = admin_direct_ws_forward_to_browser_locked(stream, &frame, payload_len);
     }
     if (result != ST_ADMIN_DIRECT_WS_ACCEPTED) {
         admin_direct_ws_fail_locked(stream, result);
     }
     pthread_mutex_unlock(&stream->send_lock);
+    admin_direct_ws_credit(stream, dropped);
     if (result != ST_ADMIN_DIRECT_WS_ACCEPTED) {
         admin_direct_ws_close_flow(stream);
     }
@@ -17312,15 +17615,10 @@ int st_admin_direct_ws_peer_finished(st_admin_direct_ws_stream *stream)
         stream->peer_finished = 1;
         /*
          * FIN without CLOSE means the upstream went away. The browser hears 1001 like Go, Java and
-         * .NET send, and its CLOSE reply still travels back as SWS2 CLOSE + FIN (our direction of
-         * the stream stays open until then).
+         * .NET send, after the frames queued before the FIN, and its CLOSE reply still travels back
+         * as SWS2 CLOSE + FIN (our direction of the stream stays open until then).
          */
-        if (admin_direct_ws_wait_handshake_locked(stream) == 0 && !stream->close_sent) {
-            admin_direct_ws_close_browser_locked(stream, ST_ADMIN_WS_CLOSE_GOING_AWAY, "");
-            if (!stream->close_sent) {
-                admin_direct_ws_abort_locked(stream);
-            }
-        }
+        (void)admin_direct_ws_close_browser_locked(stream, ST_ADMIN_WS_CLOSE_GOING_AWAY, "", 0, 0);
     }
     pthread_mutex_unlock(&stream->send_lock);
     if (result != ST_ADMIN_DIRECT_WS_ACCEPTED) {
@@ -17329,6 +17627,12 @@ int st_admin_direct_ws_peer_finished(st_admin_direct_ws_stream *stream)
     return result;
 }
 
+/*
+ * Ends the stream from outside its threads (the client's RST, the data connection's end, the end
+ * of its share): the CLOSE goes ahead of what is queued and the socket is dropped after it. This
+ * only queues, so neither the NAT session thread nor the maintenance thread ever waits on a
+ * browser.
+ */
 static void admin_direct_ws_shutdown(st_admin_direct_ws_stream *stream,
                                      uint16_t code,
                                      const char *reason)
@@ -17337,11 +17641,7 @@ static void admin_direct_ws_shutdown(st_admin_direct_ws_stream *stream,
         return;
     }
     pthread_mutex_lock(&stream->send_lock);
-    /* Abort paths never wait for the handshake: a socket still waiting for 101 just closes. */
-    if (!stream->handshake_pending) {
-        admin_direct_ws_close_browser_locked(stream, code, reason);
-    }
-    admin_direct_ws_abort_locked(stream);
+    (void)admin_direct_ws_close_browser_locked(stream, code, reason, 1, 1);
     pthread_mutex_unlock(&stream->send_lock);
     admin_direct_ws_close_flow(stream);
 }
@@ -17409,12 +17709,147 @@ void st_admin_direct_ws_release(st_admin_direct_ws_stream *stream)
     int last = --stream->refs == 0U;
     pthread_mutex_unlock(&admin_direct_ws_ref_lock);
     if (last) {
+        (void)admin_direct_ws_drop_queued_locked(stream, 0);
         pthread_cond_destroy(&stream->flow_cond);
         pthread_mutex_destroy(&stream->flow_lock);
-        pthread_cond_destroy(&stream->handshake_cond);
+        pthread_cond_destroy(&stream->out_cond);
         pthread_mutex_destroy(&stream->send_lock);
         free(stream);
     }
+}
+
+/*
+ * The only writer of a direct WebSocket's browser socket, started once the 101 is out. Each frame
+ * gets Java's limits on Tomcat's blocking send (BLOCKING_SEND_TIMEOUT, left at 20 s): a text frame
+ * 20 s for each 8 KiB, as Tomcat sends text in blocks of its 8 KiB buffer; a binary or control frame
+ * 20 s in all, as Tomcat sends such a message in one piece; a CLOSE whose code is not 1000 the
+ * abnormal close budget of 50 ms. A frame's credit goes back to the client once it is written (in
+ * batches while a backlog drains, so each frame does not cost a WINDOW_UPDATE of its own). When
+ * a write times out the browser gets CLOSE 1001 "Write timeout" within 50 ms (skipped once part of
+ * the frame went out, where it would only corrupt the stream, and when the frame was a CLOSE), the
+ * socket is dropped and the stream reset with RST 31, the client's other streams having gone on all
+ * along.
+ */
+static void *admin_direct_ws_writer_thread(void *arg)
+{
+    st_admin_direct_ws_stream *stream = (st_admin_direct_ws_stream *)arg;
+    size_t unsent_credit = 0U;
+    pthread_mutex_lock(&stream->send_lock);
+    for (;;) {
+        while (stream->out_head == NULL && !stream->out_stop && !stream->out_shutdown && !stream->closed) {
+            pthread_cond_wait(&stream->out_cond, &stream->send_lock);
+        }
+        admin_direct_ws_out *out = stream->out_head;
+        if (out == NULL || stream->closed) {
+            if (stream->out_shutdown) {
+                admin_direct_ws_drop_socket_locked(stream);
+            }
+            break;
+        }
+        stream->out_head = out->next;
+        if (stream->out_head == NULL) {
+            stream->out_tail = NULL;
+        }
+        if (out->opcode == 0x8U) {
+            stream->close_taken = 1;
+        }
+        pthread_mutex_unlock(&stream->send_lock);
+
+        long long timeout_ms = ST_ADMIN_WS_SEND_TIMEOUT_MS;
+        size_t block_bytes = out->text ? ST_ADMIN_WS_SEND_BLOCK_BYTES : 0U;
+        if (out->opcode == 0x8U && out->close_code != 0U && out->close_code != 1000U) {
+            timeout_ms = ST_ADMIN_WS_ABNORMAL_CLOSE_SEND_MS;
+            block_bytes = 0U;
+        }
+        size_t written = 0U;
+        int rc = admin_write_bounded(stream->fd, &stream->send_lock, &stream->out_abort_ms, out->bytes,
+                                     out->len, timeout_ms, block_bytes, &written);
+        int was_close = out->opcode == 0x8U;
+        int close_written = rc == 0 && was_close;
+        if (close_written) {
+            /*
+             * The browser now owes a CLOSE reply; waiting for it is bounded like the peers' timeout.
+             * The deadline lives under flow_lock, so the reading thread checks it without send_lock.
+             */
+            pthread_mutex_lock(&stream->flow_lock);
+            stream->close_deadline_ms = admin_monotonic_ms() + ST_ADMIN_WS_CLOSE_TIMEOUT_MS;
+            pthread_cond_broadcast(&stream->flow_cond);
+            pthread_mutex_unlock(&stream->flow_lock);
+        }
+        size_t credit = out->credit;
+        free(out);
+        if (rc == -2) {
+            fprintf(stderr, "[ws-specus] channel=%s: browser write timed out after %lld ms; closing it\n",
+                    stream->channel_id, timeout_ms);
+            /* A CLOSE that did not go out within its budget just ends the connection, as in Tomcat. */
+            if (written == 0U && !was_close) {
+                uint8_t payload[125];
+                size_t payload_len = admin_ws_close_payload(ST_ADMIN_WS_CLOSE_GOING_AWAY, "Write timeout", payload);
+                admin_direct_ws_out *timeout_close = admin_direct_ws_out_new(1, 0x8U, payload, payload_len);
+                if (timeout_close != NULL) {
+                    (void)admin_write_bounded(stream->fd, &stream->send_lock, &stream->out_abort_ms,
+                                              timeout_close->bytes, timeout_close->len,
+                                              ST_ADMIN_WS_ABNORMAL_CLOSE_SEND_MS, 0U, &written);
+                    free(timeout_close);
+                }
+            }
+        }
+        pthread_mutex_lock(&stream->send_lock);
+        stream->out_credit -= credit;
+        if (rc != 0) {
+            /*
+             * Only what the client sent makes a failed write the stream's end: RST 31, and the
+             * reading thread stops waiting for the client's credit. A frame the server makes itself
+             * (a PONG, an answer to the browser's CLOSE, a refusal) failing just drops the socket and
+             * leaves the end to the reading thread, which may still be passing the browser's CLOSE
+             * on, as the old synchronous write ignored such a failure; an abort that ran out its
+             * budget (-3) keeps the reason it was aborted for.
+             */
+            int client_frame = credit > 0U;
+            if (rc != -3 && client_frame && stream->abort_result == ST_ADMIN_DIRECT_WS_ACCEPTED) {
+                stream->abort_result = ST_ADMIN_DIRECT_WS_BROWSER_FAILED;
+            }
+            credit += unsent_credit + admin_direct_ws_drop_queued_locked(stream, 0);
+            admin_direct_ws_drop_socket_locked(stream);
+            pthread_mutex_unlock(&stream->send_lock);
+            admin_direct_ws_credit(stream, credit);
+            if (client_frame) {
+                admin_direct_ws_close_flow(stream);
+            }
+            return NULL;
+        }
+        unsent_credit += credit;
+        if (close_written && stream->out_shutdown) {
+            admin_direct_ws_drop_socket_locked(stream);
+            break;
+        }
+        /* While frames keep waiting the credit goes back in batches, once none waits at once. */
+        if (unsent_credit > 0U
+            && (stream->out_head == NULL || unsent_credit >= ST_ADMIN_DIRECT_WS_CREDIT_BATCH_BYTES)) {
+            size_t batch = unsent_credit;
+            unsent_credit = 0U;
+            pthread_mutex_unlock(&stream->send_lock);
+            admin_direct_ws_credit(stream, batch);
+            pthread_mutex_lock(&stream->send_lock);
+        }
+    }
+    pthread_mutex_unlock(&stream->send_lock);
+    admin_direct_ws_credit(stream, unsent_credit);
+    return NULL;
+}
+
+/* send_lock held; 0 once the writer runs. */
+static int admin_direct_ws_start_writer_locked(st_admin_direct_ws_stream *stream)
+{
+    pthread_attr_t writer_attr;
+    if (pthread_attr_init(&writer_attr) != 0) {
+        return -1;
+    }
+    (void)pthread_attr_setstacksize(&writer_attr, ST_ADMIN_WS_WRITER_STACK_BYTES);
+    int started = pthread_create(&stream->writer, &writer_attr, admin_direct_ws_writer_thread, stream) == 0;
+    pthread_attr_destroy(&writer_attr);
+    stream->writer_started = started;
+    return started ? 0 : -1;
 }
 
 /* A frame with one reference, the caller's; NULL when it cannot be built. */
@@ -17562,12 +17997,7 @@ static void admin_ws_send_close(st_admin_ws_client *client, const uint8_t *paylo
     pthread_mutex_unlock(&client->out_lock);
 }
 
-/*
- * Writes bytes for the writer thread: each block_bytes (when nonzero) has timeout_ms from the end of
- * the one before, as each of Tomcat's encoder blocks has, and nothing waits past out_abort_ms,
- * which may be set meanwhile. 0 once written, -1 on a socket error, -2 when a block timed out, -3
- * when the abort time passed. *written counts the bytes that went out.
- */
+/* admin_write_bounded for a management socket's writer, which out_abort_ms may cut short. */
 static int admin_ws_write_bounded(st_admin_ws_client *client,
                                   const uint8_t *data,
                                   size_t len,
@@ -17575,51 +18005,8 @@ static int admin_ws_write_bounded(st_admin_ws_client *client,
                                   size_t block_bytes,
                                   size_t *written)
 {
-    long long deadline_ms = admin_monotonic_ms() + timeout_ms;
-    size_t block_end = block_bytes;
-    size_t offset = 0U;
-    int rc = 0;
-    while (offset < len) {
-        ssize_t sent = send(client->fd, data + offset, len - offset, MSG_DONTWAIT | MSG_NOSIGNAL);
-        if (sent > 0) {
-            offset += (size_t)sent;
-            if (block_bytes > 0U && offset >= block_end) {
-                deadline_ms = admin_monotonic_ms() + timeout_ms;
-                block_end = offset - offset % block_bytes + block_bytes;
-            }
-            continue;
-        }
-        if (sent < 0 && errno == EINTR) {
-            continue;
-        }
-        if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            rc = -1;
-            break;
-        }
-        pthread_mutex_lock(&client->out_lock);
-        long long abort_ms = client->out_abort_ms;
-        pthread_mutex_unlock(&client->out_lock);
-        long long now = admin_monotonic_ms();
-        if (abort_ms > 0 && now >= abort_ms) {
-            rc = -3;
-            break;
-        }
-        if (now >= deadline_ms) {
-            rc = -2;
-            break;
-        }
-        long long wait_ms = (abort_ms > 0 && abort_ms < deadline_ms ? abort_ms : deadline_ms) - now;
-        if (wait_ms > ST_ADMIN_WS_WRITE_POLL_MS) {
-            wait_ms = ST_ADMIN_WS_WRITE_POLL_MS;
-        }
-        struct pollfd ready = {.fd = client->fd, .events = POLLOUT, .revents = 0};
-        if (poll(&ready, 1, (int)wait_ms) < 0 && errno != EINTR) {
-            rc = -1;
-            break;
-        }
-    }
-    *written = offset;
-    return rc;
+    return admin_write_bounded(client->fd, &client->out_lock, &client->out_abort_ms, data, len, timeout_ms,
+                               block_bytes, written);
 }
 
 /*
@@ -18773,12 +19160,13 @@ static void free_header_array(char **headers, size_t headers_len)
     free(headers);
 }
 
+/* After the writer is gone: nothing touches the socket any more. */
 static void admin_direct_ws_mark_closed(st_admin_direct_ws_stream *stream)
 {
     pthread_mutex_lock(&stream->send_lock);
     stream->closed = 1;
     stream->handshake_pending = 0;
-    pthread_cond_broadcast(&stream->handshake_cond);
+    (void)admin_direct_ws_drop_queued_locked(stream, 0);
     pthread_mutex_unlock(&stream->send_lock);
     admin_direct_ws_close_flow(stream);
 }
@@ -18919,10 +19307,10 @@ static uint32_t admin_direct_ws_tunnel_gone(st_admin_direct_ws_stream *stream,
                                             const char **reset_reason)
 {
     pthread_mutex_lock(&stream->send_lock);
-    admin_direct_ws_close_browser_locked(stream,
-                                         ST_ADMIN_WS_CLOSE_INTERNAL_ERROR,
-                                         "WebSocket tunnel reset");
+    size_t dropped = admin_direct_ws_close_browser_locked(stream, ST_ADMIN_WS_CLOSE_INTERNAL_ERROR,
+                                                          "WebSocket tunnel reset", 1, 0);
     pthread_mutex_unlock(&stream->send_lock);
+    admin_direct_ws_credit(stream, dropped);
     *reset_reason = "WebSocket tunnel closed";
     return ST_ADMIN_DIRECT_WS_RST_BROWSER_GONE;
 }
@@ -18962,8 +19350,9 @@ static uint32_t admin_direct_ws_fail_browser(st_admin_server *server,
                                              const char **reset_reason)
 {
     pthread_mutex_lock(&stream->send_lock);
-    admin_direct_ws_close_browser_locked(stream, close_code, reason);
+    size_t dropped = admin_direct_ws_close_browser_locked(stream, close_code, reason, 1, 0);
     pthread_mutex_unlock(&stream->send_lock);
+    admin_direct_ws_credit(stream, dropped);
     return admin_direct_ws_finish_with_close(server, stream, channel_id, close_code,
                                              (const uint8_t *)reason, strlen(reason),
                                              reset_reason);
@@ -19055,8 +19444,7 @@ static uint32_t admin_drain_direct_websocket(st_admin_server *server,
             }
             if (opcode == 0x9U) {
                 pthread_mutex_lock(&stream->send_lock);
-                int failed = !stream->close_sent && !stream->closed
-                    && admin_direct_ws_write_locked(stream, 1, 0xAU, chunk, control_len) != 0;
+                int failed = admin_direct_ws_queue_pong_locked(stream, chunk, control_len) != 0;
                 pthread_mutex_unlock(&stream->send_lock);
                 if (failed) {
                     result = admin_direct_ws_browser_gone(stream, reset_reason);
@@ -19097,13 +19485,14 @@ static uint32_t admin_drain_direct_websocket(st_admin_server *server,
             }
             /*
              * Echo before forwarding: once close_sent is set, the client's own CLOSE reply is
-             * recognised as the tunnel half of this handshake and never reaches the browser.
+             * recognised as the tunnel half of this handshake and never reaches the browser. The
+             * echo goes ahead of what is still queued, which is dropped as Tomcat drops what it has
+             * not sent once the browser closed; a CLOSE already queued goes next instead.
              */
             pthread_mutex_lock(&stream->send_lock);
-            if (!stream->close_sent && !stream->closed) {
-                (void)admin_direct_ws_write_locked(stream, 1, 0x8U, chunk, control_len);
-            }
+            size_t dropped = admin_direct_ws_queue_close_locked(stream, chunk, control_len, 1, 0);
             pthread_mutex_unlock(&stream->send_lock);
+            admin_direct_ws_credit(stream, dropped);
             result = admin_direct_ws_finish_with_close(server, stream, channel_id, close_code,
                                                        close_reason, close_reason_len, reset_reason);
             break;
@@ -19206,8 +19595,10 @@ static void admin_direct_ws_run(st_admin_server *server,
     stream->handshake_pending = 1;
     stream->refs = 1U;
     admin_utf8_reset(&stream->outbound_utf8);
+    admin_generate_request_id(stream->channel_id);
+    snprintf(stream->client_name, sizeof(stream->client_name), "%s", client_name == NULL ? "" : client_name);
     pthread_mutex_init(&stream->send_lock, NULL);
-    pthread_cond_init(&stream->handshake_cond, NULL);
+    pthread_cond_init(&stream->out_cond, NULL);
     pthread_mutex_init(&stream->flow_lock, NULL);
     /* Credit waits are bounded by monotonic deadlines, so the condition uses that clock too. */
     pthread_condattr_t flow_cond_attr;
@@ -19216,8 +19607,7 @@ static void admin_direct_ws_run(st_admin_server *server,
     pthread_cond_init(&stream->flow_cond, &flow_cond_attr);
     pthread_condattr_destroy(&flow_cond_attr);
 
-    char channel_id[37];
-    admin_generate_request_id(channel_id);
+    const char *channel_id = stream->channel_id;
     static const uint8_t empty_body[] = {0};
     st_admin_direct_ws_request direct = {
         .channel_id = channel_id,
@@ -19260,38 +19650,56 @@ static void admin_direct_ws_run(st_admin_server *server,
                                 accept_key);
     free(accept_key);
     /*
-     * The client may already be answering the OPEN. Its frames wait on handshake_pending, and the
-     * 101 is written under send_lock, so no WebSocket frame can reach the browser before it.
+     * The client may already be answering the OPEN. Its frames wait in the queue, and the writer
+     * only starts once the 101 is out, so no WebSocket frame can reach the browser before it. The
+     * 101 is written without send_lock, which an abort meanwhile needs only to drop the socket.
      */
     pthread_mutex_lock(&stream->send_lock);
-    int upgraded = !stream->closed && response_len > 0 && (size_t)response_len < sizeof(response)
-        && send_all(fd, response, (size_t)response_len) == 0;
+    int upgraded = !stream->closed && response_len > 0 && (size_t)response_len < sizeof(response);
+    pthread_mutex_unlock(&stream->send_lock);
+    upgraded = upgraded && send_all(fd, response, (size_t)response_len) == 0;
+    pthread_mutex_lock(&stream->send_lock);
+    upgraded = upgraded && !stream->closed && admin_direct_ws_start_writer_locked(stream) == 0;
     stream->handshake_pending = 0;
     if (!upgraded) {
-        admin_direct_ws_abort_locked(stream);
+        admin_direct_ws_drop_socket_locked(stream);
     }
-    pthread_cond_broadcast(&stream->handshake_cond);
     pthread_mutex_unlock(&stream->send_lock);
 
     const char *reset_reason = "WebSocket handshake failed";
     uint32_t reset_code = upgraded
         ? admin_drain_direct_websocket(server, stream, channel_id, &reset_reason)
         : ST_ADMIN_DIRECT_WS_RST_BROWSER_GONE;
+    /*
+     * Nothing more is queued; client frames still waiting are dropped, and a CLOSE that is queued
+     * (the answer to the browser's, a refusal) gets at most one more send timeout.
+     */
     pthread_mutex_lock(&stream->send_lock);
     int abort_result = stream->abort_result;
     int share_ended = stream->share_ended;
+    (void)admin_direct_ws_drop_queued_locked(stream, 1);
+    stream->out_stop = 1;
+    long long end_ms = admin_monotonic_ms() + ST_ADMIN_WS_SEND_TIMEOUT_MS;
+    if (stream->out_abort_ms == 0 || stream->out_abort_ms > end_ms) {
+        stream->out_abort_ms = end_ms;
+    }
+    pthread_cond_broadcast(&stream->out_cond);
+    int writer_started = stream->writer_started;
     pthread_mutex_unlock(&stream->send_lock);
     if (share_ended) {
         /* The share ended: the client hears RST whatever the browser did meanwhile. */
         reset_code = ST_ADMIN_HTTP_SHARE_RESET_CODE;
         reset_reason = ST_ADMIN_HTTP_SHARE_RESET_REASON;
     } else if (abort_result != ST_ADMIN_DIRECT_WS_ACCEPTED) {
-        /* A client-side violation dropped the socket: if the stream is still mapped, reset it. */
+        /* A client-side violation or a failed write dropped the socket: if still mapped, reset it. */
         reset_code = st_admin_direct_ws_reset_code(abort_result, &reset_reason);
+    }
+    server->direct_ws_close(server->direct_ws_ctx, channel_id, reset_code, reset_reason);
+    if (writer_started) {
+        pthread_join(stream->writer, NULL);
     }
     /* After this no thread writes to the fd, which handle_client closes once we return. */
     admin_direct_ws_mark_closed(stream);
-    server->direct_ws_close(server->direct_ws_ctx, channel_id, reset_code, reset_reason);
     st_admin_direct_ws_release(stream);
     admin_direct_ws_linger(fd);
 }
