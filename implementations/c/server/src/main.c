@@ -2663,6 +2663,33 @@ static int direct_ws_data(void *ctx, const char *channel_id, const uint8_t *payl
     return rc;
 }
 
+/* The browser side is done with client DATA of a WebSocket stream: its credit goes back. */
+static void direct_ws_credit(void *ctx, const char *channel_id, size_t bytes)
+{
+    (void)ctx;
+    specus_session *target_session = NULL;
+    uint32_t stream_id = 0U;
+    pthread_mutex_lock(&active_session_lock);
+    for (specus_session *session = active_sessions; session != NULL; session = session->active_next) {
+        pthread_mutex_lock(&session->map_lock);
+        ws_conn *conn = find_ws_conn_locked(session, channel_id);
+        if (conn != NULL) {
+            ++session->references;
+            target_session = session;
+            stream_id = conn->stream_id;
+        }
+        pthread_mutex_unlock(&session->map_lock);
+        if (target_session != NULL) {
+            break;
+        }
+    }
+    pthread_mutex_unlock(&active_session_lock);
+    if (target_session != NULL) {
+        (void)send_window_update(target_session, stream_id, bytes);
+        session_reference_release(target_session);
+    }
+}
+
 static void direct_ws_close(void *ctx, const char *channel_id, uint32_t reset_code, const char *reason)
 {
     (void)ctx;
@@ -4053,8 +4080,8 @@ static void free_ws_conn(ws_conn *conn)
 }
 
 /*
- * Looks a WebSocket stream up and takes a temporary reference, so the browser socket can be
- * written (which may block, or wait for the 101 response) without holding map_lock.
+ * Looks a WebSocket stream up and takes a temporary reference, so the browser side can be handed
+ * a frame (which it only queues for the stream's writer) without holding map_lock.
  */
 static st_admin_direct_ws_stream *acquire_ws_stream(specus_session *session, uint32_t stream_id)
 {
@@ -4104,12 +4131,14 @@ static int process_ws_data(specus_session *session, const st_nat_message *messag
     if (message->data_len > 0U) {
         record_tcp_traffic(session, 0, (long long)message->data_len, 0);
     }
-    /* An empty DATA carries no SWS2 envelope; it is only meaningful as a bare END_STREAM. */
+    /*
+     * An empty DATA carries no SWS2 envelope; it is only meaningful as a bare END_STREAM. The
+     * envelope is only queued for the browser, so this thread, the only reader of the data
+     * connection, never waits on a browser; its WINDOW_UPDATE goes out once the stream's writer
+     * wrote it (direct_ws_credit), so a browser that stops reading stops the client's credit.
+     */
     if (message->data_len > 0U || !end_stream) {
         result = st_admin_direct_ws_send_framed_payload(stream, message->data, message->data_len);
-        if (result == ST_ADMIN_DIRECT_WS_ACCEPTED) {
-            (void)send_window_update(session, message->stream_id, message->data_len);
-        }
     }
     if (result == ST_ADMIN_DIRECT_WS_ACCEPTED && end_stream) {
         result = st_admin_direct_ws_peer_finished(stream);
@@ -5715,6 +5744,7 @@ int main(void)
     st_admin_set_peer_control_send_handler(push_runtime_peer_control, NULL);
     st_admin_set_client_disconnect_handler(close_client_connections, NULL);
     st_admin_set_external_connection_stats_handler(external_connection_stats, NULL);
+    st_admin_set_direct_ws_credit_handler(direct_ws_credit, NULL);
     const st_connectivity_device connectivity_device = {
         .presence = connectivity_presence,
         .probe = connectivity_probe,
@@ -5741,6 +5771,7 @@ int main(void)
         st_admin_set_peer_control_send_handler(NULL, NULL);
         st_admin_set_client_disconnect_handler(NULL, NULL);
         st_admin_set_external_connection_stats_handler(NULL, NULL);
+        st_admin_set_direct_ws_credit_handler(NULL, NULL);
         close(listener);
         shutdown_wake_close(shutdown_pipe);
         st_stun_turn_server_stop(stun_turn_server);
@@ -5758,6 +5789,7 @@ int main(void)
         st_admin_set_peer_control_send_handler(NULL, NULL);
         st_admin_set_client_disconnect_handler(NULL, NULL);
         st_admin_set_external_connection_stats_handler(NULL, NULL);
+        st_admin_set_direct_ws_credit_handler(NULL, NULL);
         close(listener);
         shutdown_wake_close(shutdown_pipe);
         st_stun_turn_server_stop(stun_turn_server);
@@ -5781,6 +5813,7 @@ int main(void)
         st_admin_set_peer_control_send_handler(NULL, NULL);
         st_admin_set_client_disconnect_handler(NULL, NULL);
         st_admin_set_external_connection_stats_handler(NULL, NULL);
+        st_admin_set_direct_ws_credit_handler(NULL, NULL);
         close(listener);
         st_stun_turn_server_stop(stun_turn_server);
         st_tls_server_context_free(config.tls_context);
@@ -5891,6 +5924,7 @@ int main(void)
     st_admin_set_peer_control_send_handler(NULL, NULL);
     st_admin_set_client_disconnect_handler(NULL, NULL);
     st_admin_set_external_connection_stats_handler(NULL, NULL);
+    st_admin_set_direct_ws_credit_handler(NULL, NULL);
     st_stun_turn_server_stop(stun_turn_server);
     st_tls_server_context_free(config.tls_context);
     config_release_routes(&config);
