@@ -159,6 +159,29 @@ static void peer_session_expired_sqlite(sqlite3_context *context, int argc, sqli
 
 #define PEER_SESSION_EXPIRED_SQL "specus_peer_session_expired(expires_at)"
 
+/*
+ * The relay hot path caches session grants (stun_turn.c, Java relayAuthorizationCache). It is told
+ * of each committed change that can withdraw one session's authorization, a close or a change of
+ * its status, the way Java drops that session's cache entry. Expiry needs no notice: the cached
+ * grant carries the session's expiry.
+ */
+typedef void (*peer_session_listener)(long long session_id);
+static _Atomic(peer_session_listener) peer_session_change_listener;
+
+_Static_assert(sizeof(((st_storage_peer_mesh_relay_grant *)0)->expires_at) == ST_INSTANT_CAPACITY,
+               "a relay grant holds one stored instant");
+
+void st_storage_set_peer_mesh_session_listener(void (*listener)(long long session_id))
+{
+    atomic_store(&peer_session_change_listener, listener);
+}
+
+static void peer_session_changed(long long id)
+{
+    peer_session_listener listener = atomic_load(&peer_session_change_listener);
+    if (listener != NULL) listener(id);
+}
+
 static int open_db(const char *path, sqlite3 **db)
 {
     int rc = sqlite3_open(path, db);
@@ -9328,6 +9351,7 @@ int st_storage_close_peer_mesh_session_visible(const char *path,
     }
     sqlite3_finalize(stmt);
     if (rc == 0) {
+        peer_session_changed(id);
         rc = read_peer_mesh_session_visible(db, id, tenant_id, owner_username, include_all_clients, out_session);
     }
     sqlite3_close(db);
@@ -9416,6 +9440,7 @@ int st_storage_close_open_peer_mesh_sessions_visible(const char *path,
         return -1;
     }
     sqlite3_close(db);
+    for (size_t i = 0; i < id_count; ++i) peer_session_changed(closed[i].id);
     *sessions = closed;
     *session_count = id_count;
     return 0;
@@ -9660,6 +9685,8 @@ typedef struct {
     char status[41];
     int expired;
     char token_hash[ST_SHA256_HEX_LEN + 1U];
+    /* Normalized; empty when missing or unparseable, which never expires. */
+    char expires_at[ST_INSTANT_CAPACITY];
 } peer_session_state;
 
 /* 1 when found, 0 when there is no such session (in the tenant, when one is given), -1 on error. */
@@ -9673,9 +9700,9 @@ static int read_peer_session_state(sqlite3 *db,
     int rc = sqlite3_prepare_v2(db,
         tenant_id == NULL
             ? "SELECT source_client_id,target_client_id,status," PEER_SESSION_EXPIRED_SQL ","
-              "COALESCE(token_hash,'') FROM peer_mesh_session WHERE id=?"
+              "COALESCE(token_hash,''),expires_at FROM peer_mesh_session WHERE id=?"
             : "SELECT source_client_id,target_client_id,status," PEER_SESSION_EXPIRED_SQL ","
-              "COALESCE(token_hash,'') FROM peer_mesh_session WHERE id=? AND tenant_id=?",
+              "COALESCE(token_hash,''),expires_at FROM peer_mesh_session WHERE id=? AND tenant_id=?",
         -1, &stmt, NULL);
     if (rc != SQLITE_OK) return -1;
     sqlite3_bind_int64(stmt, 1, id);
@@ -9690,6 +9717,10 @@ static int read_peer_session_state(sqlite3 *db,
         state->expired = sqlite3_column_int(stmt, 3) != 0;
         const unsigned char *hash = sqlite3_column_text(stmt, 4);
         snprintf(state->token_hash, sizeof(state->token_hash), "%s", hash == NULL ? "" : (const char *)hash);
+        /* Read as specus_peer_session_expired reads it. */
+        const char *expires = (const char *)sqlite3_column_text(stmt, 5);
+        if (expires == NULL || strlen(expires) != (size_t)sqlite3_column_bytes(stmt, 5)
+            || st_instant_normalize(expires, state->expires_at) != 0) state->expires_at[0] = '\0';
     }
     sqlite3_finalize(stmt);
     return found;
@@ -9775,8 +9806,11 @@ int st_storage_report_peer_mesh_session(const char *path,
     int found = read_peer_session_state(db, id, reporter->tenant_id, &state);
     int rc = found == 1
         && (state.source_client_id == reporter->id || state.target_client_id == reporter->id) ? 0 : -1;
+    /* Whether this report closed the session or changed its status, which a relay grant depends on. */
+    int status_changed = 0;
     if (rc == 0 && close_session) {
         rc = close_peer_session(db, id);
+        status_changed = rc == 0 && sqlite3_changes(db) == 1;
     } else if (rc == 0) {
         int closed = peer_session_closed_or_expire(db, id, &state);
         if (closed < 0) rc = -1;
@@ -9817,10 +9851,18 @@ int st_storage_report_peer_mesh_session(const char *path,
                 bind_nullable_text_limit(stmt, 7, remote_endpoint, 255);
                 sqlite3_bind_int64(stmt, 8, id);
                 rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+                status_changed = rc == 0 && sqlite3_changes(db) == 1 && next_status[0] != '\0'
+                    && strcmp(next_status, state.status) != 0;
             } else rc = -1;
             sqlite3_finalize(stmt);
         }
     }
+    /*
+     * Java reportPath drops the session's cached relay grant; only a close or a new status can
+     * change what that grant says, so only those are passed on. A traffic report, a path-report
+     * keeping the status and a report refused to a client outside the session pass nothing.
+     */
+    if (status_changed) peer_session_changed(id);
     if (rc == 0 && out_session != NULL) rc = read_peer_mesh_session(db, reporter->tenant_id, id, out_session);
     sqlite3_close(db);
     return rc;
@@ -9838,12 +9880,13 @@ int st_storage_report_peer_mesh_session(const char *path,
  * it negotiates, and a client flushes its first data frames as soon as a probe succeeds, before
  * its path-report can arrive. With account_traffic the frame's bytes are counted too.
  */
-int st_storage_authorize_peer_mesh_relay(const char *path,
-                                         long long session_id,
-                                         long long from_client_id,
-                                         long long to_client_id,
-                                         long long relay_bytes,
-                                         int account_traffic)
+static int authorize_peer_mesh_relay(const char *path,
+                                     long long session_id,
+                                     long long from_client_id,
+                                     long long to_client_id,
+                                     long long relay_bytes,
+                                     int account_traffic,
+                                     st_storage_peer_mesh_relay_grant *grant)
 {
     int identified = from_client_id > 0 && to_client_id > 0;
     if (session_id <= 0 || relay_bytes < 0
@@ -9886,7 +9929,71 @@ int st_storage_authorize_peer_mesh_relay(const char *path,
         else if (sqlite3_changes(db) != 1) allowed = 0;
     }
     sqlite3_close(db);
+    if (allowed == 1 && grant != NULL) {
+        grant->source_client_id = state.source_client_id;
+        grant->target_client_id = state.target_client_id;
+        memcpy(grant->expires_at, state.expires_at, sizeof(grant->expires_at));
+    }
     return allowed;
+}
+
+int st_storage_authorize_peer_mesh_relay(const char *path,
+                                         long long session_id,
+                                         long long from_client_id,
+                                         long long to_client_id,
+                                         long long relay_bytes,
+                                         int account_traffic)
+{
+    return authorize_peer_mesh_relay(path, session_id, from_client_id, to_client_id, relay_bytes,
+                                     account_traffic, NULL);
+}
+
+int st_storage_authorize_peer_mesh_relay_grant(const char *path,
+                                               long long session_id,
+                                               long long from_client_id,
+                                               long long to_client_id,
+                                               st_storage_peer_mesh_relay_grant *grant)
+{
+    if (grant == NULL) return -1;
+    memset(grant, 0, sizeof(*grant));
+    return authorize_peer_mesh_relay(path, session_id, from_client_id, to_client_id, 0, 0, grant);
+}
+
+int st_storage_record_peer_mesh_relay_traffic(const char *path, long long session_id, long long relay_bytes)
+{
+    if (session_id <= 0 || relay_bytes <= 0) return session_id <= 0 ? -1 : 0;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
+        sqlite3_close(db);
+        return -1;
+    }
+    peer_session_state state;
+    int found = read_peer_session_state(db, session_id, NULL, &state);
+    int closed = found == 1 ? peer_session_closed_or_expire(db, session_id, &state) : 0;
+    int rc = found < 0 || closed < 0 ? -1 : 0;
+    if (rc == 0 && found == 1) {
+        /* Java applyTraffic: the bytes, the effective path type and the traffic and keepalive times. */
+        sqlite3_stmt *stmt = NULL;
+        rc = sqlite3_prepare_v2(db,
+            "UPDATE peer_mesh_session SET path_type="
+            PEER_SESSION_EFFECTIVE_PATH_SQL("direct_bytes", PEER_SESSION_ADD_RELAY_SQL,
+                                            PEER_SESSION_CURRENT_PATH_SQL) ","
+            "relay_bytes=" PEER_SESSION_ADD_RELAY_SQL ",last_traffic_at=CURRENT_TIMESTAMP,"
+            "last_keepalive_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?3",
+            -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) {
+            sqlite3_bind_int64(stmt, 2, relay_bytes);
+            sqlite3_bind_int64(stmt, 3, session_id);
+            rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (rc == 0 && exec_sql(db, "COMMIT") != 0) rc = -1;
+    if (rc != 0) (void)exec_sql(db, "ROLLBACK");
+    sqlite3_close(db);
+    if (rc != 0) return -1;
+    return found == 0 ? 2 : (closed == 1 ? 1 : 0);
 }
 
 /*

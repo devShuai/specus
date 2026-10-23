@@ -5662,14 +5662,16 @@ int main(void)
     }
     st_stun_turn_server *stun_turn_server = NULL;
     if (env_bool("SPECUS_PEER_MESH_ENABLED", 0)) {
+        /* Java StunTurnServer.run: the server runs on without STUN/TURN (every later use takes NULL). */
+        const char *stun_turn_port = getenv("SPECUS_PEER_MESH_STUN_TURN_PORT");
         if (st_stun_turn_server_start(&stun_turn_server) != 0) {
-            fprintf(stderr, "Peer Mesh STUN/TURN listener failed to start\n");
-            config_release_routes(&config);
-            st_public_discovery_shutdown();
-            return 1;
+            stun_turn_server = NULL;
+            fprintf(stderr, "[peer-mesh] standard STUN/TURN UDP server failed to start on %s\n",
+                    stun_turn_port != NULL && *stun_turn_port != '\0' ? stun_turn_port : "3478");
+        } else {
+            printf("[peer-mesh] STUN/TURN UDP listener active on port %d\n",
+                   st_stun_turn_server_port(stun_turn_server));
         }
-        printf("[peer-mesh] STUN/TURN UDP listener active on port %d\n",
-               st_stun_turn_server_port(stun_turn_server));
     }
 
     st_tls_config tls_config;

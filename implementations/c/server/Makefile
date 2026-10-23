@@ -88,6 +88,7 @@ STORAGE_TESTS := $(BUILD_DIR)/specus_c_storage_tests
 SESSION_ORDER_TESTS := $(BUILD_DIR)/specus_c_session_order_tests
 SESSION_SCOPE_TESTS := $(BUILD_DIR)/specus_c_session_scope_tests
 STUN_TURN_TESTS := $(BUILD_DIR)/specus_c_stun_turn_tests
+STUN_TURN_SCALE_TESTS := $(BUILD_DIR)/specus_c_stun_turn_scale_tests
 TLS_TRANSPORT_TESTS := $(BUILD_DIR)/specus_c_tls_transport_tests
 SEMANTIC_VERSION_TESTS := $(BUILD_DIR)/specus_c_semantic_version_tests
 TRAFFIC_CAPTURE_TESTS := $(BUILD_DIR)/specus_c_traffic_capture_tests
@@ -118,6 +119,8 @@ ALL_TESTS += $(CONNECTIVITY_RESOURCE_WIRE_TESTS)
 ALL_TESTS += $(CONNECTIVITY_RATE_HTTP_TESTS)
 TESTS += $(CLIENT_PACKAGE_CLOCK_TESTS)
 ALL_TESTS += $(CLIENT_PACKAGE_CLOCK_TESTS)
+TESTS += $(STUN_TURN_SCALE_TESTS)
+ALL_TESTS += $(STUN_TURN_SCALE_TESTS)
 CONTROL_WRITE_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_control_write_reference_tests
 SESSION_REFERENCE_SERVER := $(BUILD_DIR)/specus_c_session_reference_server
 SESSION_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_session_reference_tests
@@ -406,6 +409,9 @@ $(SESSION_SCOPE_TESTS): $(CORE_OBJS) tests/session_order_tests.c | $(BUILD_DIR)
 
 $(STUN_TURN_TESTS): $(CORE_OBJS) tests/stun_turn_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/stun_turn_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(STUN_TURN_SCALE_TESTS): $(CORE_OBJS) tests/stun_turn_scale_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/stun_turn_scale_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(TLS_TRANSPORT_TESTS): $(CORE_OBJS) tests/tls_transport_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/tls_transport_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
