@@ -65,12 +65,16 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
     /** A WebSocket message, in either direction and however fragmented, carries at most 16 MiB. */
     private static final int MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
     /**
-     * The container hands each browser message over in parts of at most this many bytes (binary)
-     * or characters (text): one part of a binary message fills one SWS2 frame. Tomcat allocates a
-     * message buffer of its full limit for every session, so the 16 MiB message limit cannot be
-     * that buffer; it is counted here instead.
+     * The container hands each browser message over in parts; these limits only size the parts.
+     * A binary part fills at most one SWS2 frame, and a text part is a third of that in UTF-16
+     * units, because each unit takes at most three bytes of UTF-8 (a surrogate pair four bytes for
+     * two units), so its UTF-8 also fits one frame. Tomcat allocates a buffer of the full limit the
+     * first time a session receives a message of that kind and keeps it, so the 16 MiB message
+     * limit cannot be this buffer (16 MiB binary, 32 MiB for 16 Mi chars of text per session); it
+     * is counted here instead.
      */
-    static final int BROWSER_PART_LIMIT = WebSocketSpecusFrame.MAX_PAYLOAD_BYTES;
+    static final int BROWSER_BINARY_PART_LIMIT = WebSocketSpecusFrame.MAX_PAYLOAD_BYTES;
+    static final int BROWSER_TEXT_PART_LIMIT = WebSocketSpecusFrame.MAX_PAYLOAD_BYTES / 3;
     /** Browser reads pause once this much SWS2 data waits on the stream, and resume at half of it. */
     static final long BROWSER_PAUSE_BYTES = StreamFlowController.INITIAL_WINDOW_BYTES;
     /** The RST code of a stream whose browser left without a CLOSE, as on the C and .NET servers. */
@@ -104,8 +108,8 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         int streamId = SpecusStreamIds.next();
         session.getAttributes().put(ATTR_CHANNEL_ID, channelId);
         session.getAttributes().put(ATTR_STREAM_ID, streamId);
-        session.setTextMessageSizeLimit(BROWSER_PART_LIMIT);
-        session.setBinaryMessageSizeLimit(BROWSER_PART_LIMIT);
+        session.setTextMessageSizeLimit(BROWSER_TEXT_PART_LIMIT);
+        session.setBinaryMessageSizeLimit(BROWSER_BINARY_PART_LIMIT);
 
         String clientName = (String) session.getAttributes().get(ATTR_CLIENT_NAME);
         String route = (String) session.getAttributes().get(ATTR_ROUTE);
@@ -118,10 +122,6 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         }
 
         registry.register(streamId, channelId, session, clientName);
-        if (session.getAttributes().get(ATTR_SHARE_STREAM) instanceof HttpShareStreamRegistry.InFlight shareStream) {
-            // A share that ends (revoked, expired, lapsed) closes this WebSocket with 1008.
-            shareStream.attach(() -> terminate(channelId, CloseStatus.POLICY_VIOLATION, "HTTP share ended"));
-        }
         markStreamOpened(controlChannel, streamId);
         StreamFlowController.get(controlChannel).open(streamId, null);
         channelClientNames.put(channelId, clientName);
@@ -151,10 +151,16 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
                         channelId, clientName, route);
             }
         });
+        if (session.getAttributes().get(ATTR_SHARE_STREAM) instanceof HttpShareStreamRegistry.InFlight shareStream) {
+            // A share that ends (revoked, expired, lapsed) closes this WebSocket with 1008. Attached
+            // last: a share cut before this point runs the action at once, and it must find every
+            // entry of the stream to remove, and an opened stream to reset (OPEN is queued first).
+            shareStream.attach(() -> terminate(channelId, CloseStatus.POLICY_VIOLATION, "HTTP share ended"));
+        }
     }
 
     /**
-     * Messages arrive in parts of at most {@link #BROWSER_PART_LIMIT} instead of whole: the
+     * Messages arrive in parts (see {@link #BROWSER_BINARY_PART_LIMIT}) instead of whole: the
      * container then never buffers a 16 MiB message, and each part is forwarded as it comes.
      */
     @Override
@@ -241,8 +247,10 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
             int chunkOpcode = first ? opcode : WebSocketSpecusFrame.OPCODE_CONTINUATION;
             byte[] framed = new WebSocketSpecusFrame(chunkOpcode, finalFragment && last, 0, 0, chunk).encode();
             inbound.queued(framed.length);
-            flow.sendAtomicAsync(streamId, framed, null, () -> closeFromBrowser(channelId))
-                    .whenComplete((ignored, error) -> inbound.sent(framed.length));
+            CompletableFuture<Void> sent = flow.sendAtomicAsync(streamId, framed, null,
+                    () -> closeFromBrowser(channelId));
+            inbound.lastQueued = sent;
+            sent.whenComplete((ignored, error) -> inbound.sent(framed.length));
             first = false;
         } while (offset < payload.length);
     }
@@ -427,13 +435,17 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
 
     /**
      * Ends the stream from the browser side. A close code the wire can carry goes to the device as
-     * SWS2 CLOSE + FIN, a close without code (1005) as a CLOSE without code + FIN. A browser that
-     * left without any CLOSE (1006, also Tomcat's report of a write timeout) or with another code
-     * the wire cannot carry gets the stream reset with {@link #RST_BROWSER_GONE}, as the C and .NET
-     * servers do: there is no close handshake to relay.
+     * SWS2 CLOSE + FIN, a close without code (1005, which Tomcat never reports: it reads an empty
+     * CLOSE as 1000) as a CLOSE without code + FIN. A browser that left without any CLOSE (1006,
+     * also Tomcat's report of a write timeout) or with another code the wire cannot carry gets the
+     * stream reset with {@link #RST_BROWSER_GONE}, as the C and .NET servers do: there is no close
+     * handshake to relay.
      */
     private void detachBrowser(String channelId, CloseStatus status, boolean closeSession) {
-        endBrowserInbound(channelId);
+        BrowserInbound inbound = browserInbound.remove(channelId);
+        if (inbound != null) {
+            inbound.close();
+        }
         String clientName = channelClientNames.remove(channelId);
         Integer streamId = channelStreamIds.remove(channelId);
         Channel controlChannel = clientName == null || streamId == null
@@ -457,7 +469,8 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         if (close == null) {
             log.info("[ws-specus][browser->client] channelId={} streamId={} reset=browser-gone status={}",
                     channelId, streamId, status);
-            flow.reset(streamId, RST_BROWSER_GONE, BROWSER_GONE_REASON);
+            resetAfterQueuedData(controlChannel, flow, streamId,
+                    inbound == null ? CompletableFuture.completedFuture(null) : inbound.lastQueued);
             return;
         }
         CompletableFuture<Void> sequence = flow.sendAtomicAsync(streamId, close, null, null)
@@ -476,6 +489,34 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
                     ? "websocket close credit timeout"
                     : "websocket close send failed";
             flow.reset(streamId, 8, resetReason);
+        });
+    }
+
+    /**
+     * Resets a stream whose browser is gone once the browser data already queued on it is written:
+     * the C server reads the next browser frame only after the last one had credit, so everything
+     * it read goes out before its RST. A reset would otherwise drop the queue (up to
+     * {@link #BROWSER_PAUSE_BYTES} and a few parts). A device that returns no credit within the
+     * close credit timeout gets the RST then, dropping what still waits; a stream that already
+     * ended meanwhile (its own RST, the device's FIN or RST, a lost connection) gets none.
+     */
+    private void resetAfterQueuedData(Channel controlChannel, StreamFlowController flow, int streamId,
+                                      CompletableFuture<Void> queued) {
+        CompletableFuture<Void> written = new CompletableFuture<>();
+        var timeout = controlChannel.eventLoop().schedule(() -> written.complete(null),
+                closeCreditTimeoutMillis, TimeUnit.MILLISECONDS);
+        queued.whenComplete((ignored, error) -> {
+            if (error == null) {
+                written.complete(null);
+            } else {
+                written.completeExceptionally(error);
+            }
+        });
+        written.whenComplete((ignored, error) -> {
+            timeout.cancel(false);
+            if (error == null) {
+                flow.reset(streamId, RST_BROWSER_GONE, BROWSER_GONE_REASON);
+            }
         });
     }
 
@@ -508,7 +549,11 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         }
     }
 
-    /** Tomcat's own session behind {@code session}, whose reads can be suspended, or null. */
+    /**
+     * Tomcat's own session behind {@code session}, whose reads can be suspended, or null. This ties
+     * the handler to Tomcat's WebSocket classes (tomcat-embed-websocket): on another servlet
+     * container without them, opening a tunnel WebSocket would fail here with NoClassDefFoundError.
+     */
     private static WsSession tomcatSession(WebSocketSession session) {
         return session instanceof NativeWebSocketSession nativeSession
                 ? nativeSession.getNativeSession(WsSession.class) : null;
@@ -529,6 +574,8 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         // touches these.
         private boolean messageOpen;
         private long messageBytes;
+        /** The last SWS2 frame queued on the stream; frames are written in order. */
+        private volatile CompletableFuture<Void> lastQueued = CompletableFuture.completedFuture(null);
         // Shared with the data connection's event loop, which completes the queued frames.
         private long queuedBytes;
         private boolean paused;

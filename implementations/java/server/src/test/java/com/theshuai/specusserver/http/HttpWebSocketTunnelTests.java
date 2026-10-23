@@ -114,6 +114,12 @@ class HttpWebSocketTunnelTests {
             browser.socket.sendText(new String(text, StandardCharsets.UTF_8), true).get(30, TimeUnit.SECONDS);
             assertMessage(device.nextMessage(), WebSocketSpecusFrame.OPCODE_TEXT, text);
 
+            // 120,000 UTF-16 units in parts of 21,841: the first boundary falls between the two
+            // halves of an emoji, which Tomcat's decoder keeps together in the next part.
+            byte[] emoji = "😀a".repeat(40_000).getBytes(StandardCharsets.UTF_8);
+            browser.socket.sendText(new String(emoji, StandardCharsets.UTF_8), true).get(30, TimeUnit.SECONDS);
+            assertMessage(device.nextMessage(), WebSocketSpecusFrame.OPCODE_TEXT, emoji);
+
             byte[] largest = pattern(MAX_MESSAGE_BYTES);
             browser.socket.sendBinary(ByteBuffer.wrap(largest), true).get(60, TimeUnit.SECONDS);
             assertMessage(device.nextMessage(), WebSocketSpecusFrame.OPCODE_BINARY, largest);
