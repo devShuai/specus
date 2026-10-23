@@ -7,6 +7,7 @@
 #include "instant.h"
 #include "json.h"
 #include "media_capture.h"
+#include "metrics.h"
 #include "object_storage.h"
 #include "peer_mesh.h"
 #include "product_metrics.h"
@@ -3099,10 +3100,21 @@ static int read_frame(specus_session *session,
     if (rc <= 0) {
         return rc;
     }
-    if (st_protocol_read_header(raw_header, header) != 0) {
+    /*
+     * Java's frame decoder refuses a frame from its length field alone, before the codec reads the
+     * rest of the header; before login that is specus.control.preauth.oversize.rejected, and a header
+     * the codec refuses is specus.control.protocol.rejected (ControlProtocolMetricsHandler).
+     */
+    uint32_t declared_length = ((uint32_t)raw_header[7] << 24) | ((uint32_t)raw_header[8] << 16)
+        | ((uint32_t)raw_header[9] << 8) | (uint32_t)raw_header[10];
+    if (declared_length > max_frame_size - ST_HEADER_SIZE) {
+        if (max_frame_size == ST_PRE_AUTH_MAX_FRAME_SIZE) {
+            st_metrics_increment(ST_METRIC_CONTROL_PREAUTH_OVERSIZE_REJECTED);
+        }
         return -1;
     }
-    if (header->length > max_frame_size - ST_HEADER_SIZE) {
+    if (st_protocol_read_header(raw_header, header) != 0) {
+        st_metrics_protocol_rejected(st_protocol_last_rejection());
         return -1;
     }
     uint8_t *frame_body = (uint8_t *)malloc(header->length == 0 ? 1U : header->length);
@@ -5627,6 +5639,7 @@ static void *client_thread(void *arg)
             }
             st_login_request request;
             if (st_protocol_decode_login_request(body, header.length, &request) != 0) {
+                st_metrics_protocol_rejected(st_protocol_last_rejection());
                 free(body);
                 st_buffer response = st_protocol_encode_login_response("", 0, "登录包无法解析");
                 session_send_packet(session, &response);
@@ -5813,6 +5826,7 @@ static void *client_thread(void *arg)
             }
             st_message_response message_request;
             if (st_protocol_decode_message_response(body, header.length, &message_request) != 0) {
+                st_metrics_protocol_rejected(st_protocol_last_rejection());
                 disconnect_reason = "PROTOCOL_VIOLATION";
                 fprintf(stderr, "[message] invalid request from %s\n", session->remote);
                 free(body);
@@ -5867,6 +5881,7 @@ static void *client_thread(void *arg)
             }
             st_nat_message message;
             if (st_protocol_decode_nat_message(body, header.length, &message) != 0) {
+                st_metrics_protocol_rejected(st_protocol_last_rejection());
                 disconnect_reason = "PROTOCOL_VIOLATION";
                 fprintf(stderr, "[nat] bad NAT frame from %s\n", session->remote);
                 free(body);
@@ -6066,6 +6081,10 @@ int main(void)
     if (st_public_coordination_validate_config() != 0) {
         return 1;
     }
+    /* Java does not start with an endpoint id it cannot read in management.endpoints.web.exposure. */
+    if (st_metrics_validate_current() != 0) {
+        return 1;
+    }
     if (st_public_discovery_initialize() != 0) {
         fprintf(stderr, "public transfer discovery initialization failed\n");
         return 1;
@@ -6100,6 +6119,7 @@ int main(void)
 
     st_tls_config tls_config;
     st_tls_config_from_env(&tls_config);
+    st_metrics_set_control_tls(st_tls_metric_mode(&tls_config), 0);
     char tls_error[512];
     if (st_tls_validate_deployment(&tls_config,
                                    getenv("SPECUS_ENV"),
@@ -6116,6 +6136,8 @@ int main(void)
         st_public_discovery_shutdown();
         return 1;
     }
+    st_metrics_set_control_tls(st_tls_metric_mode(&tls_config),
+                               st_tls_server_context_certificate_expiry(config.tls_context));
 
     int shutdown_pipe[2] = {-1, -1};
     if (shutdown_wake_open(shutdown_pipe) != 0) {

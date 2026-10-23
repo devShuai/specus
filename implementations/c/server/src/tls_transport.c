@@ -2,6 +2,7 @@
 
 #include "tls_transport.h"
 
+#include "metrics.h"
 #include "security_baseline.h"
 
 #include <arpa/inet.h>
@@ -28,6 +29,8 @@
 struct st_tls_server_context {
     SSL_CTX *ssl_ctx;
     st_tls_mode mode;
+    /* notAfter of the certificate a file keystore holds, in epoch seconds; 0 otherwise. */
+    long long certificate_expiry;
 };
 
 struct st_tls_connection {
@@ -174,12 +177,15 @@ int st_tls_validate_deployment(const st_tls_config *config,
     if (!production) {
         return 0;
     }
+    /* Java NettyServer counts specus.control.plaintext.deployment.rejected before it refuses to start. */
     if (config->mode == ST_TLS_SELF_SIGNED) {
+        st_metrics_increment(ST_METRIC_CONTROL_PLAINTEXT_DEPLOYMENT_REJECTED);
         return set_error(error, error_len,
                          "production control channel cannot use a self-signed certificate");
     }
     if (config->mode == ST_TLS_DISABLED
         && (!config->terminated_upstream || !private_bind_address(bind_address))) {
+        st_metrics_increment(ST_METRIC_CONTROL_PLAINTEXT_DEPLOYMENT_REJECTED);
         return set_error(error,
                          error_len,
                          "production control channel requires TLS, or trusted upstream TLS with a private/loopback bind address");
@@ -353,6 +359,24 @@ static int load_file_credentials(SSL_CTX *ctx,
     return 0;
 }
 
+/*
+ * Java TlsContextFactory.certificateExpiryEpochSeconds: the notAfter of the keystore's certificate
+ * (the one its key entry starts with), in seconds since the epoch; 0 when it cannot be read.
+ */
+static long long certificate_expiry_epoch_seconds(const X509 *certificate)
+{
+    const ASN1_TIME *not_after = certificate == NULL ? NULL : X509_get0_notAfter(certificate);
+    ASN1_TIME *epoch = not_after == NULL ? NULL : ASN1_TIME_set(NULL, 0);
+    int days = 0;
+    int seconds = 0;
+    long long result = 0;
+    if (epoch != NULL && ASN1_TIME_diff(&days, &seconds, epoch, not_after) == 1) {
+        result = (long long)days * 86400LL + seconds;
+    }
+    ASN1_TIME_free(epoch);
+    return result;
+}
+
 int st_tls_server_context_create(const st_tls_config *config,
                                  st_tls_server_context **out,
                                  char *error,
@@ -383,8 +407,28 @@ int st_tls_server_context_create(const st_tls_config *config,
         st_tls_server_context_free(context);
         return -1;
     }
+    if (config->mode == ST_TLS_FILE) {
+        context->certificate_expiry = certificate_expiry_epoch_seconds(SSL_CTX_get0_certificate(context->ssl_ctx));
+    }
     *out = context;
     return 0;
+}
+
+long long st_tls_server_context_certificate_expiry(const st_tls_server_context *context)
+{
+    return context == NULL ? 0 : context->certificate_expiry;
+}
+
+const char *st_tls_metric_mode(const st_tls_config *config)
+{
+    if (config == NULL) {
+        return "disabled";
+    }
+    switch (config->mode) {
+        case ST_TLS_FILE: return "file";
+        case ST_TLS_SELF_SIGNED: return "self_signed";
+        default: return config->terminated_upstream ? "terminated_upstream" : "disabled";
+    }
 }
 
 void st_tls_server_context_free(st_tls_server_context *context)
