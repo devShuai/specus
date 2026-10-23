@@ -171,7 +171,7 @@ Additional runtime knobs:
 | `SPECUS_MEDIA_CAPTURE_ENABLED` | `false` | Enables route-level media capture after its S3-compatible endpoint/bucket/credentials validate. |
 | `SPECUS_MEDIA_CAPTURE_ENDPOINT` / `REGION` / `BUCKET` | unset | Dedicated RustFS/S3-compatible media store. |
 | `SPECUS_MEDIA_CAPTURE_MAX_INFLIGHT_PARTS` | `4` | Java `max-inflight-parts`: full parts of one capture upload while the response goes on, at most this many at a time; the response waits only beyond that. At least `1`. |
-| `SPECUS_MEDIA_CAPTURE_UPLOAD_THREADS` | `4` | Java `upload-threads`: part uploads that run at once over all captures. At least `1`. |
+| `SPECUS_MEDIA_CAPTURE_UPLOAD_THREADS` | `4` | Java `upload-threads`: part uploads that run at once over all captures, on at most this many workers that go after 30 s idle. As in Java's executor, at most `max(threads, threads * max-inflight-parts * 4)` parts (64 by default) wait for a worker, and a part beyond that is uploaded by the forwarding thread itself (`CallerRunsPolicy`). At least `1`. |
 | `SPECUS_ELASTICSEARCH_URIS` | unset | Enables Elasticsearch HTTP/TCP detail storage and management queries; unset keeps SQLite details. |
 | `SPECUS_CLIENT_PACKAGE_DATA_DIRECTORY` | `./data` | Parent directory of hosted client-package artifacts; the bytes live in its `packages` child, as in Java. |
 | `SPECUS_CLIENT_PACKAGE_GITHUB_RELEASE_FALLBACK_ENABLED` | `true` | Merges validated official GitHub latest-release assets for targets without any configured row. |
@@ -205,9 +205,9 @@ Additional runtime knobs:
 | `SPECUS_HTTP_REWRITE_MAX_BODY_BYTES` | `10485760` | Max streamed HTTP response body size eligible for path rewriting when the SQLite HTTP route has `pathRewriteEnabled=true`; `0` disables rewriting. |
 | `SPECUS_HTTP_MAX_REQUEST_BODY_SIZE` | `16777216` | Java `specus.http.max-request-body-size`: the largest request body of a Direct HTTP route or share (`413` beyond it); an int, a negative value is `0`. C reads the whole body into memory before forwarding it, so a larger limit is that much memory per concurrent upload. |
 | `SPECUS_HTTP_TIMEOUT_MS` | `30000` | Java `specus.http.timeout-ms`: how long a route or share request waits for the response head once its body went up, and for the window of each body chunk; `504` (`TimeoutException`, as Java) and `RST 8` after it. A negative value times out at once. |
-| `SERVER_TOMCAT_CONNECTION_TIMEOUT` (or `SERVER_TOMCAT_CONNECTIONTIMEOUT`) | `60000` | The Java server's `server.tomcat.connection-timeout`, Tomcat's 60 s by default: a request head, request body or answer on the management listener (`/http/**` and `/http-share/**` included) that makes no progress for that long fails. A connection that sends nothing or stalls its head is dropped without an answer, a stalled body is answered `400`, and a caller that stops reading a streamed route response has its NAT stream reset with `RST 8`. An upgraded WebSocket is not subject to it. A Spring duration: milliseconds, or with a unit (`60s`, `500ms`, `1m`), or ISO-8601 (`PT60S`); `0` or less is no timeout, anything else refuses the start. |
-| `SERVER_TOMCAT_MAX_CONNECTIONS` (or `SERVER_TOMCAT_MAXCONNECTIONS`) | `8192` | `server.tomcat.max-connections`: at most this many management-listener sockets are open (each one has a thread); further connections wait in the listen backlog until one closes. `0` or less keeps the default, as Spring Boot does. |
-| `SERVER_TOMCAT_ACCEPT_COUNT` (or `SERVER_TOMCAT_ACCEPTCOUNT`) | `100` | `server.tomcat.accept-count`: the listen backlog of the management listener. `0` or less keeps the default. |
+| `SERVER_TOMCAT_CONNECTION_TIMEOUT` (or `SERVER_TOMCAT_CONNECTIONTIMEOUT`) | `60000` | The Java server's `server.tomcat.connection-timeout`, Tomcat's 60 s by default: a request head, request body or answer on the management listener (`/http/**` and `/http-share/**` included) that makes no progress for that long fails. A connection that sends nothing or stalls its head is dropped without an answer, a stalled body is answered `400`, and a caller that stops reading a streamed route response has its NAT stream reset with `RST 8`. A write fails only after that long without progress; any progress starts the time again. Once a WebSocket handler took the upgrade, the connection has no read timeout and Tomcat's 20 s WebSocket send timeout (a route or share WebSocket whose browser stops reading is reset with `RST 31`); a request that only carries the upgrade headers keeps the connection timeout. A Spring duration: milliseconds, or with a unit (`60s`, `500ms`, `1m`), or ISO-8601 (`PT60S`); `0` or less is no timeout, anything else refuses the start. |
+| `SERVER_TOMCAT_MAX_CONNECTIONS` (or `SERVER_TOMCAT_MAXCONNECTIONS`) | `8192` | `server.tomcat.max-connections`: at most this many management-listener sockets are open (each one has a thread); further connections wait in the listen backlog until one closes. `0` or less keeps the default, as Spring Boot does. Read as Spring binds an int (`NumberUtils.parseNumber`): every whitespace character is dropped, `0x`, `0X` or `#` is hexadecimal, and a value that does not bind refuses the start. |
+| `SERVER_TOMCAT_ACCEPT_COUNT` (or `SERVER_TOMCAT_ACCEPTCOUNT`) | `100` | `server.tomcat.accept-count`: the listen backlog of the management listener. `0` or less keeps the default; read like `SERVER_TOMCAT_MAX_CONNECTIONS`. |
 
 Compressed response rewriting has an additional non-configurable safety boundary shared with Java:
 decompressed output may not exceed 64 MiB or `max(64 KiB, compressed size × 100)`, whichever is
@@ -583,10 +583,11 @@ bounds the wait for the response head after the request went up and the wait for
 request body chunk; either timeout answers `504` `TimeoutException` and resets the stream with
 `RST 8`, as Java's `cancelHttpStream` resets every stream the server ends on its own (a caller that
 went away or stopped reading, an unusable response frame, an ended share). A stream reset by the
-client or by the server, or lost with its data connection, answers `502` `HTTP 转发请求失败`, never
-the `客户端不在线` of a client that was not there. The request target may be as long as the 8 KiB
-request head allows; it is never cut short. `Expect: 100-continue` on an HTTP/1.1 request gets
-Tomcat's interim `HTTP/1.1 100` as soon as the head is read, before the route gate or any handler.
+client or by the server, or lost with its data connection (a write to it that fails included),
+answers `502` `HTTP 转发请求失败`, never the `客户端不在线` of a client that was not there. The
+request target may be as long as the 8 KiB request head allows; it is never cut short.
+`Expect: 100-continue` on an HTTP/1.1 request gets Tomcat's interim `HTTP/1.1 100` as soon as the
+head is read, before the route gate or any handler.
 Trailers cross as `protocol/spec/http-route.md` sections 3 and 4 require, like Java
 `HttpSpecusController`: the names of the request's `Trailer` headers are declared in `trailerNames`
 (trimmed tokens, no hop-by-hop field, each once, without `Authorization` once the route gate
@@ -599,7 +600,9 @@ as well: a `413` with the request headers and the body's first 64 KiB, the route
 chunked with the forwarded headers and the body's start), and a share cut before the response head
 as `502` `HTTP share ended`, although the visitor's connection is aborted rather than answered
 (`protocol/spec/temporary-http-share.md` 6.6). A caller that went away or stopped reading is
-recorded with the client's status and no failure, as Java records a client abort.
+recorded with the client's status and no failure, as Java records a client abort; a response the
+server itself could not relay (no memory for it, a body before the head) is answered `502` while
+nothing went out and recorded as `HTTP response could not be relayed`.
 `tests/nat_stream_tests.c` and `tests/http_connector_tests.c` check each rule against a real server
 process.
 
