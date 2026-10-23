@@ -249,7 +249,8 @@ typedef struct {
     char resource_type[16];
     char resource_key[256];
     long long resource_id;
-    char resource_name[512];
+    /* Java's whole name: a route (under 128 bytes here) and a target URL (under 512) with " -> ". */
+    char resource_name[1024];
     char usage_date[16];
     long long upload_bytes;
     long long download_bytes;
@@ -1086,12 +1087,34 @@ int st_storage_list_connection_stats_visible(const char *path,
                                              st_storage_connection_stat *stats,
                                              size_t max_stats,
                                              size_t *stat_count);
+/*
+ * Adds bytes to a client's day as Java TrafficUsageService does: the account is found by client_id
+ * (by client_name when client_id <= 0) and gives the row its tenant, id and current name; a client
+ * that no longer exists is not counted (0). The resource variant does the same for one resource's
+ * row and stores resource_id (0 for none) and resource_name as given.
+ */
 int st_storage_record_traffic_usage(const char *path,
                                     long long client_id,
                                     const char *client_name,
                                     const char *usage_date,
                                     long long upload_bytes,
                                     long long download_bytes);
+/* Bytes counted in memory for a client's day (resource_key "") or one resource of it. */
+typedef struct {
+    const char *client_name;
+    const char *resource_key; /* "", "tcp:<listenPort>" or "http:<route>" */
+    long long upload_bytes;
+    long long download_bytes;
+} st_storage_traffic_delta;
+
+/*
+ * Java TrafficUsageService.flush: writes the counts in one transaction, on the UTC date and with
+ * the instant of the call. Each client is found by name (Java findClientByName), so the bytes of
+ * a client deleted or renamed since are dropped; a resource row takes the resource's current id
+ * and name (resolveResource: the mapping on that port or the route of that name, "端口 <port>" or
+ * the bare route when there is none). 0 once committed, -1 when nothing was written.
+ */
+int st_storage_flush_traffic_usage(const char *path, const st_storage_traffic_delta *deltas, size_t delta_count);
 int st_storage_list_traffic_usage(const char *path,
                                   long long client_id,
                                   int limit,

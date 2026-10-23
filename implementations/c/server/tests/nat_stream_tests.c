@@ -2077,7 +2077,7 @@ static int test_request_body_limit(test_server *server)
 }
 
 /* A POST to the paired client's route announcing body_len bytes, sent along when send_body is set. */
-static int browser_post(const test_server *server, const client_pair *pair, size_t body_len, int send_body)
+static int browser_upload(const test_server *server, const client_pair *pair, size_t body_len, int send_body)
 {
     char client[768];
     char head[1536];
@@ -2107,7 +2107,7 @@ static int browser_post(const test_server *server, const client_pair *pair, size
  */
 static int check_http_configured_limits(test_server *server, client_pair *pair)
 {
-    int browser = browser_post(server, pair, CONFIGURED_BODY_LIMIT + 1U, 0);
+    int browser = browser_upload(server, pair, CONFIGURED_BODY_LIMIT + 1U, 0);
     CHECK(browser >= 0, "oversized request");
     CHECK(expect_browser_status(browser, 413, "HTTP 请求体超过限制", -1) == 0, "body over the configured limit");
     close_fd(&browser);
@@ -2126,7 +2126,7 @@ static int check_http_configured_limits(test_server *server, client_pair *pair)
     /* Timed from before the request: the server may send the first window before the OPEN is read
      * here, and the upper bound covers the 2 MiB the request carries. */
     started = monotonic_ms();
-    browser = browser_post(server, pair, CONFIGURED_BODY_LIMIT, 1);
+    browser = browser_upload(server, pair, CONFIGURED_BODY_LIMIT, 1);
     CHECK(browser >= 0, "upload");
     CHECK(expect_http_open(pair->data, &stream_id) == 0, "no request OPEN for the upload");
     CHECK(wait_rst(pair->data, stream_id, &code) == 0 && code == 30U, "upload window timeout reset (code %u)", code);

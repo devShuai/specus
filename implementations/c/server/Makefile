@@ -25,6 +25,7 @@ CONNECTIVITY_LIFETIME_TESTS := $(BUILD_DIR)/specus_c_connectivity_lifetime_tests
 CONNECTIVITY_SETTER_TESTS := $(BUILD_DIR)/specus_c_connectivity_setter_tests
 CORE_OBJS += $(BUILD_DIR)/instant.o $(BUILD_DIR)/instant_storage.o $(BUILD_DIR)/java_uri.o
 CORE_OBJS += $(BUILD_DIR)/websocket_ticket.o
+CORE_OBJS += $(BUILD_DIR)/traffic_usage.o
 INSTANT_TESTS := $(BUILD_DIR)/specus_c_instant_tests
 INSTANT_MIGRATION_TESTS := $(BUILD_DIR)/specus_c_instant_migration_tests
 CONNECTION_TIME_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_connection_time_reference_tests
@@ -125,6 +126,8 @@ HTTP_LOG_REASON_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_http_log_reason_referen
 HTTP_RESET_REASON_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_http_reset_reason_reference_tests
 TESTS += $(HTTP_LOG_REASON_REFERENCE_TESTS)
 ALL_TESTS += $(HTTP_LOG_REASON_REFERENCE_TESTS) $(HTTP_RESET_REASON_REFERENCE_TESTS)
+TRAFFIC_USAGE_TESTS := $(BUILD_DIR)/specus_c_traffic_usage_tests
+ALL_TESTS += $(TRAFFIC_USAGE_TESTS)
 
 # This adverse clock view uses Linux's process-local preload, never the host clock.
 ifeq ($(shell uname -s),Linux)
@@ -208,6 +211,9 @@ $(HTTP_LOG_REASON_REFERENCE_TESTS): $(CORE_OBJS) tests/http_log_reason_reference
 
 $(HTTP_RESET_REASON_REFERENCE_TESTS): $(CORE_OBJS) tests/http_reset_reason_reference_tests.c tests/nat_stream_tests.c tests/connectivity_nat_test_cases.h tests/connectivity_nat_complete_cases.h tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DST_CONNECTIVITY_VECTOR_DIR='"../../../protocol/test-vectors/"' tests/http_reset_reason_reference_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(TRAFFIC_USAGE_TESTS): $(CORE_OBJS) tests/traffic_usage_tests.c tests/nat_stream_tests.c tests/connectivity_nat_test_cases.h tests/connectivity_nat_complete_cases.h tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DST_CONNECTIVITY_VECTOR_DIR='"../../../protocol/test-vectors/"' tests/traffic_usage_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 ifeq ($(shell uname -s),Linux)
 $(NAT_PUSH_REFERENCE_SERVER): $(CORE_OBJS) src/main.c tests/nat_push_reference_server.c | $(BUILD_DIR)
@@ -439,6 +445,7 @@ test: all
 	$(NAT_PUSH_REFERENCE_TEST_COMMAND)
 	$(SESSION_REFERENCE_TESTS) $(SESSION_REFERENCE_SERVER)
 	$(HTTP_RESET_REASON_REFERENCE_TESTS) $(SERVER)
+	$(TRAFFIC_USAGE_TESTS) $(SERVER)
 	$(CONNECTIVITY_RATE_HTTP_TESTS)
 	$(CONNECTIVITY_RESOURCE_WIRE_TESTS) $(SERVER)
 	$(UNICODE_JAVA21_TESTS) "$(abspath $(UNICODE_JAVA21_VECTORS))"
