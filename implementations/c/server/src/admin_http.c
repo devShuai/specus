@@ -14250,14 +14250,36 @@ int st_admin_resolve_static_path(const char *static_root,
     return 0;
 }
 
+/*
+ * Writes all of buffer. On a socket with a send timeout (SO_SNDTIMEO) it fails, with EAGAIN, once
+ * nothing could be written for that long, the clock restarting whenever something was, as Tomcat's
+ * blocking write does. A plain blocking send would not do that: one that wrote a little and then
+ * stalled returns only when its whole timeout ran out, and the next one waits all of it again.
+ */
 static int send_all(int fd, const char *buffer, size_t len)
 {
+    struct timeval timeout = {0, 0};
+    socklen_t timeout_len = sizeof(timeout);
+    int timeout_ms = -1;
+    if (getsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, &timeout_len) == 0
+        && (timeout.tv_sec > 0 || timeout.tv_usec > 0)) {
+        long long ms = (long long)timeout.tv_sec * 1000LL + timeout.tv_usec / 1000;
+        timeout_ms = ms > INT_MAX ? INT_MAX : ms < 1 ? 1 : (int)ms;
+    }
     size_t offset = 0;
     while (offset < len) {
-        ssize_t sent = send(fd, buffer + offset, len - offset, 0);
+        ssize_t sent = send(fd, buffer + offset, len - offset, timeout_ms < 0 ? 0 : MSG_DONTWAIT);
         if (sent < 0) {
             if (errno == EINTR) {
                 continue;
+            }
+            if (timeout_ms >= 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                struct pollfd writable = {.fd = fd, .events = POLLOUT, .revents = 0};
+                int ready = poll(&writable, 1, timeout_ms);
+                if (ready > 0 || (ready < 0 && errno == EINTR)) {
+                    continue;
+                }
+                errno = EAGAIN;
             }
             return -1;
         }
@@ -14281,8 +14303,7 @@ void st_admin_set_connector_limits(int connection_timeout_ms, int max_connection
 /*
  * Tomcat's connectionTimeout on an accepted socket: a blocking read or write that makes no progress
  * for that long fails (NioSocketWrapper restarts the clock whenever something was written; each
- * send and recv here gets the whole timeout again). 0 or less takes the timeouts off again, as for a
- * WebSocket once its upgrade is under way: Tomcat has no idle timeout for one either.
+ * send and recv here gets the whole timeout again). 0 or less: no timeout.
  */
 static void admin_socket_set_timeouts(int fd, int timeout_ms)
 {
@@ -14293,6 +14314,21 @@ static void admin_socket_set_timeouts(int fd, int timeout_ms)
     }
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+}
+
+/*
+ * The timeouts of a socket whose request asks for a WebSocket upgrade: Tomcat reads an upgraded
+ * connection without an idle timeout, and its blocking sends give up after 20 s
+ * (org.apache.tomcat.websocket.BLOCKING_SEND_TIMEOUT). A writer with deadlines of its own sends with
+ * MSG_DONTWAIT, which this does not touch.
+ */
+#define ST_ADMIN_WEBSOCKET_BLOCKING_SEND_TIMEOUT_MS 20000
+static void admin_socket_set_websocket_timeouts(int fd)
+{
+    struct timeval no_timeout = {0, 0};
+    struct timeval send_timeout = {ST_ADMIN_WEBSOCKET_BLOCKING_SEND_TIMEOUT_MS / 1000, 0};
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &no_timeout, sizeof(no_timeout));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
 }
 
 /* Whether a socket call failed because the connection timeout ran out. */
@@ -20477,8 +20513,8 @@ static void handle_http_share_client(st_admin_server *server,
         return;
     }
     if (admission.upgrade) {
-        /* Past the HTTP request the WebSocket keeps its own timing; Tomcat does not idle one out. */
-        admin_socket_set_timeouts(fd, 0);
+        /* The share's WebSocket handler answers every such request, the upgrade or a refusal. */
+        admin_socket_set_websocket_timeouts(fd);
         forward_http_share_websocket(server, fd, method, request, &admission);
     } else {
         const char *body = NULL;
@@ -20774,9 +20810,9 @@ static void handle_client(st_admin_server *server, int fd)
     char request_remote_address[ST_CLIENT_ADDRESS_MAX_LEN];
     admin_request_client_address(fd, request, request_remote_address);
 
-    if (admin_request_is_websocket_upgrade(request)) {
-        /* Past the HTTP request the WebSocket keeps its own timing; Tomcat does not idle one out. */
-        admin_socket_set_timeouts(fd, 0);
+    int websocket_upgrade = admin_request_is_websocket_upgrade(request);
+    if (websocket_upgrade) {
+        admin_socket_set_websocket_timeouts(fd);
     }
     if (st_public_discovery_handle_websocket(fd,
                                              method,
@@ -20813,6 +20849,10 @@ static void handle_client(st_admin_server *server, int fd)
         free(body_buffer);
         close(fd);
         return;
+    }
+    if (websocket_upgrade) {
+        /* No WebSocket handler took it: whatever answers is under the connection timeout again. */
+        admin_socket_set_timeouts(fd, server->connection_timeout_ms);
     }
     int direct_handled = handle_direct_http_request(server,
                                                     fd,
