@@ -565,6 +565,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             "SPECUS_NAT_STREAM_ONLY=connectivity NAT complete"
             $<TARGET_FILE:specus_c_nat_stream_tests> $<TARGET_FILE:specus-server-c>)
     set_tests_properties(nat_connectivity_clock_adjustment PROPERTIES TIMEOUT 60)
+    # The SPECUS_HTTP_TIMEOUT_MS waits of a route request, under the same wall clock 3 s behind.
+    add_test(NAME nat_http_timeout_clock_adjustment
+        COMMAND ${CMAKE_COMMAND} -E env
+            "LD_PRELOAD=$<TARGET_FILE:specus_c_connectivity_clock_offset>"
+            "SPECUS_NAT_STREAM_ONLY=SPECUS_HTTP_"
+            $<TARGET_FILE:specus_c_nat_stream_tests> $<TARGET_FILE:specus-server-c>)
+    set_tests_properties(nat_http_timeout_clock_adjustment PROPERTIES TIMEOUT 60)
 endif()
 
 # Reference tests compile private main.c code without adding switches to the shipped server.

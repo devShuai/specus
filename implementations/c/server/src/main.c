@@ -2090,13 +2090,13 @@ static void direct_pending_retire(specus_session *session, direct_http_pending *
     pthread_mutex_unlock(&session->direct_lock);
 }
 
-/* The wall-clock instant timeout_ms from now, for pthread_cond_timedwait on a default condition. */
+/* The CLOCK_MONOTONIC instant timeout_ms from now, for pthread_cond_timedwait on a pending stream. */
 static void direct_deadline_after(int64_t timeout_ms, struct timespec *deadline)
 {
-    struct timeval now;
-    gettimeofday(&now, NULL);
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
     int64_t seconds = timeout_ms / 1000;
-    long nanoseconds = (long)(timeout_ms % 1000) * 1000000L + (long)now.tv_usec * 1000L;
+    long nanoseconds = (long)(timeout_ms % 1000) * 1000000L + now.tv_nsec;
     deadline->tv_sec = now.tv_sec + (time_t)seconds + nanoseconds / 1000000000L;
     deadline->tv_nsec = nanoseconds % 1000000000L;
 }
@@ -2147,7 +2147,16 @@ static int direct_http_forward(void *ctx,
     memset(&pending, 0, sizeof(pending));
     pending.send_credit = ST_STREAM_INITIAL_WINDOW;
     pending.receive_credit = ST_STREAM_INITIAL_WINDOW;
-    pthread_cond_init(&pending.cond, NULL);
+    /* The timeouts are monotonic: a wall-clock correction must neither cut them short nor stretch them. */
+    pthread_condattr_t cond_attr;
+    int attr_ok = pthread_condattr_init(&cond_attr) == 0;
+    int cond_ok = attr_ok && pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC) == 0
+        && pthread_cond_init(&pending.cond, &cond_attr) == 0;
+    if (attr_ok) pthread_condattr_destroy(&cond_attr);
+    if (!cond_ok) {
+        session_reference_release(session);
+        return -1;
+    }
 
     pthread_mutex_lock(&session->map_lock);
     pending.stream_id = session->next_stream_id++;
