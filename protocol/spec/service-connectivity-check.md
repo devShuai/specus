@@ -38,7 +38,7 @@ Peer 服务目录里的「已发布」来自发布端自己的本地探测：TCP
 | Java | `502`，响应体为 reason | `502`「客户端不在线」 | `504`，`SPECUS_HTTP_TIMEOUT_MS`，默认 30 s，请求体上传完才开始计时 |
 | Go | `502`，响应体为 reason | `502`，最多等 3 s 的重连宽限 | `504`，同一配置，从开流时开始计时 |
 | .NET | `IOException` 逃出转发路径，变成没有响应体、也不记录的 `500` | `503` | `504`，`Specus:Http:TimeoutMs`，默认 30 s |
-| C | reason 被丢弃，返回 `502`「direct http target client is offline」，与离线无法区分 | `502` | `504`，固定 30 s |
+| C | `502`「HTTP 转发请求失败」，reason 只写日志和流量明细的 `error`，不回给调用方 | `502`「客户端不在线」 | `504`，`SPECUS_HTTP_TIMEOUT_MS`，默认 30 s，请求体上传完才开始计时；上传时每块等窗口也受同一时限 |
 
 管理页的「在线」看的是 `control` 连接，HTTP 数据面看的是 `data` 连接，两者可能不一致：页面显示在线，公网请求却得到 `502`/`503`。流量明细 `specus_http_traffic_exchange` 的 `error` 列在 Java 和 Go 中会存 reason；但只有打开全局明细采集（默认关闭）并且 route 也开启了明细采集时才会写入，.NET 和 C 根本不记录 RST 导致的失败。四个服务端都没有从服务端内部经 route 发起请求的接口；http-route.md 里提到的「管理预览」，指的是流量明细里的正文解压预览。
 

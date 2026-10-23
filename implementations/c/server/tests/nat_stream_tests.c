@@ -55,6 +55,8 @@
 #define MAX_WINDOW (16U * 1024U * 1024U)
 #define RESPONSE_LIMIT (64U * 1024U * 1024U)
 #define REQUEST_BODY_LIMIT (16U * 1024U * 1024U)
+/* SPECUS_HTTP_MAX_REQUEST_BODY_SIZE of the configured-limits scenario: twice the initial window. */
+#define CONFIGURED_BODY_LIMIT (2U * 1024U * 1024U)
 #define PENDING_STREAM_LIMIT 1024U
 /* Well beyond the 4 MiB queue plus whatever the kernel socket buffers absorb. */
 #define QUEUE_FLOOD (16U * 1024U * 1024U)
@@ -316,7 +318,7 @@ static void url_encode(const char *value, char *out, size_t out_len)
 static int browser_get(const test_server *server, const client_pair *pair, const char *path)
 {
     char client[768];
-    char request[1536];
+    char request[8192];
     url_encode(pair->runtime.client_name, client, sizeof(client));
     int len = snprintf(request, sizeof(request),
                        "GET /http/%s/%s%s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
@@ -1121,6 +1123,17 @@ static int check_http_query_forwarding(test_server *server, client_pair *pair)
           "braces encoded, '/' and '?' kept");
     CHECK(expect_forwarded_query(server, pair, "/q", "/q", "") == 0, "no query");
     CHECK(expect_forwarded_query(server, pair, "/q?", "/q", "") == 0, "empty query");
+    /* A target past 1 KiB (a signed URL, an OAuth callback) is forwarded whole, never cut short. */
+    char long_path[4200];
+    char long_query[4100];
+    int query_len = snprintf(long_query, sizeof(long_query), "signature=");
+    while (query_len < 4000) {
+        long_query[query_len] = (char)('a' + query_len % 26);
+        ++query_len;
+    }
+    snprintf(long_query + query_len, sizeof(long_query) - (size_t)query_len, "&tail=end");
+    snprintf(long_path, sizeof(long_path), "/q?%s", long_query);
+    CHECK(expect_forwarded_query(server, pair, long_path, "/q", long_query) == 0, "a 4 KiB query");
     return 0;
 }
 
@@ -2063,6 +2076,67 @@ static int test_request_body_limit(test_server *server)
     return 0;
 }
 
+/* A POST to the paired client's route announcing body_len bytes, sent along when send_body is set. */
+static int browser_upload(const test_server *server, const client_pair *pair, size_t body_len, int send_body)
+{
+    char client[768];
+    char head[1536];
+    url_encode(pair->runtime.client_name, client, sizeof(client));
+    int len = snprintf(head, sizeof(head),
+                       "POST /http/%s/%s/upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: %zu\r\n"
+                       "Connection: close\r\n\r\n",
+                       client, ROUTE, body_len);
+    uint8_t *body = send_body ? (uint8_t *)malloc(body_len + 1U) : NULL;
+    if (body != NULL) {
+        memset(body, 'x', body_len);
+    }
+    int fd = connect_local(server->admin_port);
+    if (fd >= 0 && (len <= 0 || (size_t)len >= sizeof(head) || (send_body && body == NULL)
+                    || send_all(fd, (const uint8_t *)head, (size_t)len) != 0
+                    || (send_body && send_all(fd, body, body_len) != 0))) {
+        close_fd(&fd);
+    }
+    free(body);
+    return fd;
+}
+
+/*
+ * SPECUS_HTTP_MAX_REQUEST_BODY_SIZE and SPECUS_HTTP_TIMEOUT_MS, Java's specus.http.*, set to 2 MiB
+ * and 1.5 s. The C server used to fix them at 16 MiB and 30 s, and waited without end for the
+ * window an upload needs: Java waits the timeout for each chunk too, then answers 504.
+ */
+static int check_http_configured_limits(test_server *server, client_pair *pair)
+{
+    int browser = browser_upload(server, pair, CONFIGURED_BODY_LIMIT + 1U, 0);
+    CHECK(browser >= 0, "oversized request");
+    CHECK(expect_browser_status(browser, 413, "HTTP 请求体超过限制", -1) == 0, "body over the configured limit");
+    close_fd(&browser);
+
+    uint32_t stream_id = 0U;
+    uint32_t code = 0U;
+    long long started = monotonic_ms();
+    CHECK(open_http_stream(server, pair, "/slow", &browser, &stream_id) == 0, "request");
+    CHECK(wait_rst(pair->data, stream_id, &code) == 0 && code == 30U, "response head timeout reset (code %u)", code);
+    long long waited = monotonic_ms() - started;
+    CHECK(waited >= 1400 && waited < 4500, "response head timeout after %lld ms, expected about 1500", waited);
+    CHECK(expect_browser_status(browser, 504, NULL, -1) == 0, "browser of the request without a response head");
+    close_fd(&browser);
+
+    /* A body of the whole limit, more than the 1 MiB initial window, which the client never widens. */
+    /* Timed from before the request: the server may send the first window before the OPEN is read
+     * here, and the upper bound covers the 2 MiB the request carries. */
+    started = monotonic_ms();
+    browser = browser_upload(server, pair, CONFIGURED_BODY_LIMIT, 1);
+    CHECK(browser >= 0, "upload");
+    CHECK(expect_http_open(pair->data, &stream_id) == 0, "no request OPEN for the upload");
+    CHECK(wait_rst(pair->data, stream_id, &code) == 0 && code == 30U, "upload window timeout reset (code %u)", code);
+    waited = monotonic_ms() - started;
+    CHECK(waited >= 1400 && waited < 4500, "upload window timeout after %lld ms, expected about 1500", waited);
+    CHECK(expect_browser_status(browser, 504, NULL, -1) == 0, "browser of the stalled upload");
+    close_fd(&browser);
+    return expect_data_connection_served(server, pair);
+}
+
 /* Waits until the HTTP detail holds count exchanges, the server records them after answering. */
 static int wait_exchange_count(const test_server *server, long long count)
 {
@@ -2373,6 +2447,11 @@ static const char *const long_idle_with_capture[] = {
     "SPECUS_CONTROL_READ_IDLE_SECONDS=900", "SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED=true", NULL
 };
 
+static const char *const long_idle_configured_http[] = {
+    "SPECUS_CONTROL_READ_IDLE_SECONDS=900", "SPECUS_HTTP_TIMEOUT_MS=1500", "SPECUS_HTTP_MAX_REQUEST_BODY_SIZE=2097152",
+    NULL
+};
+
 static const char *const long_idle_probe_awaits_end[] = {
     "SPECUS_CONTROL_READ_IDLE_SECONDS=900", "SPECUS_CONNECTIVITY_PROBE_TEST_AWAIT_END=true", NULL
 };
@@ -2441,6 +2520,9 @@ int main(int argc, char **argv)
     failures += run_check("TCP reads stall while the data connection is not read, then resume",
                           check_tcp_backpressure);
     failures += run_scenario("413 for request bodies over 16 MiB", test_request_body_limit, long_idle);
+    current_check = check_http_configured_limits;
+    failures += run_scenario("HTTP body limit and timeouts from SPECUS_HTTP_*", run_current_check,
+                             long_idle_configured_http);
     failures += run_scenario("413 and route gate refusals are recorded like Java's", test_refusals_recorded,
                              long_idle_with_capture);
     if (raise_descriptor_limit(4096) == 0) {

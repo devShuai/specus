@@ -478,7 +478,7 @@ int http_request(int port, const char *method, const char *path, const char *bod
     if (fd < 0) {
         return -1;
     }
-    char head[1024];
+    char head[9216];
     char authorization[600] = "";
     if (bearer != NULL) {
         snprintf(authorization, sizeof(authorization), "Authorization: Bearer %s\r\n", bearer);

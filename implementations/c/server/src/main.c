@@ -95,6 +95,9 @@ typedef struct {
     int max_global_external_connections;
     int max_client_external_connections;
     int max_port_external_connections;
+    /* SPECUS_HTTP_TIMEOUT_MS and SPECUS_HTTP_MAX_REQUEST_BODY_SIZE, as Java's specus.http.*. */
+    int64_t http_timeout_ms;
+    int64_t http_max_request_body;
     int admin_port;
     char static_root[512];
     char database_path[512];
@@ -402,8 +405,9 @@ static int env_int_range(const char *name, int default_value, int min_value, int
         return 0;
     }
     char *end = NULL;
+    errno = 0;
     long parsed = strtol(value, &end, 10);
-    if (end == value || *end != '\0' || parsed < min_value || parsed > max_value) {
+    if (errno != 0 || end == value || *end != '\0' || parsed < min_value || parsed > max_value) {
         fprintf(stderr, "invalid %s; expected integer in [%d,%d]\n", name, min_value, max_value);
         return -1;
     }
@@ -419,8 +423,10 @@ static int env_i64_range(const char *name, int64_t default_value, int64_t min_va
         return 0;
     }
     char *end = NULL;
+    /* A number past what strtoll can hold (it saturates) is no number of the setting, as for Spring. */
+    errno = 0;
     long long parsed = strtoll(value, &end, 10);
-    if (end == value || *end != '\0' || parsed < min_value || parsed > max_value) {
+    if (errno != 0 || end == value || *end != '\0' || parsed < min_value || parsed > max_value) {
         fprintf(stderr, "invalid %s; expected integer in [%lld,%lld]\n",
                 name, (long long)min_value, (long long)max_value);
         return -1;
@@ -891,8 +897,19 @@ static int load_config(server_config *config)
                          &config->max_client_external_connections) != 0
         || env_int_range("SPECUS_MAX_PORT_EXTERNAL_CONNECTIONS", 512, 1, 1000000,
                          &config->max_port_external_connections) != 0
-        || env_int_range("SPECUS_ADMIN_PORT", 0, 0, 65535, &config->admin_port) != 0) {
+        || env_int_range("SPECUS_ADMIN_PORT", 0, 0, 65535, &config->admin_port) != 0
+        || env_i64_range("SPECUS_HTTP_TIMEOUT_MS", 30000, INT64_MIN, INT64_MAX, &config->http_timeout_ms) != 0
+        || env_i64_range("SPECUS_HTTP_MAX_REQUEST_BODY_SIZE", ST_HTTP_MAX_REQUEST_BODY, INT_MIN, INT_MAX,
+                         &config->http_max_request_body) != 0) {
         return -1;
+    }
+    /* Java's body limit filter takes a negative limit as 0: any body at all is too large. A
+     * negative timeout, which Java's Future.get takes as nothing to wait for, times out at once. */
+    if (config->http_max_request_body < 0) {
+        config->http_max_request_body = 0;
+    }
+    if (config->http_timeout_ms < 0) {
+        config->http_timeout_ms = 0;
     }
     if (copy_config_string(config->static_root, sizeof(config->static_root),
                            "SPECUS_STATIC_ROOT",
@@ -2072,6 +2089,17 @@ static void direct_pending_retire(specus_session *session, direct_http_pending *
     pthread_mutex_unlock(&session->direct_lock);
 }
 
+/* The wall-clock instant timeout_ms from now, for pthread_cond_timedwait on a default condition. */
+static void direct_deadline_after(int64_t timeout_ms, struct timespec *deadline)
+{
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    int64_t seconds = timeout_ms / 1000;
+    long nanoseconds = (long)(timeout_ms % 1000) * 1000000L + (long)now.tv_usec * 1000L;
+    deadline->tv_sec = now.tv_sec + (time_t)seconds + nanoseconds / 1000000000L;
+    deadline->tv_nsec = nanoseconds % 1000000000L;
+}
+
 static int direct_http_forward(void *ctx,
                                const char *client_name,
                                const st_direct_http_request *request,
@@ -2079,8 +2107,7 @@ static int direct_http_forward(void *ctx,
 {
     (void)ctx;
 
-    if (request == NULL || request->body_len > ST_HTTP_MAX_REQUEST_BODY
-        || sink == NULL || sink->on_headers == NULL
+    if (request == NULL || sink == NULL || sink->on_headers == NULL
         || sink->on_data == NULL || sink->on_end == NULL) {
         return -1;
     }
@@ -2095,7 +2122,14 @@ static int direct_http_forward(void *ctx,
     int same_account = config_serves_account(&session->config, request->client_id);
     long long session_client_id = session->config.client_id;
     int route_configured = config_has_http_route(&session->config, request->route);
+    int64_t timeout_ms = session->config.http_timeout_ms;
+    int body_too_large = (uint64_t)request->body_len > (uint64_t)session->config.http_max_request_body;
     pthread_mutex_unlock(&session->map_lock);
+    if (body_too_large) {
+        /* The listener answers 413 before it gets here; this only keeps the bound in one place. */
+        session_reference_release(session);
+        return -1;
+    }
     if (!same_account) {
         /* Not this account's client: answered as offline, never forwarded. */
         fprintf(stderr, "[direct-http] data connection of client=%s is account %lld, not %lld\n",
@@ -2135,6 +2169,7 @@ static int direct_http_forward(void *ctx,
     /* A request through a temporary HTTP share can be cut from another thread once it ends. */
     direct_cancel_ctx cancel = {session, &pending};
     int opened = 0;
+    int upload_timed_out = 0;
     if (sink->bind_cancel != NULL) {
         sink->bind_cancel(sink->ctx, direct_pending_cancel, &cancel);
     }
@@ -2162,11 +2197,18 @@ static int direct_http_forward(void *ctx,
         if (sink->request_body_sent != NULL) {
             *sink->request_body_sent = offset + chunk_len;
         }
+        /* Java waits SPECUS_HTTP_TIMEOUT_MS for each chunk to be sent, then answers 504 and resets. */
+        struct timespec credit_deadline;
+        direct_deadline_after(timeout_ms, &credit_deadline);
         pthread_mutex_lock(&session->direct_lock);
         while (pending.error == NULL && !pending.done && !pending.cancelled && pending.send_credit < chunk_len) {
-            pthread_cond_wait(&pending.cond, &session->direct_lock);
+            if (pthread_cond_timedwait(&pending.cond, &session->direct_lock, &credit_deadline) == ETIMEDOUT
+                && pending.error == NULL && !pending.done && !pending.cancelled && pending.send_credit < chunk_len) {
+                upload_timed_out = 1;
+                break;
+            }
         }
-        if (pending.error != NULL || pending.done || pending.cancelled) {
+        if (upload_timed_out || pending.error != NULL || pending.done || pending.cancelled) {
             pthread_mutex_unlock(&session->direct_lock);
             goto failed;
         }
@@ -2193,11 +2235,8 @@ static int direct_http_forward(void *ctx,
         goto failed;
     }
 
-    struct timeval now;
-    gettimeofday(&now, NULL);
     struct timespec deadline;
-    deadline.tv_sec = now.tv_sec + 30;
-    deadline.tv_nsec = now.tv_usec * 1000L;
+    direct_deadline_after(timeout_ms, &deadline);
 
     int result = 0;
     int delivered_head = 0;
@@ -2329,10 +2368,13 @@ failed:
     pthread_mutex_unlock(&session->direct_lock);
     if (failed_cancelled && opened && !failed_reset) {
         send_reset(session, pending.stream_id, ST_ADMIN_HTTP_SHARE_RESET_CODE, ST_ADMIN_HTTP_SHARE_RESET_REASON);
+    } else if (upload_timed_out && !failed_reset) {
+        send_reset(session, pending.stream_id, 30U, "HTTP request body timeout");
     }
     direct_pending_retire(session, &pending);
     /* A client RST while the request body was still uploading is reported like one after it. */
     int failed_result = failed_cancelled ? ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED
+        : upload_timed_out ? -2
         : pending.client_reset && pending.error != NULL
         ? direct_report_client_reset(sink, pending.reset_code, pending.error, pending.error_len) : -1;
     free(pending.error);

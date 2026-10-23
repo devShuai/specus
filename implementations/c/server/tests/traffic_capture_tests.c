@@ -543,6 +543,65 @@ static void test_stored_bodies(void)
     unlink(path);
 }
 
+/*
+ * relativePath and rawQuery as long as the request head allows are kept to Java's 1024 and 2048
+ * characters (TrafficInspectionService caps rawQuery, relativePath has a 1024-character column),
+ * cut between characters: a 3-byte character at the edge stays, the 4-byte one after it does not.
+ * The SQLite store used to cut at 1023 and 2047 bytes, through a character if need be.
+ */
+static void test_long_target(void)
+{
+    char path[] = "/tmp/specus_c_traffic_target.XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        ++failures;
+        return;
+    }
+    close(fd);
+    st_storage_client client;
+    if (st_storage_init(path, 0) != 0
+        || st_storage_upsert_client(path, 0, "tenant-a", "Demo", "alice", 1, 60, &client) != 0) {
+        ++failures;
+        unlink(path);
+        return;
+    }
+    char relative_path[3002];
+    relative_path[0] = '/';
+    memset(relative_path + 1, 'p', 3000U);
+    relative_path[3001] = '\0';
+    char raw_query[2100];
+    memcpy(raw_query, "q=", 2U);
+    memset(raw_query + 2, 'a', 2045U);
+    snprintf(raw_query + 2047, sizeof(raw_query) - 2047U, "\xe2\x82\xac\xf0\x9d\x84\x9e&tail=1");
+    char expected_query[2100];
+    snprintf(expected_query, sizeof(expected_query), "%.2050s", raw_query);
+    st_storage_http_exchange_record record = {
+        .tenant_id = "tenant-a",
+        .client_id = client.id,
+        .client_name = "Demo",
+        .route = "api",
+        .method = "GET",
+        .relative_path = relative_path,
+        .raw_query = raw_query,
+        .status_code = 200,
+        .success = 1,
+        .captured_at = "2026-10-23T00:00:00Z"
+    };
+    EXPECT(st_storage_record_http_exchange(path, &record) == 0, "HTTP exchange with a long target was not recorded");
+    st_storage_http_exchange *items = (st_storage_http_exchange *)calloc(1U, sizeof(*items));
+    size_t count = 0U;
+    long long total = 0;
+    int listed = items != NULL
+        && st_storage_list_http_exchanges_visible(path, 0, NULL, NULL, NULL, NULL, "tenant-a", "alice", 0, 0, 10,
+                                                  items, 1U, &count, &total) == 0 && count == 1U;
+    EXPECT(listed && strlen(items[0].relative_path) == 1024U && strspn(items[0].relative_path + 1, "p") == 1023U
+               && strcmp(items[0].raw_query, expected_query) == 0,
+           "long target stored as a %zu-byte path and a %zu-byte query", listed ? strlen(items[0].relative_path) : 0U,
+           listed ? strlen(items[0].raw_query) : 0U);
+    free(items);
+    unlink(path);
+}
+
 int main(void)
 {
     test_capture_switch_and_preview_size();
@@ -552,6 +611,7 @@ int main(void)
     test_store();
     test_body_display();
     test_stored_bodies();
+    test_long_target();
     if (failures != 0) {
         fprintf(stderr, "%d traffic capture check(s) failed\n", failures);
         return 1;

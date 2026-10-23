@@ -193,6 +193,8 @@ Additional runtime knobs:
 | `SPECUS_STATIC_ROOT` | `implementations/java/server/src/main/resources/static` | Static SPA root used by the management listener. |
 | `SPECUS_HTTP_ROUTES` | unset | Optional comma-separated HTTP route snapshot, `route=targetBaseUrl,route2=https://host/base`, returned from client auth login and pushed in `NAT_CONTROL`. |
 | `SPECUS_HTTP_REWRITE_MAX_BODY_BYTES` | `10485760` | Max streamed HTTP response body size eligible for path rewriting when the SQLite HTTP route has `pathRewriteEnabled=true`; `0` disables rewriting. |
+| `SPECUS_HTTP_MAX_REQUEST_BODY_SIZE` | `16777216` | Java `specus.http.max-request-body-size`: the largest request body of a Direct HTTP route or share (`413` beyond it); an int, a negative value is `0`. C reads the whole body into memory before forwarding it, so a larger limit is that much memory per concurrent upload. |
+| `SPECUS_HTTP_TIMEOUT_MS` | `30000` | Java `specus.http.timeout-ms`: how long a route or share request waits for the response head once its body went up, and for the window of each body chunk; `504` and `RST 30` after it. A negative value times out at once. |
 
 Compressed response rewriting has an additional non-configurable safety boundary shared with Java:
 decompressed output may not exceed 64 MiB or `max(64 KiB, compressed size × 100)`, whichever is
@@ -548,9 +550,14 @@ when the 4 MiB client-to-public queue overflows), and `DATA|END_STREAM` is DATA 
 data connection remembers its 1024 most recently closed stream ids so a late `RST` is ignored; an
 `RST` for a stream that was never opened, a `WINDOW_UPDATE` beyond the 16 MiB window and a NAT type a
 client never sends close the data connection. A data connection holds at most 1024 pending HTTP
-streams (the next request gets `502`), and request bodies over 16 MiB get `413`; because every
-request body is read into memory before it is dispatched, that limit holds on the whole management
-listener (the client package upload has its own), where Java limits `/http/**` only.
+streams (the next request gets `502`), and a route or share request body over
+`SPECUS_HTTP_MAX_REQUEST_BODY_SIZE` (Java `specus.http.max-request-body-size`, 16 MiB by default)
+gets `413`; because every request body is read into memory before it is dispatched, the other
+management endpoints keep a fixed 16 MiB limit (the client package upload has its own), where Java
+limits `/http/**` only. `SPECUS_HTTP_TIMEOUT_MS` (Java `specus.http.timeout-ms`, 30000 by default)
+bounds the wait for the response head after the request went up and the wait for the window of each
+request body chunk; either timeout answers `504` and resets the stream (`RST 30`). The request
+target may be as long as the 8 KiB request head allows; it is never cut short.
 Trailers cross as `protocol/spec/http-route.md` sections 3 and 4 require, like Java
 `HttpSpecusController`: the names of the request's `Trailer` headers are declared in `trailerNames`
 (trimmed tokens, no hop-by-hop field, each once, without `Authorization` once the route gate

@@ -421,6 +421,9 @@ typedef struct {
     char updated_at[64];
 } st_storage_peer_mesh_egress_switch;
 
+#define ST_HTTP_EXCHANGE_PATH_CHARS 1024U
+#define ST_HTTP_EXCHANGE_QUERY_CHARS 2048U
+
 
 
 
@@ -433,8 +436,10 @@ typedef struct {
     long long resource_id;
     char resource_name[512];
     char method[16];
-    char relative_path[1024];
-    char raw_query[2048];
+    /* Java keeps relativePath in a 1024-character column and caps rawQuery at 2048 characters
+     * (TrafficInspectionService); room for that many characters in UTF-8. */
+    char relative_path[ST_HTTP_EXCHANGE_PATH_CHARS * 4U + 1U];
+    char raw_query[ST_HTTP_EXCHANGE_QUERY_CHARS * 4U + 1U];
     int status_code;
     int success;
     char error[2048];
