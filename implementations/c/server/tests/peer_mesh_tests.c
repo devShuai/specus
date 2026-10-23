@@ -1300,10 +1300,41 @@ static int test_session_reports(void)
         fprintf(stderr, "a traffic report did not record lastTrafficAt\n");
         failed = 1;
     }
+    /*
+     * Java applyTraffic returns before it sets updatedAt when neither count is above 0 (negative
+     * counts are 0, a missing one too), so such a report leaves updatedAt, and the session's place
+     * in the lists ordered by it, as they were; one that counts a byte moves it.
+     */
+    char marked[64] = "";
+    if (!failed) {
+        char sql[128];
+        snprintf(sql, sizeof(sql), "UPDATE peer_mesh_session SET updated_at='2020-01-01 00:00:00' WHERE id=%lld", id);
+        failed = exec_sql_on(path, sql) != 0
+            || st_storage_get_peer_mesh_session(path, "tenant-reports", id, &session) != 0;
+        snprintf(marked, sizeof(marked), "%s", session.updated_at);
+        const char *const empty_reports[] = {
+            "{\"type\":\"traffic-report\",\"sessionId\":%lld,\"directBytes\":0,\"relayBytes\":0}",
+            "{\"type\":\"traffic-report\",\"sessionId\":%lld,\"directBytes\":-5,\"relayBytes\":-1}",
+            "{\"type\":\"traffic-report\",\"sessionId\":%lld}",
+        };
+        for (size_t i = 0U; !failed && i < sizeof(empty_reports) / sizeof(empty_reports[0]); ++i) {
+            failed = session_report(&runtime, i == 1U ? "reports-b" : "reports-a", empty_reports[i], id) != 0
+                || st_storage_get_peer_mesh_session(path, "tenant-reports", id, &session) != 0
+                || strcmp(session.updated_at, marked) != 0
+                || session_state_is(path, id, "ACTIVE", "DIRECT", 120, 30, "traffic report without bytes") != 0;
+            if (failed) fprintf(stderr, "traffic report %zu without bytes moved updatedAt: %s, was %s\n", i,
+                                session.updated_at, marked);
+        }
+    }
     /* More relay than direct traffic makes the session a relayed one... */
     if (!failed && (session_report(&runtime, "reports-a",
                                    "{\"type\":\"traffic-report\",\"sessionId\":%lld,\"relayBytes\":200}", id) != 0
                     || session_state_is(path, id, "ACTIVE", "RELAY", 120, 230, "relay traffic") != 0)) failed = 1;
+    if (!failed && (st_storage_get_peer_mesh_session(path, "tenant-reports", id, &session) != 0
+                    || strcmp(session.updated_at, marked) == 0)) {
+        fprintf(stderr, "a traffic report that counts bytes did not move updatedAt from %s\n", marked);
+        failed = 1;
+    }
     /* ...which a later path-report does not override, and whose bytes it does not add to. */
     if (!failed && (session_report(&runtime, "reports-a",
                                    "{\"type\":\"path-report\",\"sessionId\":%lld,\"pathType\":\"DIRECT\","
