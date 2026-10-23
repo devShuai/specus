@@ -254,6 +254,16 @@ add_test(NAME management_ws_backpressure_tests
     COMMAND specus_c_management_ws_backpressure_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(management_ws_backpressure_tests PROPERTIES TIMEOUT 150)
 
+# A browser that stops reading a route WebSocket, on a real server: the data connection keeps
+# serving heartbeats, HTTP, TCP and another WebSocket meanwhile, the stalled stream gets no credit,
+# and it is closed with RST 31 after Java's Tomcat send timeout (20 s), not before.
+add_executable(specus_c_direct_websocket_backpressure_tests tests/direct_websocket_backpressure_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_direct_websocket_backpressure_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_direct_websocket_backpressure_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME direct_websocket_backpressure_tests
+    COMMAND specus_c_direct_websocket_backpressure_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(direct_websocket_backpressure_tests PROPERTIES TIMEOUT 150)
+
 # Management lists with more rows than the arrays C used to read them into, over real HTTP.
 add_executable(specus_c_management_lists_tests tests/management_lists_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_management_lists_tests PRIVATE specus_c_core)

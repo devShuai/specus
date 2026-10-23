@@ -18,6 +18,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sqlite3.h>
@@ -2990,6 +2991,182 @@ static void test_local_cascade_cuts_websocket_and_stream(void)
     printf("http: local revoke closes a WebSocket with 1008, a route hook cuts a stream %s\n", ok ? "ok" : "FAILED");
 }
 
+/*
+ * The client side of a share's WebSocket whose browser reads nothing: its window of 16 envelopes
+ * of 64 KiB, handed over the way the data connection's reader does.
+ */
+typedef struct {
+    st_admin_direct_ws_stream *stream;
+    atomic_int done;
+} stalled_feed;
+
+static void *feed_stalled_websocket(void *arg)
+{
+    stalled_feed *feed = (stalled_feed *)arg;
+    size_t payload_len = ST_ADMIN_SWS2_MAX_PAYLOAD;
+    size_t envelope_len = ST_ADMIN_SWS2_HEADER_BYTES + payload_len;
+    uint8_t *envelope = (uint8_t *)calloc(1U, envelope_len);
+    if (envelope != NULL) {
+        memcpy(envelope, "SWS2", 4U);
+        envelope[4] = 0x2U;
+        envelope[5] = 0x01U;
+        envelope[8] = (uint8_t)(payload_len >> 24U);
+        envelope[9] = (uint8_t)(payload_len >> 16U);
+        envelope[10] = (uint8_t)(payload_len >> 8U);
+        envelope[11] = (uint8_t)payload_len;
+        for (int i = 0; i < 16; ++i) {
+            if (st_admin_direct_ws_send_framed_payload(feed->stream, envelope, envelope_len)
+                != ST_ADMIN_DIRECT_WS_ACCEPTED) {
+                break;
+            }
+        }
+        free(envelope);
+    }
+    atomic_store(&feed->done, 1);
+    return NULL;
+}
+
+typedef struct {
+    char path[128];
+    char *response;
+    int status;
+    atomic_int done;
+} revoke_call;
+
+static void *revoke_share_thread(void *arg)
+{
+    revoke_call *call = (revoke_call *)arg;
+    call->status = manage("POST", call->path, "alice", NULL, call->response, RESPONSE_CAP);
+    atomic_store(&call->done, 1);
+    return NULL;
+}
+
+static int wait_flag(atomic_int *flag, long long timeout_ms)
+{
+    long long deadline = monotonic_ms() + timeout_ms;
+    while (!atomic_load(flag) && monotonic_ms() < deadline) {
+        struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000L};
+        nanosleep(&pause, NULL);
+    }
+    return atomic_load(flag) ? 0 : -1;
+}
+
+static void test_revoke_with_stalled_websocket(void)
+{
+    /*
+     * Java's share end closes the browser session from the expiry or revoking thread. C's client
+     * frames reach the browser through a writer of the socket's own, so neither the delivering
+     * thread nor the revocation (nor the maintenance thread that cuts expired shares the same way)
+     * waits on a browser that reads nothing: the revoke answers at once, the client hears RST and
+     * the browser's connection is dropped within the abnormal close budget.
+     */
+    int ok = 1;
+    char token[65];
+    char share_id[17];
+    char *response = (char *)malloc(RESPONSE_CAP);
+    st_http_share_set_clock_for_testing(0);
+    CHECK(seed_world() == 0 && create_share("alice", 42, "{\"expiresInSeconds\":3600,\"access\":\"full\"}",
+                                            token, share_id) == 0, "stalled websocket test: setup failed");
+    st_http_share_gcra_reset(st_http_share_request_limiter());
+    device_reset(DEVICE_PLAIN);
+    pthread_mutex_lock(&device.lock);
+    device.ws_accept = 1;
+    pthread_mutex_unlock(&device.lock);
+    /* A 4096-byte receive buffer and 1000-byte segments: the server's writes stall soon. */
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int rcvbuf = 4096;
+    int mss = 1000;
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons((uint16_t)server_port);
+    int connected = fd >= 0 && setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) == 0
+        && setsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof(mss)) == 0
+        && connect(fd, (struct sockaddr *)&address, sizeof(address)) == 0;
+    char request[1024];
+    int len = snprintf(request, sizeof(request),
+                       "GET /http-share/%s/live HTTP/1.1\r\nHost: share.test\r\nConnection: Upgrade\r\n"
+                       "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                       "Cookie: " ST_HTTP_SHARE_COOKIE_NAME "=%s\r\n\r\n", share_id, token);
+    char head[512] = "";
+    size_t head_len = 0U;
+    if (connected && send_text(fd, request, (size_t)len) == 0) {
+        struct timeval timeout = {.tv_sec = 10, .tv_usec = 0};
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        while (head_len + 1U < sizeof(head) && recv(fd, head + head_len, 1U, 0) == 1) {
+            ++head_len;
+            head[head_len] = '\0';
+            if (head_len >= 4U && memcmp(head + head_len - 4U, "\r\n\r\n", 4U) == 0) break;
+        }
+    }
+    pthread_mutex_lock(&device.lock);
+    st_admin_direct_ws_stream *ws = device.ws_stream;
+    st_admin_direct_ws_retain(ws);
+    pthread_mutex_unlock(&device.lock);
+    CHECK(strstr(head, "101 Switching Protocols") != NULL && ws != NULL, "stalled websocket test: no 101: %s", head);
+    if (ws == NULL) {
+        if (fd >= 0) close(fd);
+        free(response);
+        return;
+    }
+
+    static stalled_feed feed;
+    feed.stream = ws;
+    atomic_store(&feed.done, 0);
+    pthread_t feeder;
+    int feeding = pthread_create(&feeder, NULL, feed_stalled_websocket, &feed) == 0;
+    CHECK(feeding && wait_flag(&feed.done, 1000) == 0,
+          "stalled websocket test: handing over the client's window waited on the browser");
+
+    static revoke_call call;
+    snprintf(call.path, sizeof(call.path), "/api/admin/http-routes/42/shares/%s/revoke", share_id);
+    call.response = response;
+    call.status = 0;
+    atomic_store(&call.done, 0);
+    pthread_t revoker;
+    int revoking = pthread_create(&revoker, NULL, revoke_share_thread, &call) == 0;
+    int answered = revoking && wait_flag(&call.done, 2000) == 0;
+    CHECK(answered && call.status == 200, "stalled websocket test: the revoke waited on the browser (answered %d, %d)",
+          answered, call.status);
+    long long deadline = monotonic_ms() + 2000;
+    pthread_mutex_lock(&device.lock);
+    while (!device.ws_closed && monotonic_ms() < deadline) {
+        pthread_mutex_unlock(&device.lock);
+        struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000L};
+        nanosleep(&pause, NULL);
+        pthread_mutex_lock(&device.lock);
+    }
+    int device_closed = device.ws_closed;
+    uint32_t reset_code = device.ws_reset_code;
+    pthread_mutex_unlock(&device.lock);
+    CHECK(device_closed && reset_code == ST_ADMIN_HTTP_SHARE_RESET_CODE,
+          "stalled websocket test: the client's stream ended %d with %u", device_closed, reset_code);
+    /* The browser reads what reached it, then the end of its connection. */
+    int ended = 0;
+    if (answered) {
+        char sink[65536];
+        long long end_deadline = monotonic_ms() + 3000;
+        while (!ended && monotonic_ms() < end_deadline) {
+            ssize_t got = recv(fd, sink, sizeof(sink), 0);
+            if (got == 0 || (got < 0 && errno == ECONNRESET)) {
+                ended = 1;
+            } else if (got < 0 && errno != EINTR) {
+                break;
+            }
+        }
+    }
+    CHECK(ended, "stalled websocket test: the browser's connection was not dropped");
+    /* Unread input makes close() reset the connection, which also frees a writer still blocked. */
+    close(fd);
+    if (revoking) pthread_join(revoker, NULL);
+    if (feeding) pthread_join(feeder, NULL);
+    st_admin_direct_ws_release(ws);
+    free(response);
+    printf("http: revoking a share whose WebSocket browser reads nothing does not wait on it %s\n",
+           ok ? "ok" : "FAILED");
+}
+
 static void test_cascades_from_endpoints(void)
 {
     int ok = 1;
@@ -3217,6 +3394,7 @@ int main(void)
     test_invalid_body_before_store();
     test_remote_revoke_cuts_stream();
     test_local_cascade_cuts_websocket_and_stream();
+    test_revoke_with_stalled_websocket();
     test_cascades_from_endpoints();
     test_builtin_admin_share();
     test_long_target_redirect();

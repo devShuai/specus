@@ -169,6 +169,17 @@ typedef void (*st_admin_direct_ws_close_handler)(void *ctx,
                                                  uint32_t reset_code,
                                                  const char *reason);
 /*
+ * Gives the client back bytes of NAT credit for client-to-browser DATA it sent on the stream, once
+ * the browser side wrote that DATA to the browser or dropped it (a WINDOW_UPDATE). client_name is
+ * the request's, so the data connection can be found without searching every session. It does
+ * nothing for a stream that is no longer mapped. Called with no lock of the browser side held,
+ * from the stream's writer thread, its admin thread or the thread that delivered the DATA.
+ */
+typedef void (*st_admin_direct_ws_credit_handler)(void *ctx,
+                                                  const char *client_name,
+                                                  const char *channel_id,
+                                                  size_t bytes);
+/*
  * Reloads a client's routes into its connections and sends it a NAT_CONTROL: 0 when sent, -1 when the
  * client is offline or its control connection cannot be written, ST_ADMIN_NAT_CONTROL_NOT_SENT when its
  * NAT_CONTROL does not fit one MESSAGE (the routes are reloaded, nothing is sent and the connection is
@@ -294,6 +305,7 @@ int st_admin_server_start_with_forwarder(st_admin_server *server,
                                          const char *static_root,
                                          st_admin_direct_http_forwarder forwarder,
                                          void *forwarder_ctx);
+/* Route WebSockets also need st_admin_set_direct_ws_credit_handler (below) to keep flowing. */
 int st_admin_server_start_with_handlers(st_admin_server *server,
                                         int port,
                                         const char *static_root,
@@ -304,6 +316,12 @@ int st_admin_server_start_with_handlers(st_admin_server *server,
                                         st_admin_direct_ws_close_handler ws_close,
                                         void *ws_ctx);
 void st_admin_set_nat_control_handler(st_admin_nat_control_handler handler, void *ctx);
+/*
+ * Required by every embedder that serves route WebSockets (st_admin_server_start_with_handlers with
+ * a ws_data handler): client-to-browser DATA is credited back only through this handler, so without
+ * it each stream silently stops once the client used its 1 MiB window.
+ */
+void st_admin_set_direct_ws_credit_handler(st_admin_direct_ws_credit_handler handler, void *ctx);
 void st_admin_set_client_runtime_status_handler(st_admin_client_runtime_status_handler handler,
                                                 void *ctx);
 void st_admin_set_client_message_handler(st_admin_client_message_handler handler, void *ctx);
@@ -378,18 +396,25 @@ int st_admin_validate_sws2_payload(const uint8_t *payload, size_t payload_len);
  * Result of handing the browser side something the client sent on the stream. Every failure has
  * already closed the browser socket; the NAT side drops the stream and resets it with the code
  * below (30 and 31 as the .NET server uses them for WebSocket streams, 7 as for its stream-state
- * violations).
+ * violations, 6 as for a TCP stream's queue overflow).
  */
 #define ST_ADMIN_DIRECT_WS_ACCEPTED 0
 #define ST_ADMIN_DIRECT_WS_INVALID (-1)        /* malformed SWS2 or a broken message sequence */
 #define ST_ADMIN_DIRECT_WS_AFTER_FIN (-2)      /* DATA or a second FIN after the client's FIN */
 #define ST_ADMIN_DIRECT_WS_BROWSER_FAILED (-3) /* the browser socket could not be written */
+#define ST_ADMIN_DIRECT_WS_QUEUE_FULL (-4)     /* more than 4 MiB waits for the browser */
+#define ST_ADMIN_DIRECT_WS_RST_QUEUE_EXCEEDED 6U
 #define ST_ADMIN_DIRECT_WS_RST_STREAM_STATE 7U
 #define ST_ADMIN_DIRECT_WS_RST_INVALID_SWS2 30U
 #define ST_ADMIN_DIRECT_WS_RST_BROWSER_GONE 31U
 /* The RST code (and reason, when reason is not NULL) for one of the failed results above. */
 uint32_t st_admin_direct_ws_reset_code(int result, const char **reason);
 
+/*
+ * Hands one client DATA payload (an SWS2 envelope) to the browser side, which never blocks on the
+ * browser: an accepted frame is queued for the stream's writer, and its NAT credit comes back
+ * through the credit handler once written (or dropped, when the browser side is already closing).
+ */
 int st_admin_direct_ws_send_framed_payload(st_admin_direct_ws_stream *stream,
                                            const uint8_t *payload,
                                            size_t payload_len);
