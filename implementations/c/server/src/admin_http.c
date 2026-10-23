@@ -17919,9 +17919,12 @@ static void *admin_direct_ws_writer_thread(void *arg)
             credit += unsent_credit + admin_direct_ws_drop_queued_locked(stream, 0);
             admin_direct_ws_drop_socket_locked(stream);
             pthread_mutex_unlock(&stream->send_lock);
-            admin_direct_ws_credit(stream, credit);
             if (client_frame) {
+                /* The stream ends with a reset: credit given back now would only invite DATA that
+                 * crosses the RST and is answered as for an unknown stream (RST 7) ahead of it. */
                 admin_direct_ws_close_flow(stream);
+            } else {
+                admin_direct_ws_credit(stream, credit);
             }
             return NULL;
         }

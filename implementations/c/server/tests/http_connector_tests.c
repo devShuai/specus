@@ -478,6 +478,9 @@ static int check_route_websocket_send_timeout(test_server *server, client_pair *
     CHECK(encoded != NULL, "SWS2 envelope");
     uint64_t credit = INITIAL_WINDOW;
     long long last_credit = monotonic_ms();
+    /* The stall starts at the last credit before a gap of a second: the writer gives back what it
+     * still holds right before it resets the stream, so the very last credit is no anchor. */
+    long long stall_start = 0;
     long long give_up = last_credit + 60000;
     int reset = 0;
     uint32_t code = 0U;
@@ -501,11 +504,14 @@ static int check_route_websocket_send_timeout(test_server *server, client_pair *
             }
             st_nat_message_free(&message);
         }
+        if (stall_start == 0 && !reset && monotonic_ms() - last_credit >= 1000) {
+            stall_start = last_credit;
+        }
     }
-    long long stalled_for = monotonic_ms() - last_credit;
+    long long stalled_for = monotonic_ms() - (stall_start != 0 ? stall_start : last_credit);
     free(encoded);
     close_fd(&browser);
-    printf("     the WebSocket was reset %lld ms after its last credit\n", stalled_for);
+    printf("     the WebSocket was reset %lld ms after its writes stalled\n", stalled_for);
     CHECK(!failed, "the data connection failed while the WebSocket streamed");
     CHECK(reset && code == ST_ADMIN_DIRECT_WS_RST_BROWSER_GONE,
           "a WebSocket browser that stops reading must get its stream reset with RST 31 (reset=%d code=%u)", reset,
