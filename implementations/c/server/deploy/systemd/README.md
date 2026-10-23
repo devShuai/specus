@@ -33,6 +33,11 @@ including a placeholder runtime token, and are not production credentials. The u
 directory, so `SPECUS_STATIC_ROOT` must be an absolute installed path; omit it only when another server such as
 OpenResty serves the SPA and the C process is used for APIs/control traffic.
 
+Each public TCP connection runs two threads. The unit raises `LimitNOFILE` and keeps systemd's `TasksMax=15%`,
+so a flood of one public port ends at the service's task limit instead of `kernel.threads-max`, which the whole
+host shares. The example sizes `SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS*` for a device of about 1 GiB; on a larger
+host raise those limits and `TasksMax` together (twice the global limit plus some control and management threads).
+
 The production template deliberately refuses plaintext control/data traffic. Install a PKCS#12 bundle at the
 configured `SPECUS_TLS_KEYSTORE` path and replace both example passwords. PEM certificate/private-key pairs are
 also supported through `SPECUS_TLS_CERTIFICATE` and `SPECUS_TLS_PRIVATE_KEY`. If a trusted L4 proxy terminates TLS,

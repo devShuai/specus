@@ -10,6 +10,11 @@ ExecStart=/usr/local/bin/specus-server-c
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576
+# Every public TCP connection runs two threads, and descriptors (above) do not run out first: this
+# keeps a flood of one public port from taking every thread of the host (kernel.threads-max is
+# system-wide). systemd's usual default, stated here in case DefaultTasksMax was lifted; raise it
+# with the SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS* limits (README).
+TasksMax=15%
 NoNewPrivileges=true
 
 [Install]

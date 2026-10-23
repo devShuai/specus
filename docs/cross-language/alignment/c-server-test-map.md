@@ -544,12 +544,12 @@ Rate批次结束时，四类连通性中Vector、Resource、Rate三类为候选�
 | `stream_fd_lifetime_tests` 场景 6 LATE_ACCEPT_AFTER_RELEASE | 同上，监听由同一客户端的新登录释放（`release_session_listeners`） | 迟到的连接被发布，起了读写线程 |
 | `stream_fd_lifetime_tests` 场景 7 LATE_ACCEPT_DURING_SHUTDOWN | 同上，data 连接结束（`session_shutdown` 在另一线程里等监听线程） | 监听描述符当场被关闭 |
 | `stream_fd_lifetime_tests` 场景 0–4、8 的收尾（NAT-BP-01） | 流不论怎样结束（停在 recv、停在 send、写线程或读线程起不来、读线程启动前被停止、场景 8 两侧正常关闭：公网对端关闭、客户端 FIN 写完），会话存活期间 10 s 内从会话里消失、描述符已关闭、外部连接计数归零；随后 UNREGISTER 停掉的监听同样从会话里消失、描述符已关闭 | 六个场景都失败：流一直留在会话里，直到 data 连接结束（测试为在原实现上编译，只去掉了新条件变量的初始化） |
-| `nat_public_tcp_tests`「closed public connections are released while the data connection lives」（真实进程，新增） | 同一条 data 连接上先关 20 条预热，再先后建立并关闭 300 条公网连接（公网对端关闭、收到 FIN 后客户端回 FIN）：服务端 `/proc/<pid>/maps` 的行数不超过关闭前加 64（实测 236 → 236）；之后新的公网连接照常双向转发 | 306 → 1506，多出 1200 个映射，即每条连接两个未 join 线程的栈与保护页 |
+| `nat_public_tcp_tests`「closed public connections are released while the data connection lives」（真实进程，新增） | 同一条 data 连接上先关 20 条预热，再先后建立并关闭 200 条公网连接（公网对端关闭、收到 FIN 后客户端回 FIN）：服务端 `/proc/<pid>/maps` 的行数不超过关闭前加 64（300 条时实测 236 → 236）；之后新的公网连接照常双向转发 | 300 条时 306 → 1506，多出 1200 个映射，即每条连接两个未 join 线程的栈与保护页（为缩短 Makefile 测试改为 200 条后，原实现上 309 → 1109，多出 800 个） |
 | `stream_fd_lifetime_tests` 场景 9 ACCEPT_ERROR（NAT-BP-05） | 公网对端连上之后，监听线程的第一次 accept 以 `EMFILE` 失败：监听不结束，约 1 s 后接受这条等着的连接并发布为流；之后两侧正常关闭，流与监听照常回收 | 监听线程退出，等着的连接一直没有被接受 |
-| `nat_public_tcp_tests`「a failed accept pauses the public port instead of closing it」 | 用 `prlimit` 把服务端的 `RLIMIT_NOFILE` 软上限设为它最小的空闲描述符号，再连公网端口：服务端记 `[nat] accept failed port=<端口> ... retrying in 1000 ms`；恢复上限后，这条连接得到 OPEN（已阻塞的 accept 用它预留的描述符接下，或在暂停后接下），随后新的公网连接照常双向转发 | 第一条连接被接下后监听线程退出，新连接被拒绝（`public OPEN` 失败） |
-| `nat_public_tcp_tests`「a failed accept pauses the control port instead of ending the server」 | 同样压低上限后连控制端口：服务端记 `[server] accept failed`、进程仍在运行；恢复上限后新的控制登录成功，原有的控制连接应答心跳，公网连接照常转发 | 服务端进入优雅停机并退出 |
+| `nat_public_tcp_tests`「a failed accept pauses the public port instead of closing it」 | 用 `prlimit` 把服务端的 `RLIMIT_NOFILE` 软上限设为它最小的空闲描述符号，再连公网端口：服务端记 `[nat] accept failed port=<端口> ... retrying in 1000 ms`；恢复上限后，这条连接得到 OPEN（已阻塞的 accept 用它预留的描述符接下，或在暂停后接下），随后新的公网连接照常双向转发。服务端只短暂持有的描述符（例如一次 SQLite 写）若在压低上限之后、低于上限处关闭，下一次 accept 会成功、这一轮看不到失败，所以最多重复 3 轮，任一轮记下失败即可 | 第一条连接被接下后监听线程退出，新连接被拒绝（`public OPEN` 失败） |
+| `nat_public_tcp_tests`「a failed accept pauses the control port instead of ending the server」 | 同样压低上限后连控制端口：服务端记 `[server] accept failed`、进程仍在运行（最多 3 轮，同上）；恢复上限后新的控制登录成功，原有的控制连接应答心跳，公网连接照常转发 | 服务端进入优雅停机并退出 |
 | `nat_public_tcp_tests`「accepted public and data sockets have SO_KEEPALIVE by default」（NAT-BP-06） | 经 sock_diag（`NETLINK_SOCK_DIAG`）读服务端那一侧的 socket：空闲的公网连接与 data 连接都有 keepalive 定时器（`idiag_timer=2`） | 公网 socket 没有 keepalive 定时器 |
-| `nat_public_tcp_tests`「SPECUS_NETTY_KEEP_ALIVE=false leaves SO_KEEPALIVE off」 | 同上，3 s 内两个 socket 都没有 keepalive 定时器 | 通过（原实现本来就不设） |
+| `nat_public_tcp_tests`「SPECUS_NETTY_KEEP_ALIVE=false leaves SO_KEEPALIVE off」 | 同上，0.25 s 内两个 socket 都没有 keepalive 定时器 | 通过（原实现本来就不设） |
 | `nat_public_tcp_tests`「both listeners take Java's SO_BACKLOG of 8192 (capped at somaxconn)」（NAT-BP-08） | 控制端口与公网端口两个监听 socket 的 accept 队列上限（sock_diag 的 `idiag_wqueue`）都等于 min(8192, somaxconn)（本机 4096） | 都是 128 |
 | `nat_public_tcp_tests`「SPECUS_NETTY_SO_BACKLOG sets both listeners' backlog」（`SPECUS_NETTY_SO_BACKLOG= 0x4D `） | 两个监听都是 77（Spring 去掉空白、按十六进制绑定） | 都是 128 |
 | `nat_public_tcp_tests`「SPECUS_NETTY_MAX_FRAME_SIZE caps frames after login」（`=1048576`） | 登录后正好 1 MiB 的帧被读取（未知流回 RST 7，心跳照常应答），多 1 字节的帧使 data 连接被关闭，控制连接保持 | 多 1 字节的帧照常读取，连接不关 |
@@ -562,7 +562,7 @@ Rate批次结束时，四类连通性中Vector、Resource、Rate三类为候选�
 | `nat_stream_tests`「WINDOW_UPDATE beyond 16 MiB closes the data connection for an unknown stream」（NAT-BP-12） | 对从未打开的流发值为 16 MiB + 1 的 WINDOW_UPDATE：data 连接被关闭，控制连接保持，重新登录 data 连接后照常服务（值不超过 16 MiB 的仍被忽略，见既有的 `check_unknown_streams`） | 被忽略，data 连接不关 |
 | `nat_stream_tests`「credit after the server's TCP FIN is ignored」 | 公网对端半关闭、服务端发出 FIN 后，客户端对该流连发两个 16 MiB 的 WINDOW_UPDATE：data 连接保持、该流没有 RST；客户端随后的 DATA 与 FIN 照常到达公网对端 | 第一个 16 MiB 就累计越界，data 连接被关闭 |
 
-`stream_fd_lifetime_tests`、`nat_public_tcp_tests` 与全部 `nat_stream_tests` 另在本机 WSL 以 ThreadSanitizer 和 ASan/UBSan 构建运行，全部通过且没有任何报告（WSL 内核的 ASLR 熵需要 `setarch -R` 才能跑 TSan）。TSan 构建需加 `-fno-hoist-adjacent-loads`：否则 GCC 把 `record_tcp_frame` 两个方向相邻字段的读取提到分支之前，读写两个线程各自的偏移被报为竞争；这在 `origin/main` 上同样出现，不是本项引入的。`origin/main` 在同一 TSan 运行里还报出 `session_shutdown` 的数据竞争（它关闭监听描述符时监听线程正在 accept），本项之后不再出现。
+`nat_public_tcp_tests` 用到 Linux 的 sock_diag、`prlimit` 与 `/proc`，CMake 与 Makefile 都只在 Linux 上构建和运行它；本机约 7 s，其中两次 accept 失败的 1 s 暂停是被测行为本身。`stream_fd_lifetime_tests`、`nat_public_tcp_tests` 与全部 `nat_stream_tests` 另在本机 WSL 以 ThreadSanitizer 和 ASan/UBSan 构建运行，全部通过且没有任何报告（WSL 内核的 ASLR 熵需要 `setarch -R` 才能跑 TSan）。TSan 构建需加 `-fno-hoist-adjacent-loads`：否则 GCC 把 `record_tcp_frame` 两个方向相邻字段的读取提到分支之前，读写两个线程各自的偏移被报为竞争；这在 `origin/main` 上同样出现，不是本项引入的。`origin/main` 在同一 TSan 运行里还报出 `session_shutdown` 的数据竞争（它关闭监听描述符时监听线程正在 accept），本项之后不再出现。
 
 ## 历史表的读法与限制
 
