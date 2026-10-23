@@ -1358,10 +1358,11 @@ int st_storage_authorize_peer_mesh_relay_grant(const char *path,
  */
 int st_storage_record_peer_mesh_relay_traffic(const char *path, long long session_id, long long relay_bytes);
 /*
- * Changes whenever a committed write may withdraw the relay authorization of this session (a
- * close or a report); a relay grant cached under another value is checked again.
+ * Called with the session's id after each committed write that can withdraw its relay
+ * authorization: a close (by a client or the management API) or a reported change of status.
+ * Traffic reports and refused reports call nothing. One listener per process; NULL removes it.
  */
-unsigned long long st_storage_peer_mesh_session_version(long long session_id);
+void st_storage_set_peer_mesh_session_listener(void (*listener)(long long session_id));
 int st_storage_verify_peer_mesh_probe(const char *path,
                                       long long session_id,
                                       long long from_client_id,

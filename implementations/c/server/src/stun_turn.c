@@ -109,20 +109,22 @@ typedef struct {
 
 /*
  * A Peer Mesh session the relay has seen (Java relayAuthorizationCache plus pendingRelayBytes).
- * The grant answers its frames for RELAY_GRANT_TTL_MS while the session neither expires nor
- * changes (st_storage_peer_mesh_session_version); the bytes of its outbound frames wait in
- * pending_bytes for the next batch. Keyed by database and session, since the database path is
- * read per frame.
+ * The grant answers its frames for RELAY_GRANT_TTL_MS while the session neither expires nor is
+ * withdrawn (closed or given a new status, which the storage reports per session); the bytes of
+ * its outbound frames wait in pending_bytes for the next batch. Keyed by database and session,
+ * since the database path is read per frame.
  */
 typedef struct {
     char *database_path;
     long long session_id;
     st_storage_peer_mesh_relay_grant grant;
     int granted;
-    unsigned long long version;
     long long grant_expires_ms;
     long long pending_bytes;
 } relay_session;
+
+/* Sessions withdrawn lately, so that a grant read while one was withdrawn is not kept. */
+#define RELAY_WITHDRAWAL_RING 64U
 
 struct st_stun_turn_server {
     int control_fd;
@@ -145,6 +147,8 @@ struct st_stun_turn_server {
     int udp_receive_buffer;
     int udp_send_buffer;
     int udp_traffic_class;
+    /* XOR-RELAYED-ADDRESS of every allocation (Java turnAdvertisedAddress). */
+    struct in_addr relay_address;
     pthread_t thread;
     /*
      * Every allocation, without a fixed limit (Java keeps them in an unbounded map: the relay
@@ -160,9 +164,10 @@ struct st_stun_turn_server {
     turn_allocation **poll_owners;
     size_t poll_capacity;
     /*
-     * Relay sessions, shared by the STUN/TURN thread and the flusher. relay_lock guards the table
-     * and flush_stopping and is never held over database work; flush_lock lets one batch be
-     * written at a time, and only a flush removes entries.
+     * Relay sessions, shared by the STUN/TURN thread, the flusher and the storage's listener.
+     * relay_lock guards the table, the withdrawals and flush_stopping and is never held over
+     * database work; flush_lock lets one batch be written at a time, and only a flush removes
+     * entries. next_live and live belong to live_servers_lock.
      */
     pthread_mutex_t relay_lock;
     pthread_cond_t relay_wake;
@@ -171,6 +176,10 @@ struct st_stun_turn_server {
     relay_session *relay_sessions;
     size_t relay_session_count;
     size_t relay_session_capacity;
+    unsigned long long withdrawals;
+    long long withdrawn_sessions[RELAY_WITHDRAWAL_RING];
+    st_stun_turn_server *next_live;
+    int live;
     long flush_interval_ms;
     int flush_stopping;
     int flusher_started;
@@ -270,19 +279,27 @@ static int env_signed_int_alias(const char *name, const char *legacy_name, int d
 }
 
 /* Java InetAddress.getLocalHost: this host's name resolved (IPv4, as every socket here is). */
+/* Java InetAddress.getByName, for IPv4 sockets: a literal, else the first IPv4 address of the name. */
+static int resolve_ipv4(const char *text, struct in_addr *out)
+{
+    if (text == NULL || *text == '\0') return -1;
+    if (inet_pton(AF_INET, text, out) == 1) return 0;
+    struct addrinfo hints;
+    struct addrinfo *found = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    if (getaddrinfo(text, NULL, &hints, &found) != 0 || found == NULL) return -1;
+    *out = ((const struct sockaddr_in *)found->ai_addr)->sin_addr;
+    freeaddrinfo(found);
+    return 0;
+}
+
 static void local_host_address(struct in_addr *out)
 {
     char name[256];
-    struct addrinfo hints;
-    struct addrinfo *found = NULL;
-    out->s_addr = htonl(INADDR_LOOPBACK);
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    if (gethostname(name, sizeof(name)) != 0) return;
+    if (gethostname(name, sizeof(name)) != 0) name[0] = '\0';
     name[sizeof(name) - 1U] = '\0';
-    if (getaddrinfo(name, NULL, &hints, &found) != 0 || found == NULL) return;
-    *out = ((const struct sockaddr_in *)found->ai_addr)->sin_addr;
-    freeaddrinfo(found);
+    if (resolve_ipv4(name, out) != 0) out->s_addr = htonl(INADDR_LOOPBACK);
 }
 
 static int sockaddr_equal(const struct sockaddr_storage *left,
@@ -641,15 +658,18 @@ static int add_stun_endpoint(st_stun_turn_server *server,
     struct sockaddr_in *advertised = (struct sockaddr_in *)&endpoint->advertised;
     advertised->sin_family = AF_INET;
     advertised->sin_port = htons((uint16_t)actual_port);
-    /* Java resolvePrimaryAdvertisedAddress: the public address, else the bind address unless it is
-     * the wildcard, else this host's address. */
-    const char *selected = advertised_address;
-    if (selected == NULL || inet_pton(AF_INET, selected, &advertised->sin_addr) != 1) {
-        selected = bind_address;
-        if (selected == NULL || inet_pton(AF_INET, selected, &advertised->sin_addr) != 1
-            || advertised->sin_addr.s_addr == htonl(INADDR_ANY)) {
-            local_host_address(&advertised->sin_addr);
+    /* Java resolvePrimaryAdvertisedAddress: the public address, a name resolved (one that does not
+     * resolve keeps the STUN/TURN server from starting, as in Java), else the bind address unless
+     * it is the wildcard, else this host's address. */
+    if (advertised_address != NULL && *advertised_address != '\0') {
+        if (resolve_ipv4(advertised_address, &advertised->sin_addr) != 0) {
+            fprintf(stderr, "[peer-mesh] cannot resolve the advertised STUN/TURN address %s\n", advertised_address);
+            close(fd);
+            return -1;
         }
+    } else if (bind_address == NULL || inet_pton(AF_INET, bind_address, &advertised->sin_addr) != 1
+               || advertised->sin_addr.s_addr == htonl(INADDR_ANY)) {
+        local_host_address(&advertised->sin_addr);
     }
     endpoint->advertised_len = sizeof(*advertised);
     ++server->endpoint_count;
@@ -841,6 +861,56 @@ static relay_session *add_relay_session(st_stun_turn_server *server, const char 
     return entry;
 }
 
+/* Caller holds relay_lock. Whether session_id was withdrawn after the count `since` was noted. */
+static int withdrawn_since(const st_stun_turn_server *server, unsigned long long since, long long session_id)
+{
+    if (server->withdrawals - since > RELAY_WITHDRAWAL_RING) return 1;
+    for (unsigned long long seq = since; seq < server->withdrawals; ++seq) {
+        if (server->withdrawn_sessions[seq % RELAY_WITHDRAWAL_RING] == session_id) return 1;
+    }
+    return 0;
+}
+
+/* Every running server, for the storage's session listener; normally there is one. */
+static pthread_mutex_t live_servers_lock = PTHREAD_MUTEX_INITIALIZER;
+static st_stun_turn_server *live_servers;
+
+/*
+ * The storage's listener (st_storage_set_peer_mesh_session_listener): a session was closed or
+ * given a new status, so its cached grant is read again on its next frame, as Java drops that
+ * session's relayAuthorizationCache entry. Grants of other sessions are untouched.
+ */
+static void withdraw_relay_grant(long long session_id)
+{
+    pthread_mutex_lock(&live_servers_lock);
+    for (st_stun_turn_server *server = live_servers; server != NULL; server = server->next_live) {
+        pthread_mutex_lock(&server->relay_lock);
+        server->withdrawn_sessions[server->withdrawals % RELAY_WITHDRAWAL_RING] = session_id;
+        ++server->withdrawals;
+        for (size_t i = 0; i < server->relay_session_count; ++i) {
+            if (server->relay_sessions[i].session_id == session_id) server->relay_sessions[i].granted = 0;
+        }
+        pthread_mutex_unlock(&server->relay_lock);
+    }
+    pthread_mutex_unlock(&live_servers_lock);
+}
+
+static void set_server_live(st_stun_turn_server *server, int live)
+{
+    pthread_mutex_lock(&live_servers_lock);
+    if (live && !server->live) {
+        server->next_live = live_servers;
+        live_servers = server;
+        st_storage_set_peer_mesh_session_listener(withdraw_relay_grant);
+    } else if (!live && server->live) {
+        st_stun_turn_server **link = &live_servers;
+        while (*link != NULL && *link != server) link = &(*link)->next_live;
+        if (*link == server) *link = server->next_live;
+    }
+    server->live = live;
+    pthread_mutex_unlock(&live_servers_lock);
+}
+
 /* Java RelayAuthorization.matches: 0/0 is TURN authentication off, where only the session counts. */
 static int relay_grant_matches(const st_storage_peer_mesh_relay_grant *grant, long long from, long long to)
 {
@@ -867,20 +937,20 @@ static int authorize_relay_frame(st_stun_turn_server *server,
     int identified = from_client_id > 0 && to_client_id > 0;
     if ((!identified && (from_client_id != 0 || to_client_id != 0))
         || (identified && from_client_id == to_client_id)) return 0;
-    /* Read before the session is, so a change committed meanwhile leaves the new grant stale. */
-    unsigned long long version = st_storage_peer_mesh_session_version(session_id);
     long long now_ms = monotonic_ms();
     char now[ST_INSTANT_CAPACITY];
     int have_now = st_instant_now(now) == 0;
     pthread_mutex_lock(&server->relay_lock);
     relay_session *entry = find_relay_session(server, database_path, session_id);
-    if (entry != NULL && entry->granted && entry->version == version && entry->grant_expires_ms > now_ms
+    if (entry != NULL && entry->granted && entry->grant_expires_ms > now_ms
         && (entry->grant.expires_at[0] == '\0' || (have_now && strcmp(entry->grant.expires_at, now) > 0))) {
         int allowed = relay_grant_matches(&entry->grant, from_client_id, to_client_id);
         if (allowed && account_traffic) entry->pending_bytes = saturated_add(entry->pending_bytes, bytes);
         pthread_mutex_unlock(&server->relay_lock);
         return allowed;
     }
+    /* Noted before the session is read: a withdrawal committed meanwhile must not be cached over. */
+    unsigned long long withdrawals = server->withdrawals;
     pthread_mutex_unlock(&server->relay_lock);
     st_storage_peer_mesh_relay_grant grant;
     int allowed = st_storage_authorize_peer_mesh_relay_grant(database_path, session_id, from_client_id,
@@ -890,8 +960,7 @@ static int authorize_relay_frame(st_stun_turn_server *server,
     if (allowed && entry == NULL) entry = add_relay_session(server, database_path, session_id);
     if (allowed && entry != NULL) {
         entry->grant = grant;
-        entry->granted = 1;
-        entry->version = version;
+        entry->granted = !withdrawn_since(server, withdrawals, session_id);
         entry->grant_expires_ms = now_ms + RELAY_GRANT_TTL_MS;
         if (account_traffic) entry->pending_bytes = saturated_add(entry->pending_bytes, bytes);
     } else if (allowed) {
@@ -1192,12 +1261,7 @@ static turn_allocation *create_allocation(st_stun_turn_server *server,
     struct sockaddr_in *relay = (struct sockaddr_in *)&slot->relay;
     relay->sin_family = AF_INET;
     relay->sin_port = htons((uint16_t)relay_port);
-    /* SPECUS_PEER_MESH_RELAY_ADDRESS is C's own override; otherwise, as Java's
-     * turnAdvertisedAddress, the main listener's advertised address. */
-    const char *advertised = getenv("SPECUS_PEER_MESH_RELAY_ADDRESS");
-    if (advertised == NULL || inet_pton(AF_INET, advertised, &relay->sin_addr) != 1) {
-        relay->sin_addr = ((const struct sockaddr_in *)&server->endpoints[0].advertised)->sin_addr;
-    }
+    relay->sin_addr = server->relay_address;
     slot->relay_len = sizeof(*relay);
     /* Java createAllocation logs every allocation at info. */
     char client_text[INET6_ADDRSTRLEN + 16];
@@ -1871,6 +1935,7 @@ static void stop_relay_flusher(st_stun_turn_server *server)
 /* Releases a server whose threads are not running (any more). */
 static void discard_server(st_stun_turn_server *server)
 {
+    if (server->sync_ready) set_server_live(server, 0);
     for (size_t i = 0; i < server->allocation_count; ++i) {
         if (server->allocations[i]->used) close_allocation(server->allocations[i]);
     }
@@ -1973,6 +2038,17 @@ int st_stun_turn_server_start(st_stun_turn_server **out_server)
         (void)add_stun_endpoint(server, primary_bind, primary_public,
                                 alternate_port, 0, 1);
     }
+    /* SPECUS_PEER_MESH_RELAY_ADDRESS is C's own override, resolved like the public address;
+     * otherwise, as Java's turnAdvertisedAddress, the main listener's advertised address. */
+    const char *relay_address = getenv("SPECUS_PEER_MESH_RELAY_ADDRESS");
+    server->relay_address = ((const struct sockaddr_in *)&server->endpoints[0].advertised)->sin_addr;
+    if (relay_address != NULL && *relay_address != '\0'
+        && resolve_ipv4(relay_address, &server->relay_address) != 0) {
+        fprintf(stderr, "[peer-mesh] cannot resolve SPECUS_PEER_MESH_RELAY_ADDRESS %s\n", relay_address);
+        discard_server(server);
+        return -1;
+    }
+    set_server_live(server, 1);
     if (pthread_create(&server->flusher, NULL, relay_flush_thread, server) != 0) {
         discard_server(server);
         return -1;

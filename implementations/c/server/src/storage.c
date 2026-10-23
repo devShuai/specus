@@ -160,25 +160,26 @@ static void peer_session_expired_sqlite(sqlite3_context *context, int argc, sqli
 #define PEER_SESSION_EXPIRED_SQL "specus_peer_session_expired(expires_at)"
 
 /*
- * The relay hot path caches session grants (stun_turn.c, Java relayAuthorizationCache). A
- * committed close or report of a session bumps the stripe it falls in, and a grant cached under an
- * older value is read again on its next frame, the way Java drops the cache entry. Expiry needs no
- * bump: the cached grant carries the session's expiry.
+ * The relay hot path caches session grants (stun_turn.c, Java relayAuthorizationCache). It is told
+ * of each committed change that can withdraw one session's authorization, a close or a change of
+ * its status, the way Java drops that session's cache entry. Expiry needs no notice: the cached
+ * grant carries the session's expiry.
  */
-#define PEER_SESSION_VERSION_STRIPES 256U
-static atomic_ullong peer_session_versions[PEER_SESSION_VERSION_STRIPES];
+typedef void (*peer_session_listener)(long long session_id);
+static _Atomic(peer_session_listener) peer_session_change_listener;
 
 _Static_assert(sizeof(((st_storage_peer_mesh_relay_grant *)0)->expires_at) == ST_INSTANT_CAPACITY,
                "a relay grant holds one stored instant");
 
-static void peer_session_changed(long long id)
+void st_storage_set_peer_mesh_session_listener(void (*listener)(long long session_id))
 {
-    atomic_fetch_add(&peer_session_versions[(unsigned long long)id % PEER_SESSION_VERSION_STRIPES], 1ULL);
+    atomic_store(&peer_session_change_listener, listener);
 }
 
-unsigned long long st_storage_peer_mesh_session_version(long long session_id)
+static void peer_session_changed(long long id)
 {
-    return atomic_load(&peer_session_versions[(unsigned long long)session_id % PEER_SESSION_VERSION_STRIPES]);
+    peer_session_listener listener = atomic_load(&peer_session_change_listener);
+    if (listener != NULL) listener(id);
 }
 
 static int open_db(const char *path, sqlite3 **db)
@@ -9396,8 +9397,11 @@ int st_storage_report_peer_mesh_session(const char *path,
     int found = read_peer_session_state(db, id, reporter->tenant_id, &state);
     int rc = found == 1
         && (state.source_client_id == reporter->id || state.target_client_id == reporter->id) ? 0 : -1;
+    /* Whether this report closed the session or changed its status, which a relay grant depends on. */
+    int status_changed = 0;
     if (rc == 0 && close_session) {
         rc = close_peer_session(db, id);
+        status_changed = rc == 0 && sqlite3_changes(db) == 1;
     } else if (rc == 0) {
         int closed = peer_session_closed_or_expire(db, id, &state);
         if (closed < 0) rc = -1;
@@ -9437,13 +9441,18 @@ int st_storage_report_peer_mesh_session(const char *path,
                 bind_nullable_text_limit(stmt, 7, remote_endpoint, 255);
                 sqlite3_bind_int64(stmt, 8, id);
                 rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+                status_changed = rc == 0 && sqlite3_changes(db) == 1 && next_status[0] != '\0'
+                    && strcmp(next_status, state.status) != 0;
             } else rc = -1;
             sqlite3_finalize(stmt);
         }
     }
-    /* Java reportPath drops the cached relay grant: a reported status other than ACTIVE has the
-     * next relayed frame read the session again. */
-    if (found == 1) peer_session_changed(id);
+    /*
+     * Java reportPath drops the session's cached relay grant; only a close or a new status can
+     * change what that grant says, so only those are passed on. A traffic report, a path-report
+     * keeping the status and a report refused to a client outside the session pass nothing.
+     */
+    if (status_changed) peer_session_changed(id);
     if (rc == 0 && out_session != NULL) rc = read_peer_mesh_session(db, reporter->tenant_id, id, out_session);
     sqlite3_close(db);
     return rc;

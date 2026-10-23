@@ -1148,6 +1148,19 @@ static int test_turn_wire_details(void)
             || receive_exact(peer, "main", &relay, "ChannelData on the main port") != 0;
         if (failed) fprintf(stderr, "ChannelData on the alternate port was relayed, or on the main port was not\n");
     }
+    /* The answer names the configured lifetime, but the allocation lives only the 1 s asked for. */
+    received = failed ? -1 : refresh(client, &fixture, &general, st_turn_auth_nonce(), 1, 1815U,
+                                     response, sizeof(response));
+    if (!failed && (success_with_software(response, received, 0x0104U, "Refresh for 1 s") != 0
+                    || lifetime_attr(response, received) != 300)) {
+        fprintf(stderr, "Refresh asking for 1 s answered LIFETIME %d, want 300\n", lifetime_attr(response, received));
+        failed = 1;
+    }
+    if (!failed) sleep_ms(2100L);
+    received = failed ? -1 : refresh(client, &fixture, &general, st_turn_auth_nonce(), -1, 1816U,
+                                     response, sizeof(response));
+    failed = failed || expect_reason(response, received, 0x0114U, 437, "allocation-mismatch",
+                                     "Refresh after the 1 s asked for") != 0;
     if (client >= 0) close(client);
     if (second >= 0) close(second);
     if (peer >= 0) close(peer);
@@ -1167,25 +1180,26 @@ static int xor_address_text(const unsigned char *packet, int len, unsigned type,
     return inet_ntop(AF_INET, &address, out, (socklen_t)out_len) != NULL ? 0 : -1;
 }
 
-/* Java InetAddress.getLocalHost: this host's name resolved, IPv4 here; loopback when it fails. */
-static void local_host_address(char *out, size_t out_len)
+/* Java InetAddress.getByName for an IPv4 socket: the name's first IPv4 address; fallback if none. */
+static void resolved_address(const char *name, const char *fallback, char *out, size_t out_len)
 {
-    char name[256];
     struct addrinfo hints;
     struct addrinfo *found = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
-    snprintf(out, out_len, "127.0.0.1");
-    if (gethostname(name, sizeof(name)) != 0 || getaddrinfo(name, NULL, &hints, &found) != 0 || found == NULL) return;
+    snprintf(out, out_len, "%s", fallback);
+    if (getaddrinfo(name, NULL, &hints, &found) != 0 || found == NULL) return;
     (void)inet_ntop(AF_INET, &((struct sockaddr_in *)found->ai_addr)->sin_addr, out, (socklen_t)out_len);
     freeaddrinfo(found);
 }
 
 /*
- * Without a public address the relayed address and the listener's advertised address follow Java
- * resolvePrimaryAdvertisedAddress: the bind address unless it is the wildcard, then this host's
- * address. C advertised 127.0.0.1 for the relay whatever it was bound to, and for a wildcard
- * listener, which no remote client can reach.
+ * The relayed address and the listener's advertised address follow Java
+ * resolvePrimaryAdvertisedAddress: the public address, a name resolved like InetAddress.getByName;
+ * without one the bind address unless it is the wildcard, then this host's address
+ * (getLocalHost). C advertised 127.0.0.1 for the relay whatever it was bound to and for a wildcard
+ * listener, which no remote client can reach, and took a public address given as a name for none.
+ * A name that does not resolve keeps the STUN/TURN server from starting, as in Java.
  */
 static int test_advertised_address_fallback(void)
 {
@@ -1193,16 +1207,23 @@ static int test_advertised_address_fallback(void)
     turn_credential credential;
     if (turn_fixture_start(&fixture, 1, "55250", "55299", NULL) != 0
         || issue_credential("public-transfer-advertised", &credential) != 0) return -1;
+    char host_name[256] = "";
     char host[INET_ADDRSTRLEN];
-    local_host_address(host, sizeof(host));
-    static const char *const binds[] = {"127.0.0.2", "0.0.0.0"};
+    char localhost[INET_ADDRSTRLEN];
+    (void)gethostname(host_name, sizeof(host_name) - 1U);
+    resolved_address(host_name, "127.0.0.1", host, sizeof(host));
+    resolved_address("localhost", "127.0.0.1", localhost, sizeof(localhost));
+    static const char *const binds[] = {"127.0.0.2", "0.0.0.0", "127.0.0.2"};
+    static const char *const publics[] = {NULL, NULL, "localhost"};
     int failed = 0;
-    for (size_t round = 0; round < 2U && !failed; ++round) {
-        const char *expected = round == 0U ? binds[0] : host;
+    for (size_t round = 0; round < 3U && !failed; ++round) {
+        const char *expected = round == 0U ? binds[0] : (round == 1U ? host : localhost);
         unsetenv("SPECUS_PEER_MESH_RELAY_ADDRESS");
+        if (publics[round] != NULL) setenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS", publics[round], 1);
+        else unsetenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS");
         setenv("SPECUS_PEER_MESH_BIND_ADDRESS", binds[round], 1);
         failed = turn_fixture_restart(&fixture) != 0;
-        if (round == 0U) inet_pton(AF_INET, "127.0.0.2", &fixture.address.sin_addr);
+        if (strcmp(binds[round], "127.0.0.2") == 0) inet_pton(AF_INET, "127.0.0.2", &fixture.address.sin_addr);
         struct sockaddr_in client_address;
         int client = failed ? -1 : udp_socket(&client_address);
         unsigned char response[2048];
@@ -1225,7 +1246,16 @@ static int test_advertised_address_fallback(void)
         if (client >= 0) close(client);
         fixture.address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     }
+    if (fixture.server != NULL) st_stun_turn_server_stop(fixture.server);
+    fixture.server = NULL;
+    /* RFC 2606 reserves .invalid: the name never resolves. */
+    setenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS", "no-such-host.invalid", 1);
     setenv("SPECUS_PEER_MESH_BIND_ADDRESS", "127.0.0.1", 1);
+    if (!failed && st_stun_turn_server_start(&fixture.server) == 0) {
+        fprintf(stderr, "the STUN/TURN server started with a public address that does not resolve\n");
+        failed = 1;
+    }
+    unsetenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS");
     setenv("SPECUS_PEER_MESH_RELAY_ADDRESS", "127.0.0.1", 1);
     if (fixture.server != NULL) st_stun_turn_server_stop(fixture.server);
     return failed ? -1 : 0;
@@ -1896,7 +1926,8 @@ static int frame_dropped(int from_fd, const struct sockaddr_in *server, const st
 static sqlite3 *lock_database(const char *path)
 {
     sqlite3 *db = NULL;
-    if (sqlite3_open(path, &db) == SQLITE_OK
+    /* The server's flusher may hold the write lock for a moment: wait for it, as a writer would. */
+    if (sqlite3_open(path, &db) == SQLITE_OK && sqlite3_busy_timeout(db, 2000) == SQLITE_OK
         && sqlite3_exec(db, "BEGIN EXCLUSIVE", NULL, NULL, NULL) == SQLITE_OK) return db;
     sqlite3_close(db);
     return NULL;
@@ -2270,6 +2301,101 @@ static int test_relay_survives_database_lock(st_stun_turn_server *turn, const st
     if (source_fd >= 0) close(source_fd);
     if (target_fd >= 0) close(target_fd);
     if (probe_fd >= 0) close(probe_fd);
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(fixture.path);
+    return failed;
+}
+
+/* A frame covered by the session's cached grant crosses although another writer holds the database. */
+static int frame_crosses_locked_database(const char *path, int from_fd, const struct sockaddr_in *server,
+                                         const struct sockaddr_in *to_relay, int to_fd, long long session_id,
+                                         long long sequence, unsigned seed, const char *label)
+{
+    sqlite3 *lock = lock_database(path);
+    unsigned char frame[52];
+    size_t len = spm2_frame(frame, session_id, sequence);
+    long long started = monotonic_ms();
+    int crossed = lock != NULL && relayed_bytes(from_fd, server, to_relay, to_fd, frame, len, seed, 500L);
+    long long elapsed = monotonic_ms() - started;
+    unlock_database(lock);
+    if (crossed) return 0;
+    fprintf(stderr, "%s: with the database locked the frame was %s after %lld ms\n", label,
+            lock == NULL ? "not sent (no lock)" : "not relayed", elapsed);
+    return -1;
+}
+
+/*
+ * A cached relay grant is dropped only by a change that can withdraw the session's authorization,
+ * as Java drops its relayAuthorizationCache entry (markClosed, reportPath). A traffic report, a
+ * report refused because the reporter is no party to the session, a path-report that leaves the
+ * status as it is, and the close of another session (even one whose id is 256 away) leave it, so
+ * the next frame does not go back to the database on the STUN/TURN thread. A path-report that
+ * changes the status does drop it: the next frame reads the session and, like Java's slow path,
+ * activates it again.
+ */
+static int test_relay_grant_kept_across_unrelated_changes(st_stun_turn_server *turn, const struct sockaddr_in *server)
+{
+    frame_fixture fixture;
+    if (frame_fixture_setup(&fixture, "tenant-grant") != 0) return 1;
+    st_storage_peer_mesh_session session;
+    st_storage_peer_mesh_session closed;
+    struct sockaddr_in source_address, target_address, source_relay, target_relay;
+    char source_user[192], target_user[192];
+    unsigned char source_key[16], target_key[16];
+    int source_fd = udp_socket(&source_address);
+    int target_fd = udp_socket(&target_address);
+    int failed = source_fd < 0 || target_fd < 0
+        || open_session(&fixture, "grant-session-token", &session) != 0
+        || allocate_peer_relay(source_fd, server, fixture.source.id, 1170U, source_user, source_key, &source_relay) != 0
+        || allocate_peer_relay(target_fd, server, fixture.target.id, 1171U, target_user, target_key, &target_relay) != 0
+        || permit_peer(source_fd, server, source_user, source_key, &target_relay, 1172U) != 0
+        || permit_peer(target_fd, server, target_user, target_key, &source_relay, 1173U) != 0
+        || !frame_relayed(source_fd, server, &target_relay, target_fd, session.id, 1, 1174U);
+    if (failed) fprintf(stderr, "relay grant fixture setup failed\n");
+    /* Another session whose id shares the old 256-way version stripe with this one. */
+    if (!failed) {
+        sqlite3 *db = NULL;
+        char sql[512];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO peer_mesh_session(id,tenant_id,source_client_id,source_client_name,target_client_id,"
+                 "target_client_name,status,token_hash,expires_at) VALUES(%lld,'tenant-grant',%lld,'a',%lld,'b',"
+                 "'ACTIVE','x','2099-01-01T00:00:00Z')", session.id + 256, fixture.source.id, fixture.target.id);
+        failed = sqlite3_open(fixture.path, &db) != SQLITE_OK || sqlite3_exec(db, sql, NULL, NULL, NULL) != SQLITE_OK;
+        sqlite3_close(db);
+        if (failed) fprintf(stderr, "neighbour session setup failed\n");
+    }
+    failed = failed
+        || st_storage_report_peer_mesh_session(fixture.path, &fixture.source, session.id, NULL, NULL, -1, NULL, NULL,
+                                               100, 0, 0, NULL) != 0
+        || frame_crosses_locked_database(fixture.path, source_fd, server, &target_relay, target_fd, session.id, 2,
+                                         1175U, "after a traffic report") != 0
+        || st_storage_report_peer_mesh_session(fixture.path, &fixture.stranger, session.id, "RELAY", "FAILED", 5,
+                                               NULL, NULL, 0, 0, 0, NULL) == 0
+        || frame_crosses_locked_database(fixture.path, source_fd, server, &target_relay, target_fd, session.id, 3,
+                                         1176U, "after a refused report") != 0
+        || st_storage_report_peer_mesh_session(fixture.path, &fixture.source, session.id, "RELAY", "ACTIVE", 5,
+                                               NULL, NULL, 0, 0, 0, NULL) != 0
+        || frame_crosses_locked_database(fixture.path, source_fd, server, &target_relay, target_fd, session.id, 4,
+                                         1177U, "after a path-report keeping the status") != 0
+        || st_storage_close_peer_mesh_session_visible(fixture.path, session.id + 256, "tenant-grant", "", 1,
+                                                      &closed) != 0
+        || frame_crosses_locked_database(fixture.path, source_fd, server, &target_relay, target_fd, session.id, 5,
+                                         1178U, "after another session's close") != 0;
+    /* A status change is read on the next frame, which activates the session again. */
+    if (!failed && (st_storage_report_peer_mesh_session(fixture.path, &fixture.source, session.id, "RELAY", "DEGRADED",
+                                                        5, NULL, NULL, 0, 0, 0, NULL) != 0
+                    || session_is(fixture.path, "tenant-grant", session.id, "DEGRADED", NULL, -1,
+                                  "after a path-report changing the status") != 0
+                    || !frame_relayed(source_fd, server, &target_relay, target_fd, session.id, 6, 1179U)
+                    || session_is(fixture.path, "tenant-grant", session.id, "ACTIVE", "RELAY", -1,
+                                  "the frame after a status change") != 0)) {
+        fprintf(stderr, "a status change did not withdraw the cached relay grant\n");
+        failed = 1;
+    }
+    failed = failed || counted_session_is(turn, fixture.path, "tenant-grant", session.id, "ACTIVE", "RELAY", 6 * 52,
+                                          "frames relayed around unrelated changes") != 0;
+    if (source_fd >= 0) close(source_fd);
+    if (target_fd >= 0) close(target_fd);
     unsetenv("SPECUS_DATABASE_PATH");
     unlink(fixture.path);
     return failed;
@@ -2650,6 +2776,7 @@ int main(void)
     if (peer_mesh_relay_tests(&server_address) != 0
         || test_spm2_frames_bound_to_session(server, &server_address) != 0
         || test_relay_survives_database_lock(server, &server_address) != 0
+        || test_relay_grant_kept_across_unrelated_changes(server, &server_address) != 0
         || test_unknown_subject_relays_nothing(&server_address) != 0) return 1;
     st_stun_turn_server_stop(server);
 

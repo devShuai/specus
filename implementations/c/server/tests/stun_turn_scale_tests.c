@@ -262,9 +262,11 @@ static int test_sockets_past_fd_setsize(void)
     rlim_t wanted = (rlim_t)FD_SETSIZE + 512U;
     if (limit.rlim_cur < wanted) {
         limit.rlim_cur = limit.rlim_max == RLIM_INFINITY || limit.rlim_max > wanted ? wanted : limit.rlim_max;
+        /* A hard limit this low leaves the case unverified, which must not pass unnoticed. */
         if (setrlimit(RLIMIT_NOFILE, &limit) != 0 || limit.rlim_cur < wanted) {
-            fprintf(stderr, "cannot raise RLIMIT_NOFILE past FD_SETSIZE; skipping\n");
-            return 0;
+            fprintf(stderr, "cannot raise RLIMIT_NOFILE to %lu (hard limit %lu); raise it to run this case\n",
+                    (unsigned long)wanted, (unsigned long)limit.rlim_max);
+            return -1;
         }
     }
     int fillers[FD_SETSIZE + 64];
