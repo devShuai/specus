@@ -53,7 +53,7 @@ typedef struct {
     int connected;             /* context != NULL, readable under state_lock alone */
     unsigned int failures;     /* consecutive failed reconnect attempts */
     long long retry_at_ms;     /* monotonic: no reconnect attempt before this */
-    unsigned long reconnects;
+    unsigned long reconnects;  /* changed under lock and state_lock, readable under state_lock */
     const char *name;
 } st_cluster_link;
 
@@ -185,15 +185,16 @@ static const char *cluster_java_trim(const char *value, size_t *len)
 
 /*
  * Spring's StringToBooleanConverter: the trimmed value, case-insensitive, is one of
- * true/on/yes/1 (1) or false/off/no/0 (0). Unset or blank binds nothing (-2); anything else
- * fails the binding (-1).
+ * true/on/yes/1 (1) or false/off/no/0 (0); anything else fails the binding (-1), a blank value
+ * included. Unset binds nothing (-2). So does an empty value here, where Spring resolves the
+ * placeholder to "" and fails to bind it to the primitive: C keeps the default for "NAME=".
  */
 static int cluster_spring_bool(const char *value)
 {
-    if (value == NULL) return -2;
+    if (value == NULL || *value == '\0') return -2;
     size_t len = 0U;
     const char *start = cluster_java_trim(value, &len);
-    if (len == 0U) return -2;
+    if (len == 0U) return -1;
     char lowered[8];
     if (len >= sizeof(lowered)) return -1;
     for (size_t i = 0U; i < len; ++i) lowered[i] = (char)tolower((unsigned char)start[i]);
@@ -208,10 +209,11 @@ static int cluster_spring_bool(const char *value)
 }
 
 /*
- * Spring's StringToNumberConverterFactory for a long: an empty value binds nothing (-2); otherwise
- * NumberUtils.parseNumber removes every whitespace character and reads Long.valueOf (an optional
- * sign and decimal digits) or, after an optional '-', a 0x, 0X or # prefix, Long.decode's
- * hexadecimal. Anything else, including overflow, fails the binding (-1).
+ * Spring's StringToNumberConverterFactory for a long: NumberUtils.parseNumber removes every
+ * whitespace character and reads Long.valueOf (an optional sign and decimal digits) or, after an
+ * optional '-', a 0x, 0X or # prefix, Long.decode's hexadecimal. Anything else, overflow and a
+ * blank value included, fails the binding (-1). Unset binds nothing (-2); so does an empty value
+ * here, which Spring fails to bind to the primitive (C keeps the default, as for the switch).
  */
 static int cluster_spring_long(const char *value, long long *out)
 {
@@ -287,6 +289,24 @@ int st_public_coordination_validate_config(void)
         long long ignored = 0;
         if (cluster_spring_long(getenv(numbers[i]), &ignored) == -1) {
             fprintf(stderr, "invalid number %s\n", numbers[i]);
+            return -1;
+        }
+    }
+    /*
+     * Java also schedules refreshClusterPresence with @Scheduled(fixedDelayString) from the same
+     * value, clustering on or off: DurationFormatterUtils reads it as a sign and decimal digits
+     * (no blanks, no hexadecimal; a unit suffix would already fail the number), and the scheduler
+     * refuses a delay that is not positive. Either way Java does not start.
+     */
+    const char *refresh = getenv(ST_CLUSTER_REFRESH_ENV);
+    if (refresh != NULL && *refresh != '\0') {
+        const char *digits = refresh + (*refresh == '+' || *refresh == '-');
+        int decimal = *digits != '\0';
+        for (const char *cursor = digits; decimal && *cursor != '\0'; ++cursor)
+            decimal = *cursor >= '0' && *cursor <= '9';
+        long long period = 0;
+        if (!decimal || cluster_spring_long(refresh, &period) != 0 || period <= 0) {
+            fprintf(stderr, "%s must be a positive number of milliseconds\n", ST_CLUSTER_REFRESH_ENV);
             return -1;
         }
     }
@@ -549,11 +569,13 @@ static int cluster_ready(void)
     return ready;
 }
 
-static void cluster_link_set_locked(st_cluster_link *link, redisContext *context)
+/* With link->lock held: installs context (NULL when it was dropped); reconnected counts it. */
+static void cluster_link_set_locked(st_cluster_link *link, redisContext *context, int reconnected)
 {
     pthread_mutex_lock(&cluster_state.state_lock);
     link->context = context;
     link->connected = context != NULL;
+    if (reconnected) ++link->reconnects;
     pthread_mutex_unlock(&cluster_state.state_lock);
 }
 
@@ -565,7 +587,11 @@ static void cluster_link_set_locked(st_cluster_link *link, redisContext *context
 static int cluster_context_closed(const redisContext *context)
 {
     struct pollfd poller = {.fd = context->fd, .events = POLLIN, .revents = 0};
-    return poll(&poller, 1, 0) != 0;
+    int ready;
+    do {
+        ready = poll(&poller, 1, 0);
+    } while (ready < 0 && errno == EINTR);
+    return ready != 0;
 }
 
 /* With link->lock held: the live context, reconnecting first when the delay allows. */
@@ -574,7 +600,7 @@ static redisContext *cluster_link_context_locked(st_cluster_link *link)
     if (link->context != NULL && cluster_context_closed(link->context)) {
         fprintf(stderr, "[public-transfer] Redis %s connection closed by the server; reconnecting\n", link->name);
         redisContext *closed = link->context;
-        cluster_link_set_locked(link, NULL);
+        cluster_link_set_locked(link, NULL, 0);
         redisFree(closed);
     }
     if (link->context != NULL) return link->context;
@@ -596,8 +622,7 @@ static redisContext *cluster_link_context_locked(st_cluster_link *link)
         fprintf(stderr, "[public-transfer] Redis %s connection restored\n", link->name);
     link->failures = 0U;
     link->retry_at_ms = 0;
-    ++link->reconnects;
-    cluster_link_set_locked(link, context);
+    cluster_link_set_locked(link, context, 1);
     return context;
 }
 
@@ -616,7 +641,7 @@ static redisReply *cluster_link_command(st_cluster_link *link, int argc, const c
     if (context != NULL && reply == NULL) {
         fprintf(stderr, "public transfer Redis %s connection failed: %s\n", link->name,
                 context->errstr[0] != '\0' ? context->errstr : "no reply");
-        cluster_link_set_locked(link, NULL);
+        cluster_link_set_locked(link, NULL, 0);
         redisFree(context);
     } else if (reply != NULL && reply->type == REDIS_REPLY_ERROR && reply->str != NULL) {
         fprintf(stderr, "public transfer Redis command failed: %s\n", reply->str);
@@ -2129,8 +2154,10 @@ static void cluster_link_install(st_cluster_link *link, redisContext *context)
     pthread_mutex_lock(&link->lock);
     link->failures = 0U;
     link->retry_at_ms = 0;
+    pthread_mutex_lock(&cluster_state.state_lock);
     link->reconnects = 0U;
-    cluster_link_set_locked(link, context);
+    pthread_mutex_unlock(&cluster_state.state_lock);
+    cluster_link_set_locked(link, context, 0);
     pthread_mutex_unlock(&link->lock);
 }
 
@@ -2140,7 +2167,7 @@ static redisContext *cluster_link_remove(st_cluster_link *link)
     redisContext *context = link->context;
     link->failures = 0U;
     link->retry_at_ms = 0;
-    cluster_link_set_locked(link, NULL);
+    cluster_link_set_locked(link, NULL, 0);
     pthread_mutex_unlock(&link->lock);
     return context;
 }

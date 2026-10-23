@@ -665,10 +665,11 @@ static int probe_with(const char *probe, const char *const *settings, size_t cou
 
 /*
  * PublicTransferProperties as Spring binds them: the switch takes true/false, on/off, yes/no or 1/0
- * in any case and with blanks, the numbers fail startup unless they parse (with or without
- * clustering), the lease and timeout have floors of 5 s and 100 ms, refresh must be positive and
- * under half the lease, and the key prefix is trimmed of blanks and trailing colons, a blank one
- * meaning the default.
+ * in any case and with blanks around, the numbers fail startup unless they parse (with or without
+ * clustering), the lease and timeout have floors of 5 s and 100 ms, the refresh period must also
+ * suit @Scheduled (positive decimal, with or without clustering) and be under half the lease, and
+ * the key prefix is trimmed of blanks and trailing colons, a blank one meaning the default. One
+ * deliberate exception: an empty value keeps the default in C, where Spring fails startup.
  */
 static int test_spring_binding(void)
 {
@@ -680,20 +681,41 @@ static int test_spring_binding(void)
     } checks[] = {
         {"' OFF ' is false", PROBE("disabled", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", " OFF ")},
         {"'No' is false", PROBE("disabled", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", "No")},
-        {"blank is unset", PROBE("disabled", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", "   ")},
+        /* C keeps the default for an empty value; Spring fails to bind "" to the primitive. */
+        {"an empty switch keeps the default (C only)", PROBE("disabled", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", "")},
+        {"a blank switch fails", PROBE("invalid", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", "   ")},
         {"' On ' is true", PROBE("enabled", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", " On ")},
         {"'YES' is true", PROBE("enabled", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", "YES")},
         {"'maybe' fails", PROBE("invalid", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", "maybe")},
         {"'enabled' fails", PROBE("invalid", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", "enabled")},
+        {"'y' fails", PROBE("invalid", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", "y")},
         {"a word lease fails even standalone",
          PROBE("invalid-number", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", "false",
                "SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS", "abc")},
         {"a fractional refresh fails", PROBE("invalid-number", "SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", "1.5")},
         {"a unit on the timeout fails", PROBE("invalid-number", "SPECUS_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS", "2s")},
         {"a blank number fails", PROBE("invalid-number", "SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS", " ")},
-        {"refresh 0 refuses to start", PROBE("refused", "SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", "0")},
-        {"a negative refresh refuses to start",
-         PROBE("refused", "SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", "-5")},
+        {"empty numbers keep their defaults (C only)",
+         PROBE("presence", "SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS", "",
+               "SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", "",
+               "SPECUS_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS", "",
+               "SPECUS_TEST_EXPECT_PREFIX", "specus:test:coordination", "SPECUS_TEST_EXPECT_LEASE_MS", "30000")},
+        /* The refresh period is also @Scheduled(fixedDelayString), so it fails even standalone. */
+        {"refresh 0 fails even standalone",
+         PROBE("invalid-number", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", "false",
+               "SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", "0")},
+        {"a negative refresh fails even standalone",
+         PROBE("invalid-number", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", "false",
+               "SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", "-5")},
+        {"a hexadecimal refresh fails even standalone",
+         PROBE("invalid-number", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", "false",
+               "SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", "0x2710")},
+        {"blanks in the refresh fail even standalone",
+         PROBE("invalid-number", "SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", "false",
+               "SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", " 1 0 ")},
+        {"a refresh with a plus sign", PROBE("presence", "SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", "+1000",
+                                             "SPECUS_TEST_EXPECT_PREFIX", "specus:test:coordination",
+                                             "SPECUS_TEST_EXPECT_LEASE_MS", "30000")},
         {"lease 0 is 5 s, too short for the default refresh",
          PROBE("refused", "SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS", "0")},
         {"lease 0 is 5 s", PROBE("presence", "SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS", "0",

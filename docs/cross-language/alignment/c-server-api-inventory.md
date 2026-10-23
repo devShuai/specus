@@ -20,8 +20,8 @@ Java server 共 **141** 个端点：136 个 HTTP 映射（`/http/**` 与 `/http-
 
 | 状态 | 数量 | 说明 |
 | --- | ---: | --- |
-| 一致 | 130 | 其中 10 个是本分支修正后才一致，2 个是 #191 修正后才一致，2 个是 `fix/c-server-parity-edges` 修正后才一致，12 个是 `fix/c-server-parity-crud` 逐项对照（多数先修正）后才一致，24 个是 `fix/c-server-parity-peer-api` 逐项对照（多数先修正）后才一致（Peer Mesh / Egress 22 个，映射新增，HTTP 明细详情的 `br`），2 个是 `fix/c-server-client-download-messages` 按共享向量修正后才一致（客户端下载链接新增与修改）；2 个是 `fix/c-server-user-errors-as-java` 按 Java 实测修正后才一致（管理用户的修改与删除）；#35 第 45 项另改正了名称预检在 Redis 故障时的状态码与发现 WebSocket 的故障关闭码 |
-| 有差异 | 11 | 见各节“说明”，可修的列入第 9 节；`fix/c-server-parity-crud` 对照的 14 个里有 2 个（`/auth/register`、`database/initialize`）；`fix/c-server-parity-peer-api` 对照的 27 个里有 5 个（服务新增与更新的名称字节上限、服务审计存库、`stun-config` 与 `ice-config` 不发布没有服务在听的备用地址）；`POST /api/admin/users` 的拒绝已由 `fix/c-server-user-errors-as-java` 改成 Java 的顺序、状态与文案，只剩 C 的登录名存储限制；#35 第 45 项把 `POST /api/public/transfer/ws-tickets` 记为差异（公开 ticket 的签发上限，第 8 节） |
+| 一致 | 131 | 其中 10 个是本分支修正后才一致，2 个是 #191 修正后才一致，2 个是 `fix/c-server-parity-edges` 修正后才一致，12 个是 `fix/c-server-parity-crud` 逐项对照（多数先修正）后才一致，24 个是 `fix/c-server-parity-peer-api` 逐项对照（多数先修正）后才一致（Peer Mesh / Egress 22 个，映射新增，HTTP 明细详情的 `br`），2 个是 `fix/c-server-client-download-messages` 按共享向量修正后才一致（客户端下载链接新增与修改）；2 个是 `fix/c-server-user-errors-as-java` 按 Java 实测修正后才一致（管理用户的修改与删除）；#35 第 45 项另改正了名称预检在 Redis 故障时的状态码、发现 WebSocket 的故障关闭码与公开 ticket 的签发上限 |
+| 有差异 | 10 | 见各节“说明”，可修的列入第 9 节；`fix/c-server-parity-crud` 对照的 14 个里有 2 个（`/auth/register`、`database/initialize`）；`fix/c-server-parity-peer-api` 对照的 27 个里有 5 个（服务新增与更新的名称字节上限、服务审计存库、`stun-config` 与 `ice-config` 不发布没有服务在听的备用地址）；`POST /api/admin/users` 的拒绝已由 `fix/c-server-user-errors-as-java` 改成 Java 的顺序、状态与文案，只剩 C 的登录名存储限制 |
 | 没有 | 0 | 每个 Java 端点在 C 都有对应路由 |
 | 未逐项对照 | 0 | 最后 27 个（Peer Mesh / Egress）已由 `fix/c-server-parity-peer-api` 逐项对照 |
 
@@ -154,7 +154,7 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | POST | `/api/admin/ws-tickets` | Bearer | `{"endpoint":"connections"\|"client-messages"}` → 45 s 单次 ticket，`no-store` | 一致 | `WebSocketTicketServiceTests` 覆盖 |
 | WS | `/ws/connections` | ticket | 推送 `{tenantId,type:created\|updated,connection}`，管理员收本租户全部，其他人只收自己客户端的 | 一致 | #261：STCE kind 4 经 Redis 扇出，接收时校验 tenant/group 绑定并按当前客户端 owner 过滤；发布失败回退本地。真实双 C 与 C↔Java 测试见 `management_cluster_e2e.py`。**本分支**：二进制帧 1003、未掩码帧 1002（`client_messages_tests`）。`fix/c-server-parity-edges`：文本消息按 Tomcat 默认缓冲 8192 个字符（UTF-16 code unit）计，超过 1009、非 UTF-8 1007（原先上限 1 MiB、不校验 UTF-8），`client_messages_tests` |
 | WS | `/ws/client-messages` | ticket | 见下表 | 一致 | `fix/c-server-parity-edges`：原先 `messageId` 为数字时回显空串；现与 Jackson 相同，四个成员为数字或布尔值时读作其字面文本 |
-| WS | `/ws/public-transfer/discovery` | 公共 ticket | 互传发现 | 一致 | `PublicTransferDiscoveryWebSocketHandlerTests` 覆盖。#35 第 45 项：写不再持有全局锁，一个停读的浏览器只拖慢发给它的写，单帧写超时后关闭且不再有后续帧（同 Tomcat 阻塞发送超时后关闭会话；默认超时差异见第 8 节）；Redis 故障时按 Java 回错误帧与关闭码（加入失败 error 加 1008、续期周期失败 1011、定向文本失败回 `invalid message` 并保持连接、二进制 relay 失败 1011），续期按每个 net 每周期一次发布 roster（test-map 文首一节） |
+| WS | `/ws/public-transfer/discovery` | 公共 ticket | 互传发现 | 一致 | `PublicTransferDiscoveryWebSocketHandlerTests` 覆盖。#35 第 45 项：写不再持有全局锁，一个停读的浏览器只拖慢发给它的写，单帧写超时后关闭且不再有后续帧（同 Tomcat 阻塞发送超时后关闭会话；默认超时差异见第 8 节）；Redis 故障时按 Java 回错误帧与关闭码（加入失败 error 加 1008、续期周期失败 1011；每条消息先过共享限流，Redis 不可用时与 Java `allowMessage` 一样回 `rate limited` 并以 1008 关闭，只有限流成功后的查找或发布失败才是定向文本回 `invalid message` 并保持连接、二进制 relay 以 1011 关闭），续期按每个 net 每周期一次发布 roster（test-map 文首一节） |
 | WS | `/http/**`（Upgrade） | 路由认证 | Direct WebSocket（SWS2） | 一致 | `WebSocketSpecusHandlerTests`、`WebSocketSpecusHandshakeInterceptorAuthenticationTests` 覆盖 |
 | WS | `/http-share/**`（Upgrade） | 分享 cookie | 分享 WebSocket | 一致 | 中央向量 `temporary-http-share-v1.json` |
 
@@ -181,7 +181,7 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | 方法 | 路径 | 鉴权 | C 状态 | C 证据 / 说明 |
 | --- | --- | --- | --- | --- |
 | GET | `/api/public/transfer/clients/name-availability` | 公开 | 一致 | `PublicTransferDiscoveryWebSocketHandlerTests` 覆盖；#35 第 45 项起 Redis 故障时按 Java `GlobalExceptionHandler` 回 `409 {"error":"public transfer Redis coordination unavailable"}`（原为 `503 coordination unavailable`），`public_discovery_cluster_e2e` |
-| POST | `/api/public/transfer/ws-tickets` | 公开 | 有差异 | `WebSocketTicketServiceTests` 覆盖。差异见第 8 节：未消费的公开 ticket 每来源 1024、总量 16384 张，超出回 `429 too many active websocket tickets`，Java 不设上限；#35 第 45 项前是全局 1024 张，一个来源即可挡住所有人（`websocket_ticket_quota_tests`） |
+| POST | `/api/public/transfer/ws-tickets` | 公开 | 一致 | `WebSocketTicketServiceTests` 覆盖。#35 第 45 项起配了数据库时与 Java 一样不限公开 ticket 的张数；此前全库只许 1024 张未消费的公开 ticket，一个匿名来源 45 秒内签满即可让所有人得到 `429`。未配数据库时（C 独有的内存票据）的上限见第 8 节（`websocket_ticket_quota_tests`） |
 | POST | `/api/public/transfer/rooms/access-tokens/list`、`/access-tokens`、`/access-tokens/{accessId}/revoke`、`/pairing-codes`、`/pairing-codes/redeem`、`/diagram/versions/list`、`/diagram/versions`、`/diagram/versions/{versionId}`、`/diagram/versions/{versionId}/delete`（9 个） | 公开（房间凭据） | 一致 | `PublicTransferRoomResourceTests`、`PublicTransferRoomServiceTests`、`PublicTransferRateLimiterTests` 覆盖 |
 | GET | `/api/public/transfer/attachments/capabilities` | Bearer（任意） | 一致 | `TransferCapabilitiesVectorTests` 覆盖（中央向量） |
 | POST | `/api/public/transfer/attachments/presign-upload`、`/{attachmentId}/complete`、`/{attachmentId}/presign-download` | Bearer（任意） | 一致 | `TransferAttachmentServiceTests` 覆盖 |
@@ -237,7 +237,8 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | 管理事件协调不等于数据库 HA | #261 已实现 kind 4 连接事件与 kind 5 身份撤销的 Redis 扇出、租户绑定和本地授权过滤；#35 第 45 项起 Redis 断开后与 Lettuce 一样自动重连并重新订阅（`management_cluster_e2e.py`），断开期间的事件与 Java 一样漏收。C 仍只用 SQLite，这不提供分布式管理数据库、跨节点数据复制或 HA 接管 |
 | Redis URI 只接受 `redis://[user[:password]@]host[:port][/0..15]`（先 trim）；`rediss://`（TLS）、`redis-sentinel://`、unix socket 与查询参数都拒绝启动 | C 用 hiredis 的同步连接，没有接入 TLS 传输和 Sentinel 的主节点发现；Java 的 Lettuce 都支持，Sentinel 还能在主从切换后跟到新主节点。C 部署须把 Redis 放在私有可信网络、指向固定的主节点地址；该地址后面的 Redis 重启或切换由自动重连恢复。db 编号上限 15 只在 Redis 配置了超过 16 个库时才与 Java 不同 |
 | 集群事件队列除 4096 条外另有 64 MiB 载荷上限 | Java 的事件执行器只按条数限制。C 常跑在小内存设备上，4096 条 256 KiB 的事件就是 1 GiB；超出任一上限都与 Java 一样丢弃新事件并记日志，订阅不受影响 |
-| 未消费的公开互传 ticket 每来源最多 1024 张、总量最多 16384 张 | Java 存库、不设上限。C 的票据放在内存（未配数据库时）或 SQLite，匿名签发需要一个总量上界；按来源计数使单个来源签满也挡不住别人。正常浏览器 45 秒内只会持有一两张 |
+| 未配数据库时，未消费的公开互传 ticket 每来源最多 1024 张（IPv6 按 /64 计为一个来源，超出时拒绝该来源 `429`），总量最多 16384 张（超出时淘汰最旧的一张，不拒绝任何人）；配了数据库时与 Java 一样不限 | Java 总把 ticket 存库。C 未配数据库时把 ticket 放在进程内存，匿名签发需要内存上界；按来源计数让单个来源签满也挡不住别人，总量处淘汰最旧的而不是拒绝，免得 16 个来源（或一个 IPv6 /64 内的大量地址）把所有人挡在外面。正常浏览器 45 秒内只会持有一两张，且一般一秒内就消费 |
+| 集群配置的空值：`SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED`、`…_PRESENCE_LEASE_SECONDS`、`…_PRESENCE_REFRESH_INTERVAL_MS`、`…_REDIS_COMMAND_TIMEOUT_MS` 设为空串（`NAME=`）时 C 用默认值 | Spring 把 `${NAME:default}` 解析成空串（默认值只在变量不存在时才用），转换器对空串返回 null，绑定到 primitive 字段失败，Java 不能启动；刷新周期的空串另外让 `@Scheduled` 缺少调度参数而失败。环境文件里 `NAME=` 通常表示“用默认值”，C 保留这一常见写法，不因此拒绝启动。只含空白的值与 Java 一样拒绝启动；其余取值（布尔词表、数字的去空白与十六进制、刷新周期须为正的十进制数且与集群开关无关）都与 Java 相同 |
 | 发现 socket 的单帧写超时默认 5 秒（Tomcat 阻塞发送为 20 秒） | 两边超时后都关闭该连接；C 的默认值更短，让停读的浏览器更早被关闭，`SPECUS_PUBLIC_TRANSFER_DISCOVERY_WRITE_TIMEOUT_SECONDS` 可调到 300 秒 |
 | Redis 命令在每条连接上串行（状态命令一条、PUBLISH 一条、订阅一条） | hiredis 同步上下文不能并发，Lettuce 在一条连接上多路复用。C 已按 Java 用 MGET 读 presence、findPeer 只读、roster 事件按 (group, net) 只读一次快照、续期每个 net 每周期只发布一次，PUBLISH 也像 Java 的 `eventPublishConnection` 走单独连接，每条消息的往返次数与 Java 相同，只是不能并行 |
 | SQLite 明细同步写入，没有待写队列；`inspection-status` 在 SQLite 下 pending/dropped 恒为 0 | 本地写库不阻塞网络；Java 的队列为保护转发线程，C 只对 Elasticsearch（网络写入）使用 |

@@ -806,13 +806,28 @@ static int test_viewer_text_messages(void)
 
 typedef struct {
     int fd;
+    int messages;
     int sent;
 } flood_arguments;
 
 /*
- * The sender's side: 160 directed messages of 60,000 characters (9.6 MB) for the reader that
- * stalls, more than a socket send buffer grows to (4 MiB by default), so a write must wait.
+ * Enough 60,000-character messages that the server cannot buffer them all for a reader that
+ * stalls: twice the largest send buffer TCP autotuning may grow to (tcp_wmem's maximum, 4 MiB by
+ * default) plus 2 MiB, so a write must wait whatever the kernel's limit.
  */
+static int flood_messages(void)
+{
+    long long wmem_max = 4LL * 1024 * 1024;
+    FILE *settings = fopen("/proc/sys/net/ipv4/tcp_wmem", "r");
+    if (settings != NULL) {
+        long long low = 0, initial = 0, high = 0;
+        if (fscanf(settings, "%lld %lld %lld", &low, &initial, &high) == 3 && high > 0) wmem_max = high;
+        fclose(settings);
+    }
+    long long messages = (2LL * wmem_max + 2LL * 1024 * 1024) / 60000LL + 1LL;
+    return messages > 4000LL ? 4000 : (int)messages;
+}
+
 static void *flood_slow_reader(void *argument)
 {
     flood_arguments *flood = (flood_arguments *)argument;
@@ -820,7 +835,7 @@ static void *flood_slow_reader(void *argument)
     int len = snprintf(message, sizeof(message), "{\"type\":\"signal\",\"targetPeerId\":\"slow-b\",\"payload\":\"");
     memset(message + len, 'x', 60000U);
     memcpy(message + len + 60000, "\"}", 3U);
-    for (int i = 0; i < 160; ++i) {
+    for (int i = 0; i < flood->messages; ++i) {
         if (ws_send_text(flood->fd, message) != 0) break;
         ++flood->sent;
     }
@@ -917,7 +932,8 @@ static int test_slow_reader_is_isolated_and_closed(void)
     CHECK(sender_fd >= 0 && slow_fd >= 0 && left_fd >= 0 && right_fd >= 0, "slow-reader participants");
     CHECK(drain(sender_fd, &state) == 0 && drain(left_fd, &state) == 0 && drain(right_fd, &state) == 0,
           "initial rosters");
-    flood_arguments flood = {sender_fd, 0};
+    /* The case raises the per-connection message limit so the whole flood is relayed. */
+    flood_arguments flood = {sender_fd, flood_messages(), 0};
     pthread_t flooder;
     CHECK(pthread_create(&flooder, NULL, flood_slow_reader, &flood) == 0, "flood thread");
     struct timespec settle = {.tv_sec = 0, .tv_nsec = 300000000L};
@@ -1451,7 +1467,8 @@ static int owned_environment_entry(const char *entry)
         "SPECUS_ENV", "SPECUS_AUTH_JWT_SECRET", "SPECUS_TRUSTED_PROXIES", "SPECUS_DATABASE_PATH",
         "SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM",
         "SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP",
-        "SPECUS_PUBLIC_TRANSFER_DISCOVERY_WRITE_TIMEOUT_SECONDS"
+        "SPECUS_PUBLIC_TRANSFER_DISCOVERY_WRITE_TIMEOUT_SECONDS",
+        "SPECUS_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION"
     };
     for (size_t i = 0U; i < sizeof(names) / sizeof(names[0]); ++i) {
         size_t len = strlen(names[i]);
@@ -1484,7 +1501,7 @@ static char **case_environment(size_t index)
 {
     size_t count = 0U, used = 0U;
     while (environ[count] != NULL) ++count;
-    char **values = (char **)calloc(count + 8U, sizeof(*values));
+    char **values = (char **)calloc(count + 9U, sizeof(*values));
     if (values == NULL) return NULL;
     for (size_t i = 0U; i < count; ++i) {
         if (owned_environment_entry(environ[i])) continue;
@@ -1505,7 +1522,9 @@ static char **case_environment(size_t index)
         || append_environment(values, &used, "SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP",
                               profile == PROFILE_REDEEM_TRUSTED || profile == PROFILE_REDEEM_UNTRUSTED ? "1" : NULL)
         || append_environment(values, &used, "SPECUS_PUBLIC_TRANSFER_DISCOVERY_WRITE_TIMEOUT_SECONDS",
-                              profile == PROFILE_SLOW_READER ? "1" : NULL);
+                              profile == PROFILE_SLOW_READER ? "1" : NULL)
+        || append_environment(values, &used, "SPECUS_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION",
+                              profile == PROFILE_SLOW_READER ? "100000" : NULL);
     if (failed) { free_environment(values); return NULL; }
     return values;
 }

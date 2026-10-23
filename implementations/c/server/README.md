@@ -145,11 +145,11 @@ Additional runtime knobs:
 | `SPECUS_PEER_MESH_SESSION_TTL_SECONDS` | `3600` | Peer session authorization lifetime: the expiry stored for a new peer session and the `sessionTtlSeconds` sent in the login configuration. Non-positive values fall back to `3600`. |
 | `SPECUS_PEER_MESH_CATALOG_TTL_SECONDS` | `300` | Live service-catalog lease before stale withdrawal. Values outside `1..86400` fall back to `300`. |
 | `SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM` | `32` | Maximum discoverable peers in one token/public room. |
-| `SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED` | `false` | Enables Java-compatible Redis presence, merged roster revisions, Pub/Sub routing, global name checks, and shared discovery-message, pairing-code redemption and public presign-upload limits. Read as Spring binds it: `true`/`false`, `on`/`off`, `yes`/`no` or `1`/`0` in any case, blanks around ignored; any other value fails startup. A Redis failure fails only the operation that meets it (see below); there is no process-local fallback. |
+| `SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED` | `false` | Enables Java-compatible Redis presence, merged roster revisions, Pub/Sub routing, global name checks, and shared discovery-message, pairing-code redemption and public presign-upload limits. Read as Spring binds it: `true`/`false`, `on`/`off`, `yes`/`no` or `1`/`0` in any case, blanks around ignored; any other value, a blank one included, fails startup. An empty value keeps the default (Spring fails startup on it). A Redis failure fails only the operation that meets it (see below); there is no process-local fallback. |
 | `SPECUS_PUBLIC_TRANSFER_REDIS_URI` | unset | Required in cluster mode. Supports `redis://[user[:password]@]host[:port][/0..15]`, surrounding blanks trimmed; TLS `rediss://`, Sentinel and query parameters are rejected (no TLS or Sentinel transport in C). |
 | `SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX` | `specus:v2:public-transfer` | Redis keys/channel prefix, trimmed and stripped of trailing colons; a blank value means the default. Use a distinct value per environment. |
-| `SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS` | `30` | Shared discovery presence TTL; values below 5 count as 5. Like the next two, it must be a number even when clustering is off. |
-| `SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS` | `10000` | Presence refresh period; must be positive and less than half the lease TTL. |
+| `SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS` | `30` | Shared discovery presence TTL; values below 5 count as 5. Like the next two, it must be a number even when clustering is off (blanks inside are removed, `0x`/`#` hexadecimal accepted, as Spring binds numbers); an empty value keeps the default. |
+| `SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS` | `10000` | Presence refresh period; even when clustering is off it must be a positive decimal number (Java also schedules its refresh task with it), and in cluster mode less than half the lease TTL. |
 | `SPECUS_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS` | `2000` | Redis connect/read/write timeout in milliseconds; values below 100 count as 100. |
 | `SPECUS_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION` | `360` | Messages accepted from one discovery socket in a fixed window. |
 | `SPECUS_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_WINDOW_SECONDS` | `60` | Discovery connection rate-limit window in seconds. |
@@ -312,9 +312,12 @@ The public-transfer discovery WebSocket works in process-local mode by default a
 multi-instance presence, revisioned merged rosters, global peer/name/capacity checks, distributed message,
 pairing-code redemption and presign-upload limits, and STCE2 Pub/Sub text/binary routing. As with Java's
 Lettuce client, a Redis failure fails only the operation that meets it: a join answers `coordination
-unavailable` and closes with 1008, name checks answer 409, the source-address limits 429, a directed text
-`invalid message` (the socket stays), a binary relay closes its sender with 1011; the presence refresh that
-meets a failure closes the local discovery sockets with 1011. Nothing falls back to divergent local state.
+unavailable` and closes with 1008, name checks answer 409, the source-address limits 429. Every discovery
+message first passes the shared message limit (a Redis script), so while Redis is down a message is answered
+`rate limited` and its socket closed with 1008, as Java's allowMessage does; only when that check succeeds
+and the target lookup or the publish then fails does a directed text get `invalid message` (the socket
+stays) and a binary relay close its sender with 1011. The presence refresh that meets a failure closes the
+local discovery sockets with 1011. Nothing falls back to divergent local state.
 Lost connections come back without a restart: commands reconnect on demand and the Pub/Sub connection
 resubscribes, after Lettuce's exponential delay (at most 30 s). Decoded events wait in a bounded queue
 (4096 events, 64 MiB) for one dispatcher thread, so a slow consumer never stalls the subscription. Discovery

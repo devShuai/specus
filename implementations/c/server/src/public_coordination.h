@@ -83,13 +83,15 @@ typedef void (*st_public_cluster_event_handler)(const st_public_cluster_event *e
 
 /*
  * SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED as Spring binds it: trimmed, case-insensitive
- * true/on/yes/1 or false/off/no/0; unset or blank is false. Any other value is a configuration
- * error that st_public_coordination_validate_config() reports, and reads as disabled here.
+ * true/on/yes/1 or false/off/no/0. Unset is false, and so is an empty value (Spring fails startup
+ * on ""; C keeps the default). Any other value, a blank one included, is a configuration error
+ * that st_public_coordination_validate_config() reports, and reads as disabled here.
  */
 int st_public_coordination_enabled(void);
 /*
- * Startup check of the cluster settings Spring binds whether or not clustering is on: the switch
- * must be a boolean and the lease, refresh and timeout values must be numbers. 0 or -1 (logged).
+ * Startup check of the settings Java binds or schedules whether or not clustering is on: the
+ * switch must be a boolean, the lease, refresh and timeout values numbers, and the refresh period
+ * a positive decimal (@Scheduled). An empty value counts as unset. 0 or -1 (logged).
  */
 int st_public_coordination_validate_config(void);
 /*

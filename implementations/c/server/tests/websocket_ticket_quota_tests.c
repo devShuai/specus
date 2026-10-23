@@ -68,18 +68,22 @@ static void quota_scenarios(void)
         for (unsigned i = 0U; i < 1023U; ++i) {
             CHECK(st_websocket_ticket_issue("public-transfer", public_attributes, "127.16.0.1", token, expiry) == 0);
         }
-        CHECK(issue_status(2) == 429);
-        /* The public limit is per source: one full source does not lock out another browser. */
+        /* 1024 public tickets from one source: the in-memory store refuses that source; the
+         * database, like Java's table, takes them all. */
+        int public_full = persistent ? 200 : 429;
+        CHECK(issue_status(2) == public_full);
+        /* Either way the limit is per source: another browser still gets a ticket. */
         char other_source[8192];
         CHECK(http("POST", "/api/public/transfer/ws-tickets", "127.16.0.2",
                    "{\"roomId\":\"quota-room\",\"peerId\":\"other-peer\",\"displayName\":\"other\"}", other_source) == 200);
-        /* Free one management slot while the public group remains completely full. */
+        /* Free one management slot while that public source stays full. */
         char path[256];
         snprintf(path, sizeof(path), "%s?ticket=%s", ws_paths[results[winner].scope], results[winner].ticket);
         CHECK(websocket(path, "127.16.0.1") == 101 && websocket(path, "127.16.0.1") == 403);
-        CHECK(issue_status(1 - results[winner].scope) == 200 && issue_status(2) == 429);
+        CHECK(issue_status(1 - results[winner].scope) == 200 && issue_status(2) == public_full);
         set_clock(base_seconds + 45LL, 0L);
-        CHECK(issue_status(0) == 429 && issue_status(1) == 429 && issue_status(2) == 429);
+        CHECK(issue_status(0) == 429 && issue_status(1) == 429);
+        if (!persistent) CHECK(issue_status(2) == 429);
         set_clock(base_seconds + 45LL, 100L);
         CHECK(issue_status(0) == 200 && issue_status(2) == 200);
         if (persistent) {
@@ -87,11 +91,29 @@ static void quota_scenarios(void)
             CHECK(count(db, "SELECT count(*) FROM specus_websocket_ticket") == 2);
             CHECK(sqlite3_close(db) == SQLITE_OK);
         }
-        printf("ticket quota: persistent%d management1024 shared across2 scopes; actual8 concurrent HTTP issuers exactly1 success/7 quota429; public1024 independent; consume recovers slot; exact expiry still full/+100ns strict purge passed\n", persistent);
+        printf("ticket quota: persistent%d management1024 shared across2 scopes; actual8 concurrent HTTP issuers exactly1 success/7 quota429; public %s; consume recovers slot; exact expiry still full/+100ns strict purge passed\n",
+               persistent, persistent ? "1025+ from one source accepted (no limit, as Java)" : "1024 per source");
     }
     st_websocket_ticket_reset_memory_scope(NULL); clear_persistent();
 }
-/* Public tickets: a per-source limit, and a total one that bounds memory across sources. */
+static int public_issue(const char *attributes, const char *address, char token[64])
+{
+    char expiry[40];
+    return st_websocket_ticket_issue("public-transfer", attributes, address, token, expiry);
+}
+/* 0 when the ticket is still there (and is now consumed), 1 when it is gone. */
+static int public_consume(const char *token, const char *address)
+{
+    char *json = NULL;
+    int result = st_websocket_ticket_consume("public-transfer", token, address, &json);
+    free(json);
+    return result;
+}
+/*
+ * Public tickets without a database: a per-source limit (an IPv6 address counted by its /64) and a
+ * total bound where the oldest public ticket gives way instead of anybody being refused. The
+ * database keeps every public ticket, as Java's table does.
+ */
 static void public_limit_scenarios(void)
 {
     const char *attributes = "{\"roomId\":\"limit-room\",\"peerId\":\"limit-peer\",\"displayName\":\"limit\",\"publicAddress\":\"127.16.0.9\",\"roomKey\":\"\",\"roomRole\":\"member\",\"sharedRoom\":false,\"discoverable\":true}";
@@ -101,17 +123,28 @@ static void public_limit_scenarios(void)
         if (persistent) CHECK(setenv("SPECUS_DATABASE_PATH", database, 1) == 0);
         else CHECK(unsetenv("SPECUS_DATABASE_PATH") == 0);
         set_clock(base_seconds, 0L);
-        char token[64], expiry[40];
-        for (unsigned i = 0U; i < 4U; ++i)
-            CHECK(st_websocket_ticket_issue("public-transfer", attributes, "198.51.100.1", token, expiry) == 0);
-        CHECK(st_websocket_ticket_issue("public-transfer", attributes, "198.51.100.1", token, expiry) == -2);
-        CHECK(st_websocket_ticket_issue("public-transfer", attributes, "198.51.100.2", token, expiry) == 0);
-        CHECK(st_websocket_ticket_issue("public-transfer", attributes, NULL, token, expiry) == 0);
-        /* Six active public tickets: the total limit now refuses every source. */
-        CHECK(st_websocket_ticket_issue("public-transfer", attributes, "198.51.100.3", token, expiry) == -2);
-        CHECK(st_websocket_ticket_issue("public-transfer", attributes, NULL, token, expiry) == -2);
-        printf("public ticket limits: persistent%d per-source4 refused the fifth, other sources admitted until total6\n",
-               persistent);
+        char first[4][64], token[64];
+        for (unsigned i = 0U; i < 4U; ++i) CHECK(public_issue(attributes, "198.51.100.1", first[i]) == 0);
+        if (persistent) {
+            /* No limit at all: one source keeps getting tickets and the oldest stays valid. */
+            for (unsigned i = 0U; i < 8U; ++i) CHECK(public_issue(attributes, "198.51.100.1", token) == 0);
+            for (unsigned i = 0U; i < 4U; ++i) CHECK(public_issue(attributes, "2001:db8:1:1::10", token) == 0);
+            CHECK(public_consume(first[0], "198.51.100.1") == 0);
+            puts("public ticket limits: persistent1 no per-source or total limit and no eviction, as Java");
+            continue;
+        }
+        CHECK(public_issue(attributes, "198.51.100.1", token) == -2);
+        /* Two addresses of one /64 are one source; six tickets reach the total of six. */
+        CHECK(public_issue(attributes, "2001:db8:1:1::10", token) == 0);
+        CHECK(public_issue(attributes, "2001:db8:1:1:ffff::20", token) == 0);
+        /* At the total the oldest public ticket gives way; nobody is refused for it. */
+        CHECK(public_issue(attributes, "2001:db8:1:1::30", token) == 0);
+        CHECK(public_issue(attributes, "2001:db8:1:1::40", token) == 0);
+        CHECK(public_issue(attributes, "2001:db8:1:1:aaaa::50", token) == -2);
+        CHECK(public_issue(attributes, "2001:db8:1:2::10", token) == 0);
+        CHECK(public_consume(first[0], "198.51.100.1") == 1 && public_consume(first[1], "198.51.100.1") == 1
+            && public_consume(first[2], "198.51.100.1") == 1 && public_consume(first[3], "198.51.100.1") == 0);
+        puts("public ticket limits: persistent0 per-source4 refused the fifth, an IPv6 /64 counted as one source, the total of6 evicted the oldest instead of refusing");
     }
     st_websocket_ticket_set_public_limits_for_tests(1024U, 16384U);
     st_websocket_ticket_reset_memory_scope(NULL); clear_persistent();
