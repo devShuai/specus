@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestSWS2RoundTrip(t *testing.T) {
@@ -147,6 +149,25 @@ func TestSWS2DecodeRejectsMalformedFrames(t *testing.T) {
 	for name, frame := range cases {
 		if _, err := decodeSWS2(frame); err == nil {
 			t.Fatalf("%s: decodeSWS2 should fail", name)
+		}
+	}
+}
+
+// TestTruncateCloseReasonKeepsWholeUTF8Characters 关闭原因截断到 123 字节，截断处落在多字节字符
+// 中间时退到该字符之前（对齐 Java closeFrameFor）。
+func TestTruncateCloseReasonKeepsWholeUTF8Characters(t *testing.T) {
+	cases := map[string]struct{ reason, want string }{
+		"short":                   {"bye", "bye"},
+		"exactly 123 bytes":       {strings.Repeat("a", 123), strings.Repeat("a", 123)},
+		"ASCII over the limit":    {strings.Repeat("a", 130), strings.Repeat("a", 123)},
+		"3-byte character at end": {"a" + strings.Repeat("你", 50), "a" + strings.Repeat("你", 40)},
+		"3-byte characters fit":   {strings.Repeat("你", 50), strings.Repeat("你", 41)},
+		"4-byte characters":       {strings.Repeat("😀", 40), strings.Repeat("😀", 30)},
+	}
+	for name, c := range cases {
+		got := truncateCloseReason(c.reason)
+		if string(got) != c.want || !utf8.Valid(got) || len(got) > sws2MaxCloseReasonBytes {
+			t.Fatalf("%s: truncateCloseReason = %q (%d bytes), want %q", name, got, len(got), c.want)
 		}
 	}
 }
