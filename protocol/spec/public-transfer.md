@@ -749,8 +749,11 @@ ctest 或 `scripts/` 下的脚本；逐项对照见
   （[public-transfer-cluster.md](public-transfer-cluster.md) 第 6 节）和 STCE2 Pub/Sub 文本/二进制路由；与 Java 一样，Redis
   故障只让遇到它的操作失败（加入回 `coordination unavailable` 并以 1008 关闭、两个来源 IP 窗口回 `429`、名称预检回
   `409`），遇到故障的 presence 续期周期以 1011 关闭本地发现 socket，不回退到进程内 presence/routing/计数；断开的连接
-  按 Lettuce 的指数退避自动重连并重新订阅，不需重启；`rediss://` 被拒绝。证据：
+  按 Lettuce 的指数退避自动重连并重新订阅，不需重启；Redis URI 按 Lettuce `RedisURI` 解析，支持 `rediss://`（TLS）、
+  `redis-sentinel://`/`rediss-sentinel://`（每次重连都经 Sentinel 重新查主节点，故障切换后跟到新主）与 Unix socket。证据：
   `public_coordination_tests`（独立 `redis-server`，另起一个进程作为第二个实例，并在同一端口重启 Redis）、
+  `public_coordination_tls_tests`（同一套用例经 `rediss://`，加 verifyPeer 探针）、`redis_uri_tests`、
+  `public_coordination_sentinel_tests`/`public_coordination_sentinel_tls_tests`（`SENTINEL FAILOVER` 后跟到新主）、
   `public_cluster_codec_tests`（STCE2 共享向量）、
   `public_discovery_cluster_e2e`（两个 C 进程共享 Redis：跨实例 roster revision、名称占用、重复 peer、
   定向文本、二进制 relay、隐藏 peer 回退与续期、跨实例共享的兑换窗口、Redis 停止后两个实例都以 1011 失败关闭，

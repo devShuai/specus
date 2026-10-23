@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"unicode/utf8"
 )
 
 // SWS2 是 NAT stream v2 DATA 里承载 WebSocket 帧的 12 字节显式封装，
@@ -103,8 +104,7 @@ func validateSWS2(opcode byte, fin bool, rsv byte, closeCode uint16, payloadLeng
 		if payloadLength > sws2MaxCloseReasonBytes {
 			return errors.New("WebSocket close reason exceeds 123 bytes")
 		}
-		if closeCode != 0 && (closeCode < 1000 || closeCode >= 5000 ||
-			isWireForbiddenCloseCode(closeCode)) {
+		if closeCode != 0 && !isSendableCloseCode(int(closeCode)) {
 			return errors.New("invalid WebSocket close code")
 		}
 		if closeCode == 0 && payloadLength != 0 {
@@ -116,6 +116,25 @@ func validateSWS2(opcode byte, fin bool, rsv byte, closeCode uint16, payloadLeng
 	return nil
 }
 
+// isSendableCloseCode 报告 CLOSE 能否携带该关闭码：1000..4999 中除 1004/1005/1006/1015 以外的值
+// （RFC 6455 不让它们上线，1005 与 1006 只用来报告关闭没有码或根本没有 CLOSE；对齐 Java isSendableCloseCode）。
+func isSendableCloseCode(closeCode int) bool {
+	return closeCode >= 1000 && closeCode < 5000 && !isWireForbiddenCloseCode(uint16(closeCode))
+}
+
 func isWireForbiddenCloseCode(closeCode uint16) bool {
 	return closeCode == 1004 || closeCode == 1005 || closeCode == 1006 || closeCode == 1015
+}
+
+// truncateCloseReason 把关闭原因截断到 sws2MaxCloseReasonBytes 字节，且不把一个 UTF-8 字符拆成两半。
+func truncateCloseReason(reason string) []byte {
+	reasonBytes := []byte(reason)
+	if len(reasonBytes) <= sws2MaxCloseReasonBytes {
+		return reasonBytes
+	}
+	length := sws2MaxCloseReasonBytes
+	for length > 0 && !utf8.RuneStart(reasonBytes[length]) {
+		length--
+	}
+	return reasonBytes[:length]
 }

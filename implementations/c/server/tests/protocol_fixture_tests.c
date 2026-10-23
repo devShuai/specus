@@ -246,6 +246,23 @@ static int test_malformed_frames_are_rejected(void)
     return 0;
 }
 
+/*
+ * CompactBinary writes a null string as the marker 0, and Java's codec reads a login whose
+ * connectionRole is null; its login handler then refuses it. The decoder refuses it too, rather
+ * than comparing the missing role (which crashed the server on the first frame of a connection).
+ */
+static int test_login_null_role(void)
+{
+    static const uint8_t null_role[] = {2, 'c', 0, 2, 't', 0};
+    st_login_request request;
+    if (st_protocol_decode_login_request(null_role, sizeof(null_role), &request) != -1) {
+        fprintf(stderr, "a login with a null connectionRole was accepted\n");
+        st_login_request_free(&request);
+        return 1;
+    }
+    return 0;
+}
+
 static int test_java_encode_fixtures(void)
 {
     st_buffer login = st_protocol_encode_login_response("Demo client", 1, NULL);
@@ -376,5 +393,6 @@ int main(void)
         || test_frame_limit_includes_header() != 0
         || test_nat_decode() != 0
         || test_malformed_frames_are_rejected() != 0
+        || test_login_null_role() != 0
         || test_java_encode_fixtures() != 0;
 }

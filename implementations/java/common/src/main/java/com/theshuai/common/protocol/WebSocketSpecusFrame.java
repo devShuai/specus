@@ -85,8 +85,7 @@ public record WebSocketSpecusFrame(int opcode, boolean finalFragment, int rsv,
             if (payloadLength > 123) {
                 throw new IllegalArgumentException("WebSocket close reason exceeds 123 bytes");
             }
-            if (closeCode != 0 && (closeCode < 1000 || closeCode >= 5000
-                    || isWireForbiddenCloseCode(closeCode))) {
+            if (closeCode != 0 && !isSendableCloseCode(closeCode)) {
                 throw new IllegalArgumentException("invalid WebSocket close code");
             }
             if (closeCode == 0 && payloadLength != 0) {
@@ -95,6 +94,15 @@ public record WebSocketSpecusFrame(int opcode, boolean finalFragment, int rsv,
         } else if (closeCode != 0) {
             throw new IllegalArgumentException("close code is only valid on CLOSE");
         }
+    }
+
+    /**
+     * Whether a CLOSE may carry {@code closeCode}: 1000..4999 except 1004, 1005, 1006 and 1015,
+     * which RFC 6455 keeps off the wire (1005 and 1006 only report a close that had no code or no
+     * CLOSE at all).
+     */
+    public static boolean isSendableCloseCode(int closeCode) {
+        return closeCode >= 1000 && closeCode < 5000 && !isWireForbiddenCloseCode(closeCode);
     }
 
     private static boolean isWireForbiddenCloseCode(int closeCode) {

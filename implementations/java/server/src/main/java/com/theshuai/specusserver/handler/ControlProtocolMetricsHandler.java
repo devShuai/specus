@@ -32,11 +32,25 @@ public class ControlProtocolMetricsHandler extends ChannelInboundHandlerAdapter 
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        if (cause instanceof ProtocolException protocolException) {
+        // PacketCodecHandler is a MessageToMessageCodec: Netty hands a ProtocolException thrown while
+        // decoding on wrapped in a DecoderException, so the reason is looked for along the causes.
+        ProtocolException protocolException = protocolException(cause);
+        if (protocolException != null) {
             rejected.get(protocolException.getReason()).increment();
         } else if (cause instanceof TooLongFrameException && !SessionUtil.hasLogin(ctx.channel())) {
             preAuthOversize.increment();
         }
         ctx.close();
+    }
+
+    private static ProtocolException protocolException(Throwable cause) {
+        Throwable current = cause;
+        for (int depth = 0; current != null && depth < 8; depth++) {
+            if (current instanceof ProtocolException protocolException) {
+                return protocolException;
+            }
+            current = current.getCause();
+        }
+        return null;
     }
 }

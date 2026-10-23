@@ -1,7 +1,9 @@
 # systemd deployment
 
 Install runtime/build dependencies including hiredis and utf8proc (`libhiredis-dev` and
-`libutf8proc-dev` on Ubuntu). Redis itself may run on a separate host; install `redis-server` only
+`libutf8proc-dev` on Ubuntu). hiredis 0.14 is enough for `redis://`; `rediss://` needs hiredis 1.0 or
+later with `hiredis_ssl` (Ubuntu 24.04's `libhiredis-dev`; not the 0.14 of Ubuntu 22.04 or Debian 12),
+otherwise such a URI fails startup. Redis itself may run on a separate host; install `redis-server` only
 when this machine owns that service or when running the integration tests. `libbrotli-dev` is
 optional: with it the build decodes `Content-Encoding: br` in traffic details and media manifests,
 as the Java server does; without it those bodies are shown as stored.
@@ -61,6 +63,17 @@ For multiple C server instances, set `SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED=tru
 `SPECUS_PUBLIC_TRANSFER_REDIS_URI` and key prefix on every instance, and isolate prefixes between environments.
 Startup fails when Redis is missing or invalid. Later Redis failures fail the affected operations and close
 local discovery sockets at the next presence refresh, instead of silently replacing shared state with
-process-local state; the connections come back by themselves once Redis does. The current URI parser supports
-`redis://` only; deploy Redis on a private trusted network because `rediss://` and Sentinel are not
-supported.
+process-local state; the connections come back by themselves once Redis does. The URI takes the forms the
+Java server's Lettuce accepts: `redis://`, `rediss://` for TLS (verified against OpenSSL's default CA store;
+set `SSL_CERT_FILE=/path/to/ca.pem` in the environment file for a private CA, and add `?verifyPeer=CA` only
+when the certificate cannot name the host), `redis-sentinel://` or `rediss-sentinel://` with
+`#masterName` (the password in the URI is for the Redis nodes; Sentinels are reached without one), and
+`redis-socket:///path`. With Sentinel every reconnect asks the Sentinels again, so after a failover the
+instances follow the promoted master as soon as the old one drops their connections; Sentinels report
+nodes by IP address, so with `rediss-sentinel://` and full verification each node's certificate needs
+its IP address. A listed Sentinel that accepts but never answers costs up to one command timeout per
+reconnect. Redis must not require client certificates (`tls-auth-clients no` or `optional`).
+When upgrading from an older C build, note that the URI is now read exactly as Java reads it: a host
+name with `_` cannot take a port (use `redis://redis_cache` or a name without `_`), and `@`, `#`, `?`
+and `/` in a password must be percent-encoded (`%40`, `%23`, `%3F`, `%2F`). Startup then fails with a
+message that says so, without printing the host it derived (it may contain part of the password).
