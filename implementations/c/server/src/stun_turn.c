@@ -3,6 +3,7 @@
 #include "stun_turn.h"
 
 #include "crypto.h"
+#include "instant.h"
 #include "json.h"
 #include "storage.h"
 #include "turn_auth.h"
@@ -10,14 +11,16 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <openssl/rand.h>
+#include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -25,7 +28,6 @@
 #define STUN_COOKIE 0x2112a442U
 #define STUN_HEADER_SIZE 20U
 #define STUN_MAX_PACKET 65535U
-#define TURN_MAX_ALLOCATIONS 256U
 #define TURN_MAX_PERMISSIONS 32U
 #define TURN_MAX_CHANNELS 32U
 
@@ -63,6 +65,10 @@
 #define ATTR_RESPONSE_ORIGIN 0x802bU
 #define ATTR_OTHER_ADDRESS 0x802cU
 #define STUN_MAX_ENDPOINTS 4U
+#define STUN_SOFTWARE "specus-standard-stun-turn"
+/* Java PeerMeshService: RELAY_AUTH_CACHE_TTL_NANOS and relay-traffic-flush-interval-ms. */
+#define RELAY_GRANT_TTL_MS 30000LL
+#define RELAY_TRAFFIC_FLUSH_DEFAULT_MS 5000L
 
 typedef struct {
     int used;
@@ -101,13 +107,32 @@ typedef struct {
     socklen_t advertised_len;
 } stun_server_endpoint;
 
+/*
+ * A Peer Mesh session the relay has seen (Java relayAuthorizationCache plus pendingRelayBytes).
+ * The grant answers its frames for RELAY_GRANT_TTL_MS while the session neither expires nor is
+ * withdrawn (closed or given a new status, which the storage reports per session); the bytes of
+ * its outbound frames wait in pending_bytes for the next batch. Keyed by database and session,
+ * since the database path is read per frame.
+ */
+typedef struct {
+    char *database_path;
+    long long session_id;
+    st_storage_peer_mesh_relay_grant grant;
+    int granted;
+    long long grant_expires_ms;
+    long long pending_bytes;
+} relay_session;
+
+/* Sessions withdrawn lately, so that a grant read while one was withdrawn is not kept. */
+#define RELAY_WITHDRAWAL_RING 64U
+
 struct st_stun_turn_server {
     int control_fd;
     int port;
     stun_server_endpoint endpoints[STUN_MAX_ENDPOINTS];
     size_t endpoint_count;
     int rfc5780;
-    int running;
+    atomic_int running;
     int auth_required;
     int allow_private_peers;
     int allocation_ttl;
@@ -115,12 +140,50 @@ struct st_stun_turn_server {
     int channel_ttl;
     int relay_min_port;
     int relay_max_port;
-    int next_relay_port;
     int general_relay_max_allocations;
     int general_relay_max_allocations_per_address;
     long long general_relay_max_bytes;
+    /* Java configureUdpSocket: buffer sizes (<= 0 keeps the kernel's) and IP_TOS (outside 0..255 keeps it). */
+    int udp_receive_buffer;
+    int udp_send_buffer;
+    int udp_traffic_class;
+    /* XOR-RELAYED-ADDRESS of every allocation (Java turnAdvertisedAddress). */
+    struct in_addr relay_address;
     pthread_t thread;
-    turn_allocation allocations[TURN_MAX_ALLOCATIONS];
+    /*
+     * Every allocation, without a fixed limit (Java keeps them in an unbounded map: the relay
+     * port range and the descriptor limit bound them). Each is allocated on its own, so pointers
+     * to it survive the table growing; one closed during a poll pass is freed after that pass.
+     */
+    turn_allocation **allocations;
+    size_t allocation_count;
+    size_t allocation_capacity;
+    time_t last_entry_sweep;
+    /* The poll set of one pass and the allocation each relay entry belongs to (NULL: endpoint). */
+    struct pollfd *poll_fds;
+    turn_allocation **poll_owners;
+    size_t poll_capacity;
+    /*
+     * Relay sessions, shared by the STUN/TURN thread, the flusher and the storage's listener.
+     * relay_lock guards the table, the withdrawals and flush_stopping and is never held over
+     * database work; flush_lock lets one batch be written at a time, and only a flush removes
+     * entries. next_live and live belong to live_servers_lock.
+     */
+    pthread_mutex_t relay_lock;
+    pthread_cond_t relay_wake;
+    pthread_mutex_t flush_lock;
+    int sync_ready;
+    relay_session *relay_sessions;
+    size_t relay_session_count;
+    size_t relay_session_capacity;
+    unsigned long long withdrawals;
+    long long withdrawn_sessions[RELAY_WITHDRAWAL_RING];
+    st_stun_turn_server *next_live;
+    int live;
+    long flush_interval_ms;
+    int flush_stopping;
+    int flusher_started;
+    pthread_t flusher;
 };
 
 typedef struct {
@@ -187,12 +250,56 @@ static long long env_i64_value(const char *name, long long default_value)
     return end != value && *end == '\0' ? parsed : default_value;
 }
 
+/* A Java int property: any decimal int, negative values included (they switch a setting off). */
+static int env_signed_int_value(const char *name, int default_value)
+{
+    const char *value = getenv(name);
+    if (value == NULL || *value == '\0') return default_value;
+    char *end = NULL;
+    errno = 0;
+    long long parsed = strtoll(value, &end, 10);
+    return end != value && *end == '\0' && errno == 0 && parsed >= INT_MIN && parsed <= INT_MAX
+        ? (int)parsed : default_value;
+}
+
 static int env_int_alias(const char *name, const char *legacy_name, int default_value)
 {
     const char *value = getenv(name);
     return value != NULL && *value != '\0'
         ? env_int_value(name, default_value)
         : env_int_value(legacy_name, default_value);
+}
+
+static int env_signed_int_alias(const char *name, const char *legacy_name, int default_value)
+{
+    const char *value = getenv(name);
+    return value != NULL && *value != '\0'
+        ? env_signed_int_value(name, default_value)
+        : env_signed_int_value(legacy_name, default_value);
+}
+
+/* Java InetAddress.getLocalHost: this host's name resolved (IPv4, as every socket here is). */
+/* Java InetAddress.getByName, for IPv4 sockets: a literal, else the first IPv4 address of the name. */
+static int resolve_ipv4(const char *text, struct in_addr *out)
+{
+    if (text == NULL || *text == '\0') return -1;
+    if (inet_pton(AF_INET, text, out) == 1) return 0;
+    struct addrinfo hints;
+    struct addrinfo *found = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    if (getaddrinfo(text, NULL, &hints, &found) != 0 || found == NULL) return -1;
+    *out = ((const struct sockaddr_in *)found->ai_addr)->sin_addr;
+    freeaddrinfo(found);
+    return 0;
+}
+
+static void local_host_address(struct in_addr *out)
+{
+    char name[256];
+    if (gethostname(name, sizeof(name)) != 0) name[0] = '\0';
+    name[sizeof(name) - 1U] = '\0';
+    if (resolve_ipv4(name, out) != 0) out->s_addr = htonl(INADDR_LOOPBACK);
 }
 
 static int sockaddr_equal(const struct sockaddr_storage *left,
@@ -366,72 +473,65 @@ static int builder_integrity(stun_builder *builder, const uint8_t key[16])
     return builder_attr(builder, ATTR_MESSAGE_INTEGRITY, mac, sizeof(mac));
 }
 
-static int validate_integrity(const uint8_t *packet, size_t len, char username[192])
+/*
+ * Java StunTurnServer.authenticate, in its order: NULL for a request signed with a valid credential
+ * (its username is left in username), otherwise the reason and *code of the refusal. Without this
+ * realm, a user or a nonce it is 401 unauthorized; with another nonce 438 stale-nonce, which comes
+ * with a fresh nonce so the client retries once instead of treating its credential as wrong (RFC
+ * 5389 section 10.2.2); with an unknown or expired credential 401 unauthorized, and with a wrong
+ * MESSAGE-INTEGRITY 401 bad-message-integrity.
+ */
+static const char *authentication_failure(const uint8_t *packet, size_t len, char username[192], int *code)
 {
     stun_attribute user;
     stun_attribute realm;
     stun_attribute nonce;
     stun_attribute integrity;
+    const char *current = st_turn_auth_nonce();
+    *code = 401;
     if (find_attribute(packet, len, ATTR_USERNAME, &user) != 0 || user.length == 0U || user.length >= 192U
         || find_attribute(packet, len, ATTR_REALM, &realm) != 0
-        || find_attribute(packet, len, ATTR_NONCE, &nonce) != 0
-        || find_attribute(packet, len, ATTR_MESSAGE_INTEGRITY, &integrity) != 0
-        || integrity.length != ST_SHA1_LEN
         || realm.length != strlen(st_turn_auth_realm())
         || memcmp(realm.value, st_turn_auth_realm(), realm.length) != 0
-        || nonce.length != strlen(st_turn_auth_nonce())
-        || memcmp(nonce.value, st_turn_auth_nonce(), nonce.length) != 0) return -1;
+        || find_attribute(packet, len, ATTR_NONCE, &nonce) != 0 || nonce.length == 0U) return "unauthorized";
+    if (nonce.length != strlen(current) || memcmp(nonce.value, current, nonce.length) != 0) {
+        *code = 438;
+        return "stale-nonce";
+    }
     memcpy(username, user.value, user.length);
     username[user.length] = '\0';
     uint8_t key[16];
-    if (st_turn_auth_long_term_key(username, key) != 0) return -1;
+    if (st_turn_auth_long_term_key(username, key) != 0) return "unauthorized";
+    if (find_attribute(packet, len, ATTR_MESSAGE_INTEGRITY, &integrity) != 0
+        || integrity.length != ST_SHA1_LEN) return "bad-message-integrity";
     uint8_t *copy = (uint8_t *)malloc(integrity.offset);
-    if (copy == NULL) return -1;
+    if (copy == NULL) return "bad-message-integrity";
     memcpy(copy, packet, integrity.offset);
     write_u16(copy + 2U, (uint16_t)(integrity.offset + 24U - STUN_HEADER_SIZE));
     uint8_t mac[ST_SHA1_LEN];
     st_hmac_sha1(key, sizeof(key), copy, integrity.offset, mac);
     free(copy);
-    return st_constant_time_eq(mac, integrity.value, sizeof(mac)) ? 0 : -1;
+    return st_constant_time_eq(mac, integrity.value, sizeof(mac)) ? NULL : "bad-message-integrity";
 }
 
-/*
- * RFC 5389 section 10.2.2 and Java StunTurnServer.authenticate: a request that names this realm
- * and a user but carries a nonce other than the current one gets 438 with a fresh nonce, so the
- * client retries once instead of treating its credential as wrong. Anything else stays 401.
- */
-static int request_nonce_is_stale(const uint8_t *packet, size_t len)
-{
-    stun_attribute user;
-    stun_attribute realm;
-    stun_attribute nonce;
-    const char *current = st_turn_auth_nonce();
-    return find_attribute(packet, len, ATTR_USERNAME, &user) == 0 && user.length > 0U
-        && find_attribute(packet, len, ATTR_REALM, &realm) == 0
-        && realm.length == strlen(st_turn_auth_realm())
-        && memcmp(realm.value, st_turn_auth_realm(), realm.length) == 0
-        && find_attribute(packet, len, ATTR_NONCE, &nonce) == 0 && nonce.length > 0U
-        && (nonce.length != strlen(current) || memcmp(nonce.value, current, nonce.length) != 0);
-}
-
+/* Java errorType: requests of other methods are answered as Binding errors. */
 static uint16_t stun_error_type(uint16_t request_type)
 {
     switch (request_type) {
-        case STUN_BINDING_REQUEST: return 0x0111U;
         case TURN_ALLOCATE_REQUEST: return 0x0113U;
         case TURN_REFRESH_REQUEST: return 0x0114U;
         case TURN_CREATE_PERMISSION_REQUEST: return 0x0118U;
         case TURN_CHANNEL_BIND_REQUEST: return 0x0119U;
-        default: return 0x0110U;
+        default: return 0x0111U;
     }
 }
 
-static int builder_error(stun_builder *builder,
-                         uint16_t request_type,
-                         const uint8_t transaction[12],
-                         int code,
-                         const char *reason,
-                         int add_challenge)
+/* An error answer with ERROR-CODE only, for Binding (which adds its own attributes after it). */
+static int builder_error_code(stun_builder *builder,
+                              uint16_t request_type,
+                              const uint8_t transaction[12],
+                              int code,
+                              const char *reason)
 {
     builder_start(builder, stun_error_type(request_type), transaction);
     uint8_t value[256] = {0};
@@ -440,13 +540,62 @@ static int builder_error(stun_builder *builder,
     value[2] = (uint8_t)(code / 100);
     value[3] = (uint8_t)(code % 100);
     memcpy(value + 4U, reason, reason_len);
-    if (builder_attr(builder, ATTR_ERROR_CODE, value, reason_len + 4U) != 0) return -1;
+    return builder_attr(builder, ATTR_ERROR_CODE, value, reason_len + 4U);
+}
+
+/*
+ * A TURN error answer as Java sendError builds it: ERROR-CODE with Java's (and Go's) reason
+ * phrase, SOFTWARE, and for a challenge the realm and the current nonce.
+ */
+static int builder_error(stun_builder *builder,
+                         uint16_t request_type,
+                         const uint8_t transaction[12],
+                         int code,
+                         const char *reason,
+                         int add_challenge)
+{
+    if (builder_error_code(builder, request_type, transaction, code, reason) != 0
+        || builder_attr(builder, ATTR_SOFTWARE, STUN_SOFTWARE, strlen(STUN_SOFTWARE)) != 0) return -1;
     if (add_challenge && (builder_attr(builder, ATTR_REALM, st_turn_auth_realm(), strlen(st_turn_auth_realm())) != 0
                           || builder_attr(builder, ATTR_NONCE, st_turn_auth_nonce(), strlen(st_turn_auth_nonce())) != 0)) return -1;
     return 0;
 }
 
-static int create_udp_socket(const char *bind_address, int port, int *actual_port)
+/*
+ * Java configureUdpSocket, before every listening and relay socket is bound: buffers of at least
+ * one maximal datagram so bursts on the main port and the relays are not dropped by the kernel,
+ * and the traffic class. A platform that refuses either keeps its default and the socket is used.
+ */
+static void configure_udp_socket(const st_stun_turn_server *server, int fd)
+{
+    if (server->udp_receive_buffer > 0) {
+        int size = server->udp_receive_buffer < 65507 ? 65507 : server->udp_receive_buffer;
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)) != 0) {
+            fprintf(stderr, "[peer-mesh] unable to configure UDP receive buffer: %s\n", strerror(errno));
+        }
+    }
+    if (server->udp_send_buffer > 0) {
+        int size = server->udp_send_buffer < 65507 ? 65507 : server->udp_send_buffer;
+        if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size)) != 0) {
+            fprintf(stderr, "[peer-mesh] unable to configure UDP send buffer: %s\n", strerror(errno));
+        }
+    }
+    if (server->udp_traffic_class >= 0 && server->udp_traffic_class <= 255) {
+        int traffic_class = server->udp_traffic_class;
+        (void)setsockopt(fd, IPPROTO_IP, IP_TOS, &traffic_class, sizeof(traffic_class));
+    }
+}
+
+/*
+ * reuse_address is for the listening endpoints only. A relay socket must fail to bind a port
+ * another relay holds: on Linux SO_REUSEADDR lets two UDP sockets share one, and the second
+ * allocation would then take the first one's datagrams (Java's DatagramSocket does not set it).
+ */
+static int create_udp_socket(const st_stun_turn_server *server,
+                             const char *bind_address,
+                             int port,
+                             int reuse_address,
+                             int *actual_port)
 {
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
@@ -455,7 +604,9 @@ static int create_udp_socket(const char *bind_address, int port, int *actual_por
     if (inet_pton(AF_INET, bind_address, &address.sin_addr) != 1) return -1;
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     int reuse = 1;
-    if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0
+    if (fd >= 0) configure_udp_socket(server, fd);
+    if (fd < 0
+        || (reuse_address && setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0)
         || bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
         if (fd >= 0) close(fd);
         return -1;
@@ -497,7 +648,7 @@ static int add_stun_endpoint(st_stun_turn_server *server,
 {
     if (server->endpoint_count >= STUN_MAX_ENDPOINTS) return -1;
     int actual_port = 0;
-    int fd = create_udp_socket(bind_address, port, &actual_port);
+    int fd = create_udp_socket(server, bind_address, port, 1, &actual_port);
     if (fd < 0) return -1;
     stun_server_endpoint *endpoint = &server->endpoints[server->endpoint_count];
     memset(endpoint, 0, sizeof(*endpoint));
@@ -507,13 +658,18 @@ static int add_stun_endpoint(st_stun_turn_server *server,
     struct sockaddr_in *advertised = (struct sockaddr_in *)&endpoint->advertised;
     advertised->sin_family = AF_INET;
     advertised->sin_port = htons((uint16_t)actual_port);
-    const char *selected = advertised_address;
-    if (selected == NULL || inet_pton(AF_INET, selected, &advertised->sin_addr) != 1) {
-        selected = bind_address;
-        if (selected == NULL || inet_pton(AF_INET, selected, &advertised->sin_addr) != 1
-            || advertised->sin_addr.s_addr == htonl(INADDR_ANY)) {
-            advertised->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    /* Java resolvePrimaryAdvertisedAddress: the public address, a name resolved (one that does not
+     * resolve keeps the STUN/TURN server from starting, as in Java), else the bind address unless
+     * it is the wildcard, else this host's address. */
+    if (advertised_address != NULL && *advertised_address != '\0') {
+        if (resolve_ipv4(advertised_address, &advertised->sin_addr) != 0) {
+            fprintf(stderr, "[peer-mesh] cannot resolve the advertised STUN/TURN address %s\n", advertised_address);
+            close(fd);
+            return -1;
         }
+    } else if (bind_address == NULL || inet_pton(AF_INET, bind_address, &advertised->sin_addr) != 1
+               || advertised->sin_addr.s_addr == htonl(INADDR_ANY)) {
+        local_host_address(&advertised->sin_addr);
     }
     endpoint->advertised_len = sizeof(*advertised);
     ++server->endpoint_count;
@@ -541,9 +697,10 @@ static turn_allocation *find_allocation_by_client(st_stun_turn_server *server,
                                                    const struct sockaddr_storage *client)
 {
     time_t now = time(NULL);
-    for (size_t i = 0; i < TURN_MAX_ALLOCATIONS; ++i) {
-        if (server->allocations[i].used && server->allocations[i].expires_at > now
-            && sockaddr_equal(&server->allocations[i].client, client, 1)) return &server->allocations[i];
+    for (size_t i = 0; i < server->allocation_count; ++i) {
+        turn_allocation *allocation = server->allocations[i];
+        if (allocation->used && allocation->expires_at > now
+            && sockaddr_equal(&allocation->client, client, 1)) return allocation;
     }
     return NULL;
 }
@@ -552,9 +709,10 @@ static turn_allocation *find_allocation_by_relay(st_stun_turn_server *server,
                                                   const struct sockaddr_storage *relay)
 {
     time_t now = time(NULL);
-    for (size_t i = 0; i < TURN_MAX_ALLOCATIONS; ++i) {
-        if (server->allocations[i].used && server->allocations[i].expires_at > now
-            && sockaddr_equal(&server->allocations[i].relay, relay, 1)) return &server->allocations[i];
+    for (size_t i = 0; i < server->allocation_count; ++i) {
+        turn_allocation *allocation = server->allocations[i];
+        if (allocation->used && allocation->expires_at > now
+            && sockaddr_equal(&allocation->relay, relay, 1)) return allocation;
     }
     return NULL;
 }
@@ -593,37 +751,61 @@ static int allocation_matches_identity(const turn_allocation *allocation, const 
 }
 
 static void close_allocation(turn_allocation *allocation);
+static void format_endpoint(const struct sockaddr_storage *address, char *out, size_t out_len);
 
-static int general_relay_quota_allows(st_stun_turn_server *server,
-                                      const struct sockaddr_storage *client,
-                                      const turn_allocation *exclude)
+/* General relay allocations other than exclude, and how many of them come from client's address. */
+static int count_general_relays(st_stun_turn_server *server,
+                                const struct sockaddr_storage *client,
+                                const turn_allocation *exclude,
+                                int *same_address)
 {
-    if (server->general_relay_max_allocations <= 0) return 0;
     int total = 0;
-    int same_address = 0;
-    for (size_t i = 0; i < TURN_MAX_ALLOCATIONS; ++i) {
-        turn_allocation *candidate = &server->allocations[i];
+    *same_address = 0;
+    for (size_t i = 0; i < server->allocation_count; ++i) {
+        turn_allocation *candidate = server->allocations[i];
         if (!candidate->used || candidate == exclude || !allocation_is_general(candidate)) continue;
         ++total;
-        if (sockaddr_equal(&candidate->client, client, 0)) ++same_address;
+        if (client != NULL && sockaddr_equal(&candidate->client, client, 0)) ++*same_address;
     }
-    return total < server->general_relay_max_allocations
-        && (server->general_relay_max_allocations_per_address <= 0
-            || same_address < server->general_relay_max_allocations_per_address);
+    return total;
 }
 
+/*
+ * Java generalRelayQuotaRejection: NULL when a general relay allocation is admitted, otherwise the
+ * reason, which the audit line and the 486 carry. exclude is the allocation of the same endpoint
+ * that this one replaces, so a client re-allocating is not refused for the room it holds itself.
+ */
+static const char *general_relay_quota_rejection(st_stun_turn_server *server,
+                                                 const struct sockaddr_storage *client,
+                                                 const turn_allocation *exclude)
+{
+    if (server->general_relay_max_allocations <= 0) return "general-relay-disabled";
+    int same_address = 0;
+    if (count_general_relays(server, client, exclude, &same_address) >= server->general_relay_max_allocations) {
+        return "general-relay-allocation-quota";
+    }
+    if (server->general_relay_max_allocations_per_address > 0
+        && same_address >= server->general_relay_max_allocations_per_address) return "general-relay-address-quota";
+    return NULL;
+}
+
+/*
+ * Java allowGeneralRelayTraffic: a general relay allocation that has relayed more than its byte
+ * quota in both directions is closed (not throttled), with an audit line written once, as it closes.
+ */
 static int allow_general_relay_traffic(st_stun_turn_server *server,
                                        turn_allocation *allocation,
                                        size_t bytes)
 {
     if (!allocation_is_general(allocation)) return 1;
-    if (bytes > ULLONG_MAX - allocation->relayed_bytes) {
-        close_allocation(allocation);
-        return 0;
-    }
-    allocation->relayed_bytes += bytes;
-    if (server->general_relay_max_bytes > 0
-        && allocation->relayed_bytes > (unsigned long long)server->general_relay_max_bytes) {
+    int overflow = bytes > ULLONG_MAX - allocation->relayed_bytes;
+    allocation->relayed_bytes = overflow ? ULLONG_MAX : allocation->relayed_bytes + bytes;
+    if (overflow || (server->general_relay_max_bytes > 0
+                     && allocation->relayed_bytes > (unsigned long long)server->general_relay_max_bytes)) {
+        char client[INET6_ADDRSTRLEN + 16];
+        format_endpoint(&allocation->client, client, sizeof(client));
+        fprintf(stderr, "[peer-mesh][audit] general TURN byte quota exhausted, closing allocation: "
+                "client=%s, bytes=%llu\n", client, allocation->relayed_bytes);
         close_allocation(allocation);
         return 0;
     }
@@ -635,13 +817,252 @@ static uint64_t read_u64(const uint8_t *data)
     return ((uint64_t)read_u32(data) << 32U) | read_u32(data + 4U);
 }
 
+static long long monotonic_ms(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000L;
+}
+
+static long long saturated_add(long long current, long long delta)
+{
+    return delta > 0 && current > LLONG_MAX - delta ? LLONG_MAX : current + delta;
+}
+
+/* Caller holds relay_lock. */
+static relay_session *find_relay_session(st_stun_turn_server *server, const char *database_path,
+                                         long long session_id)
+{
+    for (size_t i = 0; i < server->relay_session_count; ++i) {
+        relay_session *entry = &server->relay_sessions[i];
+        if (entry->session_id == session_id && strcmp(entry->database_path, database_path) == 0) return entry;
+    }
+    return NULL;
+}
+
+/* Caller holds relay_lock. */
+static relay_session *add_relay_session(st_stun_turn_server *server, const char *database_path,
+                                        long long session_id)
+{
+    if (server->relay_session_count == server->relay_session_capacity) {
+        size_t capacity = server->relay_session_capacity == 0U ? 16U : server->relay_session_capacity * 2U;
+        if (capacity > SIZE_MAX / sizeof(*server->relay_sessions)) return NULL;
+        relay_session *grown = (relay_session *)realloc(server->relay_sessions, capacity * sizeof(*grown));
+        if (grown == NULL) return NULL;
+        server->relay_sessions = grown;
+        server->relay_session_capacity = capacity;
+    }
+    char *path = strdup(database_path);
+    if (path == NULL) return NULL;
+    relay_session *entry = &server->relay_sessions[server->relay_session_count++];
+    memset(entry, 0, sizeof(*entry));
+    entry->database_path = path;
+    entry->session_id = session_id;
+    return entry;
+}
+
+/* Caller holds relay_lock. Whether session_id was withdrawn after the count `since` was noted. */
+static int withdrawn_since(const st_stun_turn_server *server, unsigned long long since, long long session_id)
+{
+    if (server->withdrawals - since > RELAY_WITHDRAWAL_RING) return 1;
+    for (unsigned long long seq = since; seq < server->withdrawals; ++seq) {
+        if (server->withdrawn_sessions[seq % RELAY_WITHDRAWAL_RING] == session_id) return 1;
+    }
+    return 0;
+}
+
+/* Every running server, for the storage's session listener; normally there is one. */
+static pthread_mutex_t live_servers_lock = PTHREAD_MUTEX_INITIALIZER;
+static st_stun_turn_server *live_servers;
+
+/*
+ * The storage's listener (st_storage_set_peer_mesh_session_listener): a session was closed or
+ * given a new status, so its cached grant is read again on its next frame, as Java drops that
+ * session's relayAuthorizationCache entry. Grants of other sessions are untouched.
+ */
+static void withdraw_relay_grant(long long session_id)
+{
+    pthread_mutex_lock(&live_servers_lock);
+    for (st_stun_turn_server *server = live_servers; server != NULL; server = server->next_live) {
+        pthread_mutex_lock(&server->relay_lock);
+        server->withdrawn_sessions[server->withdrawals % RELAY_WITHDRAWAL_RING] = session_id;
+        ++server->withdrawals;
+        for (size_t i = 0; i < server->relay_session_count; ++i) {
+            if (server->relay_sessions[i].session_id == session_id) server->relay_sessions[i].granted = 0;
+        }
+        pthread_mutex_unlock(&server->relay_lock);
+    }
+    pthread_mutex_unlock(&live_servers_lock);
+}
+
+static void set_server_live(st_stun_turn_server *server, int live)
+{
+    pthread_mutex_lock(&live_servers_lock);
+    if (live && !server->live) {
+        server->next_live = live_servers;
+        live_servers = server;
+        st_storage_set_peer_mesh_session_listener(withdraw_relay_grant);
+    } else if (!live && server->live) {
+        st_stun_turn_server **link = &live_servers;
+        while (*link != NULL && *link != server) link = &(*link)->next_live;
+        if (*link == server) *link = server->next_live;
+    }
+    server->live = live;
+    pthread_mutex_unlock(&live_servers_lock);
+}
+
+/* Java RelayAuthorization.matches: 0/0 is TURN authentication off, where only the session counts. */
+static int relay_grant_matches(const st_storage_peer_mesh_relay_grant *grant, long long from, long long to)
+{
+    return (from <= 0 && to <= 0)
+        || (from == grant->source_client_id && to == grant->target_client_id)
+        || (from == grant->target_client_id && to == grant->source_client_id);
+}
+
+/*
+ * One SPM2 frame against its session, as Java PeerMeshService.authorizeRelayFrameForRelay does it.
+ * A grant read in the last RELAY_GRANT_TTL_MS answers from memory while the session has neither
+ * expired nor changed, and an outbound frame's bytes join the session's pending batch, so the
+ * STUN/TURN thread does not touch the database for it. Otherwise the session is read (the first
+ * frame activates a NEGOTIATING session on the relay path) and its grant kept for the next frames.
+ */
+static int authorize_relay_frame(st_stun_turn_server *server,
+                                 const char *database_path,
+                                 long long session_id,
+                                 long long from_client_id,
+                                 long long to_client_id,
+                                 long long bytes,
+                                 int account_traffic)
+{
+    int identified = from_client_id > 0 && to_client_id > 0;
+    if ((!identified && (from_client_id != 0 || to_client_id != 0))
+        || (identified && from_client_id == to_client_id)) return 0;
+    long long now_ms = monotonic_ms();
+    char now[ST_INSTANT_CAPACITY];
+    int have_now = st_instant_now(now) == 0;
+    pthread_mutex_lock(&server->relay_lock);
+    relay_session *entry = find_relay_session(server, database_path, session_id);
+    if (entry != NULL && entry->granted && entry->grant_expires_ms > now_ms
+        && (entry->grant.expires_at[0] == '\0' || (have_now && strcmp(entry->grant.expires_at, now) > 0))) {
+        int allowed = relay_grant_matches(&entry->grant, from_client_id, to_client_id);
+        if (allowed && account_traffic) entry->pending_bytes = saturated_add(entry->pending_bytes, bytes);
+        pthread_mutex_unlock(&server->relay_lock);
+        return allowed;
+    }
+    /* Noted before the session is read: a withdrawal committed meanwhile must not be cached over. */
+    unsigned long long withdrawals = server->withdrawals;
+    pthread_mutex_unlock(&server->relay_lock);
+    st_storage_peer_mesh_relay_grant grant;
+    int allowed = st_storage_authorize_peer_mesh_relay_grant(database_path, session_id, from_client_id,
+                                                             to_client_id, &grant) == 1;
+    pthread_mutex_lock(&server->relay_lock);
+    entry = find_relay_session(server, database_path, session_id);
+    if (allowed && entry == NULL) entry = add_relay_session(server, database_path, session_id);
+    if (allowed && entry != NULL) {
+        entry->grant = grant;
+        entry->granted = !withdrawn_since(server, withdrawals, session_id);
+        entry->grant_expires_ms = now_ms + RELAY_GRANT_TTL_MS;
+        if (account_traffic) entry->pending_bytes = saturated_add(entry->pending_bytes, bytes);
+    } else if (allowed) {
+        /* No memory to count it in: a frame that cannot be counted is not relayed. */
+        allowed = 0;
+    } else if (entry != NULL) {
+        entry->granted = 0;
+    }
+    pthread_mutex_unlock(&server->relay_lock);
+    return allowed;
+}
+
+void st_stun_turn_server_flush_relay_traffic(st_stun_turn_server *server)
+{
+    if (server == NULL || !server->sync_ready) return;
+    pthread_mutex_lock(&server->flush_lock);
+    /* Take the batch, then write it without holding up the hot path. Only a flush removes
+     * entries, so the paths stay valid until the end of this one. */
+    pthread_mutex_lock(&server->relay_lock);
+    size_t pending = 0U;
+    for (size_t i = 0; i < server->relay_session_count; ++i) pending += server->relay_sessions[i].pending_bytes > 0;
+    relay_session *batch = pending == 0U ? NULL : (relay_session *)calloc(pending, sizeof(*batch));
+    size_t batch_count = 0U;
+    for (size_t i = 0; batch != NULL && i < server->relay_session_count; ++i) {
+        relay_session *entry = &server->relay_sessions[i];
+        if (entry->pending_bytes <= 0) continue;
+        batch[batch_count++] = *entry;
+        entry->pending_bytes = 0;
+    }
+    pthread_mutex_unlock(&server->relay_lock);
+    for (size_t i = 0; i < batch_count; ++i) {
+        int result = st_storage_record_peer_mesh_relay_traffic(batch[i].database_path, batch[i].session_id,
+                                                               batch[i].pending_bytes);
+        if (result < 0) {
+            fprintf(stderr, "[peer-mesh] relay traffic flush failed: session=%lld, bytes=%lld\n",
+                    batch[i].session_id, batch[i].pending_bytes);
+        }
+        pthread_mutex_lock(&server->relay_lock);
+        relay_session *entry = find_relay_session(server, batch[i].database_path, batch[i].session_id);
+        if (entry != NULL && result < 0) {
+            /* Java restoreRelayTrafficBatch: kept for the next batch. */
+            entry->pending_bytes = saturated_add(entry->pending_bytes, batch[i].pending_bytes);
+        } else if (entry != NULL && result > 0) {
+            /* Closed or gone: the next frame reads the session again. */
+            entry->granted = 0;
+            if (result == 2) entry->pending_bytes = 0;
+        }
+        pthread_mutex_unlock(&server->relay_lock);
+    }
+    free(batch);
+    /* Sessions that can no longer answer a frame and have nothing waiting are forgotten. */
+    long long now_ms = monotonic_ms();
+    pthread_mutex_lock(&server->relay_lock);
+    size_t kept = 0U;
+    for (size_t i = 0; i < server->relay_session_count; ++i) {
+        relay_session *entry = &server->relay_sessions[i];
+        if (entry->pending_bytes <= 0 && (!entry->granted || entry->grant_expires_ms <= now_ms)) {
+            free(entry->database_path);
+        } else {
+            server->relay_sessions[kept++] = *entry;
+        }
+    }
+    server->relay_session_count = kept;
+    pthread_mutex_unlock(&server->relay_lock);
+    pthread_mutex_unlock(&server->flush_lock);
+}
+
+/* Writes the pending relay bytes every flush_interval_ms until the server stops. */
+static void *relay_flush_thread(void *raw)
+{
+    st_stun_turn_server *server = (st_stun_turn_server *)raw;
+    pthread_mutex_lock(&server->relay_lock);
+    while (!server->flush_stopping) {
+        struct timespec deadline;
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
+        deadline.tv_sec += server->flush_interval_ms / 1000L;
+        deadline.tv_nsec += (server->flush_interval_ms % 1000L) * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec += 1;
+            deadline.tv_nsec -= 1000000000L;
+        }
+        int waited = 0;
+        while (!server->flush_stopping && waited != ETIMEDOUT) {
+            waited = pthread_cond_timedwait(&server->relay_wake, &server->relay_lock, &deadline);
+        }
+        if (server->flush_stopping) break;
+        pthread_mutex_unlock(&server->relay_lock);
+        st_stun_turn_server_flush_relay_traffic(server);
+        pthread_mutex_lock(&server->relay_lock);
+    }
+    pthread_mutex_unlock(&server->relay_lock);
+    return NULL;
+}
+
 /*
  * identified is whether TURN authentication is on. With it off an allocation carries no client id
  * (the credential has none), so, as in Java StunTurnServer.authorizeRelayPayload, both sides go to
  * the session check as 0 and only the session itself is checked: insisting on ids there would
  * drop every Peer Mesh datagram, probes included, and leave the relay unusable.
  */
-static int authorize_relay_payload(const uint8_t *payload,
+static int authorize_relay_payload(st_stun_turn_server *server,
+                                   const uint8_t *payload,
                                    size_t payload_len,
                                    const turn_allocation *source,
                                    const turn_allocation *target,
@@ -662,10 +1083,8 @@ static int authorize_relay_payload(const uint8_t *payload,
         long long session_id = (long long)read_u64(payload + 4U);
         long long sequence = (long long)read_u64(payload + 12U);
         return session_id > 0 && sequence > 0
-            && st_storage_authorize_peer_mesh_relay(database_path, session_id,
-                                                    source_id, target_id,
-                                                    (long long)payload_len,
-                                                    account_traffic) == 1;
+            && authorize_relay_frame(server, database_path, session_id, source_id, target_id,
+                                     (long long)payload_len, account_traffic);
     }
     if (payload_len < 2U || payload_len > 2048U || payload[0] != '{'
         || payload[payload_len - 1U] != '}') return 0;
@@ -801,30 +1220,38 @@ static turn_allocation *create_allocation(st_stun_turn_server *server,
                                            socklen_t client_len,
                                            const char *username)
 {
-    turn_allocation *slot = NULL;
-    for (size_t i = 0; i < TURN_MAX_ALLOCATIONS; ++i) {
-        if (!server->allocations[i].used) {
-            slot = &server->allocations[i];
-            break;
-        }
+    if (server->allocation_count == server->allocation_capacity) {
+        size_t capacity = server->allocation_capacity == 0U ? 16U : server->allocation_capacity * 2U;
+        if (capacity > SIZE_MAX / sizeof(*server->allocations)) return NULL;
+        turn_allocation **grown = (turn_allocation **)realloc(server->allocations,
+                                                              capacity * sizeof(*grown));
+        if (grown == NULL) return NULL;
+        server->allocations = grown;
+        server->allocation_capacity = capacity;
     }
-    if (slot == NULL) return NULL;
     const char *bind_address = getenv("SPECUS_PEER_MESH_BIND_ADDRESS");
     if (bind_address == NULL || *bind_address == '\0') bind_address = "0.0.0.0";
     int relay_fd = -1;
     int relay_port = 0;
+    /* Java bindRelaySocket: the first port is random, so the next relay port cannot be predicted,
+     * and at most clamp(range, 16, 128) ports are tried, so a crowded range cannot hold this thread
+     * in thousands of bind calls. */
     int range = server->relay_max_port - server->relay_min_port + 1;
-    for (int i = 0; i < range; ++i) {
-        int port = server->relay_min_port
-            + ((server->next_relay_port - server->relay_min_port + i) % range);
-        relay_fd = create_udp_socket(bind_address, port, &relay_port);
-        if (relay_fd >= 0) {
-            server->next_relay_port = port == server->relay_max_port ? server->relay_min_port : port + 1;
-            break;
-        }
+    int attempts = range < 16 ? 16 : (range > 128 ? 128 : range);
+    unsigned int random = 0U;
+    if (RAND_bytes((unsigned char *)&random, (int)sizeof(random)) != 1) random = (unsigned int)time(NULL);
+    int first = (int)(random % (unsigned int)range);
+    for (int i = 0; i < attempts && relay_fd < 0; ++i) {
+        relay_fd = create_udp_socket(server, bind_address, server->relay_min_port + (first + i) % range, 0,
+                                     &relay_port);
     }
     if (relay_fd < 0) return NULL;
-    memset(slot, 0, sizeof(*slot));
+    turn_allocation *slot = (turn_allocation *)calloc(1, sizeof(*slot));
+    if (slot == NULL) {
+        close(relay_fd);
+        return NULL;
+    }
+    server->allocations[server->allocation_count++] = slot;
     slot->used = 1;
     slot->relay_fd = relay_fd;
     slot->client = *client;
@@ -834,12 +1261,15 @@ static turn_allocation *create_allocation(st_stun_turn_server *server,
     struct sockaddr_in *relay = (struct sockaddr_in *)&slot->relay;
     relay->sin_family = AF_INET;
     relay->sin_port = htons((uint16_t)relay_port);
-    const char *advertised = getenv("SPECUS_PEER_MESH_RELAY_ADDRESS");
-    if (advertised == NULL || *advertised == '\0') advertised = getenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS");
-    if (advertised == NULL || inet_pton(AF_INET, advertised, &relay->sin_addr) != 1) {
-        relay->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    }
+    relay->sin_addr = server->relay_address;
     slot->relay_len = sizeof(*relay);
+    /* Java createAllocation logs every allocation at info. */
+    char client_text[INET6_ADDRSTRLEN + 16];
+    char relay_text[INET6_ADDRSTRLEN + 16];
+    format_endpoint(client, client_text, sizeof(client_text));
+    format_endpoint(&slot->relay, relay_text, sizeof(relay_text));
+    printf("[peer-mesh] TURN allocation created: client=%s, relay=%s\n", client_text, relay_text);
+    fflush(stdout);
     return slot;
 }
 
@@ -854,20 +1284,29 @@ static int allocation_has_permission(turn_allocation *allocation,
     return 0;
 }
 
+/*
+ * Where a permission for this peer's address goes: its own entry, else one that is free or has
+ * expired. Java keeps permissions in an unbounded map and drops expired ones; here an allocation
+ * holds TURN_MAX_PERMISSIONS live ones, and NULL means all of them are live for other peers.
+ */
+static turn_permission *permission_slot(turn_allocation *allocation, const struct sockaddr_storage *peer)
+{
+    time_t now = time(NULL);
+    turn_permission *slot = NULL;
+    for (size_t i = 0; i < TURN_MAX_PERMISSIONS; ++i) {
+        turn_permission *candidate = &allocation->permissions[i];
+        if (candidate->used && sockaddr_equal(&candidate->address, peer, 0)) return candidate;
+        if (slot == NULL && (!candidate->used || candidate->expires_at <= now)) slot = candidate;
+    }
+    return slot;
+}
+
 static int add_permission(turn_allocation *allocation,
                           const struct sockaddr_storage *peer,
                           socklen_t peer_len,
                           int ttl)
 {
-    turn_permission *slot = NULL;
-    for (size_t i = 0; i < TURN_MAX_PERMISSIONS; ++i) {
-        if (allocation->permissions[i].used
-            && sockaddr_equal(&allocation->permissions[i].address, peer, 0)) {
-            slot = &allocation->permissions[i];
-            break;
-        }
-        if (slot == NULL && !allocation->permissions[i].used) slot = &allocation->permissions[i];
-    }
+    turn_permission *slot = permission_slot(allocation, peer);
     if (slot == NULL) return -1;
     slot->used = 1;
     slot->address = *peer;
@@ -904,15 +1343,19 @@ static int bind_channel(turn_allocation *allocation,
                         int ttl)
 {
     turn_channel *slot = find_channel_by_number(allocation, number);
-    /* RFC 5766 section 11.2: a live channel number may only be refreshed for the same peer. */
-    if (slot != NULL && !sockaddr_equal(&slot->peer, peer, 1)) return -1;
-    if (slot == NULL) {
-        for (size_t i = 0; i < TURN_MAX_CHANNELS; ++i) {
-            if (!allocation->channels[i].used) {
-                slot = &allocation->channels[i];
-                break;
-            }
+    /* RFC 5766 section 11.2: a live channel number may only be refreshed for the same peer (-2). */
+    if (slot != NULL && !sockaddr_equal(&slot->peer, peer, 1)) return -2;
+    /* Java channelBind: the peer leaves the number it was bound to before, so its data comes in
+     * on the new one and the old number is free. Expired bindings give their entries back. */
+    time_t now = time(NULL);
+    for (size_t i = 0; i < TURN_MAX_CHANNELS; ++i) {
+        turn_channel *other = &allocation->channels[i];
+        if (other->used && other != slot && (other->expires_at <= now || sockaddr_equal(&other->peer, peer, 1))) {
+            other->used = 0;
         }
+    }
+    for (size_t i = 0; slot == NULL && i < TURN_MAX_CHANNELS; ++i) {
+        if (!allocation->channels[i].used) slot = &allocation->channels[i];
     }
     if (slot == NULL) return -1;
     slot->used = 1;
@@ -944,13 +1387,21 @@ static int authenticate_request(st_stun_turn_server *server,
         username[0] = '\0';
         return 0;
     }
-    if (validate_integrity(packet, len, username) == 0) return 0;
-    int stale = request_nonce_is_stale(packet, len);
+    int code = 0;
+    const char *failure = authentication_failure(packet, len, username, &code);
+    if (failure == NULL) return 0;
     stun_builder error;
-    builder_error(&error, read_u16(packet), packet + 8U,
-                  stale ? 438 : 401, stale ? "Stale Nonce" : "Unauthorized", 1);
+    builder_error(&error, read_u16(packet), packet + 8U, code, failure, 1);
     send_builder(fd, &error, client, client_len);
     return -1;
+}
+
+/* Success answers carry SOFTWARE, and MESSAGE-INTEGRITY when the request was authenticated. */
+static void finish_success(st_stun_turn_server *server, stun_builder *response, const char *username)
+{
+    (void)builder_attr(response, ATTR_SOFTWARE, STUN_SOFTWARE, strlen(STUN_SOFTWARE));
+    uint8_t key[16];
+    if (server->auth_required && st_turn_auth_long_term_key(username, key) == 0) builder_integrity(response, key);
 }
 
 static void handle_binding(st_stun_turn_server *server,
@@ -1004,13 +1455,13 @@ static void handle_binding(st_stun_turn_server *server,
     }
     if (error_code != 0) {
         stun_builder error;
-        builder_error(&error, STUN_BINDING_REQUEST, packet + 8U, error_code, error_reason, 0);
+        builder_error_code(&error, STUN_BINDING_REQUEST, packet + 8U, error_code, error_reason);
         if (unknown_attribute != 0U) {
             uint8_t encoded[2];
             write_u16(encoded, unknown_attribute);
             (void)builder_attr(&error, ATTR_UNKNOWN_ATTRIBUTES, encoded, sizeof(encoded));
         }
-        (void)builder_attr(&error, ATTR_SOFTWARE, "specus-standard-stun-turn", 25U);
+        (void)builder_attr(&error, ATTR_SOFTWARE, STUN_SOFTWARE, strlen(STUN_SOFTWARE));
         (void)send_builder(received_fd, &error, &response_target, response_target_len);
         return;
     }
@@ -1023,7 +1474,7 @@ static void handle_binding(st_stun_turn_server *server,
     builder_start(&response, STUN_BINDING_SUCCESS, packet + 8U);
     (void)builder_address(&response, ATTR_MAPPED_ADDRESS, client, 0);
     (void)builder_address(&response, ATTR_XOR_MAPPED_ADDRESS, client, 1);
-    (void)builder_attr(&response, ATTR_SOFTWARE, "specus-standard-stun-turn", 25U);
+    (void)builder_attr(&response, ATTR_SOFTWARE, STUN_SOFTWARE, strlen(STUN_SOFTWARE));
     (void)builder_address(&response, ATTR_RESPONSE_ORIGIN, &response_endpoint->advertised,
                           server->rfc5780 ? 0 : 1);
     stun_server_endpoint *other = server->rfc5780
@@ -1057,34 +1508,48 @@ static void handle_allocate(st_stun_turn_server *server,
     if (find_attribute(packet, len, ATTR_REQUESTED_TRANSPORT, &transport) != 0
         || transport.length != 4U || transport.value[0] != 17U) {
         stun_builder error;
-        builder_error(&error, TURN_ALLOCATE_REQUEST, packet + 8U, 442, "Unsupported Transport", 0);
+        builder_error(&error, TURN_ALLOCATE_REQUEST, packet + 8U, 442, "unsupported-transport", 0);
         send_builder(fd, &error, client, client_len);
         return;
     }
     turn_allocation *allocation = find_allocation_by_client(server, client);
-    int quota_rejected = 0;
+    const char *rejection = NULL;
     int general_relay = username_is_general(username);
-    if (allocation != NULL && !allocation_matches_identity(allocation, username)) {
-        if (general_relay && !general_relay_quota_allows(server, client, allocation)) {
-            quota_rejected = 1;
+    int created = 0;
+    if (allocation == NULL || !allocation_matches_identity(allocation, username)) {
+        /* A new allocation, or one replacing this endpoint's allocation of another identity. */
+        if (general_relay) rejection = general_relay_quota_rejection(server, client, allocation);
+        if (rejection == NULL) {
+            if (allocation != NULL) close_allocation(allocation);
+            allocation = create_allocation(server, client, client_len, username);
+            created = allocation != NULL;
+        } else {
             allocation = NULL;
         }
-        else {
-            close_allocation(allocation);
-            allocation = create_allocation(server, client, client_len, username);
-        }
-    } else if (allocation == NULL) {
-        if (!general_relay || general_relay_quota_allows(server, client, NULL))
-            allocation = create_allocation(server, client, client_len, username);
-        else quota_rejected = 1;
+    }
+    char client_text[INET6_ADDRSTRLEN + 16];
+    format_endpoint(client, client_text, sizeof(client_text));
+    if (rejection != NULL) {
+        /* Java: the general relay follows the public ICE configuration, so a refusal must be traceable. */
+        fprintf(stderr, "[peer-mesh][audit] general TURN allocation rejected: client=%s, reason=%s\n",
+                client_text, rejection);
     }
     if (allocation == NULL) {
+        /* 486 names the quota that refused it, as in Java; 508 (no relay port or socket free) is
+         * C's own answer where Java fails the request without one. */
         stun_builder error;
-        builder_error(&error, TURN_ALLOCATE_REQUEST, packet + 8U,
-                      quota_rejected ? 486 : 508,
-                      quota_rejected ? "Allocation Quota Reached" : "Insufficient Capacity", 0);
+        builder_error(&error, TURN_ALLOCATE_REQUEST, packet + 8U, rejection != NULL ? 486 : 508,
+                      rejection != NULL ? rejection : "insufficient-capacity", 0);
         send_builder(fd, &error, client, client_len);
         return;
+    }
+    if (created && general_relay) {
+        int same_address = 0;
+        char relay_text[INET6_ADDRSTRLEN + 16];
+        format_endpoint(&allocation->relay, relay_text, sizeof(relay_text));
+        printf("[peer-mesh][audit] general TURN allocation created: client=%s, relay=%s, active=%d\n",
+               client_text, relay_text, count_general_relays(server, NULL, NULL, &same_address));
+        fflush(stdout);
     }
     allocation->expires_at = time(NULL) + server->allocation_ttl;
     stun_builder response;
@@ -1092,10 +1557,7 @@ static void handle_allocate(st_stun_turn_server *server,
     builder_address(&response, ATTR_XOR_RELAYED_ADDRESS, &allocation->relay, 1);
     builder_address(&response, ATTR_XOR_MAPPED_ADDRESS, client, 1);
     builder_u32(&response, ATTR_LIFETIME, (uint32_t)server->allocation_ttl);
-    if (server->auth_required) {
-        uint8_t key[16];
-        if (st_turn_auth_long_term_key(username, key) == 0) builder_integrity(&response, key);
-    }
+    finish_success(server, &response, username);
     send_builder(fd, &response, client, client_len);
 }
 
@@ -1111,7 +1573,7 @@ static void handle_refresh(st_stun_turn_server *server,
     turn_allocation *allocation = find_allocation_by_client(server, client);
     if (!allocation_matches_identity(allocation, username)) {
         stun_builder error;
-        builder_error(&error, TURN_REFRESH_REQUEST, packet + 8U, 437, "Allocation Mismatch", 0);
+        builder_error(&error, TURN_REFRESH_REQUEST, packet + 8U, 437, "allocation-mismatch", 0);
         send_builder(fd, &error, client, client_len);
         return;
     }
@@ -1121,11 +1583,12 @@ static void handle_refresh(st_stun_turn_server *server,
         lifetime = read_u32(requested.value);
         if (lifetime > (uint32_t)server->allocation_ttl) lifetime = (uint32_t)server->allocation_ttl;
     }
+    /* Java and Go answer the configured lifetime (0 for a deletion), whatever shorter one the
+     * allocation is kept for. */
     stun_builder response;
     builder_start(&response, TURN_REFRESH_SUCCESS, packet + 8U);
-    builder_u32(&response, ATTR_LIFETIME, lifetime);
-    uint8_t key[16];
-    if (server->auth_required && st_turn_auth_long_term_key(username, key) == 0) builder_integrity(&response, key);
+    builder_u32(&response, ATTR_LIFETIME, lifetime == 0U ? 0U : (uint32_t)server->allocation_ttl);
+    finish_success(server, &response, username);
     send_builder(fd, &response, client, client_len);
     if (lifetime == 0U) close_allocation(allocation);
     else allocation->expires_at = time(NULL) + lifetime;
@@ -1145,14 +1608,21 @@ static void handle_permission_or_channel(st_stun_turn_server *server,
     struct sockaddr_storage peers[TURN_MAX_PERMISSIONS];
     socklen_t peer_lens[TURN_MAX_PERMISSIONS];
     size_t peer_count = 0U;
+    int channel_bind = message_type == TURN_CHANNEL_BIND_REQUEST;
+    stun_attribute channel;
+    uint16_t number = 0U;
     int refusal = 0;
     const char *refusal_reason = NULL;
+    /* Java's order and reasons: identity, then a ChannelBind's number and peer, then the policy. */
     if (!allocation_matches_identity(allocation, username)) {
         refusal = 437;
-        refusal_reason = "Allocation Mismatch";
-    } else if (collect_peer_addresses(packet, len, peers, peer_lens, TURN_MAX_PERMISSIONS, &peer_count) != 0) {
+        refusal_reason = "allocation-mismatch";
+    } else if (collect_peer_addresses(packet, len, peers, peer_lens, TURN_MAX_PERMISSIONS, &peer_count) != 0
+               || (channel_bind && (find_attribute(packet, len, ATTR_CHANNEL_NUMBER, &channel) != 0
+                                    || channel.length != 4U || (number = read_u16(channel.value)) < 0x4000U
+                                    || number > 0x7fffU))) {
         refusal = 400;
-        refusal_reason = "Bad Request";
+        refusal_reason = channel_bind ? "bad-channel-bind" : "bad-request";
     } else if (allocation_is_general(allocation)) {
         /* Every named peer is checked before any permission is installed, as Go does: one refused
          * peer refuses the whole request instead of letting the peers before it through. */
@@ -1160,7 +1630,7 @@ static void handle_permission_or_channel(st_stun_turn_server *server,
             if (peer_address_allowed(server, &peers[i])) continue;
             log_refused_peer(message_type, client, &peers[i]);
             refusal = 403;
-            refusal_reason = "Forbidden Peer";
+            refusal_reason = "forbidden-peer-address";
         }
     }
     if (refusal != 0) {
@@ -1170,13 +1640,13 @@ static void handle_permission_or_channel(st_stun_turn_server *server,
         return;
     }
     int rc = 0;
+    const char *failure = "bad-request";
     uint16_t success_type = TURN_CREATE_PERMISSION_SUCCESS;
-    if (message_type == TURN_CHANNEL_BIND_REQUEST) {
-        stun_attribute channel;
-        uint16_t number = 0U;
-        if (find_attribute(packet, len, ATTR_CHANNEL_NUMBER, &channel) != 0 || channel.length != 4U
-            || (number = read_u16(channel.value)) < 0x4000U || number > 0x7fffU) rc = -1;
+    if (channel_bind) {
+        /* The permission it installs must fit before the binding changes anything. */
+        if (permission_slot(allocation, &peers[0]) == NULL) rc = -1;
         else rc = bind_channel(allocation, number, &peers[0], peer_lens[0], server->channel_ttl);
+        if (rc == -2) failure = "channel-in-use";
         success_type = TURN_CHANNEL_BIND_SUCCESS;
         /* A ChannelBind binds the first peer it names; the others were only policy-checked. */
         peer_count = 1U;
@@ -1187,11 +1657,12 @@ static void handle_permission_or_channel(st_stun_turn_server *server,
     }
     stun_builder response;
     if (rc != 0) {
-        builder_error(&response, message_type, packet + 8U, 400, "Bad Request", 0);
+        /* bad-request: more live permissions or channels than an allocation holds, which Java,
+         * keeping them in maps, never refuses. */
+        builder_error(&response, message_type, packet + 8U, 400, failure, 0);
     } else {
         builder_start(&response, success_type, packet + 8U);
-        uint8_t key[16];
-        if (server->auth_required && st_turn_auth_long_term_key(username, key) == 0) builder_integrity(&response, key);
+        finish_success(server, &response, username);
     }
     send_builder(fd, &response, client, client_len);
 }
@@ -1211,7 +1682,7 @@ static void handle_send_indication(st_stun_turn_server *server,
         || decode_xor_address(&peer_attr, packet + 8U, &peer, &peer_len) != 0
         || !allocation_has_permission(allocation, &peer)) return;
     turn_allocation *target = find_allocation_by_relay(server, &peer);
-    if (!authorize_relay_payload(data.value, data.length, allocation, target, 1,
+    if (!authorize_relay_payload(server, data.value, data.length, allocation, target, 1,
                                  server->auth_required)) return;
     if (!allow_general_relay_traffic(server, allocation, data.length)) return;
     (void)sendto(allocation->relay_fd, data.value, data.length, 0,
@@ -1230,7 +1701,7 @@ static void handle_channel_data(st_stun_turn_server *server,
     turn_channel *channel = allocation == NULL ? NULL : find_channel_by_number(allocation, number);
     if (channel == NULL || 4U + data_len > len || !allocation_has_permission(allocation, &channel->peer)) return;
     turn_allocation *target = find_allocation_by_relay(server, &channel->peer);
-    if (!authorize_relay_payload(packet + 4U, data_len, allocation, target, 1,
+    if (!authorize_relay_payload(server, packet + 4U, data_len, allocation, target, 1,
                                  server->auth_required)) return;
     if (!allow_general_relay_traffic(server, allocation, data_len)) return;
     (void)sendto(allocation->relay_fd, packet + 4U, data_len, 0,
@@ -1244,13 +1715,28 @@ static void handle_control_packet(st_stun_turn_server *server,
                                   const struct sockaddr_storage *client,
                                   socklen_t client_len)
 {
+    /* Java reads ChannelData on the main port only; elsewhere it is no STUN message either. */
     if (len >= 4U && (packet[0] & 0xc0U) == 0x40U) {
-        handle_channel_data(server, packet, len, client);
+        if (fd == server->control_fd) handle_channel_data(server, packet, len, client);
         return;
     }
     if (!stun_packet_valid(packet, len)) return;
     uint16_t type = read_u16(packet);
-    if (fd != server->control_fd && type != STUN_BINDING_REQUEST) return;
+    /*
+     * Java answers a TURN message on another endpoint with 400 unsupported-endpoint and one of an
+     * unknown method with 400 unsupported-method instead of letting the client retransmit until it
+     * times out. Only requests are answered here: an answer to an indication or a response could
+     * bounce between two servers (or a spoofed server and itself) for ever.
+     */
+    int request = (type & 0x0110U) == 0U;
+    if (fd != server->control_fd && type != STUN_BINDING_REQUEST) {
+        if (request) {
+            stun_builder error;
+            builder_error(&error, type, packet + 8U, 400, "unsupported-endpoint", 0);
+            (void)send_builder(fd, &error, client, client_len);
+        }
+        return;
+    }
     switch (type) {
         case STUN_BINDING_REQUEST: handle_binding(server, fd, packet, len, client, client_len); break;
         case TURN_ALLOCATE_REQUEST: handle_allocate(server, fd, packet, len, client, client_len); break;
@@ -1259,7 +1745,13 @@ static void handle_control_packet(st_stun_turn_server *server,
         case TURN_CHANNEL_BIND_REQUEST:
             handle_permission_or_channel(server, fd, type, packet, len, client, client_len); break;
         case TURN_SEND_INDICATION: handle_send_indication(server, packet, len, client); break;
-        default: break;
+        default:
+            if (request) {
+                stun_builder error;
+                builder_error(&error, type, packet + 8U, 400, "unsupported-method", 0);
+                (void)send_builder(fd, &error, client, client_len);
+            }
+            break;
     }
 }
 
@@ -1272,7 +1764,7 @@ static void handle_relay_packet(st_stun_turn_server *server, turn_allocation *al
                                 (struct sockaddr *)&peer, &peer_len);
     if (received <= 0 || !allocation_has_permission(allocation, &peer)) return;
     turn_allocation *source = find_allocation_by_relay(server, &peer);
-    if (!authorize_relay_payload(packet, (size_t)received, source, allocation, 0,
+    if (!authorize_relay_payload(server, packet, (size_t)received, source, allocation, 0,
                                  server->auth_required)) return;
     if (!allow_general_relay_traffic(server, allocation, (size_t)received)) return;
     turn_channel *channel = find_channel_by_peer(allocation, &peer);
@@ -1295,60 +1787,171 @@ static void handle_relay_packet(st_stun_turn_server *server, turn_allocation *al
     (void)send_builder(server->control_fd, &indication, &allocation->client, allocation->client_len);
 }
 
+/*
+ * The periodic sweep (Java cleanupExpiredAllocations): expired allocations after every pass, and
+ * once a second (lifetimes are whole seconds) the expired permissions and channels of the others.
+ */
 static void expire_allocations(st_stun_turn_server *server)
 {
     time_t now = time(NULL);
-    for (size_t i = 0; i < TURN_MAX_ALLOCATIONS; ++i) {
-        if (server->allocations[i].used && server->allocations[i].expires_at <= now) {
-            close_allocation(&server->allocations[i]);
+    int sweep_entries = now != server->last_entry_sweep;
+    server->last_entry_sweep = now;
+    for (size_t i = 0; i < server->allocation_count; ++i) {
+        turn_allocation *allocation = server->allocations[i];
+        if (!allocation->used) continue;
+        if (allocation->expires_at <= now) {
+            close_allocation(allocation);
+            continue;
+        }
+        for (size_t k = 0; sweep_entries && k < TURN_MAX_PERMISSIONS; ++k) {
+            if (allocation->permissions[k].expires_at <= now) allocation->permissions[k].used = 0;
+        }
+        for (size_t k = 0; sweep_entries && k < TURN_MAX_CHANNELS; ++k) {
+            if (allocation->channels[k].expires_at <= now) allocation->channels[k].used = 0;
         }
     }
 }
 
+/* Frees the allocations closed during the pass that just ended; nothing points at them any more. */
+static void reap_closed_allocations(st_stun_turn_server *server)
+{
+    size_t kept = 0U;
+    for (size_t i = 0; i < server->allocation_count; ++i) {
+        if (server->allocations[i]->used) server->allocations[kept++] = server->allocations[i];
+        else free(server->allocations[i]);
+    }
+    server->allocation_count = kept;
+}
+
+static int reserve_poll_set(st_stun_turn_server *server, size_t needed)
+{
+    if (needed <= server->poll_capacity) return 0;
+    size_t capacity = server->poll_capacity == 0U ? 32U : server->poll_capacity;
+    while (capacity < needed) {
+        if (capacity > SIZE_MAX / 2U / sizeof(*server->poll_owners)) return -1;
+        capacity *= 2U;
+    }
+    struct pollfd *fds = (struct pollfd *)realloc(server->poll_fds, capacity * sizeof(*fds));
+    if (fds == NULL) return -1;
+    server->poll_fds = fds;
+    turn_allocation **owners = (turn_allocation **)realloc(server->poll_owners, capacity * sizeof(*owners));
+    if (owners == NULL) return -1;
+    server->poll_owners = owners;
+    server->poll_capacity = capacity;
+    return 0;
+}
+
+/*
+ * One thread serves every endpoint and relay socket. poll, not select: a process with many
+ * connections hands out socket numbers at and past FD_SETSIZE (the systemd unit allows 1048576
+ * descriptors), which an fd_set cannot hold. As before, each ready socket gives up one datagram
+ * per pass, endpoints first.
+ */
 static void *stun_turn_thread(void *raw)
 {
     st_stun_turn_server *server = (st_stun_turn_server *)raw;
     while (server->running) {
-        fd_set read_fds;
-        FD_ZERO(&read_fds);
-        int max_fd = -1;
+        if (reserve_poll_set(server, server->endpoint_count + server->allocation_count) != 0) {
+            fprintf(stderr, "[peer-mesh] STUN/TURN poll set allocation failed\n");
+            struct timespec pause = {0, 100000000L};
+            nanosleep(&pause, NULL);
+            continue;
+        }
+        nfds_t count = 0U;
         for (size_t i = 0; i < server->endpoint_count; ++i) {
-            int fd = server->endpoints[i].fd;
-            if (fd >= 0) {
-                FD_SET(fd, &read_fds);
-                if (fd > max_fd) max_fd = fd;
-            }
+            if (server->endpoints[i].fd < 0) continue;
+            server->poll_fds[count] = (struct pollfd){server->endpoints[i].fd, POLLIN, 0};
+            server->poll_owners[count++] = NULL;
         }
-        for (size_t i = 0; i < TURN_MAX_ALLOCATIONS; ++i) {
-            if (server->allocations[i].used) {
-                FD_SET(server->allocations[i].relay_fd, &read_fds);
-                if (server->allocations[i].relay_fd > max_fd) max_fd = server->allocations[i].relay_fd;
-            }
+        nfds_t endpoint_entries = count;
+        for (size_t i = 0; i < server->allocation_count; ++i) {
+            turn_allocation *allocation = server->allocations[i];
+            if (!allocation->used) continue;
+            server->poll_fds[count] = (struct pollfd){allocation->relay_fd, POLLIN, 0};
+            server->poll_owners[count++] = allocation;
         }
-        struct timeval timeout = {1, 0};
-        int ready = select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
-        if (ready < 0 && errno != EINTR) break;
-        for (size_t which = 0; which < server->endpoint_count; ++which) {
-            int fd = server->endpoints[which].fd;
-            if (fd >= 0 && FD_ISSET(fd, &read_fds)) {
-                uint8_t packet[STUN_MAX_PACKET];
-                struct sockaddr_storage client;
-                socklen_t client_len = sizeof(client);
-                ssize_t received = recvfrom(fd, packet, sizeof(packet), 0,
-                                            (struct sockaddr *)&client, &client_len);
-                if (received > 0) handle_control_packet(server, fd, packet, (size_t)received,
-                                                        &client, client_len);
-            }
+        int ready = poll(server->poll_fds, count, 1000);
+        if (ready < 0 && errno != EINTR) {
+            fprintf(stderr, "[peer-mesh] STUN/TURN poll failed: %s\n", strerror(errno));
+            struct timespec pause = {0, 100000000L};
+            nanosleep(&pause, NULL);
         }
-        for (size_t i = 0; i < TURN_MAX_ALLOCATIONS; ++i) {
-            if (server->allocations[i].used
-                && FD_ISSET(server->allocations[i].relay_fd, &read_fds)) {
-                handle_relay_packet(server, &server->allocations[i]);
-            }
+        for (nfds_t k = 0; ready > 0 && k < endpoint_entries; ++k) {
+            if ((server->poll_fds[k].revents & (POLLIN | POLLERR | POLLHUP)) == 0) continue;
+            int fd = server->poll_fds[k].fd;
+            uint8_t packet[STUN_MAX_PACKET];
+            struct sockaddr_storage client;
+            socklen_t client_len = sizeof(client);
+            ssize_t received = recvfrom(fd, packet, sizeof(packet), 0,
+                                        (struct sockaddr *)&client, &client_len);
+            if (received > 0) handle_control_packet(server, fd, packet, (size_t)received,
+                                                    &client, client_len);
+        }
+        for (nfds_t k = endpoint_entries; ready > 0 && k < count; ++k) {
+            turn_allocation *allocation = server->poll_owners[k];
+            /* Closed earlier in this pass (its number may even belong to a new relay by now). */
+            if ((server->poll_fds[k].revents & (POLLIN | POLLERR | POLLHUP)) == 0
+                || !allocation->used || allocation->relay_fd != server->poll_fds[k].fd) continue;
+            handle_relay_packet(server, allocation);
         }
         expire_allocations(server);
+        reap_closed_allocations(server);
     }
     return NULL;
+}
+
+static int init_relay_sync(st_stun_turn_server *server)
+{
+    pthread_condattr_t attributes;
+    if (pthread_condattr_init(&attributes) != 0) return -1;
+    int rc = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC) == 0
+        && pthread_cond_init(&server->relay_wake, &attributes) == 0 ? 0 : -1;
+    pthread_condattr_destroy(&attributes);
+    if (rc != 0) return -1;
+    if (pthread_mutex_init(&server->relay_lock, NULL) != 0) {
+        pthread_cond_destroy(&server->relay_wake);
+        return -1;
+    }
+    if (pthread_mutex_init(&server->flush_lock, NULL) != 0) {
+        pthread_mutex_destroy(&server->relay_lock);
+        pthread_cond_destroy(&server->relay_wake);
+        return -1;
+    }
+    server->sync_ready = 1;
+    return 0;
+}
+
+static void stop_relay_flusher(st_stun_turn_server *server)
+{
+    if (!server->flusher_started) return;
+    pthread_mutex_lock(&server->relay_lock);
+    server->flush_stopping = 1;
+    pthread_cond_signal(&server->relay_wake);
+    pthread_mutex_unlock(&server->relay_lock);
+    pthread_join(server->flusher, NULL);
+    server->flusher_started = 0;
+}
+
+/* Releases a server whose threads are not running (any more). */
+static void discard_server(st_stun_turn_server *server)
+{
+    if (server->sync_ready) set_server_live(server, 0);
+    for (size_t i = 0; i < server->allocation_count; ++i) {
+        if (server->allocations[i]->used) close_allocation(server->allocations[i]);
+    }
+    reap_closed_allocations(server);
+    close_stun_endpoints(server, 0);
+    for (size_t i = 0; i < server->relay_session_count; ++i) free(server->relay_sessions[i].database_path);
+    if (server->sync_ready) {
+        pthread_mutex_destroy(&server->flush_lock);
+        pthread_mutex_destroy(&server->relay_lock);
+        pthread_cond_destroy(&server->relay_wake);
+    }
+    free(server->relay_sessions);
+    free(server->allocations);
+    free(server->poll_fds);
+    free(server->poll_owners);
+    free(server);
 }
 
 int st_stun_turn_server_start(st_stun_turn_server **out_server)
@@ -1358,28 +1961,40 @@ int st_stun_turn_server_start(st_stun_turn_server **out_server)
     st_stun_turn_server *server = (st_stun_turn_server *)calloc(1, sizeof(*server));
     if (server == NULL) return -1;
     server->control_fd = -1;
+    if (init_relay_sync(server) != 0) {
+        free(server);
+        return -1;
+    }
+    long long flush_interval = env_i64_value("SPECUS_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS",
+                                             RELAY_TRAFFIC_FLUSH_DEFAULT_MS);
+    server->flush_interval_ms = flush_interval <= 0 ? RELAY_TRAFFIC_FLUSH_DEFAULT_MS
+        : (flush_interval > 86400000LL ? 86400000L : (long)flush_interval);
     server->auth_required = env_bool_value("SPECUS_PEER_MESH_TURN_AUTH_REQUIRED", 1);
     server->allow_private_peers = env_bool_value("SPECUS_PEER_MESH_TURN_ALLOW_PRIVATE_PEERS", 0);
     server->allocation_ttl = env_int_alias("SPECUS_PEER_MESH_ALLOCATION_TTL_SECONDS",
                                            "SPECUS_PEER_MESH_TURN_ALLOCATION_TTL_SECONDS", 300);
     server->permission_ttl = env_int_value("SPECUS_PEER_MESH_TURN_PERMISSION_TTL_SECONDS", 300);
     server->channel_ttl = env_int_value("SPECUS_PEER_MESH_TURN_CHANNEL_TTL_SECONDS", 600);
-    server->relay_min_port = env_int_alias("SPECUS_PEER_MESH_RELAY_MIN_PORT",
-                                          "SPECUS_PEER_MESH_TURN_RELAY_MIN_PORT", 49152);
-    server->relay_max_port = env_int_alias("SPECUS_PEER_MESH_RELAY_MAX_PORT",
-                                          "SPECUS_PEER_MESH_TURN_RELAY_MAX_PORT", 65535);
-    server->general_relay_max_allocations = env_int_value(
+    /* Java bindRelaySocket: each end clamped to 1..65535, a reversed range put in order. */
+    int relay_min_port = env_signed_int_alias("SPECUS_PEER_MESH_RELAY_MIN_PORT",
+                                              "SPECUS_PEER_MESH_TURN_RELAY_MIN_PORT", 49152);
+    int relay_max_port = env_signed_int_alias("SPECUS_PEER_MESH_RELAY_MAX_PORT",
+                                              "SPECUS_PEER_MESH_TURN_RELAY_MAX_PORT", 65535);
+    relay_min_port = relay_min_port < 1 ? 1 : (relay_min_port > 65535 ? 65535 : relay_min_port);
+    relay_max_port = relay_max_port < 1 ? 1 : (relay_max_port > 65535 ? 65535 : relay_max_port);
+    server->relay_min_port = relay_min_port <= relay_max_port ? relay_min_port : relay_max_port;
+    server->relay_max_port = relay_min_port <= relay_max_port ? relay_max_port : relay_min_port;
+    /* Java int properties: a total <= 0 switches the general relay off, a per-address limit <= 0
+     * lifts that limit. */
+    server->general_relay_max_allocations = env_signed_int_value(
         "SPECUS_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS", 256);
-    server->general_relay_max_allocations_per_address = env_int_value(
+    server->general_relay_max_allocations_per_address = env_signed_int_value(
         "SPECUS_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS_PER_ADDRESS", 4);
     server->general_relay_max_bytes = env_i64_value(
         "SPECUS_PEER_MESH_GENERAL_RELAY_MAX_BYTES", 512LL * 1024LL * 1024LL);
-    if (server->relay_min_port <= 0 || server->relay_max_port < server->relay_min_port) {
-        free(server);
-        return -1;
-    }
-    server->next_relay_port = server->relay_min_port;
-    for (size_t i = 0; i < TURN_MAX_ALLOCATIONS; ++i) server->allocations[i].relay_fd = -1;
+    server->udp_receive_buffer = env_signed_int_value("SPECUS_PEER_MESH_UDP_RECEIVE_BUFFER_BYTES", 4 * 1024 * 1024);
+    server->udp_send_buffer = env_signed_int_value("SPECUS_PEER_MESH_UDP_SEND_BUFFER_BYTES", 4 * 1024 * 1024);
+    server->udp_traffic_class = env_signed_int_value("SPECUS_PEER_MESH_UDP_TRAFFIC_CLASS", 0x10);
     const char *primary_bind = getenv("SPECUS_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS");
     int primary_explicit = primary_bind != NULL && *primary_bind != '\0';
     if (!primary_explicit) primary_bind = getenv("SPECUS_PEER_MESH_BIND_ADDRESS");
@@ -1397,14 +2012,13 @@ int st_stun_turn_server_start(st_stun_turn_server **out_server)
         && strcmp(primary_bind, alternate_bind) != 0
         && strcmp(primary_public, alternate_public) != 0;
     if (env_bool_value("SPECUS_PEER_MESH_STUN_BEHAVIOR_STRICT", 0) && !full_rfc5780) {
-        free(server);
+        discard_server(server);
         return -1;
     }
     int primary_actual = add_stun_endpoint(server, primary_bind, primary_public,
                                            configured_port, 0, 0);
     if (primary_actual <= 0) {
-        close_stun_endpoints(server, 0);
-        free(server);
+        discard_server(server);
         return -1;
     }
     server->port = primary_actual;
@@ -1416,8 +2030,7 @@ int st_stun_turn_server_start(st_stun_turn_server **out_server)
                                  configured_port, 1, 0) <= 0
             || add_stun_endpoint(server, alternate_bind, alternate_public,
                                  alternate_port, 1, 1) <= 0) {
-            close_stun_endpoints(server, 0);
-            free(server);
+            discard_server(server);
             return -1;
         }
         server->rfc5780 = 1;
@@ -1425,10 +2038,26 @@ int st_stun_turn_server_start(st_stun_turn_server **out_server)
         (void)add_stun_endpoint(server, primary_bind, primary_public,
                                 alternate_port, 0, 1);
     }
+    /* SPECUS_PEER_MESH_RELAY_ADDRESS is C's own override, resolved like the public address;
+     * otherwise, as Java's turnAdvertisedAddress, the main listener's advertised address. */
+    const char *relay_address = getenv("SPECUS_PEER_MESH_RELAY_ADDRESS");
+    server->relay_address = ((const struct sockaddr_in *)&server->endpoints[0].advertised)->sin_addr;
+    if (relay_address != NULL && *relay_address != '\0'
+        && resolve_ipv4(relay_address, &server->relay_address) != 0) {
+        fprintf(stderr, "[peer-mesh] cannot resolve SPECUS_PEER_MESH_RELAY_ADDRESS %s\n", relay_address);
+        discard_server(server);
+        return -1;
+    }
+    set_server_live(server, 1);
+    if (pthread_create(&server->flusher, NULL, relay_flush_thread, server) != 0) {
+        discard_server(server);
+        return -1;
+    }
+    server->flusher_started = 1;
     server->running = 1;
     if (pthread_create(&server->thread, NULL, stun_turn_thread, server) != 0) {
-        close_stun_endpoints(server, 0);
-        free(server);
+        stop_relay_flusher(server);
+        discard_server(server);
         return -1;
     }
     *out_server = server;
@@ -1446,9 +2075,8 @@ void st_stun_turn_server_stop(st_stun_turn_server *server)
     server->running = 0;
     close_stun_endpoints(server, 1);
     pthread_join(server->thread, NULL);
-    for (size_t i = 0; i < TURN_MAX_ALLOCATIONS; ++i) {
-        if (server->allocations[i].used) close_allocation(&server->allocations[i]);
-    }
-    close_stun_endpoints(server, 0);
-    free(server);
+    stop_relay_flusher(server);
+    /* Nothing relays any more: what is still counted is written now, not lost. */
+    st_stun_turn_server_flush_relay_traffic(server);
+    discard_server(server);
 }

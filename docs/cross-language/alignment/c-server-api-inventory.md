@@ -284,6 +284,13 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | 路由 WebSocket 浏览器灌入速度超过客户端时，C 暂停读浏览器，不断开 | Java `handleAppFrame` 用 `sendAtomic` 入队而无法暂停 Tomcat 的读，1 MiB 窗口加 4 MiB 队列满后 `RST 6` 并以 1011 关闭浏览器。`control-protocol.md` 要求 credit 不足时暂停对应上游读取，Go 与 .NET 也暂停；规范站在 C 一边，应改的是 Java |
 | 路由 WebSocket 浏览器发来的单条消息上限 16 MiB（超出 1009） | Java `WebSocketSpecusHandler` 没有调高 Tomcat 默认的 8192 消息缓冲（文本按字符、二进制按字节），浏览器超过 8 KiB 的消息即以 1009 关闭。`http-route.md` 第 7 节与 `control-protocol.md` 都写 16 MiB，Go 与 .NET 也是 16 MiB；改成 8 KiB 会让依赖大消息的应用在 C 上失败，应改的是 Java（在 `afterConnectionEstablished` 里把两个上限设为 16 MiB） |
 | `/ws/client-messages` 发往客户端的在途写按 socket 64 条、全局 1024 条限制，超出立即回 `failed`/`target-write-failed` | Java `channel.writeAndFlush` 不看 `isWritable`，消息在 Netty 出站缓冲里无界排队，写完回 `written`，通道关闭时回 `failed`。C 每条在途写占一个线程并阻塞在目标 control 连接上（受 `SPECUS_CONTROL_WRITE_TIMEOUT_SECONDS` 约束），线程与内存都必须有界。只有目标 control 连接停读、发送缓冲已满时才会出现 64 条在途；此时 Java 的排队也只是推迟结果（目标恢复读则 `written`，断开则 `failed`），C 对超出的部分立即答 `failed`。`management_ws_backpressure_tests` 场景 3 固定这一行为 |
+| 每个 TURN allocation 同时有效的 permission 与 channel 各 32 个，一个 CreatePermission 最多 32 个对端，超出回 `400 bad-request` | Java/Go 用 Map 保存、不设上限。C 给单个已认证客户端能占用的内存设上界；过期的条目每秒清理并让出位置，浏览器 ICE 与 Peer Mesh relay 同时用到的对端远少于 32 个（`stun_turn_tests` 的 `test_expired_permissions_and_channels_recycled`；Issue #35 第 45 项） |
+| 备用端口上的 TURN 消息与未知方法：只对请求回 `400 unsupported-endpoint` / `400 unsupported-method`，指示与响应静默丢弃 | Java 对能解析的任何 STUN 消息都回 400。对错误响应再回一个错误响应，会在两台服务器之间、或源地址伪造成服务器自己时来回反弹；请求得到的应答与 Java 相同（`test_turn_wire_details`） |
+| Allocate 找不到可用的 relay 端口或 socket 时回 `508 insufficient-capacity` | Java `bindRelaySocket` 抛出异常，被接收循环吞掉，客户端收不到应答、只能重传到超时；C 立即回一个明确的错误 |
+| 没有中继相关的 Micrometer 指标：`specus.peer_mesh.turn.*`（relay 队列深度、高水位与丢弃，发送失败，通用中继字节、配额拒绝、目的地址拒绝与字节配额关闭）与 `specus.peer_mesh.relay.traffic.*`（flush 失败、待写字节、flush 滞后） | C 没有指标注册表与导出端点（`/api/admin/metrics` 是管理概览，不是 Micrometer），Java 默认的 actuator 也只暴露 health。对应事件 C 写日志：配额拒绝、字节配额关闭与目的地址拒绝写 `[peer-mesh][audit]` 行，批量写库失败写 `[peer-mesh] relay traffic flush failed` 行；relay 发送没有工作队列，见 test-map `StunTurnServerMetricsTests` 行 |
+| 会话关闭后，关闭前已经中继、还没写库的那批 relay 字节照记 | Java 本实例关闭会话（`markClosed`）时丢弃这部分 `pendingRelayBytes`，别的实例关闭的会话则照记（`persistRelayTrafficBatch`）；C 一律照记，只会少丢数据 |
+| 停止时写出待写的 relay 字节 | Java `PeerMeshService` 没有 `@PreDestroy` 的 flush，停止时最多丢掉一个 flush 间隔（默认 5 秒）的待写字节；C 在 STUN/TURN 停止时写出，只会少丢数据 |
+| 内置 STUN/TURN 起不来（端口被占用、公网地址或 `SPECUS_PEER_MESH_RELAY_ADDRESS` 解析不了、严格 RFC 5780 配置不全）时，告警行 `[peer-mesh] standard STUN/TURN UDP server failed to start on <端口>` 不带原因，原因在它之前单独成行（例如 `cannot resolve the advertised STUN/TURN address ...`） | 行为与 Java 相同：记一条告警后服务照常运行，只是没有 STUN/TURN（`peer_mesh_e2e_tests` 的 "the server runs on when STUN/TURN cannot start"；C 原先整个进程退出）。Java 把异常消息接在同一行，C 在出错的地方就写出原因 |
 
 ## 9. 待办（按影响排序）
 
