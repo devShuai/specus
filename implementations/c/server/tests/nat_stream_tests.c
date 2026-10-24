@@ -1529,6 +1529,58 @@ static int check_window_overflow(test_server *server, client_pair *pair)
     return expect_data_connection_served(server, pair);
 }
 
+/*
+ * Java StreamFlowController.onWindowUpdate checks the credit before it looks the stream up: more
+ * than the 16 MiB window closes the data connection for any stream id, one that was never opened
+ * included. Credit up to the window for an unknown stream stays ignored (check_unknown_streams).
+ */
+static int check_window_update_beyond_window_for_unknown_stream(test_server *server, client_pair *pair)
+{
+    CHECK(send_nat(pair->data, ST_NAT_WINDOW_UPDATE, 0U, UNKNOWN_STREAM_BASE + 5U, MAX_WINDOW + 1U, NULL, NULL, 0U)
+              == 0,
+          "WINDOW_UPDATE beyond the window");
+    CHECK(expect_channel_closed(pair->data, IO_TIMEOUT_MS) == 0,
+          "a WINDOW_UPDATE beyond 16 MiB must close the data connection even for an unknown stream");
+    close_fd(&pair->data);
+    CHECK(expect_channel_alive(pair->control) == 0, "the control connection must stay");
+    CHECK(login_data(server, pair) == 0, "data re-login");
+    return expect_data_connection_served(server, pair);
+}
+
+/*
+ * Once the server sent a TCP stream's FIN, Java has taken it out of StreamFlowController: credit
+ * for it is ignored, not counted toward the window, so it cannot overflow and close the data
+ * connection while the client's direction is still open.
+ */
+static int check_credit_after_server_fin(test_server *server, client_pair *pair)
+{
+    int public_fd = -1;
+    uint32_t stream_id = 0U;
+    CHECK(open_public_stream_id(pair->data, pair->public_port, &public_fd, &stream_id) == 0, "public OPEN");
+    CHECK(shutdown(public_fd, SHUT_WR) == 0, "the public peer half-closes");
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    int fin = 0;
+    while (!fin) {
+        st_nat_message message;
+        CHECK(next_nat_frame(pair->data, deadline, &message) == 1, "no FIN after the public half-close");
+        fin = message.stream_id == stream_id && message.type == ST_NAT_FIN;
+        st_nat_message_free(&message);
+    }
+    for (int i = 0; i < 2; ++i) {
+        CHECK(send_nat(pair->data, ST_NAT_WINDOW_UPDATE, 0U, stream_id, MAX_WINDOW, NULL, NULL, 0U) == 0, "credit");
+    }
+    CHECK(expect_alive_without_rst(pair->data, stream_id) == 0,
+          "credit for a stream the server finished must be ignored, not close the data connection");
+    /* The client's direction still works, and its FIN ends the stream. */
+    CHECK(send_nat(pair->data, ST_NAT_DATA, 0U, stream_id, 0U, NULL, "late-answer", 11U) == 0
+              && send_nat(pair->data, ST_NAT_FIN, 0U, stream_id, 0U, NULL, NULL, 0U) == 0,
+          "answer and FIN");
+    CHECK(expect_public_bytes(public_fd, "late-answer") == 0, "the client's answer after the server's FIN");
+    CHECK(expect_socket_eof(public_fd, IO_TIMEOUT_MS) == 0, "the client FIN must end the public peer");
+    close_fd(&public_fd);
+    return expect_data_connection_served(server, pair);
+}
+
 /* Sends one raw browser request for the client's route and returns the browser socket. */
 static int browser_send(const test_server *server, const client_pair *pair, const char *path,
                         const char *extra_headers)
@@ -1750,7 +1802,9 @@ static int check_heartbeat_response(test_server *server, client_pair *pair)
 
 /*
  * More client data than the 4 MiB client-to-public queue holds resets that stream with RST 6
- * ("stream send queue exceeded", as Java StreamFlowController); the data connection carries on.
+ * ("stream send queue exceeded"); the data connection carries on. The queue is C's own: Java has
+ * none in this direction and stops reading the whole data connection instead (API inventory §8);
+ * the code is that of Java StreamFlowController's overflow in the other direction.
  */
 static int check_tcp_queue_overflow(test_server *server, client_pair *pair)
 {
@@ -2498,6 +2552,9 @@ int main(int argc, char **argv)
     failures += run_check("RST for a never-opened stream closes the data connection",
                           check_rst_for_never_opened_stream);
     failures += run_check("WINDOW_UPDATE overflow closes the data connection", check_window_overflow);
+    failures += run_check("WINDOW_UPDATE beyond 16 MiB closes the data connection for an unknown stream",
+                          check_window_update_beyond_window_for_unknown_stream);
+    failures += run_check("credit after the server's TCP FIN is ignored", check_credit_after_server_fin);
     failures += run_check("late frames for connectivity probe streams are silently discarded",
                           check_connectivity_probe_late_rst);
     current_check = check_connectivity_client_reset_failure;
