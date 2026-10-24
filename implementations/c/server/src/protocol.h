@@ -80,6 +80,24 @@ typedef struct {
     size_t data_len;
 } st_nat_message;
 
+/* Java ProtocolException.Reason: why the codec refused a frame (specus.control.protocol.rejected). */
+typedef enum {
+    ST_PROTOCOL_REJECTION_NONE = 0,
+    ST_PROTOCOL_REJECTION_INVALID_MAGIC,
+    ST_PROTOCOL_REJECTION_UNSUPPORTED_VERSION,
+    ST_PROTOCOL_REJECTION_UNSUPPORTED_SERIALIZER,
+    ST_PROTOCOL_REJECTION_UNKNOWN_COMMAND,
+    ST_PROTOCOL_REJECTION_INVALID_LENGTH,
+    ST_PROTOCOL_REJECTION_MALFORMED_BODY
+} st_protocol_rejection;
+
+/*
+ * Why the last st_protocol_read_header or st_protocol_decode_* call of this thread failed, by the
+ * reason Java's PacketCodec gives the same frame; NONE after a success, and after a refusal that is
+ * no codec error in Java (a login role that is neither control nor data).
+ */
+st_protocol_rejection st_protocol_last_rejection(void);
+
 int st_protocol_read_header(const uint8_t raw[ST_HEADER_SIZE], st_frame_header *header);
 int st_protocol_decode_empty_packet(const uint8_t *body, size_t body_len);
 int st_protocol_decode_login_request(const uint8_t *body, size_t body_len, st_login_request *request);

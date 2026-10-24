@@ -5,6 +5,7 @@
 #include "crypto.h"
 #include "instant.h"
 #include "json.h"
+#include "metrics.h"
 #include "storage.h"
 #include "turn_auth.h"
 
@@ -804,12 +805,22 @@ static int allow_general_relay_traffic(st_stun_turn_server *server,
                      && allocation->relayed_bytes > (unsigned long long)server->general_relay_max_bytes)) {
         char client[INET6_ADDRSTRLEN + 16];
         format_endpoint(&allocation->client, client, sizeof(client));
+        st_metrics_increment(ST_METRIC_TURN_GENERAL_RELAY_QUOTA_CLOSED);
         fprintf(stderr, "[peer-mesh][audit] general TURN byte quota exhausted, closing allocation: "
                 "client=%s, bytes=%llu\n", client, allocation->relayed_bytes);
         close_allocation(allocation);
         return 0;
     }
+    st_metrics_add(ST_METRIC_TURN_GENERAL_RELAY_BYTES, (unsigned long long)bytes);
     return 1;
+}
+
+/* A relayed datagram the socket did not take (Java counts the IOException of DatagramSocket.send). */
+static void count_relay_send(ssize_t sent)
+{
+    if (sent < 0) {
+        st_metrics_increment(ST_METRIC_TURN_RELAY_SEND_FAILURES);
+    }
 }
 
 static uint64_t read_u64(const uint8_t *data)
@@ -895,8 +906,28 @@ static void withdraw_relay_grant(long long session_id)
     pthread_mutex_unlock(&live_servers_lock);
 }
 
+/*
+ * specus.peer_mesh.relay.traffic.pending.bytes (Java pendingRelayByteCount): the relay bytes every
+ * running server holds for its next batch, saturating as Java's sum does.
+ */
+static double pending_relay_bytes(void)
+{
+    long long total = 0;
+    pthread_mutex_lock(&live_servers_lock);
+    for (st_stun_turn_server *server = live_servers; server != NULL; server = server->next_live) {
+        pthread_mutex_lock(&server->relay_lock);
+        for (size_t i = 0; i < server->relay_session_count; ++i) {
+            total = saturated_add(total, server->relay_sessions[i].pending_bytes);
+        }
+        pthread_mutex_unlock(&server->relay_lock);
+    }
+    pthread_mutex_unlock(&live_servers_lock);
+    return (double)total;
+}
+
 static void set_server_live(st_stun_turn_server *server, int live)
 {
+    st_metrics_set_relay_pending_bytes_source(pending_relay_bytes);
     pthread_mutex_lock(&live_servers_lock);
     if (live && !server->live) {
         server->next_live = live_servers;
@@ -995,8 +1026,12 @@ void st_stun_turn_server_flush_relay_traffic(st_stun_turn_server *server)
         int result = st_storage_record_peer_mesh_relay_traffic(batch[i].database_path, batch[i].session_id,
                                                                batch[i].pending_bytes);
         if (result < 0) {
+            st_metrics_increment(ST_METRIC_RELAY_TRAFFIC_FLUSH_FAILURES);
             fprintf(stderr, "[peer-mesh] relay traffic flush failed: session=%lld, bytes=%lld\n",
                     batch[i].session_id, batch[i].pending_bytes);
+        } else {
+            /* Java sets lastRelayTrafficFlushSuccessMillis for every batch its transaction wrote. */
+            st_metrics_relay_traffic_flushed();
         }
         pthread_mutex_lock(&server->relay_lock);
         relay_session *entry = find_relay_session(server, batch[i].database_path, batch[i].session_id);
@@ -1530,6 +1565,7 @@ static void handle_allocate(st_stun_turn_server *server,
     char client_text[INET6_ADDRSTRLEN + 16];
     format_endpoint(client, client_text, sizeof(client_text));
     if (rejection != NULL) {
+        st_metrics_increment(ST_METRIC_TURN_GENERAL_RELAY_QUOTA_REJECTED);
         /* Java: the general relay follows the public ICE configuration, so a refusal must be traceable. */
         fprintf(stderr, "[peer-mesh][audit] general TURN allocation rejected: client=%s, reason=%s\n",
                 client_text, rejection);
@@ -1628,6 +1664,7 @@ static void handle_permission_or_channel(st_stun_turn_server *server,
          * peer refuses the whole request instead of letting the peers before it through. */
         for (size_t i = 0; i < peer_count && refusal == 0; ++i) {
             if (peer_address_allowed(server, &peers[i])) continue;
+            st_metrics_increment(ST_METRIC_TURN_GENERAL_RELAY_DESTINATION_FORBIDDEN);
             log_refused_peer(message_type, client, &peers[i]);
             refusal = 403;
             refusal_reason = "forbidden-peer-address";
@@ -1685,8 +1722,8 @@ static void handle_send_indication(st_stun_turn_server *server,
     if (!authorize_relay_payload(server, data.value, data.length, allocation, target, 1,
                                  server->auth_required)) return;
     if (!allow_general_relay_traffic(server, allocation, data.length)) return;
-    (void)sendto(allocation->relay_fd, data.value, data.length, 0,
-                 (struct sockaddr *)&peer, peer_len);
+    count_relay_send(sendto(allocation->relay_fd, data.value, data.length, 0,
+                            (struct sockaddr *)&peer, peer_len));
 }
 
 static void handle_channel_data(st_stun_turn_server *server,
@@ -1704,8 +1741,8 @@ static void handle_channel_data(st_stun_turn_server *server,
     if (!authorize_relay_payload(server, packet + 4U, data_len, allocation, target, 1,
                                  server->auth_required)) return;
     if (!allow_general_relay_traffic(server, allocation, data_len)) return;
-    (void)sendto(allocation->relay_fd, packet + 4U, data_len, 0,
-                 (struct sockaddr *)&channel->peer, channel->peer_len);
+    count_relay_send(sendto(allocation->relay_fd, packet + 4U, data_len, 0,
+                            (struct sockaddr *)&channel->peer, channel->peer_len));
 }
 
 static void handle_control_packet(st_stun_turn_server *server,
@@ -1770,12 +1807,16 @@ static void handle_relay_packet(st_stun_turn_server *server, turn_allocation *al
     turn_channel *channel = find_channel_by_peer(allocation, &peer);
     if (channel != NULL) {
         uint8_t channel_packet[STUN_MAX_PACKET];
-        if ((size_t)received + 4U > sizeof(channel_packet)) return;
+        if ((size_t)received + 4U > sizeof(channel_packet)) {
+            /* Too long for a ChannelData message: Java's send of it fails as well. */
+            count_relay_send(-1);
+            return;
+        }
         write_u16(channel_packet, channel->number);
         write_u16(channel_packet + 2U, (uint16_t)received);
         memcpy(channel_packet + 4U, packet, (size_t)received);
-        (void)sendto(server->control_fd, channel_packet, (size_t)received + 4U, 0,
-                     (struct sockaddr *)&allocation->client, allocation->client_len);
+        count_relay_send(sendto(server->control_fd, channel_packet, (size_t)received + 4U, 0,
+                                (struct sockaddr *)&allocation->client, allocation->client_len));
         return;
     }
     uint8_t transaction[12];
@@ -1784,7 +1825,7 @@ static void handle_relay_packet(st_stun_turn_server *server, turn_allocation *al
     builder_start(&indication, TURN_DATA_INDICATION, transaction);
     builder_address(&indication, ATTR_XOR_PEER_ADDRESS, &peer, 1);
     builder_attr(&indication, ATTR_DATA, packet, (size_t)received);
-    (void)send_builder(server->control_fd, &indication, &allocation->client, allocation->client_len);
+    count_relay_send(send_builder(server->control_fd, &indication, &allocation->client, allocation->client_len));
 }
 
 /*

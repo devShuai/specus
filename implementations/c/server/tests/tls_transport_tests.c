@@ -495,10 +495,12 @@ static int test_pkcs12_file_context(void)
     char path[256];
     snprintf(path, sizeof(path), "/tmp/specus-c-tls-%ld.p12", (long)getpid());
     unlink(path);
+    time_t before = time(NULL);
     if (write_pkcs12_fixture(path, "fixture-password") != 0) {
         fprintf(stderr, "PKCS#12 TLS fixture creation failed\n");
         return 1;
     }
+    time_t after = time(NULL);
     st_tls_config config;
     memset(&config, 0, sizeof(config));
     config.mode = ST_TLS_FILE;
@@ -508,10 +510,32 @@ static int test_pkcs12_file_context(void)
     char error[512];
     int failed = st_tls_server_context_create(&config, &context, error, sizeof(error)) != 0
         || !st_tls_server_context_enabled(context);
+    /* specus.control.tls.certificate.expiry.epoch.seconds: the certificate's notAfter, now + 1 h. */
+    long long expiry = st_tls_server_context_certificate_expiry(context);
     st_tls_server_context_free(context);
     unlink(path);
     if (failed) {
         fprintf(stderr, "PKCS#12 TLS context load failed: %s\n", error);
+        return 1;
+    }
+    if (expiry < (long long)before + 3600 || expiry > (long long)after + 3600) {
+        fprintf(stderr, "certificate expiry %lld is not the notAfter written between %lld and %lld\n", expiry,
+                (long long)before + 3600, (long long)after + 3600);
+        return 1;
+    }
+    /* Java NettyServer.effectiveTlsMode, the tag of specus.control.tls.mode. */
+    config.terminated_upstream = 1;
+    const char *file_mode = st_tls_metric_mode(&config);
+    config.mode = ST_TLS_SELF_SIGNED;
+    const char *self_signed_mode = st_tls_metric_mode(&config);
+    config.mode = ST_TLS_DISABLED;
+    const char *upstream_mode = st_tls_metric_mode(&config);
+    config.terminated_upstream = 0;
+    if (strcmp(file_mode, "file") != 0 || strcmp(self_signed_mode, "self_signed") != 0
+        || strcmp(upstream_mode, "terminated_upstream") != 0 || strcmp(st_tls_metric_mode(&config), "disabled") != 0
+        || st_tls_server_context_certificate_expiry(NULL) != 0) {
+        fprintf(stderr, "TLS metric modes %s/%s/%s/%s\n", file_mode, self_signed_mode, upstream_mode,
+                st_tls_metric_mode(&config));
         return 1;
     }
     return 0;

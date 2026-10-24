@@ -238,3 +238,16 @@ H-4 / H-5 / H-7 仍按打洞审计文档列为 OPEN，待基线数据确认对�
 4. Android client：先完成真机安装与控制通道/TCP/Direct HTTP smoke test，再用两台真实 Android/混合桌面客户端验证 VPN 虚拟 IP、业务流量和 relay fallback。
 5. .NET server/client：做真实跨 NAT 压测，验证 direct 失败后的标准 TURN relay fallback、relay 计量和管理统计。
 6. C server：计划内 Peer Mesh server 源码能力已完成；仓库仍没有 C client。下一步只保留真实跨 NAT、Java/Go/.NET/Android 混部、真机 VPN/TUN、长流量和故障注入等发布环境验收。
+
+## 运行指标（Micrometer 与 actuator 指标端点）
+
+Java server 的运行指标在 Micrometer 里，经 Spring Boot Actuator 的 `GET /actuator/metrics` 与 `/actuator/metrics/{requiredMetricName}` 读出（JSON）；没有 Prometheus 端点，web 默认只发布 health，`MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE` 含 `metrics` 时才有这两个路由，不要 token；`MANAGEMENT_ENDPOINT_METRICS_ACCESS` 等访问控制为 none 时没有，管理端口、基路径或路径映射另设时 Java 把端点挪走、C 不提供（API 盘点第 7 节末表）。C server 自 `feat/c-server-metrics` 起在管理监听器上提供同样的两个路由与同样的发布规则，只含 Java 自己注册的 16 个指标（Spring Boot 自带的 JVM、Tomcat、HikariCP 等指标没有）。Go、.NET 的主服务没有这组指标（独立 STUN 服务的 `/metrics` 是另一套，与此无关）。各指标在 C 与 Java 里计数的事件相同：
+
+- `specus.control.preauth.oversize.rejected`：登录前声明长度超过 16 KiB 的帧，只看长度字段、先于其余帧头检查。
+- `specus.control.protocol.rejected{reason}`：编解码拒绝的帧，原因同 Java `ProtocolException.Reason`（`invalid_magic`、`unsupported_version`、`unsupported_serializer`、`unknown_command`、`invalid_length`、`malformed_body`）。Java 原先因 `DecoderException` 包装让这 6 个计数器恒为 0，自 #340 起已与 C 一致，按原因计数；C 不解码的心跳、登出正文与 NAT 元数据 JSON 不计（API 盘点第 8 节）。
+- `specus.control.plaintext.deployment.rejected`：生产环境拒绝自签或不受信的明文部署，计数后进程退出。`specus.control.tls.mode{mode}` 恒为 1，标签为 `file`、`self_signed`、`terminated_upstream` 或 `disabled`；`specus.control.tls.certificate.expiry.epoch.seconds` 为 file 模式证书的 notAfter（C 的 PKCS#12 与 PEM 都取叶证书），其余模式为 0。
+- `specus.peer_mesh.turn.general_relay.quota.rejected`、`.destination.forbidden`、`.bytes`、`.quota.closed`：通用 TURN（`public-transfer` 凭证）的分配配额拒绝、目的地址策略拒绝（每个被拒的请求一次）、双向转发且未超字节配额的字节、超配额关闭（每个分配一次）。
+- `specus.peer_mesh.turn.relay.send.failures`：发不出去的中继数据报（四个转发方向）。`.queue.depth`、`.queue.high.water`、`.queue.dropped` 在 C 恒为 0：C 同步转发，没有 Java 的 relay 工作队列。
+- `specus.peer_mesh.relay.traffic.pending.bytes`：Peer Mesh 中继出站 SPM2 帧已计、尚未写库的字节（所有运行中的 STUN/TURN 服务之和）；`.flush.failures`：写库失败、留到下一批的会话批次数；`.flush.lag.seconds`：距上次有批次写成功的秒数，首次之前为 0。Java 按墙钟算，C 按单调时钟算。
+
+计数器只增不减，进程重启归零，与 Micrometer 的 `SimpleMeterRegistry` 相同。数值按 Java `Double.toString` 输出（`1.2345678E7`）。C 的 `/api/admin/metrics` 是另一回事：管理概览快照，`metricsWired` 仍为 `false`。

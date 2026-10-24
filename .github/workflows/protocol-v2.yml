@@ -431,11 +431,12 @@ jobs:
       - name: Keep client E2E logs
         run: echo "SPECUS_E2E_LOG_DIR=$RUNNER_TEMP/c-server-e2e-logs" >> "$GITHUB_ENV"
       # The Makefile build is checked on its own: its unit tests take minutes, and the E2E steps below
-      # each have a few minutes for the end-to-end part alone.
+      # each have a few minutes for the end-to-end part alone. The serial `make test` already took
+      # 470-560 s of its former 600 s on main (October 2026), so it has 900 s now; a hang still ends.
       - name: Makefile build and unit tests
         run: |
           ulimit -c unlimited
-          timeout --preserve-status 600s make -C implementations/c/server test \
+          timeout --preserve-status 900s make -C implementations/c/server test \
             CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -O2 -g"
       - name: Java client NAT, heartbeat and Direct HTTP/WebSocket E2E
         run: SPECUS_SMOKE_REUSE_BUILD=1 timeout --preserve-status 180s bash implementations/c/server/scripts/nat_e2e_smoke.sh

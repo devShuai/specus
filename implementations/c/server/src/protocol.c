@@ -20,6 +20,20 @@ typedef struct {
 
 #define ST_NAT_HEADER_SIZE 16U
 
+static _Thread_local st_protocol_rejection protocol_rejection;
+
+st_protocol_rejection st_protocol_last_rejection(void)
+{
+    return protocol_rejection;
+}
+
+/* A refused frame, remembered for st_protocol_last_rejection. */
+static int protocol_reject(st_protocol_rejection reason)
+{
+    protocol_rejection = reason;
+    return -1;
+}
+
 static uint16_t read_be16(const uint8_t *p)
 {
     return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
@@ -276,21 +290,29 @@ static st_buffer encode_compact_frame(int8_t command, compact_writer *payload)
     return encode_raw_frame(command, payload->data, payload->len);
 }
 
+/* Java PacketCodec.decode's header checks, in its order and with its reasons. */
 int st_protocol_read_header(const uint8_t raw[ST_HEADER_SIZE], st_frame_header *header)
 {
+    protocol_rejection = ST_PROTOCOL_REJECTION_NONE;
     uint32_t magic = read_be32(raw);
     if (magic != ST_MAGIC) {
-        return -1;
+        return protocol_reject(ST_PROTOCOL_REJECTION_INVALID_MAGIC);
     }
     header->version = raw[4];
     header->serializer = raw[5];
     header->command = (int8_t)raw[6];
     header->length = read_be32(raw + 7);
-    if (header->version != ST_VERSION
-        || header->serializer != ST_SERIALIZER_COMPACT_BINARY
-        || !known_command(header->command)
-        || header->length > command_body_limit(header->command)) {
-        return -1;
+    if (header->version != ST_VERSION) {
+        return protocol_reject(ST_PROTOCOL_REJECTION_UNSUPPORTED_VERSION);
+    }
+    if (header->serializer != ST_SERIALIZER_COMPACT_BINARY) {
+        return protocol_reject(ST_PROTOCOL_REJECTION_UNSUPPORTED_SERIALIZER);
+    }
+    if (!known_command(header->command)) {
+        return protocol_reject(ST_PROTOCOL_REJECTION_UNKNOWN_COMMAND);
+    }
+    if (header->length > command_body_limit(header->command)) {
+        return protocol_reject(ST_PROTOCOL_REJECTION_INVALID_LENGTH);
     }
     return 0;
 }
@@ -303,24 +325,26 @@ int st_protocol_decode_empty_packet(const uint8_t *body, size_t body_len)
 
 int st_protocol_decode_login_request(const uint8_t *body, size_t body_len, st_login_request *request)
 {
+    protocol_rejection = ST_PROTOCOL_REJECTION_NONE;
     memset(request, 0, sizeof(*request));
     compact_reader reader = {
         .data = body,
         .len = body_len,
         .pos = 0
     };
+    /* A body CompactBinary cannot read, trailing bytes included, is MALFORMED_BODY in Java. */
     if (reader_string(&reader, &request->client_name) != 0
         || reader_nullable_long(&reader, &request->client_session_id) != 0
         || reader_string(&reader, &request->access_token) != 0
         || reader_string(&reader, &request->connection_role) != 0
-        /* A null role (marker 0) is refused like an unknown one, as Java's login handler does. */
-        || request->connection_role == NULL
+        || reader.pos != reader.len) {
+        st_login_request_free(request);
+        return protocol_reject(ST_PROTOCOL_REJECTION_MALFORMED_BODY);
+    }
+    /* Java's codec reads any role, null included; the login handler is what refuses it. */
+    if (request->connection_role == NULL
         || (strcmp(request->connection_role, ST_CONNECTION_ROLE_CONTROL) != 0
             && strcmp(request->connection_role, ST_CONNECTION_ROLE_DATA) != 0)) {
-        st_login_request_free(request);
-        return -1;
-    }
-    if (reader.pos != reader.len) {
         st_login_request_free(request);
         return -1;
     }
@@ -329,6 +353,7 @@ int st_protocol_decode_login_request(const uint8_t *body, size_t body_len, st_lo
 
 int st_protocol_decode_message_response(const uint8_t *body, size_t body_len, st_message_response *response)
 {
+    protocol_rejection = ST_PROTOCOL_REJECTION_NONE;
     memset(response, 0, sizeof(*response));
     compact_reader reader = {
         .data = body,
@@ -341,7 +366,7 @@ int st_protocol_decode_message_response(const uint8_t *body, size_t body_len, st
         || reader_string(&reader, &response->message) != 0
         || reader.pos != reader.len) {
         st_message_response_free(response);
-        return -1;
+        return protocol_reject(ST_PROTOCOL_REJECTION_MALFORMED_BODY);
     }
     return 0;
 }
@@ -382,19 +407,21 @@ static int validate_nat_semantics(int type, uint8_t flags, uint32_t stream_id, u
     return 0;
 }
 
+/* Java PacketCodec.decodeNatMessage: sizes are INVALID_LENGTH, the rest MALFORMED_BODY. */
 int st_protocol_decode_nat_message(const uint8_t *body, size_t body_len, st_nat_message *message)
 {
+    protocol_rejection = ST_PROTOCOL_REJECTION_NONE;
     memset(message, 0, sizeof(*message));
     if (body == NULL || body_len < ST_NAT_HEADER_SIZE) {
-        return -1;
+        return protocol_reject(ST_PROTOCOL_REJECTION_INVALID_LENGTH);
     }
     message->type = (int)body[0];
     if (message->type < ST_NAT_REGISTER || message->type > ST_NAT_WINDOW_UPDATE) {
-        return -1;
+        return protocol_reject(ST_PROTOCOL_REJECTION_MALFORMED_BODY);
     }
     message->flags = body[1];
     if ((message->flags & (uint8_t)~ST_NAT_FLAG_END_STREAM) != 0U) {
-        return -1;
+        return protocol_reject(ST_PROTOCOL_REJECTION_MALFORMED_BODY);
     }
     size_t meta_len = read_be16(body + 2U);
     message->stream_id = read_be32(body + 4U);
@@ -403,10 +430,12 @@ int st_protocol_decode_nat_message(const uint8_t *body, size_t body_len, st_nat_
     if (meta_len > ST_MAX_NAT_METADATA_SIZE
         || data_len > ST_MAX_BODY_SIZE
         || meta_len > SIZE_MAX - ST_NAT_HEADER_SIZE - data_len
-        || body_len != ST_NAT_HEADER_SIZE + meta_len + data_len
-        || validate_nat_semantics(message->type, message->flags, message->stream_id,
-                                  message->value, meta_len, data_len) != 0) {
-        return -1;
+        || body_len != ST_NAT_HEADER_SIZE + meta_len + data_len) {
+        return protocol_reject(ST_PROTOCOL_REJECTION_INVALID_LENGTH);
+    }
+    if (validate_nat_semantics(message->type, message->flags, message->stream_id,
+                               message->value, meta_len, data_len) != 0) {
+        return protocol_reject(ST_PROTOCOL_REJECTION_MALFORMED_BODY);
     }
     if (meta_len == 0U) {
         message->meta_json = (char *)malloc(3U);
