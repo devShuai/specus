@@ -3131,6 +3131,19 @@ static int read_frame(specus_session *session,
 }
 
 /*
+ * A frame the connection refuses without handling it: a non-login frame before login, a frame of the
+ * other role, a second login, a server packet. Java's PacketCodec decodes every frame before a handler
+ * looks at it (AuthHandler, ConnectionRoleHandler, the duplicate login check), so a body its codec
+ * cannot read is counted in specus.control.protocol.rejected first. The connection is closed either way.
+ */
+static void count_refused_frame_body(const st_frame_header *header, const uint8_t *body)
+{
+    if (st_protocol_validate_body(header->command, body, header->length) != 0) {
+        st_metrics_protocol_rejected(st_protocol_last_rejection());
+    }
+}
+
+/*
  * Loads the configuration of the account the session's token was issued for, under the account's
  * current name: the name the session was created under may since belong to another account.
  */
@@ -5632,6 +5645,7 @@ static void *client_thread(void *arg)
 
         if (!logged_in) {
             if (header.command != ST_CMD_LOGIN_REQUEST) {
+                count_refused_frame_body(&header, body);
                 disconnect_reason = "PROTOCOL_VIOLATION";
                 fprintf(stderr, "[control] non-login packet before auth from %s\n", session->remote);
                 free(body);
@@ -5784,8 +5798,26 @@ static void *client_thread(void *arg)
             continue;
         }
 
-        if (header.command == ST_CMD_HEARTBEAT_REQUEST) {
+        if (header.command == ST_CMD_HEARTBEAT_REQUEST || header.command == ST_CMD_HEARTBEAT_RESPONSE
+            || header.command == ST_CMD_LOGOUT_REQUEST) {
+            /*
+             * Java's schemas for these have no fields: its codec refuses a body of even one byte as
+             * MALFORMED_BODY (protocol/test-vectors' invalid_heartbeat_body.bin) and closes the
+             * connection before any handler answers, on either role.
+             */
+            int empty = st_protocol_decode_empty_packet(body, header.length) == 0;
             free(body);
+            if (!empty) {
+                st_metrics_protocol_rejected(st_protocol_last_rejection());
+                disconnect_reason = "PROTOCOL_VIOLATION";
+                fprintf(stderr, "[%s] command=%d with a %u-byte body from %s\n",
+                        session->is_data_connection ? "data" : "control",
+                        (int)header.command, (unsigned)header.length, session->remote);
+                break;
+            }
+        }
+
+        if (header.command == ST_CMD_HEARTBEAT_REQUEST) {
             st_buffer response = st_protocol_encode_empty_packet(ST_CMD_HEARTBEAT_RESPONSE);
             if (session_send_packet(session, &response) != 0) {
                 disconnect_reason = "HEARTBEAT_WRITE_FAILED";
@@ -5805,13 +5837,12 @@ static void *client_thread(void *arg)
         if (header.command == ST_CMD_HEARTBEAT_RESPONSE) {
             /* Heartbeats are allowed on both roles (protocol/spec/control-protocol.md); a response
              * needs no answer and, as in Java ConnectionRoleHandler and Go, is simply accepted. */
-            free(body);
             continue;
         }
 
         if (header.command == ST_CMD_LOGOUT_REQUEST) {
-            free(body);
-            st_buffer response = st_protocol_encode_empty_packet(ST_CMD_LOGOUT_RESPONSE);
+            /* Java LogoutRequestHandler's answer: success, no reason (logout_response.bin). */
+            st_buffer response = st_protocol_encode_logout_response(1, NULL);
             session_send_packet(session, &response);
             disconnect_reason = "CLIENT_CLOSED";
             break;
@@ -5819,6 +5850,7 @@ static void *client_thread(void *arg)
 
         if (header.command == ST_CMD_MESSAGE_REQUEST) {
             if (session->is_data_connection) {
+                count_refused_frame_body(&header, body);
                 disconnect_reason = "PROTOCOL_VIOLATION";
                 fprintf(stderr, "[data] message request received on data connection from %s\n", session->remote);
                 free(body);
@@ -5874,6 +5906,7 @@ static void *client_thread(void *arg)
 
         if (header.command == ST_CMD_NAT_MESSAGE) {
             if (!session->is_data_connection) {
+                count_refused_frame_body(&header, body);
                 disconnect_reason = "PROTOCOL_VIOLATION";
                 fprintf(stderr, "[control] NAT frame received on control connection from %s\n", session->remote);
                 free(body);
@@ -5897,6 +5930,8 @@ static void *client_thread(void *arg)
             continue;
         }
 
+        /* A second LOGIN_REQUEST, or a LOGIN_, MESSAGE_ or LOGOUT_RESPONSE: server packets. */
+        count_refused_frame_body(&header, body);
         disconnect_reason = "PROTOCOL_VIOLATION";
         fprintf(stderr, "[%s] unsupported command=%d from %s\n",
                session->is_data_connection ? "data" : "control",

@@ -175,6 +175,101 @@ static void frame_header(uint8_t out[ST_HEADER_SIZE], uint32_t magic, uint8_t ve
     out[10] = (uint8_t)length;
 }
 
+#ifndef ST_FIXTURE_DIR
+#define ST_FIXTURE_DIR "../../../protocol/test-vectors/control-v2/frames/"
+#endif
+
+typedef struct {
+    uint8_t bytes[512];
+    size_t len;
+} wire_frame;
+
+/* A shared frame of protocol/test-vectors/control-v2/frames, byte for byte. */
+static int fixture_frame(const char *name, wire_frame *out)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s%s", ST_FIXTURE_DIR, name);
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        perror(path);
+        return -1;
+    }
+    out->len = fread(out->bytes, 1U, sizeof(out->bytes), file);
+    int whole = !ferror(file) && fgetc(file) == EOF && out->len >= ST_HEADER_SIZE;
+    fclose(file);
+    return whole ? 0 : -1;
+}
+
+/* A frame of the given command with exactly the given body. */
+static void raw_frame(wire_frame *out, int8_t command, const uint8_t *body, size_t body_len)
+{
+    frame_header(out->bytes, ST_MAGIC, ST_VERSION, (uint8_t)command, (uint32_t)body_len);
+    if (body_len > 0U) memcpy(out->bytes + ST_HEADER_SIZE, body, body_len);
+    out->len = ST_HEADER_SIZE + body_len;
+}
+
+static int send_frame(int fd, const wire_frame *frame)
+{
+    return send_all(fd, frame->bytes, frame->len);
+}
+
+/*
+ * Reads up to the next frame of the given command, skipping what the server pushes meanwhile (the
+ * login NAT_CONTROL and Peer Mesh messages on control), and checks it is the expected frame byte for
+ * byte. The harness's read_frame has already checked magic, version and serializer.
+ */
+static int expect_frame(int fd, const wire_frame *expected)
+{
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    int8_t command = (int8_t)expected->bytes[6];
+    for (;;) {
+        long long remaining = deadline - monotonic_ms();
+        st_frame_header header;
+        uint8_t *body = NULL;
+        if (remaining <= 0 || read_frame(fd, (int)remaining, &header, &body) != 1) {
+            fprintf(stderr, "no frame of command %d\n", (int)command);
+            return -1;
+        }
+        if (header.command != command) {
+            free(body);
+            continue;
+        }
+        int same = header.length == expected->len - ST_HEADER_SIZE
+            && memcmp(body, expected->bytes + ST_HEADER_SIZE, header.length) == 0;
+        free(body);
+        if (!same) fprintf(stderr, "command %d answered with a %u-byte body\n", (int)command, (unsigned)header.length);
+        return same ? 0 : -1;
+    }
+}
+
+/* Waits for the server to close the connection, failing if it answers with the given command first. */
+static int expect_closed_unanswered(int fd, int8_t unwanted)
+{
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    for (;;) {
+        long long remaining = deadline - monotonic_ms();
+        st_frame_header header;
+        uint8_t *body = NULL;
+        int rc = remaining <= 0 ? -2 : read_frame(fd, (int)remaining, &header, &body);
+        if (rc != 1) {
+            if (rc != 0) fprintf(stderr, "the connection was not closed (%d)\n", rc);
+            return rc == 0 ? 0 : -1;
+        }
+        free(body);
+        if (header.command == unwanted) {
+            fprintf(stderr, "the server answered command %d before closing\n", (int)unwanted);
+            return -1;
+        }
+    }
+}
+
+/* specus.control.protocol.rejected for malformed_body and in all, as Java's Double.toString writes them. */
+static int expect_rejections(const test_server *server, const char *malformed_body, const char *total)
+{
+    return expect_value(server, "specus.control.protocol.rejected", "?tag=reason:malformed_body", malformed_body) == 0
+        && expect_value(server, "specus.control.protocol.rejected", NULL, total) == 0 ? 0 : -1;
+}
+
 /* ---- TURN ------------------------------------------------------------------------------------ */
 
 typedef struct {
@@ -562,6 +657,190 @@ static int scenario_control_and_turn_policy(test_server *server)
     return 0;
 }
 
+/* ---- frame bodies the server does not otherwise read ----------------------------------------- */
+
+/*
+ * Before login. Java's codec decodes a frame before AuthHandler closes a connection that has not
+ * logged in, so a heartbeat closes it uncounted and a heartbeat with a body counts malformed_body.
+ */
+static int scenario_bodies_before_login(test_server *server)
+{
+    wire_frame heartbeat;
+    wire_frame invalid;
+    CHECK(fixture_frame("heartbeat_request.bin", &heartbeat) == 0
+              && fixture_frame("invalid_heartbeat_body.bin", &invalid) == 0,
+          "cannot read the shared frames");
+    CHECK(refused_frame(server, heartbeat.bytes, heartbeat.len) == 0, "a heartbeat before login was not refused");
+    CHECK(expect_rejections(server, "0.0", "0.0") == 0, "a heartbeat before login was counted");
+    CHECK(refused_frame(server, invalid.bytes, invalid.len) == 0,
+          "invalid_heartbeat_body.bin before login was not refused");
+    CHECK(expect_rejections(server, "1.0", "1.0") == 0, "invalid_heartbeat_body.bin before login was not counted");
+    /* The LOGOUT_RESPONSE this server used to write: no fields, where Java's schema has success and reason. */
+    wire_frame bare_logout_response;
+    raw_frame(&bare_logout_response, ST_CMD_LOGOUT_RESPONSE, NULL, 0U);
+    CHECK(refused_frame(server, bare_logout_response.bytes, bare_logout_response.len) == 0,
+          "an empty LOGOUT_RESPONSE before login was not refused");
+    CHECK(expect_rejections(server, "2.0", "2.0") == 0, "an empty LOGOUT_RESPONSE before login was not counted");
+    return 0;
+}
+
+/*
+ * Authenticated control and data connections. The shared heartbeats are answered and accepted on
+ * both; a heartbeat, LOGOUT_REQUEST or LOGOUT_RESPONSE whose body Java's codec cannot read closes
+ * that connection unanswered and counts malformed_body, the other connection carrying on; a
+ * LOGOUT_REQUEST is answered with logout_response.bin.
+ */
+static int scenario_heartbeat_and_logout_bodies(test_server *server)
+{
+    wire_frame heartbeat;
+    wire_frame heartbeat_response;
+    wire_frame invalid;
+    wire_frame logout;
+    wire_frame logout_response;
+    CHECK(fixture_frame("heartbeat_request.bin", &heartbeat) == 0
+              && fixture_frame("heartbeat_response.bin", &heartbeat_response) == 0
+              && fixture_frame("invalid_heartbeat_body.bin", &invalid) == 0
+              && fixture_frame("logout_request.bin", &logout) == 0
+              && fixture_frame("logout_response.bin", &logout_response) == 0,
+          "cannot read the shared frames");
+    char reason[256];
+    runtime_session runtime;
+    int control = -1;
+    int data = -1;
+    CHECK(create_credential(server->db_path, "ck_bodies", "bodies-secret", 2) == 0, "credential");
+    CHECK(http_client_login(server, "ck_bodies", "bodies-secret", "machine-bodies", "bea", &runtime) == 0,
+          "client login");
+    CHECK(channel_login(server->control_port, &runtime, "control", &control, reason, sizeof(reason)) == 1,
+          "control login: %s", reason);
+    CHECK(channel_login(server->control_port, &runtime, "data", &data, reason, sizeof(reason)) == 1,
+          "data login: %s", reason);
+
+    CHECK(send_frame(control, &heartbeat) == 0 && expect_frame(control, &heartbeat_response) == 0,
+          "heartbeat_request.bin on control was not answered with heartbeat_response.bin");
+    CHECK(send_frame(data, &heartbeat) == 0 && expect_frame(data, &heartbeat_response) == 0,
+          "heartbeat_request.bin on data was not answered with heartbeat_response.bin");
+    CHECK(send_frame(control, &heartbeat_response) == 0 && expect_channel_alive(control) == 0,
+          "heartbeat_response.bin closed the control connection");
+    CHECK(send_frame(data, &heartbeat_response) == 0 && expect_channel_alive(data) == 0,
+          "heartbeat_response.bin closed the data connection");
+    CHECK(expect_rejections(server, "0.0", "0.0") == 0, "well-formed heartbeats were counted");
+
+    CHECK(send_frame(data, &invalid) == 0 && expect_closed_unanswered(data, ST_CMD_HEARTBEAT_RESPONSE) == 0,
+          "invalid_heartbeat_body.bin on data was not refused unanswered");
+    close_fd(&data);
+    CHECK(expect_channel_alive(control) == 0, "a refused data heartbeat closed the control connection");
+    CHECK(expect_rejections(server, "1.0", "1.0") == 0, "invalid_heartbeat_body.bin on data was not counted");
+
+    static const uint8_t one_byte[] = {0};
+    static const uint8_t success_only[] = {1};
+    const struct {
+        int8_t command;
+        const uint8_t *body;
+        size_t body_len;
+        int8_t unwanted;
+        const char *count;
+    } refused[] = {
+        {ST_CMD_HEARTBEAT_RESPONSE, one_byte, sizeof(one_byte), ST_CMD_HEARTBEAT_RESPONSE, "2.0"},
+        {ST_CMD_LOGOUT_REQUEST, one_byte, sizeof(one_byte), ST_CMD_LOGOUT_RESPONSE, "3.0"},
+        {ST_CMD_LOGOUT_RESPONSE, success_only, sizeof(success_only), ST_CMD_LOGOUT_RESPONSE, "4.0"},
+        /* logout_response.bin itself is readable: refused as a server packet, not counted. */
+        {ST_CMD_LOGOUT_RESPONSE, logout_response.bytes + ST_HEADER_SIZE, logout_response.len - ST_HEADER_SIZE,
+         ST_CMD_LOGOUT_RESPONSE, "4.0"},
+    };
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); ++i) {
+        CHECK(channel_login(server->control_port, &runtime, "data", &data, reason, sizeof(reason)) == 1,
+              "data login %zu: %s", i, reason);
+        wire_frame frame;
+        raw_frame(&frame, refused[i].command, refused[i].body, refused[i].body_len);
+        CHECK(send_frame(data, &frame) == 0 && expect_closed_unanswered(data, refused[i].unwanted) == 0,
+              "command %d with a %zu-byte body was not refused unanswered on data", (int)refused[i].command,
+              refused[i].body_len);
+        close_fd(&data);
+        CHECK(expect_rejections(server, refused[i].count, refused[i].count) == 0,
+              "command %d with a %zu-byte body was not counted as Java counts it", (int)refused[i].command,
+              refused[i].body_len);
+    }
+
+    CHECK(channel_login(server->control_port, &runtime, "data", &data, reason, sizeof(reason)) == 1,
+          "data login: %s", reason);
+    CHECK(send_frame(data, &logout) == 0 && expect_frame(data, &logout_response) == 0,
+          "logout_request.bin on data was not answered with logout_response.bin");
+    CHECK(expect_channel_closed(data, IO_TIMEOUT_MS) == 0, "the data connection outlived its logout");
+    close_fd(&data);
+
+    CHECK(expect_channel_alive(control) == 0, "the data logout closed the control connection");
+    CHECK(send_frame(control, &invalid) == 0 && expect_closed_unanswered(control, ST_CMD_HEARTBEAT_RESPONSE) == 0,
+          "invalid_heartbeat_body.bin on control was not refused unanswered");
+    close_fd(&control);
+    CHECK(expect_rejections(server, "5.0", "5.0") == 0, "invalid_heartbeat_body.bin on control was not counted");
+    return 0;
+}
+
+static int fresh_control(test_server *server, runtime_session *runtime, int *control)
+{
+    char reason[256];
+    CHECK(http_client_login(server, "ck_refused", "refused-secret", "machine-refused", "rex", runtime) == 0,
+          "client login");
+    CHECK(channel_login(server->control_port, runtime, "control", control, reason, sizeof(reason)) == 1,
+          "control login: %s", reason);
+    return 0;
+}
+
+/*
+ * Frames refused without being handled: a MESSAGE_REQUEST on data, a NAT frame on control and a
+ * second login. Java's codec decodes each before ConnectionRoleHandler or the duplicate-login check
+ * closes the connection, so only an unreadable body counts, with the codec's reason.
+ */
+static int scenario_refused_frame_bodies(test_server *server)
+{
+    char reason[256];
+    runtime_session runtime;
+    int control = -1;
+    int data = -1;
+    CHECK(create_credential(server->db_path, "ck_refused", "refused-secret", 2) == 0, "credential");
+    CHECK(fresh_control(server, &runtime, &control) == 0, "first control");
+
+    static const uint8_t message[] = {2, 'a', 2, 'b', ST_MESSAGE_TYPE_CLIENT_TO_SERVER, 2, 'm', 0};
+    static const size_t message_lengths[] = {sizeof(message) - 1U, sizeof(message)};
+    static const char *const message_counts[] = {"0.0", "1.0"};
+    wire_frame frame;
+    for (size_t i = 0; i < 2U; ++i) {
+        CHECK(channel_login(server->control_port, &runtime, "data", &data, reason, sizeof(reason)) == 1,
+              "data login: %s", reason);
+        raw_frame(&frame, ST_CMD_MESSAGE_REQUEST, message, message_lengths[i]);
+        CHECK(send_frame(data, &frame) == 0 && expect_channel_closed(data, IO_TIMEOUT_MS) == 0,
+              "a MESSAGE_REQUEST on data was not refused");
+        close_fd(&data);
+        CHECK(expect_rejections(server, message_counts[i], message_counts[i]) == 0,
+              "a %zu-byte MESSAGE_REQUEST on data was not counted as Java counts it", message_lengths[i]);
+    }
+
+    /* A NAT body shorter than its 16-byte header: INVALID_LENGTH in Java's decodeNatMessage. */
+    static const uint8_t short_nat[] = {ST_NAT_KEEPALIVE, 0, 0, 0};
+    raw_frame(&frame, ST_CMD_NAT_MESSAGE, short_nat, sizeof(short_nat));
+    CHECK(send_frame(control, &frame) == 0 && expect_channel_closed(control, IO_TIMEOUT_MS) == 0,
+          "a NAT frame on control was not refused");
+    close_fd(&control);
+    CHECK(expect_value(server, "specus.control.protocol.rejected", "?tag=reason:invalid_length", "1.0") == 0
+              && expect_rejections(server, "1.0", "2.0") == 0,
+          "a short NAT body on control was not counted as invalid_length");
+
+    /* A second login, with a byte after its last field and then readable. */
+    static const uint8_t login[] = {2, 'c', 0, 2, 't', 8, 'c', 'o', 'n', 't', 'r', 'o', 'l', 0};
+    CHECK(fresh_control(server, &runtime, &control) == 0, "second control");
+    raw_frame(&frame, ST_CMD_LOGIN_REQUEST, login, sizeof(login));
+    CHECK(send_frame(control, &frame) == 0 && expect_channel_closed(control, IO_TIMEOUT_MS) == 0,
+          "an unreadable second login was not refused");
+    close_fd(&control);
+    CHECK(expect_rejections(server, "2.0", "3.0") == 0, "an unreadable second login was not counted");
+    CHECK(fresh_control(server, &runtime, &control) == 0, "third control");
+    CHECK(send_login_request(control, &runtime, "control") == 0 && expect_channel_closed(control, IO_TIMEOUT_MS) == 0,
+          "a second login was not refused");
+    close_fd(&control);
+    CHECK(expect_rejections(server, "2.0", "3.0") == 0, "a readable second login was counted");
+    return 0;
+}
+
 /* General relay bytes up to the byte quota, a send the kernel refuses, and the quota closing. */
 static int scenario_general_relay_bytes(test_server *server)
 {
@@ -738,6 +1017,10 @@ int main(int argc, char **argv)
     setenv("MANAGEMENT_ENDPOINT_METRICS_ACCESS", "none", 1);
     failures += run_on_fresh_server("no metrics routes when the endpoint's access is none", scenario_not_exposed, NULL);
     unsetenv("MANAGEMENT_ENDPOINT_METRICS_ACCESS");
+    failures += run_on_fresh_server("heartbeat and logout bodies before login", scenario_bodies_before_login, NULL);
+    failures += run_on_fresh_server("heartbeat and logout bodies on control and data",
+                                    scenario_heartbeat_and_logout_bodies, NULL);
+    failures += run_on_fresh_server("bodies of frames refused unhandled", scenario_refused_frame_bodies, NULL);
     unsetenv("MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE");
 
     peer_mesh_environment("600000");

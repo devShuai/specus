@@ -581,6 +581,8 @@ add_test(NAME metrics_tests COMMAND specus_c_metrics_tests)
 add_executable(specus_c_metrics_endpoint_tests tests/metrics_endpoint_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_metrics_endpoint_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_metrics_endpoint_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_metrics_endpoint_tests PRIVATE
+    ST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/control-v2/frames/")
 add_test(NAME metrics_endpoint_tests
     COMMAND specus_c_metrics_endpoint_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(metrics_endpoint_tests PROPERTIES TIMEOUT 120)
