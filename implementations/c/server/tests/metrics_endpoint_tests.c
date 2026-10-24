@@ -11,6 +11,7 @@
 #include "crypto.h"
 #include "server_harness.h"
 #include "storage.h"
+#include "test_util.h"
 #include "turn_auth.h"
 
 #include <arpa/inet.h>
@@ -175,29 +176,26 @@ static void frame_header(uint8_t out[ST_HEADER_SIZE], uint32_t magic, uint8_t ve
     out[10] = (uint8_t)length;
 }
 
-#ifndef ST_FIXTURE_DIR
-#define ST_FIXTURE_DIR "../../../protocol/test-vectors/control-v2/frames/"
-#endif
-
 typedef struct {
     uint8_t bytes[512];
     size_t len;
 } wire_frame;
 
-/* A shared frame of protocol/test-vectors/control-v2/frames, byte for byte. */
+/* A shared frame of protocol/test-vectors/control-v2/frames, byte for byte (test_util.h's reader). */
 static int fixture_frame(const char *name, wire_frame *out)
 {
-    char path[512];
-    snprintf(path, sizeof(path), "%s%s", ST_FIXTURE_DIR, name);
-    FILE *file = fopen(path, "rb");
-    if (file == NULL) {
-        perror(path);
+    uint8_t *bytes = NULL;
+    size_t len = 0U;
+    if (st_test_read_fixture(name, &bytes, &len) != 0) {
         return -1;
     }
-    out->len = fread(out->bytes, 1U, sizeof(out->bytes), file);
-    int whole = !ferror(file) && fgetc(file) == EOF && out->len >= ST_HEADER_SIZE;
-    fclose(file);
-    return whole ? 0 : -1;
+    int fits = len >= ST_HEADER_SIZE && len <= sizeof(out->bytes);
+    if (fits) {
+        memcpy(out->bytes, bytes, len);
+        out->len = len;
+    }
+    free(bytes);
+    return fits ? 0 : -1;
 }
 
 /* A frame of the given command with exactly the given body. */
@@ -688,7 +686,7 @@ static int scenario_bodies_before_login(test_server *server)
  * Authenticated control and data connections. The shared heartbeats are answered and accepted on
  * both; a heartbeat, LOGOUT_REQUEST or LOGOUT_RESPONSE whose body Java's codec cannot read closes
  * that connection unanswered and counts malformed_body, the other connection carrying on; a
- * LOGOUT_REQUEST is answered with logout_response.bin.
+ * LOGOUT_REQUEST is answered with logout_response.bin (and then closed, which is C's alone).
  */
 static int scenario_heartbeat_and_logout_bodies(test_server *server)
 {
@@ -765,7 +763,9 @@ static int scenario_heartbeat_and_logout_bodies(test_server *server)
           "data login: %s", reason);
     CHECK(send_frame(data, &logout) == 0 && expect_frame(data, &logout_response) == 0,
           "logout_request.bin on data was not answered with logout_response.bin");
-    CHECK(expect_channel_closed(data, IO_TIMEOUT_MS) == 0, "the data connection outlived its logout");
+    /* C's own rule: it closes a connection after answering its logout. Java, Go and .NET only unbind
+     * it and leave it open (c-server-api-inventory.md section 8); the answer above is what is Java's. */
+    CHECK(expect_channel_closed(data, IO_TIMEOUT_MS) == 0, "C did not close the data connection after its logout");
     close_fd(&data);
 
     CHECK(expect_channel_alive(control) == 0, "the data logout closed the control connection");

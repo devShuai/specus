@@ -12,7 +12,7 @@
 #define ST_FIXTURE_DIR "../../../protocol/test-vectors/control-v2/frames/"
 #endif
 
-static int st_test_read_file(const char *path, uint8_t **out, size_t *out_len)
+static inline int st_test_read_file(const char *path, uint8_t **out, size_t *out_len)
 {
     FILE *file = fopen(path, "rb");
     if (file == NULL) {
@@ -45,14 +45,14 @@ static int st_test_read_file(const char *path, uint8_t **out, size_t *out_len)
     return 0;
 }
 
-static int st_test_read_fixture(const char *fixture, uint8_t **out, size_t *out_len)
+static inline int st_test_read_fixture(const char *fixture, uint8_t **out, size_t *out_len)
 {
     char path[256];
     snprintf(path, sizeof(path), "%s%s", ST_FIXTURE_DIR, fixture);
     return st_test_read_file(path, out, out_len);
 }
 
-static int st_test_expect_fixture_bytes(const char *fixture, const st_buffer *actual)
+static inline int st_test_expect_fixture_bytes(const char *fixture, const st_buffer *actual)
 {
     uint8_t *expected = NULL;
     size_t expected_len = 0;
@@ -68,7 +68,7 @@ static int st_test_expect_fixture_bytes(const char *fixture, const st_buffer *ac
     return mismatch ? 1 : 0;
 }
 
-static int st_test_decode_fixture_header(const char *fixture, uint8_t **bytes, st_frame_header *header)
+static inline int st_test_decode_fixture_header(const char *fixture, uint8_t **bytes, st_frame_header *header)
 {
     size_t len = 0;
     if (st_test_read_fixture(fixture, bytes, &len) != 0) {

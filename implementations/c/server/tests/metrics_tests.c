@@ -754,6 +754,8 @@ static void test_protocol_reasons(void)
     static const uint8_t message_null_type[] = {2, 'a', 2, 'b', 0, 2, 'm'};
     static const uint8_t message_bad_type_body[] = {2, 'a', 2, 'b', 6, 2, 'm'};
     static const uint8_t nat_short[] = {6, 0, 0, 0};
+    /* One byte over the login body limit (16 KiB frames before login, header included). */
+    static const uint8_t oversized_login[ST_PRE_AUTH_MAX_FRAME_SIZE - ST_HEADER_SIZE + 1U] = {0};
     static const struct {
         int8_t command;
         const uint8_t *body;
@@ -792,8 +794,7 @@ static void test_protocol_reasons(void)
         {ST_CMD_MESSAGE_REQUEST, message_bad_type_body, sizeof(message_bad_type_body), -1,
          ST_PROTOCOL_REJECTION_MALFORMED_BODY},
         {ST_CMD_NAT_MESSAGE, nat_short, sizeof(nat_short), -1, ST_PROTOCOL_REJECTION_INVALID_LENGTH},
-        {ST_CMD_LOGIN_REQUEST, one_zero, ST_PRE_AUTH_MAX_FRAME_SIZE - ST_HEADER_SIZE + 1U, -1,
-         ST_PROTOCOL_REJECTION_INVALID_LENGTH},
+        {ST_CMD_LOGIN_REQUEST, oversized_login, sizeof(oversized_login), -1, ST_PROTOCOL_REJECTION_INVALID_LENGTH},
         {5, one_zero, 0, -1, ST_PROTOCOL_REJECTION_UNKNOWN_COMMAND},
     };
     for (size_t i = 0; i < sizeof(bodies) / sizeof(bodies[0]); ++i) {

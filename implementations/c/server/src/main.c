@@ -6227,7 +6227,11 @@ static void *client_thread(void *arg)
         }
 
         if (header.command == ST_CMD_LOGOUT_REQUEST) {
-            /* Java LogoutRequestHandler's answer: success, no reason (logout_response.bin). */
+            /*
+             * Java LogoutRequestHandler's answer: success, no reason (logout_response.bin). C then
+             * closes the connection; Java, Go and .NET only unbind it and leave it open until the
+             * client closes it or it idles out (c-server-api-inventory.md section 8).
+             */
             st_buffer response = st_protocol_encode_logout_response(1, NULL);
             session_send_packet(session, &response);
             disconnect_reason = "CLIENT_CLOSED";

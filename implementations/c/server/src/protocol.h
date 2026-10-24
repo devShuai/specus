@@ -115,7 +115,8 @@ int st_protocol_decode_nat_message(const uint8_t *body, size_t body_len, st_nat_
 /*
  * Java PacketCodec.decode's body step for a frame whose header st_protocol_read_header accepted: 0
  * when Java's codec reads the body as the command's packet, -1 with the reason in
- * st_protocol_last_rejection when it refuses it. Nothing is kept. It is for the frames the server
+ * st_protocol_last_rejection when it refuses it. It reads past the fields without copying or
+ * allocating anything (a refused NAT frame can be 32 MiB). It is for the frames the server
  * refuses without handling them (a non-login frame before login, a frame of the other role, a second
  * login, a server packet): Java decodes those before any handler looks at them. A login role of any
  * value, null included, and a null messageType are read, as Java's codec reads them.

@@ -462,7 +462,7 @@ $(SESSION_SCOPE_TESTS): $(CORE_OBJS) tests/session_order_tests.c | $(BUILD_DIR)
 $(METRICS_TESTS): $(CORE_OBJS) tests/metrics_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/metrics_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
-$(METRICS_ENDPOINT_TESTS): $(CORE_OBJS) tests/metrics_endpoint_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+$(METRICS_ENDPOINT_TESTS): $(CORE_OBJS) tests/metrics_endpoint_tests.c tests/server_harness.c tests/server_harness.h tests/test_util.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/metrics_endpoint_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(STUN_TURN_TESTS): $(CORE_OBJS) tests/stun_turn_tests.c | $(BUILD_DIR)
