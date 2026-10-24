@@ -16,6 +16,7 @@
 #include "peer_egress.h"
 #include "login_rate_limiter.h"
 #include "media_capture.h"
+#include "metrics.h"
 #include "object_storage.h"
 #include "oidc.h"
 #include "password_hash.h"
@@ -20670,6 +20671,30 @@ static char *admin_portal_security_headers(void)
     return builder.data;
 }
 
+/*
+ * Java's actuator metrics endpoint (GET /actuator/metrics and /actuator/metrics/{name}), answered
+ * only while management.endpoints.web.exposure includes metrics; SecurityConfig leaves every
+ * /actuator path open, so no token is asked for. 1 when this sent the answer.
+ */
+static int send_actuator_metrics(int fd, const char *method, const char *path, const char *request)
+{
+    char *accept = admin_extract_header_value(request, "Accept");
+    char *response = NULL;
+    size_t response_len = 0U;
+    int rc = st_metrics_actuator_response(method, path, accept, &response, &response_len);
+    free(accept);
+    if (rc == 0) {
+        return 0;
+    }
+    if (rc < 0) {
+        send_text_http_error(fd, 500, "metrics response allocation failed");
+        return 1;
+    }
+    (void)send_all(fd, response, response_len);
+    free(response);
+    return 1;
+}
+
 static int send_static_file(int fd, const char *method, const char *path, const char *static_root)
 {
     if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0) {
@@ -21336,6 +21361,11 @@ static void handle_client(st_admin_server *server, int fd)
     free(package_range);
     free(package_if_none_match);
     if (package_download_response != 0) {
+        free(body_buffer);
+        close(fd);
+        return;
+    }
+    if (send_actuator_metrics(fd, method, path, request)) {
         free(body_buffer);
         close(fd);
         return;

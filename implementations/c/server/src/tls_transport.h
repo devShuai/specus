@@ -41,6 +41,10 @@ int st_tls_server_context_create(const st_tls_config *config,
                                  size_t error_len);
 void st_tls_server_context_free(st_tls_server_context *context);
 int st_tls_server_context_enabled(const st_tls_server_context *context);
+/* The notAfter of a file keystore's certificate in epoch seconds, 0 in the other modes. */
+long long st_tls_server_context_certificate_expiry(const st_tls_server_context *context);
+/* Java NettyServer.effectiveTlsMode: file, self_signed, terminated_upstream or disabled. */
+const char *st_tls_metric_mode(const st_tls_config *config);
 
 /*
  * A connection reads and writes through OpenSSL's socket BIO, which writes with write(2): a write

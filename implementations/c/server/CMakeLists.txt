@@ -36,6 +36,7 @@ add_library(specus_c_core
     src/json.c
     src/login_rate_limiter.c
     src/media_capture.c
+    src/metrics.c
     src/object_storage.c
     src/oidc.c
     src/password_hash.c
@@ -567,6 +568,22 @@ add_executable(specus_c_stun_turn_tests tests/stun_turn_tests.c)
 target_link_libraries(specus_c_stun_turn_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_stun_turn_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME stun_turn_tests COMMAND specus_c_stun_turn_tests)
+
+# The meters Java registers with Micrometer and its actuator metrics endpoint: values, Java's
+# Double.toString, the exposure settings, content negotiation and every answer of the two routes.
+add_executable(specus_c_metrics_tests tests/metrics_tests.c)
+target_link_libraries(specus_c_metrics_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_metrics_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME metrics_tests COMMAND specus_c_metrics_tests)
+
+# The endpoint of a real server process, scraped after control-channel and TURN traffic and a
+# Peer Mesh relay batch.
+add_executable(specus_c_metrics_endpoint_tests tests/metrics_endpoint_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_metrics_endpoint_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_metrics_endpoint_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME metrics_endpoint_tests
+    COMMAND specus_c_metrics_endpoint_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(metrics_endpoint_tests PROPERTIES TIMEOUT 120)
 
 add_executable(specus_c_stun_turn_scale_tests tests/stun_turn_scale_tests.c)
 target_link_libraries(specus_c_stun_turn_scale_tests PRIVATE specus_c_core)

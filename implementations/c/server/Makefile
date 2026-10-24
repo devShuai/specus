@@ -39,6 +39,7 @@ CORE_OBJS += $(BUILD_DIR)/instant.o $(BUILD_DIR)/instant_storage.o $(BUILD_DIR)/
 CORE_OBJS += $(BUILD_DIR)/redis_uri.o
 CORE_OBJS += $(BUILD_DIR)/websocket_ticket.o
 CORE_OBJS += $(BUILD_DIR)/traffic_usage.o
+CORE_OBJS += $(BUILD_DIR)/metrics.o
 INSTANT_TESTS := $(BUILD_DIR)/specus_c_instant_tests
 INSTANT_MIGRATION_TESTS := $(BUILD_DIR)/specus_c_instant_migration_tests
 CONNECTION_TIME_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_connection_time_reference_tests
@@ -150,6 +151,10 @@ TESTS += $(HTTP_LOG_REASON_REFERENCE_TESTS)
 ALL_TESTS += $(HTTP_LOG_REASON_REFERENCE_TESTS) $(HTTP_RESET_REASON_REFERENCE_TESTS)
 TRAFFIC_USAGE_TESTS := $(BUILD_DIR)/specus_c_traffic_usage_tests
 ALL_TESTS += $(TRAFFIC_USAGE_TESTS)
+METRICS_TESTS := $(BUILD_DIR)/specus_c_metrics_tests
+METRICS_ENDPOINT_TESTS := $(BUILD_DIR)/specus_c_metrics_endpoint_tests
+TESTS += $(METRICS_TESTS)
+ALL_TESTS += $(METRICS_TESTS) $(METRICS_ENDPOINT_TESTS)
 HTTP_CONNECTOR_TESTS := $(BUILD_DIR)/specus_c_http_connector_tests
 ALL_TESTS += $(HTTP_CONNECTOR_TESTS)
 
@@ -447,6 +452,12 @@ $(SESSION_ORDER_TESTS): $(CORE_OBJS) tests/session_order_tests.c | $(BUILD_DIR)
 $(SESSION_SCOPE_TESTS): $(CORE_OBJS) tests/session_order_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DST_SESSION_ORDER_VECTOR_FILE='"../../../protocol/test-vectors/peer-egress-session-scope-v1.json"' -DST_SESSION_ORDER_EXPECTED_CASES=8U -DST_SESSION_SCOPE_NOCASE=1 tests/session_order_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
+$(METRICS_TESTS): $(CORE_OBJS) tests/metrics_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/metrics_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(METRICS_ENDPOINT_TESTS): $(CORE_OBJS) tests/metrics_endpoint_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/metrics_endpoint_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
 $(STUN_TURN_TESTS): $(CORE_OBJS) tests/stun_turn_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/stun_turn_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
@@ -497,6 +508,7 @@ test: all
 	$(SESSION_REFERENCE_TESTS) $(SESSION_REFERENCE_SERVER)
 	$(HTTP_RESET_REASON_REFERENCE_TESTS) $(SERVER)
 	$(TRAFFIC_USAGE_TESTS) $(SERVER)
+	$(METRICS_ENDPOINT_TESTS) $(SERVER)
 	$(HTTP_CONNECTOR_TESTS) $(SERVER)
 	$(CONNECTIVITY_RATE_HTTP_TESTS)
 	$(CONNECTIVITY_RESOURCE_WIRE_TESTS) $(SERVER)

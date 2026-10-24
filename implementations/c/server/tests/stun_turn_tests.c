@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "crypto.h"
+#include "metrics.h"
 #include "storage.h"
 #include "stun_turn.h"
 #include "turn_auth.h"
@@ -2517,17 +2518,47 @@ static int test_relay_traffic_batches(void)
      * here the database is away, so the flush opens an empty one beside it and fails. */
     char away[80];
     snprintf(away, sizeof(away), "%s.away", fixture.path);
+    /* Java's meters of the same batch (PeerMeshServiceTests.relayTrafficFlushRestoresBatchAfterRepositoryFailure):
+     * the outbound bytes of both frames wait, and the failed batch is counted and kept. */
+    double pending = -1.0;
+    double failures_before = -1.0;
+    double failures_after = -1.0;
+    if (!failed
+        && (st_metrics_measure("specus.peer_mesh.relay.traffic.pending.bytes", NULL, NULL, &pending) != 0
+            || pending != 104.0
+            || st_metrics_measure("specus.peer_mesh.relay.traffic.flush.failures", NULL, NULL, &failures_before) != 0)) {
+        fprintf(stderr, "pending relay bytes are %g before the batch, want 104\n", pending);
+        failed = 1;
+    }
     if (!failed && rename(fixture.path, away) == 0) {
         st_stun_turn_server_flush_relay_traffic(turn.server);
         unlink(fixture.path);
         failed = rename(away, fixture.path) != 0
             || wait_for_relay_bytes(fixture.path, "tenant-batches", third.id, 0, 0L) != 0;
         if (failed) fprintf(stderr, "a failed relay batch was not kept back\n");
+        if (!failed
+            && (st_metrics_measure("specus.peer_mesh.relay.traffic.flush.failures", NULL, NULL, &failures_after) != 0
+                || failures_after != failures_before + 1.0
+                || st_metrics_measure("specus.peer_mesh.relay.traffic.pending.bytes", NULL, NULL, &pending) != 0
+                || pending != 104.0)) {
+            fprintf(stderr, "a failed batch left %g failures (before %g) and %g pending bytes\n", failures_after,
+                    failures_before, pending);
+            failed = 1;
+        }
     } else if (!failed) {
         failed = 1;
     }
     relay_pair_close(&pair);
     if (started) st_stun_turn_server_stop(turn.server);
+    double lag = -1.0;
+    if (!failed
+        && (st_metrics_measure("specus.peer_mesh.relay.traffic.pending.bytes", NULL, NULL, &pending) != 0
+            || pending != 0.0
+            || st_metrics_measure("specus.peer_mesh.relay.traffic.flush.lag.seconds", NULL, NULL, &lag) != 0
+            || lag < 0.0 || lag > 5.0)) {
+        fprintf(stderr, "after the stop's batch: %g pending bytes, flush lag %g\n", pending, lag);
+        failed = 1;
+    }
     if (!failed && wait_for_relay_bytes(fixture.path, "tenant-batches", third.id, 104, 0L) != 0) {
         fprintf(stderr, "relay bytes pending at stop were not written\n");
         failed = 1;
