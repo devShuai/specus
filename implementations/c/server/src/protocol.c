@@ -155,19 +155,11 @@ static int reader_bool(compact_reader *reader, int *value)
     return 0;
 }
 
-/* Java MessageTypeCodec: 0 is a null messageType, any other value must be a known wire id. */
-static int reader_skip_message_type(compact_reader *reader)
+/* Java MessageTypeCodec: 0 is a null messageType (left as 0), any other value must be a known wire id. */
+static int reader_message_type(compact_reader *reader, int *value)
 {
     uint32_t marker;
-    return reader_varint(reader, &marker) != 0 || marker > ST_MESSAGE_TYPE_PEER_CONTROL ? -1 : 0;
-}
-
-static int reader_enum(compact_reader *reader, int *value)
-{
-    uint32_t marker;
-    if (reader_varint(reader, &marker) != 0
-        || marker < ST_MESSAGE_TYPE_SERVER_TO_CLIENT
-        || marker > ST_MESSAGE_TYPE_PEER_CONTROL) {
+    if (reader_varint(reader, &marker) != 0 || marker > ST_MESSAGE_TYPE_PEER_CONTROL) {
         return -1;
     }
     *value = (int)marker;
@@ -431,7 +423,7 @@ int st_protocol_decode_message_response(const uint8_t *body, size_t body_len, st
     };
     if (reader_string(&reader, &response->client_name) != 0
         || reader_string(&reader, &response->to_client_name) != 0
-        || reader_enum(&reader, &response->message_type) != 0
+        || reader_message_type(&reader, &response->message_type) != 0
         || reader_string(&reader, &response->message) != 0
         || reader.pos != reader.len) {
         st_message_response_free(response);
@@ -573,6 +565,7 @@ int st_protocol_validate_body(int8_t command, const uint8_t *body, size_t body_l
     };
     int64_t session_id;
     int success;
+    int message_type;
     int unreadable;
     switch (command) {
         case ST_CMD_LOGIN_REQUEST:
@@ -593,7 +586,7 @@ int st_protocol_validate_body(int8_t command, const uint8_t *body, size_t body_l
             /* clientName, toClientName, messageType, message */
             unreadable = reader_skip_string(&reader) != 0
                 || reader_skip_string(&reader) != 0
-                || reader_skip_message_type(&reader) != 0
+                || reader_message_type(&reader, &message_type) != 0
                 || reader_skip_string(&reader) != 0;
             break;
         case ST_CMD_LOGOUT_RESPONSE:

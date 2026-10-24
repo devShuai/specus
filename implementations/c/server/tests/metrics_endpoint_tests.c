@@ -841,6 +841,47 @@ static int scenario_refused_frame_bodies(test_server *server)
     return 0;
 }
 
+/*
+ * A MESSAGE_REQUEST with a null messageType on control: Java's codec reads it, MessageRequestHandler's
+ * switch throws, and the exception ends at the tail of the pipeline. Nothing is counted and the
+ * connection stays; an unknown wire id (6) is MALFORMED_BODY and closes it.
+ */
+static int scenario_null_message_type(test_server *server)
+{
+    wire_frame heartbeat;
+    wire_frame heartbeat_response;
+    CHECK(fixture_frame("heartbeat_request.bin", &heartbeat) == 0
+              && fixture_frame("heartbeat_response.bin", &heartbeat_response) == 0,
+          "cannot read the shared frames");
+    char reason[256];
+    runtime_session runtime;
+    int control = -1;
+    CHECK(create_credential(server->db_path, "ck_nulltype", "nulltype-secret", 2) == 0, "credential");
+    CHECK(http_client_login(server, "ck_nulltype", "nulltype-secret", "machine-nulltype", "nul", &runtime) == 0,
+          "client login");
+    CHECK(channel_login(server->control_port, &runtime, "control", &control, reason, sizeof(reason)) == 1,
+          "control login: %s", reason);
+
+    static const uint8_t null_type[] = {2, 'a', 2, 'b', 0, 2, 'm'};
+    static const uint8_t all_null[] = {0, 0, 0, 0};
+    wire_frame frame;
+    raw_frame(&frame, ST_CMD_MESSAGE_REQUEST, null_type, sizeof(null_type));
+    CHECK(send_frame(control, &frame) == 0, "send a null messageType");
+    raw_frame(&frame, ST_CMD_MESSAGE_REQUEST, all_null, sizeof(all_null));
+    CHECK(send_frame(control, &frame) == 0, "send an all-null MESSAGE_REQUEST");
+    CHECK(send_frame(control, &heartbeat) == 0 && expect_frame(control, &heartbeat_response) == 0,
+          "the control connection did not answer a heartbeat after a null messageType");
+    CHECK(expect_rejections(server, "0.0", "0.0") == 0, "a null messageType was counted");
+
+    static const uint8_t unknown_type[] = {2, 'a', 2, 'b', 6, 2, 'm'};
+    raw_frame(&frame, ST_CMD_MESSAGE_REQUEST, unknown_type, sizeof(unknown_type));
+    CHECK(send_frame(control, &frame) == 0 && expect_channel_closed(control, IO_TIMEOUT_MS) == 0,
+          "an unknown messageType did not close the control connection");
+    close_fd(&control);
+    CHECK(expect_rejections(server, "1.0", "1.0") == 0, "an unknown messageType was not counted as malformed_body");
+    return 0;
+}
+
 /* General relay bytes up to the byte quota, a send the kernel refuses, and the quota closing. */
 static int scenario_general_relay_bytes(test_server *server)
 {
@@ -1021,6 +1062,7 @@ int main(int argc, char **argv)
     failures += run_on_fresh_server("heartbeat and logout bodies on control and data",
                                     scenario_heartbeat_and_logout_bodies, NULL);
     failures += run_on_fresh_server("bodies of frames refused unhandled", scenario_refused_frame_bodies, NULL);
+    failures += run_on_fresh_server("a null messageType on control", scenario_null_message_type, NULL);
     unsetenv("MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE");
 
     peer_mesh_environment("600000");

@@ -61,6 +61,7 @@ typedef struct {
 typedef struct {
     char *client_name;
     char *to_client_name;
+    /* An ST_MESSAGE_TYPE_* value, or 0 for a packet whose messageType is null. */
     int message_type;
     char *message;
 } st_message_response;

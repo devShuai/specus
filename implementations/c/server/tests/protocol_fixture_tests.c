@@ -362,6 +362,36 @@ static int test_login_null_role(void)
     return 0;
 }
 
+/*
+ * Java MessageTypeCodec reads 0 as a null messageType, and the rest of the body is read as usual; an
+ * id past PEER_CONTROL is MALFORMED_BODY.
+ */
+static int test_message_null_type(void)
+{
+    static const uint8_t null_type[] = {2, 'a', 2, 'b', 0, 2, 'm'};
+    static const uint8_t all_null[] = {0, 0, 0, 0};
+    static const uint8_t unknown_type[] = {2, 'a', 2, 'b', 6, 2, 'm'};
+    st_message_response response;
+    int ok = st_protocol_decode_message_response(null_type, sizeof(null_type), &response) == 0
+        && response.message_type == 0
+        && strcmp(response.client_name, "a") == 0
+        && strcmp(response.to_client_name, "b") == 0
+        && strcmp(response.message, "m") == 0;
+    st_message_response_free(&response);
+    ok = ok && st_protocol_decode_message_response(all_null, sizeof(all_null), &response) == 0
+        && response.message_type == 0
+        && response.client_name == NULL
+        && response.to_client_name == NULL
+        && response.message == NULL;
+    st_message_response_free(&response);
+    ok = ok && st_protocol_decode_message_response(unknown_type, sizeof(unknown_type), &response) == -1
+        && st_protocol_last_rejection() == ST_PROTOCOL_REJECTION_MALFORMED_BODY;
+    if (!ok) {
+        fprintf(stderr, "a null messageType was not read as Java's codec reads it\n");
+    }
+    return ok ? 0 : 1;
+}
+
 static int test_java_encode_fixtures(void)
 {
     st_buffer login = st_protocol_encode_login_response("Demo client", 1, NULL);
@@ -495,5 +525,6 @@ int main(void)
         || test_nat_decode() != 0
         || test_malformed_frames_are_rejected() != 0
         || test_login_null_role() != 0
+        || test_message_null_type() != 0
         || test_java_encode_fixtures() != 0;
 }

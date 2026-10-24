@@ -6284,6 +6284,11 @@ static void *client_thread(void *arg)
                        session->config.client_name,
                        message_request.to_client_name == NULL ? "" : message_request.to_client_name);
             } else {
+                /*
+                 * A null messageType (0) is readable in Java's codec; MessageRequestHandler's switch then
+                 * throws, and the exception only reaches the end of the pipeline: logged, not counted, the
+                 * connection kept. Other types a client does not send are logged and ignored the same way.
+                 */
                 fprintf(stderr,
                         "[message] unsupported type=%d source=%s target=%s\n",
                         message_request.message_type,
