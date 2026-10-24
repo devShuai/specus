@@ -433,6 +433,11 @@ Java 的指标端点来自 `spring-boot-starter-actuator`（Spring Boot 4.1.1）
 | `test(c-server): check that part uploads share a bounded set of workers` | `media_capture_tests` 新增 `test_part_uploads_share_bounded_workers` |
 | `Merge origin/main into fix/c-server-item45-http-conn` | 合入 #332（Direct HTTP 等待改用单调时钟）、#333（TURN）、#334（TCP 流描述符生命周期），没有冲突 |
 | `docs(alignment): review follow-ups of the public HTTP connection alignment` | 本文第 9、10 节，test-map、runtime-semantics（同时改正原「RST 30」与「1025 个按 Java 答 502」两句）、C server README |
+
+`feat/c-server-metrics`（第 9 节第 16 项）的提交：
+
+| 提交 | 内容 |
+| --- | --- |
 | `fix(c-server): refuse a login whose connectionRole is null instead of crashing` | 第 9 节第 16 项末：登录前的一个帧即可让 C 进程在 `strcmp(NULL, …)` 上崩溃（原代码实测段错误），现与非法角色一样拒绝；`protocol_fixture_tests` |
 | `feat(c-server): expose Java's Micrometer meters on /actuator/metrics` | 第 7 节末「Actuator 指标端点」、第 9 节第 16 项：`src/metrics.c`、各事件的计数、发布规则与端点，ctest `metrics_tests`、`metrics_endpoint_tests`，`stun_turn_tests` 的批次断言 |
 | `docs(alignment): record the metrics endpoint and what still differs from Java` | 本文汇总、第 7、8、9、10 节，test-map、runtime-semantics、C server README |
