@@ -41,6 +41,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
@@ -63,6 +64,8 @@
 #define ST_MAX_STALE_SESSION_SCAN 256U
 /* A displaced client has at most one control and one data connection; slack covers a race. */
 #define ST_MAX_DISPLACED_SESSIONS 8U
+/* Netty's ServerBootstrapAcceptor stops accepting this long after accept() fails, then resumes. */
+#define ST_ACCEPT_ERROR_PAUSE_MS 1000
 
 typedef struct {
     long long id;
@@ -96,9 +99,23 @@ typedef struct {
     int control_read_idle_seconds;
     int control_write_timeout_seconds;
     int per_machine_user_max_instances;
+    /*
+     * Java's specus.netty.* (NettyServerProperties), bound as Spring binds them (load_netty_options).
+     * The external connection limits are max-external-connections, -per-client (per data
+     * connection, as Java's NatServerHandler counts) and -per-port; 0 or less is no limit.
+     */
     int max_global_external_connections;
     int max_client_external_connections;
     int max_port_external_connections;
+    /* SO_BACKLOG of the control and public listeners, as bound (see netty_listen_backlog). */
+    int netty_so_backlog;
+    int netty_reuse_address;
+    /* Child options of every accepted control, data and public socket. */
+    int netty_keep_alive;
+    int netty_tcp_no_delay;
+    /* The largest frame read after and before login, header included, at most ST_MAX_FRAME_SIZE. */
+    size_t netty_max_frame_size;
+    size_t netty_pre_auth_max_frame_size;
     /* SPECUS_HTTP_TIMEOUT_MS and SPECUS_HTTP_MAX_REQUEST_BODY_SIZE, as Java's specus.http.*. */
     int64_t http_timeout_ms;
     int64_t http_max_request_body;
@@ -147,14 +164,12 @@ typedef struct external_conn {
     long long client_to_public_offset;
     long long public_to_client_frame_index;
     long long client_to_public_frame_index;
-    pthread_t thread;
-    int thread_started;
-    pthread_t writer_thread;
-    int writer_thread_started;
     /*
-     * The reader and writer that may still use fd (session->map_lock): reserved before the stream
-     * is published and given back after each one's last socket call, also when its thread could
-     * not be started. A stopped stream keeps fd open until this is 0 (close_conn_fd_locked).
+     * The reader and writer that may still use the stream (session->map_lock): reserved before it
+     * is published and given back after each one's last use, also when its thread could not be
+     * started. A stopped stream keeps fd open until this is 0 (close_conn_fd_locked), and is
+     * taken out of session->conns and freed then (unlink_finished_conn_locked). Both threads are
+     * detached; nobody joins them.
      */
     unsigned int io_workers;
     int done;
@@ -176,11 +191,14 @@ typedef struct external_conn {
     struct external_conn *next;
 } external_conn;
 
+/*
+ * A public port's listener. Its thread is detached and owns fd: it closes it, takes the listener
+ * out of session->listeners and frees it once accept() has returned for good. Others only shut fd
+ * down and set done, under session->map_lock.
+ */
 typedef struct specus_listener {
     int fd;
     int port;
-    pthread_t thread;
-    int thread_started;
     int done;
     specus_session *session;
     struct specus_listener *next;
@@ -250,9 +268,19 @@ struct specus_session {
     pthread_mutex_t map_lock;
     pthread_mutex_t direct_lock;
     pthread_cond_t reference_cond;
+    /* The public TCP streams that are open or still have a worker, and the running listeners. */
     external_conn *conns;
     ws_conn *ws_conns;
     specus_listener *listeners;
+    /*
+     * Listener and stream worker threads of this connection that may still use it (map_lock).
+     * They are detached and free what they own as they end, so a closed public connection or a
+     * stopped port leaves nothing behind while the data connection lives, as a closed Netty
+     * channel leaves nothing in Java. session_shutdown waits on nat_threads_cond for 0; listeners
+     * also pause on it after a failed accept (CLOCK_MONOTONIC, see nat_threads_cond_init).
+     */
+    size_t nat_threads;
+    pthread_cond_t nat_threads_cond;
     direct_http_pending *direct_pending;
     int active;
     /*
@@ -723,6 +751,111 @@ static int env_spring_int(const char *name, int default_value, int *out)
     return 0;
 }
 
+/*
+ * A boolean as Spring binds it (StringToBooleanConverter): String.trim(), then, ignoring case,
+ * true/on/yes/1 or false/off/no/0. Anything else, a blank value included, fails the binding and
+ * with it the start; unset or empty keeps default_value, as env_spring_int.
+ */
+static int env_spring_bool(const char *name, int default_value, int *out)
+{
+    const char *value = getenv(name);
+    if (value == NULL || *value == '\0') {
+        *out = default_value;
+        return 0;
+    }
+    const char *start = value;
+    while (*start != '\0' && (unsigned char)*start <= 0x20U) {
+        ++start;
+    }
+    size_t len = strlen(start);
+    while (len > 0U && (unsigned char)start[len - 1U] <= 0x20U) {
+        --len;
+    }
+    static const char *const truths[] = {"true", "on", "yes", "1"};
+    static const char *const falsehoods[] = {"false", "off", "no", "0"};
+    for (size_t i = 0U; i < sizeof(truths) / sizeof(truths[0]); ++i) {
+        if (len == strlen(truths[i]) && strncasecmp(start, truths[i], len) == 0) {
+            *out = 1;
+            return 0;
+        }
+        if (len == strlen(falsehoods[i]) && strncasecmp(start, falsehoods[i], len) == 0) {
+            *out = 0;
+            return 0;
+        }
+    }
+    fprintf(stderr, "invalid %s; use true/false, on/off, yes/no or 1/0\n", name);
+    return -1;
+}
+
+/*
+ * The variable a specus.netty.* property is bound from: Spring's canonical name (dashes dropped)
+ * or its legacy one (dashes as underscores, the one application.yml names), else the name this
+ * server read before, kept as an alias.
+ */
+static const char *netty_env_name(const char *canonical, const char *legacy, const char *alias)
+{
+    if (getenv(canonical) != NULL) {
+        return canonical;
+    }
+    if (alias != NULL && getenv(legacy) == NULL && getenv(alias) != NULL) {
+        return alias;
+    }
+    return legacy;
+}
+
+/*
+ * Java's specus.netty.* (application.yml, NettyServerProperties) with its defaults, bound as Spring
+ * binds them; a value Spring cannot bind, or one NettyServer.validateConfiguration refuses (the
+ * pre-auth frame size outside [header size, max frame size]), refuses the start.
+ * WRITE_BUFFER_LOW/HIGH_WATER_MARK and the thread counts have no counterpart (API inventory §8).
+ */
+static int load_netty_options(server_config *config)
+{
+    int max_frame_size = 0;
+    int pre_auth_max_frame_size = 0;
+    if (env_spring_int(netty_env_name("SPECUS_NETTY_MAXEXTERNALCONNECTIONS", "SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS",
+                                      "SPECUS_MAX_GLOBAL_EXTERNAL_CONNECTIONS"),
+                       10000, &config->max_global_external_connections) != 0
+        || env_spring_int(netty_env_name("SPECUS_NETTY_MAXEXTERNALCONNECTIONSPERCLIENT",
+                                         "SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_CLIENT",
+                                         "SPECUS_MAX_CLIENT_EXTERNAL_CONNECTIONS"),
+                          10000, &config->max_client_external_connections) != 0
+        || env_spring_int(netty_env_name("SPECUS_NETTY_MAXEXTERNALCONNECTIONSPERPORT",
+                                         "SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT",
+                                         "SPECUS_MAX_PORT_EXTERNAL_CONNECTIONS"),
+                          10000, &config->max_port_external_connections) != 0
+        || env_spring_int(netty_env_name("SPECUS_NETTY_SOBACKLOG", "SPECUS_NETTY_SO_BACKLOG", NULL), 8192,
+                          &config->netty_so_backlog) != 0
+        || env_spring_bool(netty_env_name("SPECUS_NETTY_REUSEADDRESS", "SPECUS_NETTY_REUSE_ADDRESS", NULL), 1,
+                           &config->netty_reuse_address) != 0
+        || env_spring_bool(netty_env_name("SPECUS_NETTY_KEEPALIVE", "SPECUS_NETTY_KEEP_ALIVE", NULL), 1,
+                           &config->netty_keep_alive) != 0
+        || env_spring_bool(netty_env_name("SPECUS_NETTY_TCPNODELAY", "SPECUS_NETTY_TCP_NO_DELAY", NULL), 1,
+                           &config->netty_tcp_no_delay) != 0
+        || env_spring_int(netty_env_name("SPECUS_NETTY_MAXFRAMESIZE", "SPECUS_NETTY_MAX_FRAME_SIZE", NULL),
+                          (int)ST_MAX_FRAME_SIZE, &max_frame_size) != 0
+        || env_spring_int(netty_env_name("SPECUS_NETTY_PREAUTHMAXFRAMESIZE", "SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE",
+                                         NULL),
+                          (int)ST_PRE_AUTH_MAX_FRAME_SIZE, &pre_auth_max_frame_size) != 0) {
+        return -1;
+    }
+    if (pre_auth_max_frame_size < (int)ST_HEADER_SIZE || pre_auth_max_frame_size > max_frame_size) {
+        fprintf(stderr, "SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE must be between the protocol header (%u) and "
+                        "SPECUS_NETTY_MAX_FRAME_SIZE\n", ST_HEADER_SIZE);
+        return -1;
+    }
+    /* The protocol layer reads no frame beyond 32 MiB, Java's default, whatever is configured above. */
+    if (max_frame_size > (int)ST_MAX_FRAME_SIZE) {
+        fprintf(stderr, "SPECUS_NETTY_MAX_FRAME_SIZE=%d is read as %u: no larger frame is read\n",
+                max_frame_size, ST_MAX_FRAME_SIZE);
+        max_frame_size = (int)ST_MAX_FRAME_SIZE;
+    }
+    config->netty_max_frame_size = (size_t)max_frame_size;
+    config->netty_pre_auth_max_frame_size = (size_t)(pre_auth_max_frame_size < max_frame_size
+                                                         ? pre_auth_max_frame_size : max_frame_size);
+    return 0;
+}
+
 static int copy_config_string(char *dest, size_t dest_len, const char *name, const char *value)
 {
     if (value == NULL || *value == '\0') {
@@ -1179,12 +1312,7 @@ static int load_config(server_config *config)
                          &config->control_write_timeout_seconds) != 0
         || env_int_range("SPECUS_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES", 1, 1, 1000000,
                          &config->per_machine_user_max_instances) != 0
-        || env_int_range("SPECUS_MAX_GLOBAL_EXTERNAL_CONNECTIONS", 4096, 1, 1000000,
-                         &config->max_global_external_connections) != 0
-        || env_int_range("SPECUS_MAX_CLIENT_EXTERNAL_CONNECTIONS", 1024, 1, 1000000,
-                         &config->max_client_external_connections) != 0
-        || env_int_range("SPECUS_MAX_PORT_EXTERNAL_CONNECTIONS", 512, 1, 1000000,
-                         &config->max_port_external_connections) != 0
+        || load_netty_options(config) != 0
         || env_int_range("SPECUS_ADMIN_PORT", 0, 0, 65535, &config->admin_port) != 0
         || env_i64_range("SPECUS_HTTP_TIMEOUT_MS", 30000, INT64_MIN, INT64_MAX, &config->http_timeout_ms) != 0
         || env_i64_range("SPECUS_HTTP_MAX_REQUEST_BODY_SIZE", ST_HTTP_MAX_REQUEST_BODY, INT_MIN, INT_MAX,
@@ -2138,7 +2266,8 @@ static void displace_session_locked(specus_session *session, const char *reason)
  * client's next REGISTER for the same port would otherwise race that and fail to bind. Shutting a
  * listening socket down takes it out of LISTEN, which with SO_REUSEADDR already frees the port;
  * the descriptor itself is left to the listener thread, which closes it once accept() fails, so
- * no descriptor is closed under a thread still blocked on it.
+ * no descriptor is closed under a thread still blocked on it. A connection its accept() returned
+ * meanwhile is refused (start_external_conn), not published to the connection that is going away.
  */
 static void release_session_listeners(specus_session *session)
 {
@@ -2147,7 +2276,10 @@ static void release_session_listeners(specus_session *session)
         if (listener->fd >= 0) {
             shutdown(listener->fd, SHUT_RDWR);
         }
+        listener->done = 1;
     }
+    /* A listener pausing after a failed accept ends at once. */
+    pthread_cond_broadcast(&session->nat_threads_cond);
     pthread_mutex_unlock(&session->map_lock);
 }
 
@@ -4068,7 +4200,29 @@ static void remote_endpoint(const struct sockaddr_storage *remote,
     snprintf(text, text_len, "unknown");
 }
 
-static int create_listener_on(const char *bind_address, int port)
+/*
+ * The backlog Netty's server channel listens with for SO_BACKLOG: as given; 0 as the JDK's 50
+ * (ServerSocketChannelImpl.bind); a negative one Netty refuses to set and keeps its default, the
+ * kernel's somaxconn, to which listen(2) also caps any larger value.
+ */
+static int netty_listen_backlog(int so_backlog)
+{
+    if (so_backlog > 0) {
+        return so_backlog;
+    }
+    return so_backlog == 0 ? 50 : INT_MAX;
+}
+
+/* The child options Netty sets on every accepted socket, control, data and public alike. */
+static void apply_netty_child_options(int fd, const server_config *config)
+{
+    int value = config->netty_tcp_no_delay ? 1 : 0;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value));
+    value = config->netty_keep_alive ? 1 : 0;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &value, sizeof(value));
+}
+
+static int create_listener_on(const char *bind_address, int port, const server_config *config)
 {
     char port_text[16];
     snprintf(port_text, sizeof(port_text), "%d", port);
@@ -4090,11 +4244,15 @@ static int create_listener_on(const char *bind_address, int port)
             continue;
         }
         int yes = 1;
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        /* Netty's SO_REUSEADDR server option. A stopped listener frees its port at once only
+         * with it: its socket is shut down but stays open until its thread ends. */
+        int reuse = config->netty_reuse_address ? 1 : 0;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
         if (address->ai_family == AF_INET6) {
             setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &yes, sizeof(yes));
         }
-        if (bind(fd, address->ai_addr, address->ai_addrlen) == 0 && listen(fd, 128) == 0) {
+        if (bind(fd, address->ai_addr, address->ai_addrlen) == 0
+            && listen(fd, netty_listen_backlog(config->netty_so_backlog)) == 0) {
             break;
         }
         close(fd);
@@ -4107,9 +4265,9 @@ static int create_listener_on(const char *bind_address, int port)
     return fd;
 }
 
-static int create_listener(int port)
+static int create_listener(int port, const server_config *config)
 {
-    return create_listener_on("0.0.0.0", port);
+    return create_listener_on("0.0.0.0", port, config);
 }
 
 static void configure_control_socket(int fd, const server_config *config)
@@ -4674,17 +4832,6 @@ static void close_conn_locked(external_conn *conn)
     close_conn_fd_locked(conn);
 }
 
-/* A worker's last use of the stream's socket is over. */
-static void external_worker_finished(external_conn *conn)
-{
-    pthread_mutex_lock(&conn->session->map_lock);
-    if (conn->io_workers > 0U) {
-        --conn->io_workers;
-    }
-    close_conn_fd_locked(conn);
-    pthread_mutex_unlock(&conn->session->map_lock);
-}
-
 static void free_external_write_queue(external_conn *conn)
 {
     external_write_chunk *chunk = conn->write_head;
@@ -4697,6 +4844,117 @@ static void free_external_write_queue(external_conn *conn)
     conn->write_head = NULL;
     conn->write_tail = NULL;
     conn->queued_write_bytes = 0U;
+}
+
+/* A stream nobody can reach any more: unlinked, or never published. */
+static void free_external_conn(external_conn *conn)
+{
+    /* The last worker closed the socket already; a safety net only. */
+    if (conn->fd >= 0) {
+        close(conn->fd);
+    }
+    free_external_write_queue(conn);
+    pthread_cond_destroy(&conn->flow_cond);
+    pthread_mutex_destroy(&conn->flow_lock);
+    pthread_cond_destroy(&conn->write_cond);
+    pthread_mutex_destroy(&conn->write_lock);
+    free(conn);
+}
+
+/*
+ * Takes a stream out of the session once it is stopped and no worker can use it any more, as Java
+ * drops a closed external channel from its maps at once (NatServerHandler, closeFuture). Everything
+ * else reaches a stream only through session->conns under map_lock, so once unlinked it is the
+ * caller's to free, after releasing map_lock. Returns 1 when it was unlinked.
+ */
+static int unlink_finished_conn_locked(external_conn *conn)
+{
+    if (!conn->done || conn->io_workers != 0U) {
+        return 0;
+    }
+    for (external_conn **cursor = &conn->session->conns; *cursor != NULL; cursor = &(*cursor)->next) {
+        if (*cursor == conn) {
+            *cursor = conn->next;
+            conn->next = NULL;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* count listener or worker threads of the session are over, or were never started. */
+static void nat_threads_release_locked(specus_session *session, size_t count)
+{
+    session->nat_threads = session->nat_threads > count ? session->nat_threads - count : 0U;
+    pthread_cond_broadcast(&session->nat_threads_cond);
+}
+
+/* nat_threads_cond times the listeners' pause after a failed accept on CLOCK_MONOTONIC. */
+static int nat_threads_cond_init(specus_session *session)
+{
+    pthread_condattr_t attributes;
+    if (pthread_condattr_init(&attributes) != 0) {
+        return -1;
+    }
+    int rc = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC) == 0
+        && pthread_cond_init(&session->nat_threads_cond, &attributes) == 0 ? 0 : -1;
+    pthread_condattr_destroy(&attributes);
+    return rc;
+}
+
+/* Starts a thread nobody joins; 0, or pthread_create's error. */
+static int start_detached_thread(void *(*start)(void *), void *arg)
+{
+    pthread_attr_t attributes;
+    int rc = pthread_attr_init(&attributes);
+    if (rc != 0) {
+        return rc;
+    }
+    rc = pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+    pthread_t thread;
+    if (rc == 0) {
+        rc = pthread_create(&thread, &attributes, start, arg);
+    }
+    pthread_attr_destroy(&attributes);
+    return rc;
+}
+
+/*
+ * A worker's last use of the stream is over. The last of the two to finish frees a stream that
+ * is stopped; the session itself is not touched once nat_threads is given back.
+ */
+static void external_worker_finished(external_conn *conn)
+{
+    specus_session *session = conn->session;
+    pthread_mutex_lock(&session->map_lock);
+    if (conn->io_workers > 0U) {
+        --conn->io_workers;
+    }
+    close_conn_fd_locked(conn);
+    int unlinked = unlink_finished_conn_locked(conn);
+    nat_threads_release_locked(session, 1U);
+    pthread_mutex_unlock(&session->map_lock);
+    if (unlinked) {
+        free_external_conn(conn);
+    }
+}
+
+/*
+ * Gives back the reservations of workers that could not be started and stops the stream, freeing
+ * it when no started worker is left to do so.
+ */
+static void external_workers_not_started(external_conn *conn, unsigned int count)
+{
+    specus_session *session = conn->session;
+    pthread_mutex_lock(&session->map_lock);
+    conn->io_workers = conn->io_workers > count ? conn->io_workers - count : 0U;
+    close_conn_locked(conn);
+    int unlinked = unlink_finished_conn_locked(conn);
+    nat_threads_release_locked(session, count);
+    pthread_mutex_unlock(&session->map_lock);
+    if (unlinked) {
+        free_external_conn(conn);
+    }
 }
 
 /* Results of queueing client data for the public socket, each answered with its own RST code. */
@@ -4788,7 +5046,12 @@ static int add_send_credit(external_conn *conn, uint32_t credit)
         return -1;
     }
     pthread_mutex_lock(&conn->flow_lock);
-    if (conn->flow_closed || conn->send_credit > ST_STREAM_MAX_WINDOW - credit) {
+    /* Nothing more is sent on a stream whose reader is done: its credit is late and ignored. */
+    if (conn->flow_closed) {
+        pthread_mutex_unlock(&conn->flow_lock);
+        return 0;
+    }
+    if (conn->send_credit > ST_STREAM_MAX_WINDOW - credit) {
         pthread_mutex_unlock(&conn->flow_lock);
         return -1;
     }
@@ -4821,9 +5084,12 @@ static int try_count_external_connection(external_conn *conn)
     int client_count = 0;
     int port_count = 0;
     count_external_locked(session, conn->port, &client_count, &port_count);
-    /* Java records every refusal by a connection limit against the client's tenant. */
-    if (client_count >= session->config.max_client_external_connections
-        || port_count >= session->config.max_port_external_connections) {
+    /* Java records every refusal by a connection limit against the client's tenant; a limit of 0
+     * or less is no limit (RemotePortServerManager, NatServerHandler.tryIncrement). */
+    int max_client = session->config.max_client_external_connections;
+    int max_port = session->config.max_port_external_connections;
+    int max_global = session->config.max_global_external_connections;
+    if ((max_client > 0 && client_count >= max_client) || (max_port > 0 && port_count >= max_port)) {
         pthread_mutex_lock(&global_external_lock);
         record_rejected_external_locked(session->config.tenant_id);
         pthread_mutex_unlock(&global_external_lock);
@@ -4831,7 +5097,7 @@ static int try_count_external_connection(external_conn *conn)
     }
 
     pthread_mutex_lock(&global_external_lock);
-    if (global_external_connections >= session->config.max_global_external_connections) {
+    if (max_global > 0 && global_external_connections >= max_global) {
         record_rejected_external_locked(session->config.tenant_id);
         pthread_mutex_unlock(&global_external_lock);
         return -1;
@@ -4976,6 +5242,15 @@ static void *external_conn_thread(void *arg)
         break;
     }
 
+    /*
+     * No more DATA goes out on the stream. Java takes it out of StreamFlowController once its FIN
+     * is written, and credit the client sends for it after that is ignored instead of counted
+     * toward the 16 MiB window; so it is here, from before the FIN goes out.
+     */
+    pthread_mutex_lock(&conn->flow_lock);
+    conn->flow_closed = 1;
+    pthread_cond_broadcast(&conn->flow_cond);
+    pthread_mutex_unlock(&conn->flow_lock);
     /* A stream already closed (reset by either side, or its connection shutting down) is over;
      * a FIN after its RST would name a stream the client has already dropped. */
     pthread_mutex_lock(&session->map_lock);
@@ -4996,11 +5271,12 @@ static void *external_conn_thread(void *arg)
     return NULL;
 }
 
-static int start_external_conn(specus_session *session,
+static int start_external_conn(specus_listener *listener,
                                int fd,
-                               int port,
                                const struct sockaddr_storage *remote)
 {
+    specus_session *session = listener->session;
+    int port = listener->port;
     external_conn *conn = (external_conn *)calloc(1, sizeof(*conn));
     if (conn == NULL) {
         close(fd);
@@ -5024,10 +5300,13 @@ static int start_external_conn(specus_session *session,
     }
 
     pthread_mutex_lock(&session->map_lock);
-    if (try_count_external_connection(conn) != 0) {
+    /* accept() may return a connection just as the listener is stopped (UNREGISTER, a newer login
+     * of the client, the connection's end): Java's closed server channel takes none any more. */
+    int stopped = !session->active || listener->done;
+    if (stopped || try_count_external_connection(conn) != 0) {
         pthread_mutex_unlock(&session->map_lock);
-        fprintf(stderr, "[nat] reject external connection on port=%d client=%s: limit reached\n",
-                port, session->config.client_name);
+        fprintf(stderr, "[nat] reject external connection on port=%d client=%s: %s\n",
+                port, session->config.client_name, stopped ? "listener stopped" : "limit reached");
         close(fd);
         pthread_cond_destroy(&conn->flow_cond);
         pthread_mutex_destroy(&conn->flow_lock);
@@ -5042,33 +5321,98 @@ static int start_external_conn(specus_session *session,
     }
     mark_stream_opened_locked(session, conn->stream_id);
     snprintf(conn->channel_id, sizeof(conn->channel_id), "c-%u", conn->stream_id);
-    /* Both workers are reserved before anyone can stop the stream, so its socket outlives them. */
+    /*
+     * Both workers are reserved before anyone can stop the stream, so its socket outlives them,
+     * and so does the stream itself: the reader's reservation keeps it alive (and here) while
+     * the writer may already be running, until the reader is started or given up.
+     */
     conn->io_workers = 2U;
+    session->nat_threads += 2U;
     conn->next = session->conns;
     session->conns = conn;
     pthread_mutex_unlock(&session->map_lock);
 
-    if (pthread_create(&conn->writer_thread, NULL, external_writer_thread, conn) != 0) {
+    if (start_detached_thread(external_writer_thread, conn) != 0) {
         perror("pthread_create");
-        pthread_mutex_lock(&session->map_lock);
-        conn->io_workers -= 2U;
-        close_conn_locked(conn);
-        pthread_mutex_unlock(&session->map_lock);
+        external_workers_not_started(conn, 2U);
         return -1;
     }
-    conn->writer_thread_started = 1;
-    if (pthread_create(&conn->thread, NULL, external_conn_thread, conn) != 0) {
+    /* Once the reader runs, conn is the workers' alone: the last of them to finish frees it. */
+    if (start_detached_thread(external_conn_thread, conn) != 0) {
         perror("pthread_create");
-        pthread_mutex_lock(&session->map_lock);
-        --conn->io_workers;
-        close_conn_locked(conn);
-        pthread_mutex_unlock(&session->map_lock);
-        pthread_join(conn->writer_thread, NULL);
-        conn->writer_thread_started = 0;
+        external_workers_not_started(conn, 1U);
         return -1;
     }
-    conn->thread_started = 1;
     return 0;
+}
+
+/*
+ * accept() failures Java never sees: OpenJDK's Net.accept retries ECONNABORTED (the connection
+ * was reset before it was taken) itself and reports EINTR and EAGAIN as nothing accepted. Every
+ * other failure is an IOException to Netty.
+ */
+static int accept_retry_at_once(int accept_errno)
+{
+    return accept_errno == EINTR || accept_errno == ECONNABORTED || accept_errno == EAGAIN
+        || accept_errno == EWOULDBLOCK;
+}
+
+/*
+ * Milliseconds on CLOCK_MONOTONIC, which a wall-clock step does not move.
+ */
+static long long accept_monotonic_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000L;
+}
+
+/*
+ * The control listener's pause after a failed accept (see listener_pause_after_accept_error).
+ * Returns 1 when a shutdown was requested meanwhile; the byte stays in the pipe.
+ */
+static int control_accept_pause(int shutdown_fd)
+{
+    long long deadline = accept_monotonic_ms() + ST_ACCEPT_ERROR_PAUSE_MS;
+    for (;;) {
+        long long remaining = deadline - accept_monotonic_ms();
+        if (remaining <= 0) {
+            return 0;
+        }
+        struct pollfd wake = {.fd = shutdown_fd, .events = POLLIN, .revents = 0};
+        int ready = poll(&wake, 1, (int)remaining);
+        if (ready > 0) {
+            return 1;
+        }
+        if (ready < 0 && errno != EINTR) {
+            return 0;
+        }
+    }
+}
+
+/*
+ * Netty's ServerBootstrapAcceptor, on an IOException from accept (EMFILE, ENFILE, ENOBUFS,
+ * ENOMEM, a network error of the pending connection, ...): the server channel stays open, reads
+ * stop for 1 s, then accepting resumes. Returns 1 when the listener was stopped meanwhile.
+ */
+static int listener_pause_after_accept_error(specus_listener *listener)
+{
+    specus_session *session = listener->session;
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += ST_ACCEPT_ERROR_PAUSE_MS / 1000;
+    deadline.tv_nsec += (long)(ST_ACCEPT_ERROR_PAUSE_MS % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&session->map_lock);
+    while (!listener->done && session->active
+           && pthread_cond_timedwait(&session->nat_threads_cond, &session->map_lock, &deadline) != ETIMEDOUT) {
+    }
+    int stopped = listener->done || !session->active;
+    pthread_mutex_unlock(&session->map_lock);
+    return stopped;
 }
 
 static void *listener_thread(void *arg)
@@ -5083,25 +5427,44 @@ static void *listener_thread(void *arg)
         socklen_t remote_len = sizeof(remote);
         int fd = accept(listener->fd, (struct sockaddr *)&remote, &remote_len);
         if (fd < 0) {
-            if (errno == EINTR) {
+            int accept_errno = errno;
+            if (accept_retry_at_once(accept_errno)) {
                 continue;
             }
-            break;
+            /* Stopping the listener shuts its socket down, after which accept() fails with EINVAL. */
+            if (accept_errno == EINVAL || accept_errno == EBADF || accept_errno == ENOTSOCK) {
+                break;
+            }
+            /* Running out of descriptors or memory does not close the port, as in Netty. */
+            fprintf(stderr, "[nat] accept failed port=%d client=%s: %s; retrying in %d ms\n",
+                    listener->port, session->config.client_name, strerror(accept_errno), ST_ACCEPT_ERROR_PAUSE_MS);
+            if (listener_pause_after_accept_error(listener)) {
+                break;
+            }
+            continue;
         }
-        int one = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        start_external_conn(session, fd, listener->port, &remote);
+        apply_netty_child_options(fd, &session->config);
+        start_external_conn(listener, fd, &remote);
     }
 
+    printf("[nat] listener stopped port=%d client=%s\n",
+           listener->port, session->config.client_name);
+    /* No accept() can use the descriptor any more: close it, and let the listener go. */
     pthread_mutex_lock(&session->map_lock);
     if (listener->fd >= 0) {
         close(listener->fd);
         listener->fd = -1;
     }
     listener->done = 1;
+    for (specus_listener **cursor = &session->listeners; *cursor != NULL; cursor = &(*cursor)->next) {
+        if (*cursor == listener) {
+            *cursor = listener->next;
+            break;
+        }
+    }
+    nat_threads_release_locked(session, 1U);
     pthread_mutex_unlock(&session->map_lock);
-    printf("[nat] listener stopped port=%d client=%s\n",
-           listener->port, session->config.client_name);
+    free(listener);
     return NULL;
 }
 
@@ -5117,7 +5480,7 @@ static int listener_exists_locked(specus_session *session, int port)
 
 static int start_specus_listener(specus_session *session, int port, char *reason, size_t reason_len)
 {
-    int fd = create_listener(port);
+    int fd = create_listener(port, &session->config);
     if (fd < 0) {
         snprintf(reason, reason_len, "port %d bind failed", port);
         return -1;
@@ -5143,22 +5506,35 @@ static int start_specus_listener(specus_session *session, int port, char *reason
     }
     listener->next = session->listeners;
     session->listeners = listener;
+    ++session->nat_threads;
     pthread_mutex_unlock(&session->map_lock);
 
-    if (pthread_create(&listener->thread, NULL, listener_thread, listener) != 0) {
+    if (start_detached_thread(listener_thread, listener) != 0) {
         perror("pthread_create");
         pthread_mutex_lock(&session->map_lock);
-        close(listener->fd);
-        listener->fd = -1;
-        listener->done = 1;
+        for (specus_listener **cursor = &session->listeners; *cursor != NULL; cursor = &(*cursor)->next) {
+            if (*cursor == listener) {
+                *cursor = listener->next;
+                break;
+            }
+        }
+        nat_threads_release_locked(session, 1U);
         pthread_mutex_unlock(&session->map_lock);
+        /* Shut down at most, by a stop that found it published; no thread ever used it. */
+        close(fd);
+        free(listener);
         snprintf(reason, reason_len, "failed to start listener thread");
         return -1;
     }
-    listener->thread_started = 1;
     return 0;
 }
 
+/*
+ * UNREGISTER: shutting the listening socket down ends its accept() and frees the port at once
+ * (see release_session_listeners). Its descriptor stays open until the listener thread, which may
+ * be about to call accept() on it, has ended: closed now, the number could already name another
+ * socket, a listener of another client's port included, by the time that accept() runs.
+ */
 static void stop_specus_listener(specus_session *session, int port)
 {
     pthread_mutex_lock(&session->map_lock);
@@ -5166,12 +5542,12 @@ static void stop_specus_listener(specus_session *session, int port)
         if (!listener->done && listener->port == port) {
             if (listener->fd >= 0) {
                 shutdown(listener->fd, SHUT_RDWR);
-                close(listener->fd);
-                listener->fd = -1;
             }
             listener->done = 1;
         }
     }
+    /* A listener pausing after a failed accept ends at once. */
+    pthread_cond_broadcast(&session->nat_threads_cond);
     pthread_mutex_unlock(&session->map_lock);
 }
 
@@ -5242,7 +5618,12 @@ static void reset_unknown_stream(specus_session *session, uint32_t stream_id,
  * DATA or DATA|END_STREAM for an ordinary TCP stream; an empty DATA|END_STREAM is a bare FIN. A
  * frame the stream cannot take resets only this stream (protocol/spec/control-protocol.md): DATA
  * for an unknown stream or after the client's FIN with RST 7 as in Java and Go, a frame the 4 MiB
- * client-to-public queue cannot hold with RST 6 like Java StreamFlowController's queue overflow.
+ * client-to-public queue cannot hold (or one over the spec's 64 KiB DATA fragment) with RST 6.
+ * That queue is C's own: Java writes client data straight to the public channel and, once it is
+ * not writable, stops reading the whole data connection (RemoteSpecusHandler.writeFromClient),
+ * where C stops only this stream (API inventory §8). RST 6 mirrors the code of Java's queue
+ * overflow in the other direction (StreamFlowController), which a client that keeps to its
+ * window never meets here either.
  */
 static void process_control_data(specus_session *session, const st_nat_message *message)
 {
@@ -5365,6 +5746,16 @@ static void process_unregister(specus_session *session, const st_nat_message *me
  */
 static int process_nat_message(specus_session *session, const st_nat_message *message)
 {
+    /*
+     * Java StreamFlowController.onWindowUpdate checks the credit before it looks the stream up: a
+     * WINDOW_UPDATE beyond the 16 MiB window closes the data connection whatever stream it names,
+     * an unknown, finished or abandoned one included. (A credit of 0 never decodes.)
+     */
+    if (message->type == ST_NAT_WINDOW_UPDATE && message->value > ST_STREAM_MAX_WINDOW) {
+        fprintf(stderr, "[nat] WINDOW_UPDATE of %u exceeds the 16 MiB window stream=%u client=%s\n",
+                (unsigned)message->value, message->stream_id, session->config.client_name);
+        return -1;
+    }
     int direct_result = process_direct_http_message(session, message);
     if (direct_result != 0) {
         if (direct_result < 0) {
@@ -5445,12 +5836,12 @@ static void session_shutdown(specus_session *session)
 
     pthread_mutex_lock(&session->map_lock);
     session->active = 0;
+    /* Each listener thread closes its own descriptor once its accept() has returned. */
     for (specus_listener *listener = session->listeners; listener != NULL; listener = listener->next) {
         if (listener->fd >= 0) {
             shutdown(listener->fd, SHUT_RDWR);
-            close(listener->fd);
-            listener->fd = -1;
         }
+        listener->done = 1;
     }
     for (external_conn *conn = session->conns; conn != NULL; conn = conn->next) {
         close_conn_locked(conn);
@@ -5458,41 +5849,29 @@ static void session_shutdown(specus_session *session)
     for (ws_conn *conn = session->ws_conns; conn != NULL; conn = conn->next) {
         st_admin_direct_ws_close(conn->stream);
     }
+    /* Every listener and worker frees what it owns as it ends; the session must outlive them. */
+    pthread_cond_broadcast(&session->nat_threads_cond);
+    while (session->nat_threads > 0U) {
+        pthread_cond_wait(&session->nat_threads_cond, &session->map_lock);
+    }
+    specus_listener *listener = session->listeners;
+    session->listeners = NULL;
+    external_conn *conn = session->conns;
+    session->conns = NULL;
     pthread_mutex_unlock(&session->map_lock);
 
-    for (specus_listener *listener = session->listeners; listener != NULL; listener = listener->next) {
-        if (listener->thread_started) {
-            pthread_join(listener->thread, NULL);
-        }
-    }
-    for (external_conn *conn = session->conns; conn != NULL; conn = conn->next) {
-        if (conn->thread_started) {
-            pthread_join(conn->thread, NULL);
-        }
-        if (conn->writer_thread_started) {
-            pthread_join(conn->writer_thread, NULL);
-        }
-    }
-
-    specus_listener *listener = session->listeners;
+    /* Nothing is left here but what no thread ever ran for; a safety net only. */
     while (listener != NULL) {
         specus_listener *next = listener->next;
+        if (listener->fd >= 0) {
+            close(listener->fd);
+        }
         free(listener);
         listener = next;
     }
-    external_conn *conn = session->conns;
     while (conn != NULL) {
         external_conn *next = conn->next;
-        /* Both workers are joined and the last of them closed the socket; a safety net only. */
-        if (conn->fd >= 0) {
-            close(conn->fd);
-        }
-        free_external_write_queue(conn);
-        pthread_cond_destroy(&conn->flow_cond);
-        pthread_mutex_destroy(&conn->flow_lock);
-        pthread_cond_destroy(&conn->write_cond);
-        pthread_mutex_destroy(&conn->write_lock);
-        free(conn);
+        free_external_conn(conn);
         conn = next;
     }
     ws_conn *ws = session->ws_conns;
@@ -5577,16 +5956,20 @@ static void *client_thread(void *arg)
     pthread_mutex_init(&session->map_lock, NULL);
     pthread_mutex_init(&session->direct_lock, NULL);
     pthread_cond_init(&session->reference_cond, NULL);
+    int nat_cond_ok = nat_threads_cond_init(session) == 0;
     remote_text(&args->remote, args->remote_len, session->remote, sizeof(session->remote));
     free(args);
 
-    if (connection_register(session) != 0) {
+    if (!nat_cond_ok || connection_register(session) != 0) {
         /* Accepted just as the server began to stop: nothing was read, so nothing to record. */
         close(session->control_fd);
         pthread_mutex_destroy(&session->send_lock);
         pthread_mutex_destroy(&session->map_lock);
         pthread_mutex_destroy(&session->direct_lock);
         pthread_cond_destroy(&session->reference_cond);
+        if (nat_cond_ok) {
+            pthread_cond_destroy(&session->nat_threads_cond);
+        }
         free(session);
         return NULL;
     }
@@ -5606,6 +5989,7 @@ static void *client_thread(void *arg)
             pthread_mutex_destroy(&session->map_lock);
             pthread_mutex_destroy(&session->direct_lock);
             pthread_cond_destroy(&session->reference_cond);
+            pthread_cond_destroy(&session->nat_threads_cond);
             free(session);
             return NULL;
         }
@@ -5618,7 +6002,9 @@ static void *client_thread(void *arg)
     for (;;) {
         st_frame_header header;
         uint8_t *body = NULL;
-        size_t frame_limit = logged_in ? ST_MAX_FRAME_SIZE : ST_PRE_AUTH_MAX_FRAME_SIZE;
+        /* Java's Spliter: SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE until login, then MAX_FRAME_SIZE. */
+        size_t frame_limit = logged_in ? session->config.netty_max_frame_size
+                                       : session->config.netty_pre_auth_max_frame_size;
         int rc = read_frame(session, frame_limit, &header, &body);
         if (rc != 1 && session_write_failed(session)) {
             /* A failed write, on whichever thread sent it, shut the socket down and so ended the read. */
@@ -6007,6 +6393,7 @@ static void *client_thread(void *arg)
     pthread_mutex_destroy(&session->map_lock);
     pthread_mutex_destroy(&session->direct_lock);
     pthread_cond_destroy(&session->reference_cond);
+    pthread_cond_destroy(&session->nat_threads_cond);
     free(session);
     return NULL;
 }
@@ -6183,7 +6570,7 @@ int main(void)
         st_public_discovery_shutdown();
         return 1;
     }
-    int listener = create_listener_on(config.bind_address, config.port);
+    int listener = create_listener_on(config.bind_address, config.port, &config);
     if (listener < 0) {
         shutdown_wake_close(shutdown_pipe);
         st_stun_turn_server_stop(stun_turn_server);
@@ -6287,6 +6674,13 @@ int main(void)
         return 1;
     }
 
+    /*
+     * Like Netty's server channel the control listener outlives a failed accept: running out of
+     * descriptors or memory pauses it for 1 s (ServerBootstrapAcceptor) instead of ending the
+     * process. Only a listener that is itself broken ends it, and then with a failure status, so
+     * a supervisor restarts it.
+     */
+    int exit_status = 0;
     for (;;) {
         struct pollfd ready[2];
         ready[0].fd = listener;
@@ -6296,10 +6690,18 @@ int main(void)
         ready[1].events = POLLIN;
         ready[1].revents = 0;
         if (poll(ready, 2, -1) < 0) {
-            if (errno == EINTR) {
+            int poll_errno = errno;
+            if (poll_errno == EINTR) {
                 continue;
             }
-            perror("poll");
+            fprintf(stderr, "[server] control listener poll failed: %s\n", strerror(poll_errno));
+            if (poll_errno == ENOMEM) {
+                if (control_accept_pause(shutdown_pipe[0])) {
+                    break;
+                }
+                continue;
+            }
+            exit_status = 1;
             break;
         }
         if (ready[1].revents != 0) {
@@ -6308,24 +6710,38 @@ int main(void)
         if ((ready[0].revents & POLLIN) == 0) {
             if ((ready[0].revents & (POLLERR | POLLNVAL)) != 0) {
                 fprintf(stderr, "control listener failed\n");
+                exit_status = 1;
                 break;
             }
             continue;
         }
         client_args *args = (client_args *)calloc(1, sizeof(*args));
         if (args == NULL) {
-            fprintf(stderr, "out of memory\n");
-            break;
+            fprintf(stderr, "[server] accept failed: out of memory; retrying in %d ms\n", ST_ACCEPT_ERROR_PAUSE_MS);
+            if (control_accept_pause(shutdown_pipe[0])) {
+                break;
+            }
+            continue;
         }
         args->remote_len = sizeof(args->remote);
         args->fd = accept(listener, (struct sockaddr *)&args->remote, &args->remote_len);
         if (args->fd < 0) {
+            int accept_errno = errno;
             free(args);
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED) {
+            if (accept_retry_at_once(accept_errno)) {
                 continue;
             }
-            perror("accept");
-            break;
+            if (accept_errno == EBADF || accept_errno == EINVAL || accept_errno == ENOTSOCK) {
+                fprintf(stderr, "control listener failed: %s\n", strerror(accept_errno));
+                exit_status = 1;
+                break;
+            }
+            fprintf(stderr, "[server] accept failed: %s; retrying in %d ms\n", strerror(accept_errno),
+                    ST_ACCEPT_ERROR_PAUSE_MS);
+            if (control_accept_pause(shutdown_pipe[0])) {
+                break;
+            }
+            continue;
         }
         /* Linux does not pass O_NONBLOCK on to accepted sockets, but other systems do. */
         int accepted_flags = fcntl(args->fd, F_GETFL, 0);
@@ -6335,8 +6751,7 @@ int main(void)
         args->config = config;
         /* Shared until the login loads the account's own set; the listener's config keeps it. */
         args->config.owns_routes = 0;
-        int one = 1;
-        setsockopt(args->fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        apply_netty_child_options(args->fd, &config);
         configure_control_socket(args->fd, &config);
 
         pthread_t thread;
@@ -6394,5 +6809,5 @@ int main(void)
     st_tls_server_context_free(config.tls_context);
     config_release_routes(&config);
     st_public_discovery_shutdown();
-    return 0;
+    return exit_status;
 }
