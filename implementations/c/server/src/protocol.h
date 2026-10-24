@@ -65,6 +65,12 @@ typedef struct {
     char *message;
 } st_message_response;
 
+/* Java LogoutResponsePacket: success, then a nullable reason. */
+typedef struct {
+    int success;
+    char *reason;
+} st_logout_response;
+
 typedef struct {
     uint8_t *data;
     size_t len;
@@ -92,18 +98,32 @@ typedef enum {
 } st_protocol_rejection;
 
 /*
- * Why the last st_protocol_read_header or st_protocol_decode_* call of this thread failed, by the
- * reason Java's PacketCodec gives the same frame; NONE after a success, and after a refusal that is
- * no codec error in Java (a login role that is neither control nor data).
+ * Why the last st_protocol_read_header, st_protocol_decode_* or st_protocol_validate_body call of
+ * this thread failed, by the reason Java's PacketCodec gives the same frame; NONE after a success,
+ * and after a refusal that is no codec error in Java (a login role that is neither control nor data).
  */
 st_protocol_rejection st_protocol_last_rejection(void);
 
 int st_protocol_read_header(const uint8_t raw[ST_HEADER_SIZE], st_frame_header *header);
+/* HEARTBEAT_REQUEST, HEARTBEAT_RESPONSE and LOGOUT_REQUEST: Java's schemas have no fields, so a body
+ * of even one byte has trailing bytes, MALFORMED_BODY. */
 int st_protocol_decode_empty_packet(const uint8_t *body, size_t body_len);
+int st_protocol_decode_logout_response(const uint8_t *body, size_t body_len, st_logout_response *response);
 int st_protocol_decode_login_request(const uint8_t *body, size_t body_len, st_login_request *request);
 int st_protocol_decode_message_response(const uint8_t *body, size_t body_len, st_message_response *response);
 int st_protocol_decode_nat_message(const uint8_t *body, size_t body_len, st_nat_message *message);
+/*
+ * Java PacketCodec.decode's body step for a frame whose header st_protocol_read_header accepted: 0
+ * when Java's codec reads the body as the command's packet, -1 with the reason in
+ * st_protocol_last_rejection when it refuses it. It reads past the fields without copying or
+ * allocating anything (a refused NAT frame can be 32 MiB). It is for the frames the server
+ * refuses without handling them (a non-login frame before login, a frame of the other role, a second
+ * login, a server packet): Java decodes those before any handler looks at them. A login role of any
+ * value, null included, and a null messageType are read, as Java's codec reads them.
+ */
+int st_protocol_validate_body(int8_t command, const uint8_t *body, size_t body_len);
 st_buffer st_protocol_encode_login_response(const char *client_name, int success, const char *reason);
+st_buffer st_protocol_encode_logout_response(int success, const char *reason);
 st_buffer st_protocol_encode_message_response(const char *client_name,
                                                const char *to_client_name,
                                                int message_type,
@@ -118,6 +138,7 @@ st_buffer st_protocol_encode_nat_message(int type, uint8_t flags, uint32_t strea
 st_buffer st_protocol_encode_empty_packet(int8_t command);
 void st_login_request_free(st_login_request *request);
 void st_message_response_free(st_message_response *response);
+void st_logout_response_free(st_logout_response *response);
 void st_nat_message_free(st_nat_message *message);
 void st_buffer_free(st_buffer *buffer);
 

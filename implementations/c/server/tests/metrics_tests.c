@@ -735,6 +735,88 @@ static void test_protocol_reasons(void)
                i, rc, (int)st_protocol_last_rejection(), nat[i].rc, (int)nat[i].reason);
         if (rc == 0) st_nat_message_free(&decoded);
     }
+
+    /*
+     * Java PacketCodec's verdict on each body, for the frames the server loop does not otherwise
+     * read: heartbeats and LOGOUT_REQUEST (no fields), LOGOUT_RESPONSE (success, reason) and the
+     * frames it refuses unhandled. Each was checked against Java's PacketCodec.decode.
+     */
+    static const uint8_t one_zero[] = {0};
+    static const uint8_t logout_ok[] = {1, 0};
+    static const uint8_t logout_reason[] = {0, 3, 'n', 'o'};
+    static const uint8_t logout_no_reason_field[] = {1};
+    static const uint8_t logout_bad_boolean[] = {2, 0};
+    static const uint8_t logout_trailing[] = {1, 0, 0};
+    static const uint8_t logout_truncated_reason[] = {1, 5, 'a'};
+    static const uint8_t logout_long_varint[] = {1, 0x80, 0x80, 0x80, 0x80, 0x80};
+    static const uint8_t login_response_ok[] = {2, 'c', 1, 0};
+    static const uint8_t login_response_bad_boolean[] = {2, 'c', 7, 0};
+    static const uint8_t message_null_type[] = {2, 'a', 2, 'b', 0, 2, 'm'};
+    static const uint8_t message_bad_type_body[] = {2, 'a', 2, 'b', 6, 2, 'm'};
+    static const uint8_t nat_short[] = {6, 0, 0, 0};
+    /* One byte over the login body limit (16 KiB frames before login, header included). */
+    static const uint8_t oversized_login[ST_PRE_AUTH_MAX_FRAME_SIZE - ST_HEADER_SIZE + 1U] = {0};
+    static const struct {
+        int8_t command;
+        const uint8_t *body;
+        size_t body_len;
+        int rc;
+        st_protocol_rejection reason;
+    } bodies[] = {
+        {ST_CMD_HEARTBEAT_REQUEST, one_zero, 0, 0, ST_PROTOCOL_REJECTION_NONE},
+        {ST_CMD_HEARTBEAT_REQUEST, one_zero, 1, -1, ST_PROTOCOL_REJECTION_MALFORMED_BODY},
+        {ST_CMD_HEARTBEAT_RESPONSE, one_zero, 1, -1, ST_PROTOCOL_REJECTION_MALFORMED_BODY},
+        {ST_CMD_LOGOUT_REQUEST, one_zero, 1, -1, ST_PROTOCOL_REJECTION_MALFORMED_BODY},
+        {ST_CMD_LOGOUT_REQUEST, logout_ok, 2, -1, ST_PROTOCOL_REJECTION_MALFORMED_BODY},
+        {ST_CMD_LOGOUT_RESPONSE, logout_ok, sizeof(logout_ok), 0, ST_PROTOCOL_REJECTION_NONE},
+        {ST_CMD_LOGOUT_RESPONSE, logout_reason, sizeof(logout_reason), 0, ST_PROTOCOL_REJECTION_NONE},
+        {ST_CMD_LOGOUT_RESPONSE, one_zero, 0, -1, ST_PROTOCOL_REJECTION_MALFORMED_BODY},
+        {ST_CMD_LOGOUT_RESPONSE, logout_no_reason_field, sizeof(logout_no_reason_field), -1,
+         ST_PROTOCOL_REJECTION_MALFORMED_BODY},
+        {ST_CMD_LOGOUT_RESPONSE, logout_bad_boolean, sizeof(logout_bad_boolean), -1,
+         ST_PROTOCOL_REJECTION_MALFORMED_BODY},
+        {ST_CMD_LOGOUT_RESPONSE, logout_trailing, sizeof(logout_trailing), -1, ST_PROTOCOL_REJECTION_MALFORMED_BODY},
+        {ST_CMD_LOGOUT_RESPONSE, logout_truncated_reason, sizeof(logout_truncated_reason), -1,
+         ST_PROTOCOL_REJECTION_MALFORMED_BODY},
+        {ST_CMD_LOGOUT_RESPONSE, logout_long_varint, sizeof(logout_long_varint), -1,
+         ST_PROTOCOL_REJECTION_MALFORMED_BODY},
+        {ST_CMD_LOGIN_RESPONSE, login_response_ok, sizeof(login_response_ok), 0, ST_PROTOCOL_REJECTION_NONE},
+        {ST_CMD_LOGIN_RESPONSE, login_response_bad_boolean, sizeof(login_response_bad_boolean), -1,
+         ST_PROTOCOL_REJECTION_MALFORMED_BODY},
+        /* The codec reads any role, null too; the login handler is what refuses those. */
+        {ST_CMD_LOGIN_REQUEST, login_ok, sizeof(login_ok), 0, ST_PROTOCOL_REJECTION_NONE},
+        {ST_CMD_LOGIN_REQUEST, login_bad_role, sizeof(login_bad_role), 0, ST_PROTOCOL_REJECTION_NONE},
+        {ST_CMD_LOGIN_REQUEST, login_null_role, sizeof(login_null_role), 0, ST_PROTOCOL_REJECTION_NONE},
+        {ST_CMD_LOGIN_REQUEST, login_trailing, sizeof(login_trailing), -1, ST_PROTOCOL_REJECTION_MALFORMED_BODY},
+        {ST_CMD_LOGIN_REQUEST, login_truncated, sizeof(login_truncated), -1, ST_PROTOCOL_REJECTION_MALFORMED_BODY},
+        /* MessageTypeCodec reads 0 as a null messageType. */
+        {ST_CMD_MESSAGE_RESPONSE, message_null_type, sizeof(message_null_type), 0, ST_PROTOCOL_REJECTION_NONE},
+        {ST_CMD_MESSAGE_REQUEST, message_bad_type_body, sizeof(message_bad_type_body), -1,
+         ST_PROTOCOL_REJECTION_MALFORMED_BODY},
+        {ST_CMD_NAT_MESSAGE, nat_short, sizeof(nat_short), -1, ST_PROTOCOL_REJECTION_INVALID_LENGTH},
+        {ST_CMD_LOGIN_REQUEST, oversized_login, sizeof(oversized_login), -1, ST_PROTOCOL_REJECTION_INVALID_LENGTH},
+        {5, one_zero, 0, -1, ST_PROTOCOL_REJECTION_UNKNOWN_COMMAND},
+    };
+    for (size_t i = 0; i < sizeof(bodies) / sizeof(bodies[0]); ++i) {
+        int rc = st_protocol_validate_body(bodies[i].command, bodies[i].body, bodies[i].body_len);
+        EXPECT(rc == bodies[i].rc && st_protocol_last_rejection() == bodies[i].reason,
+               "body case %zu (command %d): %d/%d, want %d/%d", i, (int)bodies[i].command, rc,
+               (int)st_protocol_last_rejection(), bodies[i].rc, (int)bodies[i].reason);
+        int empty_command = bodies[i].command == ST_CMD_HEARTBEAT_REQUEST
+            || bodies[i].command == ST_CMD_HEARTBEAT_RESPONSE || bodies[i].command == ST_CMD_LOGOUT_REQUEST;
+        if (empty_command) {
+            rc = st_protocol_decode_empty_packet(bodies[i].body, bodies[i].body_len);
+            EXPECT(rc == bodies[i].rc && st_protocol_last_rejection() == bodies[i].reason,
+                   "empty body case %zu: %d/%d", i, rc, (int)st_protocol_last_rejection());
+        }
+        if (bodies[i].command == ST_CMD_LOGOUT_RESPONSE) {
+            st_logout_response logout;
+            rc = st_protocol_decode_logout_response(bodies[i].body, bodies[i].body_len, &logout);
+            EXPECT(rc == bodies[i].rc && st_protocol_last_rejection() == bodies[i].reason,
+                   "logout response case %zu: %d/%d", i, rc, (int)st_protocol_last_rejection());
+            if (rc == 0) st_logout_response_free(&logout);
+        }
+    }
 }
 
 /* ---- the other management settings Java reads (each case measured on the Java server) -------- */

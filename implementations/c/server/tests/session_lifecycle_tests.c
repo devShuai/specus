@@ -1797,10 +1797,11 @@ static st_buffer encode_server_packet(int which, const char *client_name)
     if (which == 1) {
         return st_protocol_encode_message_response(client_name, NULL, ST_MESSAGE_TYPE_SERVER_TO_CLIENT, "x");
     }
-    return st_protocol_encode_empty_packet(ST_CMD_LOGOUT_RESPONSE);
+    return st_protocol_encode_logout_response(1, NULL);
 }
 
-/* LOGOUT_REQUEST is answered with LOGOUT_RESPONSE before the server closes the connection. */
+/* LOGOUT_REQUEST is answered with LOGOUT_RESPONSE before the server closes the connection. The close
+ * is C's own: Java, Go and .NET only unbind the connection (c-server-api-inventory.md section 8). */
 static int expect_logout_answered(int fd)
 {
     st_buffer logout = st_protocol_encode_empty_packet(ST_CMD_LOGOUT_REQUEST);

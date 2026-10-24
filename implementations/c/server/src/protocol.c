@@ -10,6 +10,8 @@ typedef struct {
     const uint8_t *data;
     size_t len;
     size_t pos;
+    /* Set when a field could not be copied for want of memory: no codec rejection in Java's terms. */
+    int out_of_memory;
 } compact_reader;
 
 typedef struct {
@@ -114,6 +116,7 @@ static int reader_string(compact_reader *reader, char **value)
     }
     char *out = (char *)malloc((size_t)len + 1U);
     if (out == NULL) {
+        reader->out_of_memory = 1;
         return -1;
     }
     memcpy(out, reader->data + reader->pos, len);
@@ -121,6 +124,42 @@ static int reader_string(compact_reader *reader, char **value)
     reader->pos += len;
     *value = out;
     return 0;
+}
+
+/* A string field passed over, as Java's StringCodec reads it: varint(length + 1) or 0 for null. */
+static int reader_skip_string(compact_reader *reader)
+{
+    uint32_t marker;
+    if (reader_varint(reader, &marker) != 0) {
+        return -1;
+    }
+    if (marker == 0) {
+        return 0;
+    }
+    uint32_t len = marker - 1U;
+    if (reader->len - reader->pos < len) {
+        return -1;
+    }
+    reader->pos += len;
+    return 0;
+}
+
+/* Java BooleanCodec: one byte, 0 or 1; any other value is refused. */
+static int reader_bool(compact_reader *reader, int *value)
+{
+    uint8_t b;
+    if (reader_u8(reader, &b) != 0 || b > 1U) {
+        return -1;
+    }
+    *value = b;
+    return 0;
+}
+
+/* Java MessageTypeCodec: 0 is a null messageType, any other value must be a known wire id. */
+static int reader_skip_message_type(compact_reader *reader)
+{
+    uint32_t marker;
+    return reader_varint(reader, &marker) != 0 || marker > ST_MESSAGE_TYPE_PEER_CONTROL ? -1 : 0;
 }
 
 static int reader_enum(compact_reader *reader, int *value)
@@ -317,10 +356,40 @@ int st_protocol_read_header(const uint8_t raw[ST_HEADER_SIZE], st_frame_header *
     return 0;
 }
 
+/*
+ * A CompactBinary body the reader could not get through, trailing bytes included: MALFORMED_BODY in
+ * Java. A field that could not be copied for want of memory is no codec rejection and is not counted.
+ */
+static int reader_refusal(const compact_reader *reader)
+{
+    return reader->out_of_memory ? -1 : protocol_reject(ST_PROTOCOL_REJECTION_MALFORMED_BODY);
+}
+
 int st_protocol_decode_empty_packet(const uint8_t *body, size_t body_len)
 {
     (void)body;
-    return body_len == 0 ? 0 : -1;
+    protocol_rejection = ST_PROTOCOL_REJECTION_NONE;
+    /* Java's ObjectSchema reads no field and then refuses whatever is left as trailing bytes. */
+    return body_len == 0 ? 0 : protocol_reject(ST_PROTOCOL_REJECTION_MALFORMED_BODY);
+}
+
+int st_protocol_decode_logout_response(const uint8_t *body, size_t body_len, st_logout_response *response)
+{
+    protocol_rejection = ST_PROTOCOL_REJECTION_NONE;
+    memset(response, 0, sizeof(*response));
+    compact_reader reader = {
+        .data = body,
+        .len = body_len,
+        .pos = 0
+    };
+    /* Java CompactBinarySerializer's LogoutResponsePacket schema: success, reason; nothing after. */
+    if (reader_bool(&reader, &response->success) != 0
+        || reader_string(&reader, &response->reason) != 0
+        || reader.pos != reader.len) {
+        st_logout_response_free(response);
+        return reader_refusal(&reader);
+    }
+    return 0;
 }
 
 int st_protocol_decode_login_request(const uint8_t *body, size_t body_len, st_login_request *request)
@@ -339,7 +408,7 @@ int st_protocol_decode_login_request(const uint8_t *body, size_t body_len, st_lo
         || reader_string(&reader, &request->connection_role) != 0
         || reader.pos != reader.len) {
         st_login_request_free(request);
-        return protocol_reject(ST_PROTOCOL_REJECTION_MALFORMED_BODY);
+        return reader_refusal(&reader);
     }
     /* Java's codec reads any role, null included; the login handler is what refuses it. */
     if (request->connection_role == NULL
@@ -366,7 +435,7 @@ int st_protocol_decode_message_response(const uint8_t *body, size_t body_len, st
         || reader_string(&reader, &response->message) != 0
         || reader.pos != reader.len) {
         st_message_response_free(response);
-        return protocol_reject(ST_PROTOCOL_REJECTION_MALFORMED_BODY);
+        return reader_refusal(&reader);
     }
     return 0;
 }
@@ -407,11 +476,13 @@ static int validate_nat_semantics(int type, uint8_t flags, uint32_t stream_id, u
     return 0;
 }
 
-/* Java PacketCodec.decodeNatMessage: sizes are INVALID_LENGTH, the rest MALFORMED_BODY. */
-int st_protocol_decode_nat_message(const uint8_t *body, size_t body_len, st_nat_message *message)
+/*
+ * Java PacketCodec.decodeNatMessage's checks, without copying anything: sizes are INVALID_LENGTH, the
+ * rest MALFORMED_BODY. Fills the fixed fields of *message and the two lengths.
+ */
+static int check_nat_body(const uint8_t *body, size_t body_len, st_nat_message *message,
+                          size_t *meta_len, size_t *data_len)
 {
-    protocol_rejection = ST_PROTOCOL_REJECTION_NONE;
-    memset(message, 0, sizeof(*message));
     if (body == NULL || body_len < ST_NAT_HEADER_SIZE) {
         return protocol_reject(ST_PROTOCOL_REJECTION_INVALID_LENGTH);
     }
@@ -423,19 +494,31 @@ int st_protocol_decode_nat_message(const uint8_t *body, size_t body_len, st_nat_
     if ((message->flags & (uint8_t)~ST_NAT_FLAG_END_STREAM) != 0U) {
         return protocol_reject(ST_PROTOCOL_REJECTION_MALFORMED_BODY);
     }
-    size_t meta_len = read_be16(body + 2U);
+    *meta_len = read_be16(body + 2U);
     message->stream_id = read_be32(body + 4U);
     message->value = read_be32(body + 8U);
-    size_t data_len = read_be32(body + 12U);
-    if (meta_len > ST_MAX_NAT_METADATA_SIZE
-        || data_len > ST_MAX_BODY_SIZE
-        || meta_len > SIZE_MAX - ST_NAT_HEADER_SIZE - data_len
-        || body_len != ST_NAT_HEADER_SIZE + meta_len + data_len) {
+    *data_len = read_be32(body + 12U);
+    if (*meta_len > ST_MAX_NAT_METADATA_SIZE
+        || *data_len > ST_MAX_BODY_SIZE
+        || *meta_len > SIZE_MAX - ST_NAT_HEADER_SIZE - *data_len
+        || body_len != ST_NAT_HEADER_SIZE + *meta_len + *data_len) {
         return protocol_reject(ST_PROTOCOL_REJECTION_INVALID_LENGTH);
     }
     if (validate_nat_semantics(message->type, message->flags, message->stream_id,
-                               message->value, meta_len, data_len) != 0) {
+                               message->value, *meta_len, *data_len) != 0) {
         return protocol_reject(ST_PROTOCOL_REJECTION_MALFORMED_BODY);
+    }
+    return 0;
+}
+
+int st_protocol_decode_nat_message(const uint8_t *body, size_t body_len, st_nat_message *message)
+{
+    protocol_rejection = ST_PROTOCOL_REJECTION_NONE;
+    memset(message, 0, sizeof(*message));
+    size_t meta_len = 0U;
+    size_t data_len = 0U;
+    if (check_nat_body(body, body_len, message, &meta_len, &data_len) != 0) {
+        return -1;
     }
     if (meta_len == 0U) {
         message->meta_json = (char *)malloc(3U);
@@ -464,6 +547,71 @@ int st_protocol_decode_nat_message(const uint8_t *body, size_t body_len, st_nat_
     return 0;
 }
 
+/*
+ * Java PacketCodec.decode after the header: the command's CompactBinary schema, or the NAT body. It
+ * only reads past the fields, copying nothing, for a frame that is about to be refused anyway.
+ */
+int st_protocol_validate_body(int8_t command, const uint8_t *body, size_t body_len)
+{
+    protocol_rejection = ST_PROTOCOL_REJECTION_NONE;
+    if (!known_command(command)) {
+        return protocol_reject(ST_PROTOCOL_REJECTION_UNKNOWN_COMMAND);
+    }
+    if (body_len > command_body_limit(command)) {
+        return protocol_reject(ST_PROTOCOL_REJECTION_INVALID_LENGTH);
+    }
+    if (command == ST_CMD_NAT_MESSAGE) {
+        st_nat_message fields;
+        size_t meta_len = 0U;
+        size_t data_len = 0U;
+        return check_nat_body(body, body_len, &fields, &meta_len, &data_len);
+    }
+    compact_reader reader = {
+        .data = body,
+        .len = body_len,
+        .pos = 0
+    };
+    int64_t session_id;
+    int success;
+    int unreadable;
+    switch (command) {
+        case ST_CMD_LOGIN_REQUEST:
+            /* clientName, clientSessionId, accessToken, connectionRole */
+            unreadable = reader_skip_string(&reader) != 0
+                || reader_nullable_long(&reader, &session_id) != 0
+                || reader_skip_string(&reader) != 0
+                || reader_skip_string(&reader) != 0;
+            break;
+        case ST_CMD_LOGIN_RESPONSE:
+            /* clientName, success, reason */
+            unreadable = reader_skip_string(&reader) != 0
+                || reader_bool(&reader, &success) != 0
+                || reader_skip_string(&reader) != 0;
+            break;
+        case ST_CMD_MESSAGE_REQUEST:
+        case ST_CMD_MESSAGE_RESPONSE:
+            /* clientName, toClientName, messageType, message */
+            unreadable = reader_skip_string(&reader) != 0
+                || reader_skip_string(&reader) != 0
+                || reader_skip_message_type(&reader) != 0
+                || reader_skip_string(&reader) != 0;
+            break;
+        case ST_CMD_LOGOUT_RESPONSE:
+            /* success, reason */
+            unreadable = reader_bool(&reader, &success) != 0
+                || reader_skip_string(&reader) != 0;
+            break;
+        default:
+            /* LOGOUT_REQUEST, HEARTBEAT_REQUEST, HEARTBEAT_RESPONSE: schemas without fields. */
+            unreadable = 0;
+            break;
+    }
+    if (unreadable || reader.pos != reader.len) {
+        return protocol_reject(ST_PROTOCOL_REJECTION_MALFORMED_BODY);
+    }
+    return 0;
+}
+
 st_buffer st_protocol_encode_login_response(const char *client_name, int success, const char *reason)
 {
     compact_writer payload = {0};
@@ -475,6 +623,20 @@ st_buffer st_protocol_encode_login_response(const char *client_name, int success
         return buffer;
     }
     buffer = encode_compact_frame(ST_CMD_LOGIN_RESPONSE, &payload);
+    free(payload.data);
+    return buffer;
+}
+
+st_buffer st_protocol_encode_logout_response(int success, const char *reason)
+{
+    compact_writer payload = {0};
+    st_buffer buffer = {0};
+    if (writer_u8(&payload, success ? 1U : 0U) != 0
+        || writer_string(&payload, reason) != 0) {
+        free(payload.data);
+        return buffer;
+    }
+    buffer = encode_compact_frame(ST_CMD_LOGOUT_RESPONSE, &payload);
     free(payload.data);
     return buffer;
 }
@@ -608,6 +770,15 @@ void st_message_response_free(st_message_response *response)
     free(response->client_name);
     free(response->to_client_name);
     free(response->message);
+    memset(response, 0, sizeof(*response));
+}
+
+void st_logout_response_free(st_logout_response *response)
+{
+    if (response == NULL) {
+        return;
+    }
+    free(response->reason);
     memset(response, 0, sizeof(*response));
 }
 

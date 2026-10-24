@@ -85,10 +85,88 @@ static int test_empty_packets(void)
             return 1;
         }
         int ok = header.command == cases[i].command
-            && st_protocol_decode_empty_packet(bytes + ST_HEADER_SIZE, header.length) == 0;
+            && st_protocol_decode_empty_packet(bytes + ST_HEADER_SIZE, header.length) == 0
+            && st_protocol_last_rejection() == ST_PROTOCOL_REJECTION_NONE;
         free(bytes);
         if (!ok) {
             fprintf(stderr, "%s empty packet mismatch\n", cases[i].fixture);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Java LogoutRequestHandler answers LogoutResponsePacket(success=true, reason=null): body 01 00. */
+static int test_logout_response(void)
+{
+    uint8_t *bytes = NULL;
+    st_frame_header header;
+    if (st_test_decode_fixture_header("logout_response.bin", &bytes, &header) != 0) {
+        return 1;
+    }
+    st_logout_response response;
+    int ok = header.command == ST_CMD_LOGOUT_RESPONSE
+        && st_protocol_decode_logout_response(bytes + ST_HEADER_SIZE, header.length, &response) == 0
+        && response.success == 1
+        && response.reason == NULL;
+    if (ok) {
+        st_logout_response_free(&response);
+    }
+    free(bytes);
+    st_buffer encoded = st_protocol_encode_logout_response(1, NULL);
+    if (!ok || encoded.data == NULL || st_test_expect_fixture_bytes("logout_response.bin", &encoded) != 0) {
+        fprintf(stderr, "logout response fixture mismatch\n");
+        st_buffer_free(&encoded);
+        return 1;
+    }
+    st_buffer_free(&encoded);
+
+    /* A reason round-trips; the empty body the server used to send is not a LOGOUT_RESPONSE. */
+    encoded = st_protocol_encode_logout_response(0, "kicked");
+    ok = encoded.data != NULL
+        && st_protocol_read_header(encoded.data, &header) == 0
+        && header.length == encoded.len - ST_HEADER_SIZE
+        && st_protocol_decode_logout_response(encoded.data + ST_HEADER_SIZE, header.length, &response) == 0
+        && response.success == 0
+        && response.reason != NULL && strcmp(response.reason, "kicked") == 0;
+    if (ok) {
+        st_logout_response_free(&response);
+    }
+    st_buffer_free(&encoded);
+    if (!ok
+        || st_protocol_decode_logout_response((const uint8_t *)"", 0U, &response) != -1
+        || st_protocol_last_rejection() != ST_PROTOCOL_REJECTION_MALFORMED_BODY) {
+        fprintf(stderr, "logout response round trip or empty body mismatch\n");
+        return 1;
+    }
+    return 0;
+}
+
+/* Every well-formed shared frame is a body Java's codec reads, whatever the server then does with it. */
+static int test_valid_fixtures_validate(void)
+{
+    static const char *const fixtures[] = {
+        "login_request.bin", "login_response.bin", "login_response_fail.bin",
+        "logout_request.bin", "logout_response.bin", "heartbeat_request.bin", "heartbeat_response.bin",
+        "message_request.bin", "message_response.bin",
+        "nat_register.bin", "nat_register_result.bin", "nat_open.bin", "nat_fin.bin", "nat_rst.bin",
+        "nat_window_update.bin", "nat_keepalive.bin", "nat_unregister.bin", "nat_data_small.bin",
+        "nat_data_large.bin", "http_stream_request_open.bin", "http_stream_request_data.bin",
+        "http_stream_request_fin.bin", "http_stream_response_open.bin", "http_stream_response_data.bin",
+        "http_stream_response_fin.bin"
+    };
+    for (size_t i = 0; i < sizeof(fixtures) / sizeof(fixtures[0]); ++i) {
+        uint8_t *bytes = NULL;
+        st_frame_header header;
+        if (st_test_decode_fixture_header(fixtures[i], &bytes, &header) != 0) {
+            return 1;
+        }
+        int ok = st_protocol_validate_body(header.command, bytes + ST_HEADER_SIZE, header.length) == 0
+            && st_protocol_last_rejection() == ST_PROTOCOL_REJECTION_NONE;
+        free(bytes);
+        if (!ok) {
+            fprintf(stderr, "%s: a well-formed body was refused (reason %d)\n", fixtures[i],
+                    (int)st_protocol_last_rejection());
             return 1;
         }
     }
@@ -210,36 +288,57 @@ static int test_nat_decode(void)
     return 0;
 }
 
+/*
+ * Each malformed shared frame is refused, with the reason Java's PacketCodec gives it where the C
+ * codec decides it (header and body). A frame shorter or longer than its declared length is refused
+ * by its length alone, reason NONE here: Java's PacketCodec.decode, handed those bytes as one frame,
+ * says INVALID_LENGTH, but on a connection both servers read exactly the declared body (Java's
+ * Spliter), so a short frame waits for more bytes and a trailing byte starts the next frame.
+ */
 static int test_malformed_frames_are_rejected(void)
 {
-    const char *fixtures[] = {
-        "invalid_bad_magic.bin",
-        "invalid_version_v1.bin",
-        "invalid_serializer.bin",
-        "invalid_unknown_command.bin",
-        "invalid_truncated_header.bin",
-        "invalid_truncated_body.bin",
-        "invalid_trailing_body.bin",
-        "invalid_heartbeat_body.bin",
-        "invalid_oversized_length.bin"
+    static const struct {
+        const char *fixture;
+        st_protocol_rejection reason;
+    } fixtures[] = {
+        {"invalid_bad_magic.bin", ST_PROTOCOL_REJECTION_INVALID_MAGIC},
+        {"invalid_version_v1.bin", ST_PROTOCOL_REJECTION_UNSUPPORTED_VERSION},
+        {"invalid_serializer.bin", ST_PROTOCOL_REJECTION_UNSUPPORTED_SERIALIZER},
+        {"invalid_unknown_command.bin", ST_PROTOCOL_REJECTION_UNKNOWN_COMMAND},
+        {"invalid_truncated_header.bin", ST_PROTOCOL_REJECTION_NONE},
+        {"invalid_truncated_body.bin", ST_PROTOCOL_REJECTION_NONE},
+        {"invalid_trailing_body.bin", ST_PROTOCOL_REJECTION_NONE},
+        {"invalid_heartbeat_body.bin", ST_PROTOCOL_REJECTION_MALFORMED_BODY},
+        {"invalid_oversized_length.bin", ST_PROTOCOL_REJECTION_INVALID_LENGTH}
     };
     for (size_t index = 0; index < sizeof(fixtures) / sizeof(fixtures[0]); ++index) {
         uint8_t *bytes = NULL;
         size_t length = 0;
-        if (st_test_read_fixture(fixtures[index], &bytes, &length) != 0) {
+        if (st_test_read_fixture(fixtures[index].fixture, &bytes, &length) != 0) {
             return 1;
         }
         st_frame_header header;
-        int rejected = length < ST_HEADER_SIZE || st_protocol_read_header(bytes, &header) != 0;
+        st_protocol_rejection reason = ST_PROTOCOL_REJECTION_NONE;
+        int rejected = length < ST_HEADER_SIZE;
+        if (!rejected && st_protocol_read_header(bytes, &header) != 0) {
+            rejected = 1;
+            reason = st_protocol_last_rejection();
+        }
         if (!rejected) {
             rejected = header.length != length - ST_HEADER_SIZE;
         }
-        if (!rejected && header.command == ST_CMD_HEARTBEAT_REQUEST) {
-            rejected = st_protocol_decode_empty_packet(bytes + ST_HEADER_SIZE, header.length) != 0;
+        if (!rejected && st_protocol_validate_body(header.command, bytes + ST_HEADER_SIZE, header.length) != 0) {
+            rejected = 1;
+            reason = st_protocol_last_rejection();
         }
+        /* The decoder the server loop uses for a heartbeat agrees with the validator. */
+        int same_decoder = strcmp(fixtures[index].fixture, "invalid_heartbeat_body.bin") != 0
+            || (st_protocol_decode_empty_packet(bytes + ST_HEADER_SIZE, header.length) == -1
+                && st_protocol_last_rejection() == ST_PROTOCOL_REJECTION_MALFORMED_BODY);
         free(bytes);
-        if (!rejected) {
-            fprintf(stderr, "malformed fixture %s was accepted\n", fixtures[index]);
+        if (!rejected || reason != fixtures[index].reason || !same_decoder) {
+            fprintf(stderr, "malformed fixture %s: rejected=%d reason=%d, want reason %d\n",
+                    fixtures[index].fixture, rejected, (int)reason, (int)fixtures[index].reason);
             return 1;
         }
     }
@@ -390,6 +489,8 @@ int main(void)
     return test_login_request_decode() != 0
         || test_message_response_decode() != 0
         || test_empty_packets() != 0
+        || test_logout_response() != 0
+        || test_valid_fixtures_validate() != 0
         || test_frame_limit_includes_header() != 0
         || test_nat_decode() != 0
         || test_malformed_frames_are_rejected() != 0
