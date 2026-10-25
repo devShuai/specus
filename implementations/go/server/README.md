@@ -6,8 +6,8 @@ Go 实现的 specus 服务端，与 Java / Go / .NET / Android client 使用唯�
 
 ## 运行
 
-构建要求 Go **1.27.2 或更新的已修补版本**。客户端和服务端的 `go.mod` 将
-1.27.2 设为强制最低版本；`GOTOOLCHAIN=auto` 可下载相应工具链，关闭自动切换时必须自行安装满足要求的版本。
+构建要求 Go **1.27.3 或更新的已修补版本**。客户端和服务端的 `go.mod` 将
+1.27.3 设为强制最低版本；`GOTOOLCHAIN=auto` 可下载相应工具链，关闭自动切换时必须自行安装满足要求的版本。
 CI 与发版从模块文件选择编译器。安装包中的 `go-build-info.txt` 来自实际二进制的
 `go version -m`，服务端 `manifest.json` 的 `binaryGoVersion` 同时记录实际编译器；
 不要在模块目录外查询 bootstrap `go version` 来代替二进制证据。

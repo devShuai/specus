@@ -1,70 +1,232 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>specus · 本机连接工作台</title><link rel="stylesheet" href="/app.css"><script src="/app.js" defer></script></head>
-<body>
-<section id="unlock" class="unlock">
-  <div class="brand">specus <span>LOCAL</span></div><h1>连接管理，从本机开始。</h1>
-  <p>这是 CLI 提供的本地页面。打开页面不会登录服务端，也不会启动隧道。</p>
-  <form id="unlock-form"><label for="code">终端中的一次性连接码</label><input id="code" type="password" autocomplete="off" required spellcheck="false"><button type="submit" class="primary">打开工作台</button></form>
-  <p class="muted">刷新后需重新授权。在管理终端按回车可生成新码；已运行的隧道不受页面刷新影响。没有终端输入时，请在方便断开连接时重新启动 ui。</p>
-  <p id="unlock-error" role="alert"></p>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><title>specus · 本机连接工作台</title><link rel="stylesheet" href="/app.css"><script src="/app.js" defer></script></head>
+<body class="bd-root">
+<svg class="icon-sprite" aria-hidden="true" focusable="false">
+  <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-shuffle" viewBox="0 0 24 24"><path d="M2 18h1.4c1.3 0 2.5-.6 3.3-1.7l6.1-8.6c.7-1.1 2-1.7 3.3-1.7H22"/><path d="m18 2 4 4-4 4"/><path d="M2 6h1.9c1.5 0 2.9.9 3.6 2.2"/><path d="M22 18h-5.9c-1.3 0-2.6-.7-3.3-1.8l-.5-.8"/><path d="m18 14 4 4-4 4"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></symbol>
+  <symbol id="i-circle-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></symbol>
+  <symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M12 5v14"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></symbol>
+</svg>
+
+<section id="unlock" class="unlock" aria-labelledby="unlock-title">
+  <div class="unlock-inner">
+    <div class="brand unlock-brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 14 H57"/><path d="M8 52 V36 A6 6 0 0 1 20 36 V52" opacity=".5"/><path d="M20 52 V36 A12 12 0 0 1 44 36 V52"/><path d="M44 52 V36 A6 6 0 0 1 56 36 V52" opacity=".5"/><circle class="brand-dot" cx="32" cy="42" r="4" stroke="none"/></svg></span><span class="brand-text">specus</span></div>
+    <div class="bd-card unlock-card">
+      <div class="unlock-head">
+        <h1 id="unlock-title" class="unlock-title">连接管理，从本机开始。</h1>
+        <p class="unlock-sub">这是 CLI 提供的本地页面。打开页面不会登录服务端，也不会启动隧道。</p>
+      </div>
+      <form id="unlock-form" class="unlock-form">
+        <div class="bd-field">
+          <label class="bd-label" for="code">终端中的一次性连接码</label>
+          <input id="code" class="bd-input bd-input--lg" type="password" autocomplete="off" required spellcheck="false" aria-describedby="code-help">
+          <p id="code-help" class="bd-help">5 分钟内有效，用一次就失效</p>
+        </div>
+        <div class="alert-slot">
+          <p id="unlock-error" class="bd-alert bd-alert--danger slot-alert" role="alert"></p>
+          <svg class="icon slot-icon slot-icon--danger" aria-hidden="true" focusable="false"><use href="#i-circle-alert"/></svg>
+        </div>
+        <button type="submit" class="bd-btn bd-btn--primary bd-btn--lg unlock-submit">打开工作台</button>
+      </form>
+      <p class="unlock-meta">刷新后需重新授权。在管理终端按回车可生成新码；已运行的隧道不受页面刷新影响。没有终端输入时，在方便断开连接时重新启动 ui。</p>
+    </div>
+    <p class="unlock-foot"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-lock"/></svg>仅本机访问 · 127.0.0.1</p>
+  </div>
 </section>
+
 <div id="workspace" class="workspace" hidden>
-  <aside><div class="brand">specus <span>LOCAL</span></div><p class="aside-caption">本机连接工作台</p>
-    <nav aria-label="工作台页面"><button data-view="overview" aria-current="page">连接与服务</button><button data-view="settings">连接设置<span id="dirty-dot" hidden> · 未保存</span></button><button data-view="rules">出口规则</button></nav>
-    <div class="local-boundary"><span class="boundary-dot"></span><strong>仅本机访问</strong><p>关闭网页不停止隧道。<br>终端 Ctrl+C 退出管理，<br>并断开本页拥有的连接。</p><code id="implementation">Specus CLI</code></div>
+  <aside class="sidebar" aria-label="本机连接工作台">
+    <div class="sidebar-top">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 14 H57"/><path d="M8 52 V36 A6 6 0 0 1 20 36 V52" opacity=".5"/><path d="M20 52 V36 A12 12 0 0 1 44 36 V52"/><path d="M44 52 V36 A6 6 0 0 1 56 36 V52" opacity=".5"/><circle class="brand-dot" cx="32" cy="42" r="4" stroke="none"/></svg></span><span class="brand-text">specus</span></div>
+      <p class="nav-group">本机连接工作台</p>
+      <nav class="nav" aria-label="工作台页面">
+        <button type="button" class="nav-item" data-view="overview" aria-current="page"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-activity"/></svg><span class="nav-label">连接与服务</span></button>
+        <button type="button" class="nav-item" data-view="settings"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-settings"/></svg><span class="nav-label">连接设置</span><span id="dirty-dot" class="nav-dirty" hidden>未保存</span></button>
+        <button type="button" class="nav-item" data-view="rules"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-shuffle"/></svg><span class="nav-label">出口规则</span></button>
+      </nav>
+    </div>
+    <div class="local-boundary">
+      <p class="boundary-title"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-shield"/></svg>仅本机访问</p>
+      <p class="boundary-text">关闭网页不停止隧道。终端 Ctrl+C 退出管理，并断开本页拥有的连接。</p>
+      <code id="implementation" class="boundary-version">Specus CLI</code>
+    </div>
   </aside>
-  <main><header><div><p class="eyebrow">LOCAL CONNECTION / 本机管理</p><h1 id="page-title">连接与服务</h1></div><span class="local-tag">回环访问 · 会话授权</span></header>
-    <p id="notice" class="notice" role="status" aria-live="polite" hidden></p>
+
+  <main class="main">
+    <header class="bd-page-header">
+      <div class="page-heading">
+        <h1 id="page-title" class="bd-page-title">连接与服务</h1>
+        <p class="bd-page-desc" data-desc="overview">连接、断开本页拥有的隧道；设备和服务来自服务端目录，不主动探测。</p>
+        <p class="bd-page-desc" data-desc="settings">修改所选配置文件里的服务地址、接入凭证和虚拟网卡模式；保存不会连接。</p>
+        <p class="bd-page-desc" data-desc="rules">编辑 peerEgressRules、开关系统接管；只改配置文件，运行中的连接重新连接后应用。</p>
+      </div>
+      <div class="bd-page-actions">
+        <span class="bd-tag bd-tag--plain local-tag"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-lock"/></svg>回环访问 · 会话授权</span>
+      </div>
+    </header>
+
+    <div class="alert-slot notice-slot">
+      <p id="notice" class="bd-alert notice slot-alert" role="status" aria-live="polite" hidden></p>
+      <svg class="icon slot-icon slot-icon--info" aria-hidden="true" focusable="false"><use href="#i-info"/></svg>
+      <svg class="icon slot-icon slot-icon--danger" aria-hidden="true" focusable="false"><use href="#i-circle-alert"/></svg>
+    </div>
+
     <section id="overview" class="view">
-      <section class="connection-panel" aria-labelledby="connection-title"><div class="connection-top"><div><p class="eyebrow">当前连接</p><h2 id="connection-title">尚未连接</h2><p id="connection-detail">读取本机状态…</p></div><div class="actions"><button id="connect" class="primary">连接</button><button id="disconnect" disabled>断开</button><button id="restart" disabled>重新连接</button></div></div>
+      <section class="bd-card connection-panel" aria-labelledby="connection-title">
+        <div class="connection-top">
+          <div class="connection-state">
+            <p class="kicker">当前连接</p>
+            <h2 id="connection-title" class="connection-title">尚未连接</h2>
+            <p id="connection-detail" class="connection-detail">读取本机状态…</p>
+          </div>
+          <div class="actions">
+            <button id="connect" type="button" class="bd-btn bd-btn--primary"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-power"/></svg>连接</button>
+            <button id="disconnect" type="button" class="bd-btn bd-btn--secondary" disabled>断开</button>
+            <button id="restart" type="button" class="bd-btn bd-btn--secondary" disabled><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-refresh"/></svg>重新连接</button>
+          </div>
+        </div>
         <ol class="phase-rail" aria-label="连接阶段"><li data-stage="0"><span></span>本机管理</li><li data-stage="1"><span></span>HTTP 登录</li><li data-stage="2"><span></span>控制认证</li><li data-stage="3"><span></span>通道就绪</li></ol>
         <p class="scope-note">通道就绪不等于目标服务可达。本页不自动探测内网，也不自动检查或安装更新。</p>
-        <p id="pending" class="pending" hidden>磁盘配置与当前运行版本不同。重新连接后才应用已保存的配置。</p>
+        <div id="pending" class="bd-alert bd-alert--warning pending" hidden><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-alert"/></svg><p>磁盘配置与当前运行版本不同。重新连接后才应用已保存的配置。</p></div>
       </section>
-      <section id="others-panel" class="panel" hidden><h2>其他实例 · 只读</h2><p>先从原终端停止同配置实例，才能在本页启动；本页不会接管或误停它们。</p><ul id="others"></ul></section>
-      <div class="catalog-grid"><section class="panel"><div class="section-heading"><h2>在线设备</h2><span id="peers-count" class="count">0</span></div><p class="muted">来自当前控制通道的设备目录</p><ul id="peers" class="catalog"></ul></section>
-      <section class="panel"><div class="section-heading"><h2>可访问服务</h2><span id="services-count" class="count">0</span></div><p class="muted">服务端下发，只读展示；未执行业务探测</p><ul id="services" class="catalog"></ul></section></div>
-      <section class="panel egress-panel" aria-labelledby="egress-title"><div class="section-heading"><h2 id="egress-title">出口分流</h2><span id="egress-problems" class="count">—</span></div>
-        <p id="egress-summary" class="muted">连接后显示本机分流规则是否生效。</p>
+
+      <section id="others-panel" class="bd-card panel others-panel" aria-labelledby="others-title" hidden>
+        <div class="card-head"><h2 id="others-title" class="card-title">其他实例</h2><span class="bd-tag bd-tag--warning">只读</span></div>
+        <p class="card-desc">先从原终端停止同配置实例，才能在本页启动；本页不会接管或误停它们。</p>
+        <ul id="others" class="catalog others"></ul>
+      </section>
+
+      <div class="catalog-grid">
+        <section class="bd-card panel" aria-labelledby="peers-title">
+          <div class="card-head"><div class="card-title-row"><h2 id="peers-title" class="card-title">在线设备</h2><span id="peers-count" class="count">0</span></div></div>
+          <p class="card-desc">来自当前控制通道的设备目录</p>
+          <ul id="peers" class="catalog"></ul>
+        </section>
+        <section class="bd-card panel" aria-labelledby="services-title">
+          <div class="card-head"><div class="card-title-row"><h2 id="services-title" class="card-title">可访问服务</h2><span id="services-count" class="count">0</span></div></div>
+          <p class="card-desc">服务端下发，只读展示；未执行业务探测</p>
+          <ul id="services" class="catalog"></ul>
+        </section>
+      </div>
+
+      <section class="bd-card panel egress-panel" aria-labelledby="egress-title">
+        <div class="card-head"><h2 id="egress-title" class="card-title">出口分流</h2><span id="egress-problems" class="bd-tag status-tag">—</span></div>
+        <p id="egress-summary" class="card-desc">连接后显示本机分流规则是否生效。</p>
         <ul id="egress-issues" class="catalog issues" aria-label="分流问题"></ul>
         <p id="egress-role" class="egress-role"></p>
-        <p class="scope-note">域名规则靠系统 DNS 接管生效（peerEgressDnsTakeover）。应用自带 DoH/DoT、使用系统缓存、或直接硬编码 IP 时，域名规则不会命中，这类流量只能靠 IP/CIDR 规则覆盖。</p>
-        <p class="scope-note">只列出没有生效的部分，其余只计数。规则是否生效每次按本机校验重算；路由是否已安装来自上次下发时的系统路由表。</p>
+        <div class="notes">
+          <p class="scope-note">域名规则靠系统 DNS 接管生效（peerEgressDnsTakeover）。应用自带 DoH/DoT、使用系统缓存、或直接硬编码 IP 时，域名规则不会命中，这类流量只能靠 IP/CIDR 规则覆盖。</p>
+          <p class="scope-note">只列出没有生效的部分，其余只计数。规则是否生效每次按本机校验重算；路由是否已安装来自上次下发时的系统路由表。</p>
+        </div>
       </section>
     </section>
-    <section id="settings" class="view" hidden><section class="panel settings-panel"><div class="section-heading"><h2>让这台设备接入</h2><button id="reload" type="button">重新载入</button></div><p>从服务端管理后台「接入凭证」获取 API Key 和 Secret。先校验保存，再主动连接。</p>
-      <div class="config-path"><span>配置文件</span><code id="config-path"></code></div>
-      <form id="config-form" autocomplete="off"><label for="server">服务地址</label><input id="server" type="url" placeholder="https://your-server.example" required spellcheck="false">
-        <div class="form-grid"><div><label for="api-key">API Key</label><input id="api-key" type="password" autocomplete="off" spellcheck="false"><p id="key-hint" class="field-hint">填写接入凭据</p></div><div><label for="secret">Secret</label><input id="secret" type="password" autocomplete="new-password" spellcheck="false"><p id="secret-hint" class="field-hint">支持 env: / file: 引用</p></div></div>
-        <details><summary>高级设置与权限</summary><label for="device">虚拟网卡模式</label><select id="device"><option value="noop">仅转发与互传（noop，不创建网卡）</option><option value="auto">私有组网（auto，可能需要额外权限）</option></select><p class="muted">TLS、MTU、更新策略及其他字段暂由外部编辑器管理，保存时保留原内容。服务端下发的路由和权限不在本页修改。</p></details>
-        <p class="save-boundary">只保存本次改动；保留注释、未知字段及未修改的密钥引用。凭据留空表示保留，保存成功不代表已经连接或已应用。</p>
-        <div class="form-actions"><button id="validate" type="button">离线校验</button><button id="save" type="submit" class="primary">保存配置</button><span id="edit-state" class="muted">没有未保存修改</span></div>
-      </form></section></section>
-    <section id="rules" class="view" hidden>
-      <section class="panel rules-panel" aria-labelledby="takeover-title"><div class="section-heading"><h2 id="takeover-title">系统接管</h2><span id="takeover-state" class="count">—</span></div>
-        <p id="takeover-detail" class="muted">读取配置…</p>
-        <div class="form-actions"><button id="takeover" type="button" class="primary" disabled>开启接管</button><button id="rules-reload" type="button">重新载入</button></div>
-        <p class="save-boundary">保存规则与启用系统接管是两步：接管关闭时规则只保存，不装路由、不接管任何流量。这里只修改配置文件中的 peerEgressRules 与 peerEgressEnabled，文件其余内容与注释原样保留；运行中的连接需重新连接后才应用。</p>
+
+    <section id="settings" class="view" hidden>
+      <section class="bd-card settings-panel" aria-labelledby="settings-title">
+        <div class="bd-card-header">
+          <h2 id="settings-title" class="card-title">让这台设备接入</h2>
+          <button id="reload" type="button" class="bd-btn bd-btn--secondary bd-btn--sm"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-refresh"/></svg>重新载入</button>
+        </div>
+        <div class="bd-card-body">
+          <p class="card-desc">从服务端管理后台「接入凭证」获取 API Key 和 Secret。先校验保存，再主动连接。</p>
+          <div class="config-path"><span class="config-path-label">配置文件</span><code id="config-path"></code></div>
+          <form id="config-form" class="form" autocomplete="off">
+            <div class="bd-field">
+              <label class="bd-label" for="server">服务地址</label>
+              <input id="server" class="bd-input" type="url" placeholder="https://your-server.example" required spellcheck="false" aria-describedby="server-hint">
+              <p id="server-hint" class="bd-help">HTTP 或 HTTPS 地址，不带账号密码、查询串和 # 片段</p>
+            </div>
+            <div class="bd-form-grid">
+              <div class="bd-field"><label class="bd-label" for="api-key">API Key</label><input id="api-key" class="bd-input" type="password" autocomplete="off" spellcheck="false" aria-describedby="key-hint"><p id="key-hint" class="bd-help">填写接入凭据</p></div>
+              <div class="bd-field"><label class="bd-label" for="secret">Secret</label><input id="secret" class="bd-input" type="password" autocomplete="new-password" spellcheck="false" aria-describedby="secret-hint"><p id="secret-hint" class="bd-help">支持 env: / file: 引用</p></div>
+            </div>
+            <details class="advanced">
+              <summary><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-chevron-right"/></svg>高级设置与权限</summary>
+              <div class="advanced-body">
+                <fieldset id="device" class="choice-group">
+                  <legend class="bd-label">虚拟网卡模式</legend>
+                  <div class="radio-cards">
+                    <label class="radio-card"><input type="radio" name="device" value="noop"><span class="bd-radio-card"><b>仅转发与互传</b><span>noop，不创建网卡</span></span></label>
+                    <label class="radio-card"><input type="radio" name="device" value="auto"><span class="bd-radio-card"><b>私有组网</b><span>auto，可能需要额外权限</span></span></label>
+                  </div>
+                </fieldset>
+                <p class="bd-help">TLS、MTU、更新策略及其他字段暂由外部编辑器管理，保存时保留原内容。服务端下发的路由和权限不在本页修改。</p>
+              </div>
+            </details>
+            <p class="bd-help save-boundary">只保存本次改动；保留注释、未知字段及未修改的密钥引用。凭据留空表示保留，保存成功不代表已经连接或已应用。</p>
+            <div class="form-actions">
+              <span id="edit-state" class="edit-state">没有未保存修改</span>
+              <button id="validate" type="button" class="bd-btn bd-btn--secondary">离线校验</button>
+              <button id="save" type="submit" class="bd-btn bd-btn--primary">保存配置</button>
+            </div>
+          </form>
+        </div>
       </section>
-      <section class="panel rules-panel" aria-labelledby="rules-title"><div class="section-heading"><h2 id="rules-title">分流规则</h2><span id="rules-count" class="count">0</span></div>
-        <p class="muted">前缀更长的规则优先，同样长时靠前的优先；未命中任何规则的流量本地直连。</p>
-        <ul id="rules-list" class="catalog rules" aria-label="分流规则"></ul>
-        <form id="rule-form" autocomplete="off"><h3>添加规则</h3>
-          <div class="form-grid"><div><label for="rule-match">目标地址、网段或域名</label><input id="rule-match" placeholder="203.0.113.0/24" required spellcheck="false"></div>
-            <div><label for="rule-action">动作</label><select id="rule-action"><option value="egress">经出口设备访问</option><option value="direct">本地直连</option><option value="block">阻断</option></select></div></div>
-          <div class="form-grid"><div id="rule-target-field"><label for="rule-target">出口设备 ID</label><input id="rule-target" inputmode="numeric" placeholder="例如 2" spellcheck="false"></div>
-            <div><label for="rule-position">位置</label><select id="rule-position"><option value="end">加到末尾</option><option value="start">加到最前</option></select></div></div>
-          <label class="check"><input id="rule-disabled" type="checkbox"> 以停用状态加入</label>
-          <div class="form-actions"><button type="submit" class="primary">添加规则</button><span class="muted">只接受 IPv4 地址或网段；会被拒绝的规则不会写入。</span></div>
+    </section>
+
+    <section id="rules" class="view" hidden>
+      <section class="bd-card rules-panel" aria-labelledby="takeover-title">
+        <div class="bd-card-header"><h2 id="takeover-title" class="card-title">系统接管</h2><span id="takeover-state" class="bd-tag status-tag">—</span></div>
+        <div class="bd-card-body">
+          <p id="takeover-detail" class="card-desc">读取配置…</p>
+          <p class="bd-help save-boundary">保存规则与启用系统接管是两步：接管关闭时规则只保存，不装路由、不接管任何流量。这里只修改配置文件中的 peerEgressRules 与 peerEgressEnabled，文件其余内容与注释原样保留；运行中的连接需重新连接后才应用。</p>
+        </div>
+        <div class="bd-card-footer">
+          <button id="rules-reload" type="button" class="bd-btn bd-btn--secondary"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-refresh"/></svg>重新载入</button>
+          <button id="takeover" type="button" class="bd-btn bd-btn--primary" disabled>开启接管</button>
+        </div>
+      </section>
+
+      <section class="bd-card rules-panel" aria-labelledby="rules-title">
+        <div class="bd-card-header"><div class="card-title-row"><h2 id="rules-title" class="card-title">分流规则</h2><span id="rules-count" class="count">0</span></div></div>
+        <div class="bd-card-body">
+          <p class="card-desc">前缀更长的规则优先，同样长时靠前的优先；未命中任何规则的流量本地直连。</p>
+          <ul id="rules-list" class="catalog rules" aria-label="分流规则"></ul>
+        </div>
+        <form id="rule-form" class="rule-form" autocomplete="off">
+          <h3 class="form-title">添加规则</h3>
+          <div class="bd-form-grid">
+            <div class="bd-field bd-col-full"><label class="bd-label" for="rule-match">目标地址、网段或域名</label><input id="rule-match" class="bd-input" placeholder="203.0.113.0/24" required spellcheck="false" aria-describedby="rule-match-help"><p id="rule-match-help" class="bd-help">只接受 IPv4 地址或网段；会被拒绝的规则不会写入。</p></div>
+            <fieldset id="rule-action" class="choice-group">
+              <legend class="bd-label">动作</legend>
+              <div class="bd-seg seg-radios"><label><input type="radio" name="rule-action" value="egress" checked><span>经出口设备访问</span></label><label><input type="radio" name="rule-action" value="direct"><span>本地直连</span></label><label><input type="radio" name="rule-action" value="block"><span>阻断</span></label></div>
+            </fieldset>
+            <div id="rule-target-field" class="bd-field"><label class="bd-label" for="rule-target">出口设备 ID</label><input id="rule-target" class="bd-input" inputmode="numeric" placeholder="例如 2" spellcheck="false" aria-describedby="rule-target-help"><p id="rule-target-help" class="bd-help">出口设备的客户端 ID，正整数</p></div>
+            <fieldset id="rule-position" class="choice-group">
+              <legend class="bd-label">位置</legend>
+              <div class="bd-seg seg-radios"><label><input type="radio" name="rule-position" value="end" checked><span>加到末尾</span></label><label><input type="radio" name="rule-position" value="start"><span>加到最前</span></label></div>
+            </fieldset>
+          </div>
+          <label class="bd-check"><input id="rule-disabled" type="checkbox"><span class="bd-check-box"></span>以停用状态加入</label>
+          <div class="form-actions"><button type="submit" class="bd-btn bd-btn--primary"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-plus"/></svg>添加规则</button></div>
         </form>
       </section>
-      <section class="panel rules-panel" aria-labelledby="preview-title"><div class="section-heading"><h2 id="preview-title">预演</h2></div>
-        <p class="muted">「预演」按配置判断一个 IPv4 地址会命中哪条规则、去向如何，不建立任何连接，也不代表出口设备在线。「连通测试」从本机真实连接一次指定端口，只说明能否连上，不说明走了哪条路径。</p>
-        <form id="preview-form" class="inline-form" autocomplete="off"><input id="preview-address" placeholder="203.0.113.5 或 example.com" aria-label="要预演的 IPv4 地址或域名" required spellcheck="false"><button type="submit">预演</button><input id="preview-port" class="port" value="443" inputmode="numeric" aria-label="连通测试的 TCP 端口"><button type="button" id="preview-connect">连通测试</button></form>
-        <p id="preview-result" role="status"></p>
+
+      <section class="bd-card rules-panel" aria-labelledby="preview-title">
+        <div class="bd-card-header"><h2 id="preview-title" class="card-title">预演</h2></div>
+        <div class="bd-card-body">
+          <p class="card-desc">「预演」按配置判断一个 IPv4 地址会命中哪条规则、去向如何，不建立任何连接，也不代表出口设备在线。「连通测试」从本机真实连接一次指定端口，只说明能否连上，不说明走了哪条路径。</p>
+          <form id="preview-form" class="preview-form" autocomplete="off">
+            <div class="bd-field preview-address"><label class="bd-label" for="preview-address">IPv4 地址或域名</label><input id="preview-address" class="bd-input" placeholder="203.0.113.5 或 example.com" aria-label="要预演的 IPv4 地址或域名" required spellcheck="false"></div>
+            <button type="submit" class="bd-btn bd-btn--secondary">预演</button>
+            <div class="bd-field preview-port"><label class="bd-label" for="preview-port">TCP 端口</label><input id="preview-port" class="bd-input port" value="443" inputmode="numeric" aria-label="连通测试的 TCP 端口"></div>
+            <button type="button" id="preview-connect" class="bd-btn bd-btn--secondary"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-send"/></svg>连通测试</button>
+          </form>
+          <p id="preview-result" class="preview-result" role="status"></p>
+        </div>
       </section>
     </section>
-    <footer><span id="freshness">等待状态</span><span>管理页不替代服务端后台</span></footer>
+
+    <footer class="page-foot"><span id="freshness">等待状态</span><span>管理页不替代服务端后台</span></footer>
   </main>
 </div>
 </body></html>

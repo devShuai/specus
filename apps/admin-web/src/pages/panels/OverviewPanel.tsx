@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { PageHeader } from "../../components/PageHeader";
 import type { ReactNode } from "react";
 import { Button, Card, CardBody, CardHeader, Spinner } from "@heroui/react";
 import { adminApi } from "../../api/client";
@@ -103,16 +104,16 @@ export function OverviewPanel() {
     : [];
 
   return (
-    <div className="mt-4 flex flex-col gap-4">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-lg font-semibold">运行概览</h2>
-          <p className="text-small text-default-500">客户端、连接质量和流量走势</p>
-        </div>
-        <Button size="sm" variant="flat" isLoading={loading} onPress={() => void load()}>
-          刷新
-        </Button>
-      </div>
+    <div className="flex flex-col gap-4">
+      <PageHeader
+        title="运行概览"
+        description="客户端、连接质量和流量走势"
+        actions={
+          <Button size="sm" variant="flat" isLoading={loading} onPress={() => void load()}>
+            刷新
+          </Button>
+        }
+      />
 
       <section className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-primary-200 bg-primary-50/40 p-4" aria-label="接入与发布入口">
         <div>

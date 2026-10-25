@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { PageHeader } from "../../components/PageHeader";
 import {
   Button,
   Checkbox,
@@ -237,7 +238,8 @@ export function HttpRoutesPanel() {
   const createAuthError = authValidationVisible ? validateHttpRouteAuth(createAuthDraft) : "";
 
   return (
-    <div className="mt-4 flex min-w-0 flex-col gap-4">
+    <div className="flex min-w-0 flex-col gap-4">
+      <PageHeader title="HTTP 路由" description="通过服务端的 HTTP 入口发布客户端网络里的 Web 服务，可加访问认证与分享链接。" />
       {!clientsLoading && clientsError ? <div role="alert" className="rounded-md border border-danger-200 p-3 text-small text-danger">客户端状态读取失败，暂时不能发布。<Button className="ml-2" size="sm" variant="flat" onPress={() => void reloadClients()}>重新加载客户端</Button></div>
         : !clientsLoading && clients.length === 0 ? <div className="rounded-md border border-primary-200 bg-primary-50/40 p-3 text-small">尚无客户端实例。请先创建接入凭证并启动客户端，首次登录后才能选择它。<Button as="a" href="#/clients" className="ml-2" size="sm" variant="flat">去接入设备</Button></div> : null}
       <form className="flex flex-wrap items-end gap-3" onSubmit={onCreate}>
@@ -256,13 +258,13 @@ export function HttpRoutesPanel() {
         <Input className="w-full sm:w-40" label="路由名" placeholder="web" value={route} onValueChange={setRoute} maxLength={60} isRequired />
         <Input className="w-full sm:w-64" label="目标地址" placeholder="http://127.0.0.1:8080" value={targetBaseUrl} onValueChange={setTargetBaseUrl} maxLength={512} isRequired />
         <Switch
-          className="h-14"
+          className="h-10"
           isSelected={verifyTlsCertificate}
           onValueChange={setVerifyTlsCertificate}
         >
           验证 HTTPS 证书
         </Switch>
-        <Button className="h-14 w-full sm:w-auto" variant="flat" isLoading={loading} onPress={() => void refresh()}>
+        <Button className="h-10 w-full sm:w-auto" variant="flat" isLoading={loading} onPress={() => void refresh()}>
           刷新
         </Button>
         <div className="w-full rounded-medium border border-default-200 bg-default-50/70 p-3">
@@ -354,7 +356,7 @@ export function HttpRoutesPanel() {
         >
           {(item) => <SelectItem key={item.id}>{item.clientName}</SelectItem>}
         </Select>
-        <Button className="h-14 w-full sm:w-auto" variant="flat" isLoading={loading} onPress={() => void refresh()}>
+        <Button className="h-10 w-full sm:w-auto" variant="flat" isLoading={loading} onPress={() => void refresh()}>
           刷新
         </Button>
       </div>

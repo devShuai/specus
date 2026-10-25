@@ -1,0 +1,6 @@
+<resources>
+    <!-- Liquid Glass Base sizes used from XML. MainActivity keeps the same tokens as dp
+         constants for the views it builds in code. -->
+    <dimen name="gui_radius_2xl">24dp</dimen>
+    <dimen name="gui_dialog_inset">16dp</dimen>
+</resources>

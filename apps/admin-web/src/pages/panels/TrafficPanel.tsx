@@ -48,6 +48,7 @@ import type {
 } from "../../api/types";
 import { formatBytes, formatDateTime } from "../../lib/format";
 import { notifyError } from "../../components/toast";
+import { PageHeader } from "../../components/PageHeader";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 import {
   aggregateResources,
@@ -377,7 +378,8 @@ export function TrafficPanel() {
   }, [selectedTcpStream]);
 
   return (
-    <div className="mt-4 flex min-w-0 flex-col gap-2">
+    <div className="flex min-w-0 flex-col gap-2">
+      <PageHeader title="流量使用" description="按资源和协议查看流量排行、HTTP 记录与 TCP 帧。" />
       <div className="flex min-h-10 flex-wrap items-center justify-between gap-3">
         <Tabs
           aria-label="流量观测维度"

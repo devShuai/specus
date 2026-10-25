@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { PageHeader } from "../../components/PageHeader";
 import {
   Button,
   Chip,
@@ -274,7 +275,8 @@ export function ClientsPanel() {
   const clientPagination = useLocalPagination(clients);
 
   return (
-    <div className="mt-3 flex min-w-0 flex-col gap-5">
+    <div className="flex min-w-0 flex-col gap-5">
+      <PageHeader title="客户端" description="创建接入凭证、管理客户端实例，确认设备上线后再发布服务。" />
       <ClientOnboardingGuide loading={loadingClients || loadingCredentials} error={clientsLoadError || credentialsLoadError}
         online={clients.filter((client) => client.enabled && client.online).length} registered={clients.length} credentials={credentials.length}
         onRefresh={() => void load()} />
@@ -303,7 +305,7 @@ export function ClientsPanel() {
             isInvalid={Boolean(maxOnlineError)}
             errorMessage={maxOnlineError}
           />
-          <Button className="h-14 w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
+          <Button className="h-10 w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
             新建接入凭证
           </Button>
         </form>

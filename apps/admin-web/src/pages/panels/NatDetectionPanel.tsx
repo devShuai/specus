@@ -630,7 +630,7 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
     return (
       <main className="app-apple-tool nat-tool-plain relative min-h-screen overflow-x-hidden text-zinc-950 dark:text-white">
         <header className="app-apple-tool-header relative z-40 mx-auto flex w-full max-w-[1080px] items-center justify-between gap-3 px-5 py-5 sm:px-8 xl:max-w-[1280px]">
-          <AppLogo className="min-w-0 flex-1" label="specus" subtitle="浏览器 NAT 检测" markClassName="h-9 w-9" />
+          <AppLogo className="min-w-0 flex-1" label="specus" subtitle="浏览器 NAT 检测" />
           <div className="public-header-actions flex shrink-0 items-center gap-2">
             <PublicToolsMenu active="nat-detect" />
             <UserMenuButton className="public-header-theme-button" />

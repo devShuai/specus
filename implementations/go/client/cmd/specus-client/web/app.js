@@ -26,9 +26,9 @@ async function loadConfig() {
   const data = await api("/api/config"); revision = data.revision; original = data.fields;
   $("config-path").textContent = data.configPath;
   $("server").value = original.serverBaseUrl;
-  const existingCustom = $("device").querySelector("option[data-custom]"); if (existingCustom) existingCustom.remove();
-  if (!["noop", "auto"].includes(original.peerMeshDevice)) { const option = document.createElement("option"); option.value = original.peerMeshDevice; option.textContent = "保留现有模式（外部配置）"; option.dataset.custom = "true"; $("device").append(option); }
-  $("device").value = original.peerMeshDevice;
+  const existingCustom = $("device").querySelector("[data-custom]"); if (existingCustom) existingCustom.remove();
+  if (!["noop", "auto"].includes(original.peerMeshDevice)) { const label = document.createElement("label"), input = document.createElement("input"), card = document.createElement("span"); label.className = "radio-card"; label.dataset.custom = "true"; input.type = "radio"; input.name = "device"; input.value = original.peerMeshDevice; card.className = "bd-radio-card"; text(card, "b", "保留现有模式"); text(card, "span", "外部配置"); label.append(input, card); $("device").querySelector(".radio-cards").append(label); }
+  $("device").querySelectorAll("input").forEach(input => input.checked = input.value === original.peerMeshDevice);
   $("api-key").value = ""; $("secret").value = "";
   $("key-hint").textContent = data.hasApiKey ? "已配置 · 留空保留，不回显原值" : "填写管理后台提供的 API Key";
   $("secret-hint").textContent = data.hasSecret ? "已配置 · 留空保留原值或引用" : "支持 env: / file: 引用，不回显解析结果";
@@ -37,7 +37,7 @@ async function loadConfig() {
 function changes() {
   const result = {};
   if ($("server").value !== original.serverBaseUrl) result.serverBaseUrl = $("server").value;
-  if ($("device").value !== original.peerMeshDevice) result.peerMeshDevice = $("device").value;
+  if (choice("device") !== original.peerMeshDevice) result.peerMeshDevice = choice("device");
   if ($("api-key").value.trim()) result.apiKey = $("api-key").value;
   if ($("secret").value.trim()) result.secret = $("secret").value;
   return result;
@@ -54,6 +54,11 @@ async function connection(kind) {
 $("connect").addEventListener("click", () => connection("start")); $("disconnect").addEventListener("click", () => connection("stop")); $("restart").addEventListener("click", () => connection("restart"));
 function catalog(id, items, empty, render) { const list = $(id); list.replaceChildren(); $(id + "-count").textContent = String(items.length); if (!items.length) { const li = document.createElement("li"); li.className = "empty"; li.textContent = empty; list.append(li); } for (const item of items) { const li = document.createElement("li"); render(li, item); list.append(li); } }
 function text(parent, tag, value) { const element = document.createElement(tag); element.textContent = value || "—"; parent.append(element); return element; }
+// The value of a group of radios (the segmented controls and radio cards), read like a select's.
+function choice(id) { const checked = $(id).querySelector("input:checked"); return checked ? checked.value : ""; }
+// A status word in a pill; the tone only repeats what the word says.
+function tag(parent, value, tone) { const element = text(parent, "span", value); element.className = "bd-tag" + (tone ? " bd-tag--" + tone : ""); return element; }
+function row(parent) { const element = document.createElement("div"); element.className = "item-head"; parent.append(element); return element; }
 function renderState(data) {
   const state = data.runtime, others = data.otherInstances || [], blocked = others.length > 0 || !!data.instanceWarning;
   $("implementation").textContent = ({go: "Go", java: "Java", dotnet: ".NET"}[data.implementation] || "Specus") + " CLI · " + data.version;
@@ -67,8 +72,8 @@ function renderState(data) {
   $("restart").disabled = busy || blocked || !state.processRunning;
   $("pending").hidden = !state.processRunning || state.runningRevision === revision;
   $("others-panel").hidden = !others.length; $("others").replaceChildren(); for (const other of others) text($("others"), "li", "PID " + other.pid + " · " + other.phase + " · 不支持网页控制");
-  catalog("peers", state.peers || [], state.controlAuthenticated ? "目录中暂无设备。" : "连接后显示设备；当前没有有效目录。", (li, item) => { text(li, "strong", item.clientName); text(li, "p", (item.virtualIp || "无虚拟地址") + " · " + (item.online ? "在线" : "离线")); });
-  catalog("services", state.services || [], state.controlAuthenticated ? "尚未收到可访问服务，请检查服务端发布配置。" : "连接后显示服务，不主动扫描内网。", (li, item) => { text(li, "strong", item.name); text(li, "p", item.publisher + " · " + item.application + " · " + (item.available ? "目录允许访问，未探测" : "目录不可用")); text(li, "code", item.accessTarget); const button = text(li, "button", "复制访问地址"); button.disabled = !item.accessTarget; button.addEventListener("click", async () => { try { await navigator.clipboard.writeText(item.accessTarget); notice("已复制访问地址，未执行连通性探测。"); } catch { notice("浏览器未允许复制，请选择地址手动复制。"); } }); });
+  catalog("peers", state.peers || [], state.controlAuthenticated ? "目录中暂无设备。" : "连接后显示设备；当前没有有效目录。", (li, item) => { const head = row(li); text(head, "strong", item.clientName); tag(head, item.online ? "在线" : "离线", item.online ? "success" : "plain"); text(li, "p", item.virtualIp || "无虚拟地址"); });
+  catalog("services", state.services || [], state.controlAuthenticated ? "尚未收到可访问服务，请检查服务端发布配置。" : "连接后显示服务，不主动扫描内网。", (li, item) => { const head = row(li); text(head, "strong", item.name); tag(head, item.available ? "目录允许访问" : "目录不可用", item.available ? "success" : "plain"); text(li, "p", item.publisher + " · " + item.application + (item.available ? " · 未探测" : "")); text(li, "code", item.accessTarget); const button = text(li, "button", "复制访问地址"); button.disabled = !item.accessTarget; button.addEventListener("click", async () => { try { await navigator.clipboard.writeText(item.accessTarget); notice("已复制访问地址，未执行连通性探测。"); } catch { notice("浏览器未允许复制，请选择地址手动复制。"); } }); });
   renderEgress(state);
   $("freshness").textContent = "本机状态更新于 " + new Date().toLocaleTimeString();
 }
@@ -91,7 +96,7 @@ function issue(parent, title, detail, code, ok = false) { const li = document.cr
 // everything else looks healthy, so those are listed one by one and nothing that works is.
 function renderEgress(state) {
   const section = state.egress && typeof state.egress === "object" ? state.egress : null, issues = $("egress-issues"), badge = $("egress-problems");
-  issues.replaceChildren(); badge.removeAttribute("data-problems");
+  issues.replaceChildren(); badge.removeAttribute("data-problems"); badge.removeAttribute("data-state");
   if (!section) { badge.textContent = "—"; $("egress-summary").textContent = state.processRunning ? "当前运行版本没有提供分流状态。" : "连接后显示本机分流规则是否生效；未连接时不读取路由表。"; $("egress-role").textContent = ""; return; }
   const consumer = section.consumer && typeof section.consumer === "object" ? section.consumer : {}, egress = section.egress && typeof section.egress === "object" ? section.egress : {};
   let problems = 0;
@@ -139,11 +144,11 @@ function renderEgress(state) {
       issue(issues, "系统 DNS 已接管", "查询由 " + (dns.listen || "—") + " 应答，" + (upstreams.length ? "其余转发到 " + upstreams.join("、") : "没有上游，需要转发的查询回 SERVFAIL") + "；fake-IP 映射 " + count(dns.mappings) + " 个，隔离中 " + count(dns.quarantined) + " 个。退出客户端时交还系统 DNS。", "", true);
     }
   }
-  badge.textContent = problems ? problems + " 个问题" : "正常"; if (problems) badge.dataset.problems = String(problems);
+  badge.textContent = problems ? problems + " 个问题" : "正常"; if (problems) badge.dataset.problems = String(problems); else badge.dataset.state = "ok";
   const refusedByEgress = counters(egress.refused);
   $("egress-role").textContent = egress.active === true ? "本机正在作为出口 · " + count(egress.flows) + " 个流 · 累计 " + count(egress.totalFlows) + " 个" + (refusedByEgress ? " · 拒绝：" + refusedByEgress : "") : "本机未作为出口（尚无策略启用）";
 }
-async function poll() { clearTimeout(timer); if (!token) return; try { lastState = await api("/api/status"); renderState(lastState); } catch (error) { lastState = null; notice(error.message); $("connection-title").textContent = "状态不可用"; $("connection-detail").textContent = "无法确认当前连接，请恢复管理服务后重试。"; $("freshness").textContent = "状态更新失败 · 旧状态不可作为当前在线证明"; document.querySelectorAll("[data-stage]").forEach(li => li.classList.remove("reached")); for (const id of ["peers", "services"]) catalog(id, [], "目录状态已过期，恢复连接后重新获取。", () => {}); $("egress-issues").replaceChildren(); $("egress-problems").textContent = "—"; $("egress-problems").removeAttribute("data-problems"); $("egress-summary").textContent = "分流状态已过期，不能作为规则仍然生效的证明。"; $("egress-role").textContent = ""; document.querySelectorAll(".actions button").forEach(b => b.disabled = true); } if (token) timer = setTimeout(poll, 3000); }
+async function poll() { clearTimeout(timer); if (!token) return; try { lastState = await api("/api/status"); renderState(lastState); } catch (error) { lastState = null; notice(error.message); $("connection-title").textContent = "状态不可用"; $("connection-detail").textContent = "无法确认当前连接，请恢复管理服务后重试。"; $("freshness").textContent = "状态更新失败 · 旧状态不可作为当前在线证明"; document.querySelectorAll("[data-stage]").forEach(li => li.classList.remove("reached")); for (const id of ["peers", "services"]) catalog(id, [], "目录状态已过期，恢复连接后重新获取。", () => {}); $("egress-issues").replaceChildren(); $("egress-problems").textContent = "—"; $("egress-problems").removeAttribute("data-problems"); $("egress-problems").removeAttribute("data-state"); $("egress-summary").textContent = "分流状态已过期，不能作为规则仍然生效的证明。"; $("egress-role").textContent = ""; document.querySelectorAll(".actions button").forEach(b => b.disabled = true); } if (token) timer = setTimeout(poll, 3000); }
 if (bootstrap) unlock(bootstrap);
 
 // The egress rule editor. Every change goes to the server as one operation with the revision the
@@ -166,7 +171,7 @@ async function change(body, done) { const data = await api("/api/egress/change",
 function egressWarning(line) { return /peerMeshDevice is noop/.test(line) ? "注意：虚拟网卡模式为 noop，没有可接管路由的网卡；请在「连接设置」改为私有组网（auto）。" : line; }
 function renderRules(data) {
   egressState = data; const rules = list(data.rules), on = data.enabled === true;
-  $("takeover-state").textContent = on ? "已开启" : "已关闭";
+  $("takeover-state").textContent = on ? "已开启" : "已关闭"; $("takeover-state").dataset.on = String(on);
   $("takeover-detail").textContent = on ? "命中规则的目标由系统接管；出口不可用时这些目标被阻断，不会改走本机。" : rules.length ? rules.length + " 条规则已保存，均未生效：流量照常从本机出去。" : "尚未配置规则；流量照常从本机出去。";
   $("takeover").textContent = on ? "关闭接管" : "开启接管"; $("takeover").disabled = egressBusy;
   $("rules-count").textContent = String(rules.length);
@@ -175,8 +180,12 @@ function renderRules(data) {
   rules.forEach((rule, index) => {
     const li = document.createElement("li"); if (rule.enabled === false) li.className = "off";
     text(li, "strong", "#" + index + " " + (rule.match || "—") + " → " + egressTarget(rule));
-    const state = rule.refusal ? "不会生效：" + (egressRuleReasons[rule.refusal] || "规则被拒绝") : rule.enabled === false ? "已停用" : on ? "已启用，按配置生效" : "已启用，开启系统接管后生效";
-    text(li, "p", state); if (rule.refusal) text(li, "code", rule.refusal);
+    // The state as a word in a pill, and what it means next to it.
+    const state = row(li);
+    if (rule.refusal) { tag(state, "不会生效", "danger"); text(state, "span", egressRuleReasons[rule.refusal] || "规则被拒绝"); }
+    else if (rule.enabled === false) tag(state, "已停用", "plain");
+    else { tag(state, "已启用", on ? "success" : ""); text(state, "span", on ? "按配置生效" : "开启系统接管后生效"); }
+    if (rule.refusal) text(li, "code", rule.refusal);
     const buttons = document.createElement("div"); buttons.className = "rule-actions"; li.append(buttons);
     const add = (label, handler, disabled = false) => { const button = text(buttons, "button", label); button.type = "button"; button.disabled = egressBusy || disabled; button.addEventListener("click", () => egressAction(handler)); };
     add(rule.enabled === false ? "启用" : "停用", () => change({op: rule.enabled === false ? "enable" : "disable", index}, "规则 #" + index + (rule.enabled === false ? " 已启用，" : " 已停用，")));
@@ -193,12 +202,12 @@ $("takeover").addEventListener("click", () => egressAction(async () => {
   const accepted = confirm("开启系统接管：\n\n· 需要创建虚拟网卡与安装路由的权限（管理员或 root；虚拟网卡模式不能是 noop）\n· 只接管规则命中的目标，其余流量保持本地直连\n· 命中「经出口设备」规则而出口不可用时，这些目标被阻断，不会改走本机\n\n确认开启？");
   if (accepted) await change({op: "takeover", enabled: true, confirmed: true}, "系统接管已开启，");
 }));
-function syncTargetField() { $("rule-target-field").hidden = $("rule-action").value !== "egress"; }
+function syncTargetField() { $("rule-target-field").hidden = choice("rule-action") !== "egress"; }
 $("rule-action").addEventListener("change", syncTargetField); syncTargetField();
 $("rule-form").addEventListener("submit", event => { event.preventDefault(); egressAction(async () => {
-  const body = {op: "add", match: $("rule-match").value.trim(), action: $("rule-action").value, disabled: $("rule-disabled").checked};
+  const body = {op: "add", match: $("rule-match").value.trim(), action: choice("rule-action"), disabled: $("rule-disabled").checked};
   if (body.action === "egress") { const id = Number($("rule-target").value.trim()); if (!Number.isInteger(id) || id <= 0) { notice("请填写出口设备 ID（正整数）。", true); return; } body.egressClientId = id; }
-  if ($("rule-position").value === "start") body.at = 0;
+  if (choice("rule-position") === "start") body.at = 0;
   await change(body, "规则已添加，"); $("rule-match").value = ""; $("rule-disabled").checked = false;
 }); });
 // A real connection from this device, told apart from the preview: it says whether the address

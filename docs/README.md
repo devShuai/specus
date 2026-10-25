@@ -10,6 +10,7 @@
 
 * [design.md](architecture/design.md) — 系统详细设计:协议、模块职责、数据模型、并发与安全模型。
 * [server-control-edge-ha-plan.md](architecture/server-control-edge-ha-plan.md) — 控制端 / 连接端拆分与高可用演进方案。
+* [ui-design-system.md](architecture/ui-design-system.md) — 四端界面共用的 Liquid Glass 设计规范：令牌在各端的位置、主要取值、页面结构与文案规则。
 
 ## peer-mesh/ — 私有组网与 NAT 打洞
 

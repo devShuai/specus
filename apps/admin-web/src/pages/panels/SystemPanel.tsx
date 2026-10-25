@@ -1,4 +1,5 @@
 import { useEffect, useState, type DragEvent } from "react";
+import { PageHeader } from "../../components/PageHeader";
 import {
   Button,
   Card,
@@ -254,6 +255,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
 
   return (
     <div className="flex flex-col gap-4">
+    <PageHeader title="系统管理" description="用户、数据库与客户端发布。" />
     <div className="grid gap-4 xl:grid-cols-[minmax(0,1.5fr)_minmax(360px,0.8fr)]">
       <Card shadow="none" className="rounded-md border border-default-200 bg-content1">
         <CardHeader className="flex items-center justify-between gap-4 px-5 pb-2 pt-5">

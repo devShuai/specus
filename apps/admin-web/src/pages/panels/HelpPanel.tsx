@@ -10,6 +10,7 @@ import { NAT_BEHAVIOR_AXES, NAT_TRAVERSAL_REFERENCE } from "../../lib/nat";
 import { CLIENT_ONBOARDING_STEPS } from "../../lib/clientOnboarding";
 import { useProductMetricsCollecting } from "../../hooks/useProductMetricsCollecting";
 import { ProductMetricsDisclosure, ProductMetricsMemberNotice } from "../../components/ProductMetricsDisclosure";
+import { PageHeader } from "../../components/PageHeader";
 
 const HELP_TABS = [
   "quickstart",
@@ -115,11 +116,8 @@ export function HelpPanel() {
   };
 
   return (
-    <div className="mt-4 flex flex-col gap-4">
-      <div>
-        <h2 className="text-lg font-semibold">帮助文档</h2>
-        <p className="text-small text-default-500">客户端启动方法、配置模板与常见问题</p>
-      </div>
+    <div className="flex flex-col gap-4">
+      <PageHeader title="帮助文档" description="客户端启动方法、配置模板与常见问题" />
 
       <Tabs aria-label="帮助文档" variant="underlined" selectedKey={activeTab} onSelectionChange={onTabChange}>
         <Tab key="quickstart" title="快速开始">

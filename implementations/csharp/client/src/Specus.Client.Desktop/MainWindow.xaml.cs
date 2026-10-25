@@ -32,9 +32,10 @@ public partial class MainWindow : Window
     private const string ThemeModeSystem = "system";
     private const string ThemeModeLight = "light";
     private const string ThemeModeDark = "dark";
-    private const string ThemeModeSystemIcon = "M4,5 H20 V15 H4 Z M8,19 H16 M12,15 V19";
-    private const string ThemeModeLightIcon = "M12,5 A7,7 0 1 1 12,19 A7,7 0 1 1 12,5 M12,1 V3 M12,21 V23 M4.22,4.22 L5.64,5.64 M18.36,18.36 L19.78,19.78 M1,12 H3 M21,12 H23 M4.22,19.78 L5.64,18.36 M18.36,5.64 L19.78,4.22";
-    private const string ThemeModeDarkIcon = "M20,14.5 A8.5,8.5 0 0 1 9.5,4 A7,7 0 1 0 20,14.5 Z";
+    // The design system's monitor, sun and moon icons (24 canvas, drawn with a 1.75 stroke).
+    private const string ThemeModeSystemIcon = "M4,3 H20 A2,2 0 0 1 22,5 V15 A2,2 0 0 1 20,17 H4 A2,2 0 0 1 2,15 V5 A2,2 0 0 1 4,3 Z M8,21 H16 M12,17 V21";
+    private const string ThemeModeLightIcon = "M8,12 A4,4 0 1 0 16,12 A4,4 0 1 0 8,12 Z M12,2 V4 M12,20 V22 M4.93,4.93 L6.34,6.34 M17.66,17.66 L19.07,19.07 M2,12 H4 M20,12 H22 M6.34,17.66 L4.93,19.07 M19.07,4.93 L17.66,6.34";
+    private const string ThemeModeDarkIcon = "M12,3 A6,6 0 0 0 21,12 A9,9 0 1 1 12,3 Z";
 
     private readonly UiSpecusObserver _observer;
     private readonly FileTransferManager _transferManager = FileTransferManager.Instance;
@@ -962,79 +963,131 @@ public partial class MainWindow : Window
         Application.Current.Resources[key] = new SolidColorBrush(color);
     }
 
+    // Liquid Glass Base colour tokens. Every key also has a light default in App.xaml; the
+    // mapping from the design's token names to these keys is listed there.
     private static IReadOnlyDictionary<string, Color> DarkPalette() => new Dictionary<string, Color>
     {
-        ["AppBackgroundBrush"] = Rgb(0x07, 0x10, 0x18),
-        ["SidebarBrush"] = Rgb(0x09, 0x14, 0x1E),
-        ["SurfaceBrush"] = Rgb(0x0D, 0x18, 0x24),
-        ["SurfaceAltBrush"] = Rgb(0x10, 0x1D, 0x2B),
-        ["SurfaceRaisedBrush"] = Rgb(0x13, 0x23, 0x33),
-        ["ControlBrush"] = Rgb(0x12, 0x1F, 0x2D),
-        ["ControlHoverBrush"] = Rgb(0x17, 0x28, 0x3A),
-        ["PanelStrokeBrush"] = Rgb(0x22, 0x34, 0x47),
-        ["PanelStrokeStrongBrush"] = Rgb(0x2E, 0x4B, 0x62),
-        ["DividerBrush"] = Rgb(0x18, 0x26, 0x35),
-        ["PrimaryBrush"] = Rgb(0x22, 0xD3, 0xEE),
-        ["PrimaryHoverBrush"] = Rgb(0x67, 0xE8, 0xF9),
-        ["PrimarySoftBrush"] = Rgb(0x12, 0x3B, 0x49),
-        ["SecondaryBrush"] = Rgb(0x1A, 0x2A, 0x3A),
-        ["SecondaryHoverBrush"] = Rgb(0x24, 0x38, 0x4B),
-        ["SuccessBrush"] = Rgb(0x34, 0xD3, 0x99),
-        ["WarningBrush"] = Rgb(0xFB, 0xBF, 0x24),
-        ["DangerBrush"] = Rgb(0xFB, 0x71, 0x85),
-        ["TextPrimaryBrush"] = Rgb(0xF4, 0xFA, 0xFF),
-        ["TextSecondaryBrush"] = Rgb(0xB8, 0xC6, 0xD8),
-        ["TextMutedBrush"] = Rgb(0x7E, 0x8E, 0xA3),
-        ["LogBackgroundBrush"] = Rgb(0x05, 0x0A, 0x10),
-        ["LogTextBrush"] = Rgb(0xB9, 0xF6, 0xFF),
-        ["TableHeaderBrush"] = Rgb(0x14, 0x22, 0x33),
-        ["TableLineBrush"] = Rgb(0x1B, 0x2B, 0x3E),
-        ["InfoStripBorderBrush"] = Rgb(0x23, 0x65, 0x79),
-        ["ControlFocusBrush"] = Rgb(0x0F, 0x25, 0x30),
-        ["ComboSelectedBrush"] = Rgb(0x16, 0x34, 0x45),
-        ["TableRowHoverBrush"] = Rgb(0x17, 0x25, 0x36),
-        ["ScrollThumbBrush"] = Rgb(0x35, 0x50, 0x6B),
-        ["ScrollThumbHoverBrush"] = Rgb(0x4B, 0x6C, 0x8F),
-        ["PrimaryButtonTextBrush"] = Rgb(0x04, 0x21, 0x2A),
+        ["AppBackgroundBrush"] = Rgb(0x0C, 0x0C, 0x0E),            // bg
+        ["SidebarBrush"] = Argb(0x80, 0x1E, 0x1E, 0x22),           // glass
+        ["GlassBrush"] = Argb(0x80, 0x1E, 0x1E, 0x22),             // glass
+        ["GlassStrongBrush"] = Argb(0xD6, 0x1E, 0x1E, 0x22),       // glass-strong
+        ["GlassHighlightBrush"] = Argb(0x24, 0xFF, 0xFF, 0xFF),    // glass-edge top line / glass-border
+        ["GlassEdgeBrush"] = Argb(0x80, 0x00, 0x00, 0x00),         // glass-edge outer hairline
+        ["Glow1Brush"] = Argb(0x33, 0x0A, 0x84, 0xFF),             // glow-1
+        ["Glow2Brush"] = Argb(0x26, 0xBF, 0x5A, 0xF2),             // glow-2
+        ["Glow3Brush"] = Argb(0x17, 0xFF, 0x9F, 0x0A),             // glow-3
+        ["SurfaceBrush"] = Rgb(0x1C, 0x1C, 0x1F),                  // surface
+        ["SurfaceAltBrush"] = Rgb(0x2A, 0x2A, 0x2E),               // surface-muted
+        ["SurfaceMutedBrush"] = Rgb(0x2A, 0x2A, 0x2E),             // surface-muted
+        ["SurfaceRaisedBrush"] = Rgb(0x2A, 0x2A, 0x2E),            // popovers (glass-strong, drawn solid)
+        ["TagBrush"] = Argb(0x14, 0xFF, 0xFF, 0xFF),               // bd-tag in the dark theme
+        ["SwitchTrackBrush"] = Argb(0x29, 0xFF, 0xFF, 0xFF),       // switch track in the dark theme
+        ["HoverBrush"] = Argb(0x0F, 0xFF, 0xFF, 0xFF),             // hover
+        ["PressedBrush"] = Argb(0x1A, 0xFF, 0xFF, 0xFF),           // pressed
+        ["SelectedBrush"] = Argb(0x24, 0xFF, 0xFF, 0xFF),          // selected
+        ["SelectedEdgeBrush"] = Argb(0x00, 0x00, 0x00, 0x00),      // no shadow-sm in the dark theme
+        ["ControlBrush"] = Argb(0x0F, 0xFF, 0xFF, 0xFF),           // field-bg
+        ["ControlHoverBrush"] = Argb(0x0F, 0xFF, 0xFF, 0xFF),      // hover
+        ["ControlFocusBrush"] = Argb(0x0F, 0xFF, 0xFF, 0xFF),      // field-bg
+        ["FieldBorderBrush"] = Argb(0x24, 0xFF, 0xFF, 0xFF),       // field-border
+        ["PanelStrokeBrush"] = Argb(0x14, 0xFF, 0xFF, 0xFF),       // border
+        ["PanelStrokeStrongBrush"] = Argb(0x33, 0xFF, 0xFF, 0xFF), // border-strong
+        ["DividerBrush"] = Argb(0x14, 0xFF, 0xFF, 0xFF),           // border
+        ["PrimaryBrush"] = Rgb(0x0A, 0x84, 0xFF),                  // accent
+        ["PrimaryHoverBrush"] = Rgb(0x3D, 0x9B, 0xFF),             // accent-hover
+        ["PrimarySoftBrush"] = Argb(0x33, 0x0A, 0x84, 0xFF),       // accent-soft
+        ["PrimaryButtonTextBrush"] = Rgb(0xFF, 0xFF, 0xFF),        // on-primary
+        ["FocusRingBrush"] = Argb(0x99, 0x0A, 0x84, 0xFF),         // focus-ring
+        ["SecondaryBrush"] = Argb(0x12, 0xFF, 0xFF, 0xFF),         // secondary button in the dark theme
+        ["SecondaryHoverBrush"] = Argb(0x1F, 0xFF, 0xFF, 0xFF),
+        ["SuccessBrush"] = Rgb(0x30, 0xD1, 0x58),                  // success
+        ["SuccessBgBrush"] = Argb(0x29, 0x30, 0xD1, 0x58),         // success-bg
+        ["InfoBrush"] = Rgb(0x64, 0xA8, 0xFF),                     // info
+        ["InfoBgBrush"] = Argb(0x2E, 0x0A, 0x84, 0xFF),            // info-bg
+        ["WarningBrush"] = Rgb(0xFF, 0xB3, 0x40),                  // warning
+        ["WarningBgBrush"] = Argb(0x2E, 0xFF, 0x9F, 0x0A),         // warning-bg
+        ["DangerBrush"] = Rgb(0xFF, 0x69, 0x61),                   // danger
+        ["DangerBgBrush"] = Argb(0x2E, 0xFF, 0x45, 0x3A),          // danger-bg
+        ["DangerSolidBrush"] = Rgb(0xFF, 0x45, 0x3A),              // danger-solid
+        ["DangerSolidHoverBrush"] = Rgb(0xF0, 0x41, 0x37),         // danger-solid at 94% brightness
+        ["OnDangerBrush"] = Rgb(0xFF, 0xFF, 0xFF),                 // on-danger
+        ["TextPrimaryBrush"] = Rgb(0xF5, 0xF5, 0xF7),              // text
+        ["TextSecondaryBrush"] = Rgb(0xA8, 0xA8, 0xAD),            // text-muted
+        ["TextMutedBrush"] = Rgb(0x8E, 0x8E, 0x94),                // text-subtle
+        ["LogBackgroundBrush"] = Rgb(0x14, 0x14, 0x16),            // surface-sunken
+        ["LogTextBrush"] = Rgb(0xF5, 0xF5, 0xF7),                  // text
+        ["TableHeaderBrush"] = Argb(0x00, 0x1C, 0x1C, 0x1F),       // header on the table's surface
+        ["TableLineBrush"] = Argb(0x14, 0xFF, 0xFF, 0xFF),         // border
+        ["TableRowHoverBrush"] = Argb(0x0F, 0xFF, 0xFF, 0xFF),     // hover
+        ["InfoStripBorderBrush"] = Argb(0x14, 0xFF, 0xFF, 0xFF),   // border
+        ["ComboSelectedBrush"] = Argb(0x33, 0x0A, 0x84, 0xFF),     // accent-soft
+        ["ScrollThumbBrush"] = Argb(0x33, 0xFF, 0xFF, 0xFF),
+        ["ScrollThumbHoverBrush"] = Argb(0x5C, 0xFF, 0xFF, 0xFF),
     };
 
     private static IReadOnlyDictionary<string, Color> LightPalette() => new Dictionary<string, Color>
     {
-        ["AppBackgroundBrush"] = Rgb(0xF4, 0xF8, 0xFB),
-        ["SidebarBrush"] = Rgb(0xFF, 0xFF, 0xFF),
-        ["SurfaceBrush"] = Rgb(0xFF, 0xFF, 0xFF),
-        ["SurfaceAltBrush"] = Rgb(0xEC, 0xF4, 0xFA),
-        ["SurfaceRaisedBrush"] = Rgb(0xFF, 0xFF, 0xFF),
-        ["ControlBrush"] = Rgb(0xF1, 0xF6, 0xFA),
-        ["ControlHoverBrush"] = Rgb(0xE6, 0xF0, 0xF7),
-        ["PanelStrokeBrush"] = Rgb(0xC9, 0xD8, 0xE5),
-        ["PanelStrokeStrongBrush"] = Rgb(0x82, 0xA8, 0xBE),
-        ["DividerBrush"] = Rgb(0xD9, 0xE4, 0xEE),
-        ["PrimaryBrush"] = Rgb(0x08, 0x91, 0xB2),
-        ["PrimaryHoverBrush"] = Rgb(0x0E, 0x74, 0x90),
-        ["PrimarySoftBrush"] = Rgb(0xDE, 0xF7, 0xFB),
-        ["SecondaryBrush"] = Rgb(0xE9, 0xF1, 0xF7),
-        ["SecondaryHoverBrush"] = Rgb(0xD9, 0xE8, 0xF2),
-        ["SuccessBrush"] = Rgb(0x05, 0x96, 0x69),
-        ["WarningBrush"] = Rgb(0xB7, 0x79, 0x1F),
-        ["DangerBrush"] = Rgb(0xE1, 0x1D, 0x48),
-        ["TextPrimaryBrush"] = Rgb(0x10, 0x20, 0x2F),
-        ["TextSecondaryBrush"] = Rgb(0x35, 0x51, 0x68),
-        ["TextMutedBrush"] = Rgb(0x6B, 0x7E, 0x8F),
-        ["LogBackgroundBrush"] = Rgb(0xF7, 0xFB, 0xFE),
-        ["LogTextBrush"] = Rgb(0x16, 0x42, 0x59),
-        ["TableHeaderBrush"] = Rgb(0xE7, 0xF0, 0xF8),
-        ["TableLineBrush"] = Rgb(0xCF, 0xDF, 0xEC),
-        ["InfoStripBorderBrush"] = Rgb(0x8D, 0xD6, 0xE7),
-        ["ControlFocusBrush"] = Rgb(0xE2, 0xF6, 0xFB),
-        ["ComboSelectedBrush"] = Rgb(0xD7, 0xF0, 0xF7),
-        ["TableRowHoverBrush"] = Rgb(0xEA, 0xF5, 0xFB),
-        ["ScrollThumbBrush"] = Rgb(0x9A, 0xB0, 0xC4),
-        ["ScrollThumbHoverBrush"] = Rgb(0x70, 0x8A, 0xA3),
-        ["PrimaryButtonTextBrush"] = Rgb(0xFF, 0xFF, 0xFF),
+        ["AppBackgroundBrush"] = Rgb(0xF5, 0xF5, 0xF7),            // bg
+        ["SidebarBrush"] = Argb(0x8F, 0xFF, 0xFF, 0xFF),           // glass
+        ["GlassBrush"] = Argb(0x8F, 0xFF, 0xFF, 0xFF),             // glass
+        ["GlassStrongBrush"] = Argb(0xDB, 0xFF, 0xFF, 0xFF),       // glass-strong
+        ["GlassHighlightBrush"] = Argb(0xF2, 0xFF, 0xFF, 0xFF),    // glass-edge top line / glass-border
+        ["GlassEdgeBrush"] = Argb(0x0F, 0x00, 0x00, 0x00),         // glass-edge outer hairline
+        ["Glow1Brush"] = Argb(0x24, 0x0A, 0x84, 0xFF),             // glow-1
+        ["Glow2Brush"] = Argb(0x1A, 0xFF, 0x2D, 0x55),             // glow-2
+        ["Glow3Brush"] = Argb(0x17, 0x34, 0xC7, 0x59),             // glow-3
+        ["SurfaceBrush"] = Rgb(0xFF, 0xFF, 0xFF),                  // surface
+        ["SurfaceAltBrush"] = Rgb(0xED, 0xED, 0xF0),               // surface-muted
+        ["SurfaceMutedBrush"] = Rgb(0xED, 0xED, 0xF0),             // surface-muted
+        ["SurfaceRaisedBrush"] = Rgb(0xFF, 0xFF, 0xFF),            // popovers (glass-strong, drawn solid)
+        ["TagBrush"] = Rgb(0xED, 0xED, 0xF0),                      // bd-tag: surface-muted
+        ["SwitchTrackBrush"] = Rgb(0xE8, 0xE8, 0xEC),              // surface-sunken
+        ["HoverBrush"] = Argb(0x0B, 0x00, 0x00, 0x00),             // hover
+        ["PressedBrush"] = Argb(0x14, 0x00, 0x00, 0x00),           // pressed
+        ["SelectedBrush"] = Rgb(0xFF, 0xFF, 0xFF),                 // selected
+        ["SelectedEdgeBrush"] = Argb(0x14, 0x00, 0x00, 0x00),      // stands in for shadow-sm
+        ["ControlBrush"] = Rgb(0xFF, 0xFF, 0xFF),                  // field-bg
+        ["ControlHoverBrush"] = Argb(0x0B, 0x00, 0x00, 0x00),      // hover
+        ["ControlFocusBrush"] = Rgb(0xFF, 0xFF, 0xFF),             // field-bg
+        ["FieldBorderBrush"] = Argb(0x24, 0x00, 0x00, 0x00),       // field-border
+        ["PanelStrokeBrush"] = Argb(0x14, 0x00, 0x00, 0x00),       // border
+        ["PanelStrokeStrongBrush"] = Argb(0x2E, 0x00, 0x00, 0x00), // border-strong
+        ["DividerBrush"] = Argb(0x14, 0x00, 0x00, 0x00),           // border
+        ["PrimaryBrush"] = Rgb(0x00, 0x71, 0xE3),                  // accent
+        ["PrimaryHoverBrush"] = Rgb(0x00, 0x62, 0xC4),             // accent-hover
+        ["PrimarySoftBrush"] = Argb(0x1F, 0x00, 0x71, 0xE3),       // accent-soft
+        ["PrimaryButtonTextBrush"] = Rgb(0xFF, 0xFF, 0xFF),        // on-primary
+        ["FocusRingBrush"] = Argb(0x80, 0x00, 0x71, 0xE3),         // focus-ring
+        ["SecondaryBrush"] = Rgb(0xFF, 0xFF, 0xFF),                // secondary button: surface
+        ["SecondaryHoverBrush"] = Rgb(0xED, 0xED, 0xF0),           // surface-muted
+        ["SuccessBrush"] = Rgb(0x1A, 0x7F, 0x37),                  // success
+        ["SuccessBgBrush"] = Argb(0x24, 0x34, 0xC7, 0x59),         // success-bg
+        ["InfoBrush"] = Rgb(0x00, 0x62, 0xC4),                     // info
+        ["InfoBgBrush"] = Argb(0x1A, 0x00, 0x71, 0xE3),            // info-bg
+        ["WarningBrush"] = Rgb(0xA3, 0x52, 0x00),                  // warning
+        ["WarningBgBrush"] = Argb(0x29, 0xFF, 0x9F, 0x0A),         // warning-bg
+        ["DangerBrush"] = Rgb(0xC4, 0x16, 0x1C),                   // danger
+        ["DangerBgBrush"] = Argb(0x1A, 0xFF, 0x3B, 0x30),          // danger-bg
+        ["DangerSolidBrush"] = Rgb(0xE5, 0x34, 0x2B),              // danger-solid
+        ["DangerSolidHoverBrush"] = Rgb(0xD7, 0x31, 0x2A),         // danger-solid at 94% brightness
+        ["OnDangerBrush"] = Rgb(0xFF, 0xFF, 0xFF),                 // on-danger
+        ["TextPrimaryBrush"] = Rgb(0x1D, 0x1D, 0x1F),              // text
+        ["TextSecondaryBrush"] = Rgb(0x5C, 0x5C, 0x63),            // text-muted
+        ["TextMutedBrush"] = Rgb(0x6F, 0x6F, 0x76),                // text-subtle
+        ["LogBackgroundBrush"] = Rgb(0xF5, 0xF5, 0xF7),            // bg
+        ["LogTextBrush"] = Rgb(0x1D, 0x1D, 0x1F),                  // text
+        ["TableHeaderBrush"] = Argb(0x00, 0xFF, 0xFF, 0xFF),       // header on the table's surface
+        ["TableLineBrush"] = Argb(0x14, 0x00, 0x00, 0x00),         // border
+        ["TableRowHoverBrush"] = Argb(0x0B, 0x00, 0x00, 0x00),     // hover
+        ["InfoStripBorderBrush"] = Argb(0x14, 0x00, 0x00, 0x00),   // border
+        ["ComboSelectedBrush"] = Argb(0x1F, 0x00, 0x71, 0xE3),     // accent-soft
+        ["ScrollThumbBrush"] = Argb(0x33, 0x00, 0x00, 0x00),
+        ["ScrollThumbHoverBrush"] = Argb(0x5C, 0x00, 0x00, 0x00),
     };
 
     private static Color Rgb(byte red, byte green, byte blue) => Color.FromRgb(red, green, blue);
+
+    private static Color Argb(byte alpha, byte red, byte green, byte blue) => Color.FromArgb(alpha, red, green, blue);
 
     private void UpdateThemeModeButton()
     {
@@ -1341,12 +1394,13 @@ public partial class MainWindow : Window
             _ = DwmSetWindowAttribute(hwnd, DwmwaUseImmersiveDarkModeBefore20H1, ref enabled, sizeof(int));
         }
 
+        // The page's bg and text tokens, so the title bar runs into the window.
         var captionColor = dark
-            ? ColorRef(0x07, 0x10, 0x18)
-            : ColorRef(0xF4, 0xF8, 0xFB);
+            ? ColorRef(0x0C, 0x0C, 0x0E)
+            : ColorRef(0xF5, 0xF5, 0xF7);
         var textColor = dark
-            ? ColorRef(0xF4, 0xFA, 0xFF)
-            : ColorRef(0x10, 0x20, 0x2F);
+            ? ColorRef(0xF5, 0xF5, 0xF7)
+            : ColorRef(0x1D, 0x1D, 0x1F);
         _ = DwmSetWindowAttribute(hwnd, DwmwaCaptionColor, ref captionColor, sizeof(int));
         _ = DwmSetWindowAttribute(hwnd, DwmwaTextColor, ref textColor, sizeof(int));
     }

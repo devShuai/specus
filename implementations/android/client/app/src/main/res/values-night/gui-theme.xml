@@ -1,15 +1,67 @@
 <resources>
+    <!-- Liquid Glass Base, dark theme. The dark theme is not an inversion: a near-black page,
+         two surface levels, a brighter accent, translucent white for secondary buttons and the
+         segmented track, and no shadow under cards or the selected segment. -->
     <style name="SpecusTheme" parent="android:style/Theme.Material.NoActionBar">
         <item name="android:fontFamily">sans</item>
-        <item name="android:colorAccent">#73CBBE</item>
+        <item name="android:colorAccent">@color/gui_accent</item>
+        <item name="android:colorControlActivated">@color/gui_accent</item>
+        <item name="android:colorControlHighlight">@color/gui_pressed</item>
+        <item name="android:windowBackground">@color/gui_bg</item>
+        <item name="android:statusBarColor">@color/gui_bg</item>
         <item name="android:windowLightStatusBar">false</item>
         <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:alertDialogTheme">@style/SpecusDialog</item>
     </style>
-    <color name="gui_ink">#E8F0F3</color>
-    <color name="gui_muted">#AFBFC8</color>
-    <color name="gui_page">#121C23</color>
-    <color name="gui_panel">#1C2A33</color>
-    <color name="gui_line">#3A4D59</color>
-    <color name="gui_accent">#216F66</color>
-    <color name="gui_danger">#A93E4A</color>
+
+    <style name="SpecusDialog" parent="android:style/Theme.Material.Dialog.Alert">
+        <item name="android:windowBackground">@drawable/gui_dialog_background</item>
+        <item name="android:colorAccent">@color/gui_accent</item>
+        <item name="android:colorBackground">@color/gui_surface</item>
+        <item name="android:textColorPrimary">@color/gui_text</item>
+        <item name="android:textColorSecondary">@color/gui_text_muted</item>
+    </style>
+
+    <!-- Surfaces -->
+    <color name="gui_bg">#0C0C0E</color>
+    <color name="gui_surface">#1C1C1F</color>
+    <color name="gui_surface_muted">#2A2A2E</color>
+    <color name="gui_border">#14FFFFFF</color>
+    <color name="gui_field_bg">#0FFFFFFF</color>
+    <color name="gui_field_border">#24FFFFFF</color>
+    <color name="gui_pressed">#1AFFFFFF</color>
+    <color name="gui_selected">#24FFFFFF</color>
+
+    <!-- Text -->
+    <color name="gui_text">#F5F5F7</color>
+    <color name="gui_text_muted">#A8A8AD</color>
+    <color name="gui_text_subtle">#8E8E94</color>
+
+    <!-- Accent -->
+    <color name="gui_accent">#0A84FF</color>
+    <color name="gui_accent_hover">#3D9BFF</color>
+    <color name="gui_accent_soft">#330A84FF</color>
+    <color name="gui_on_primary">#FFFFFF</color>
+    <color name="gui_focus_ring">#990A84FF</color>
+
+    <!-- Status -->
+    <color name="gui_success">#30D158</color>
+    <color name="gui_success_bg">#2930D158</color>
+    <color name="gui_info">#64A8FF</color>
+    <color name="gui_info_bg">#2E0A84FF</color>
+    <color name="gui_warning">#FFB340</color>
+    <color name="gui_warning_bg">#2EFF9F0A</color>
+    <color name="gui_danger">#FF6961</color>
+    <color name="gui_danger_bg">#2EFF453A</color>
+    <color name="gui_danger_solid">#FF453A</color>
+    <color name="gui_on_danger">#FFFFFF</color>
+
+    <!-- Per-theme component values from bundle.css -->
+    <color name="gui_secondary_bg">#12FFFFFF</color>
+    <color name="gui_secondary_pressed">#1FFFFFFF</color>
+    <color name="gui_danger_pressed">#F04137</color>
+    <color name="gui_muted_fill">#12FFFFFF</color>
+    <color name="gui_switch_off">#29FFFFFF</color>
+    <color name="gui_tag_bg">#14FFFFFF</color>
+    <color name="gui_shadow">#00000000</color>
 </resources>

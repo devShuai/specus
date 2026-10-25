@@ -137,7 +137,7 @@ function DashboardContent() {
   return (
     <div className="app-apple app-apple-dashboard flex min-h-screen">
       <a className="app-skip-link" href="#app-main-content">跳到主内容</a>
-      <aside className="app-apple-sidebar hidden w-56 shrink-0 bg-background lg:fixed lg:inset-y-0 lg:left-0 lg:z-30 lg:flex lg:flex-col">
+      <aside className="app-apple-sidebar hidden shrink-0 p-2.5 lg:fixed lg:inset-y-3 lg:left-3 lg:z-30 lg:flex lg:w-[236px] lg:flex-col">
         <Sidebar
           groups={visibleGroups}
           active={renderedPanel}
@@ -146,16 +146,16 @@ function DashboardContent() {
           footer={<UserMenu profile={profile} onLogout={logout} variant="block" />}
         />
       </aside>
-      <div className="flex min-w-0 flex-1 flex-col lg:ml-56">
-        <header className="app-apple-mobile-header sticky top-0 z-30 bg-background/80 backdrop-blur-sm lg:hidden">
+      <div className="flex min-w-0 flex-1 flex-col lg:ml-[248px]">
+        <header className="app-apple-mobile-header sticky top-0 z-30 lg:hidden">
           <div className="flex items-center gap-2 px-3 py-2 sm:px-4">
-            <Button ref={mobileMenuButtonRef} isIconOnly aria-label="打开菜单" className="h-10 w-10 min-w-10" radius="sm" variant="flat" onPress={() => setMobileNavOpen(true)}><HamburgerIcon /></Button>
-            <AppLogo className="min-w-0 shrink" label="specus" markClassName="h-8 w-8" />
+            <Button ref={mobileMenuButtonRef} isIconOnly aria-label="打开菜单" className="h-10 w-10 min-w-10" radius="full" variant="flat" onPress={() => setMobileNavOpen(true)}><HamburgerIcon /></Button>
+            <AppLogo className="min-w-0 shrink" label="specus" />
             <span className="ml-auto truncate text-tiny font-medium text-default-500">{activeTitle}</span>
             <div className="flex shrink-0 items-center gap-1.5"><UserMenu profile={profile} onLogout={logout} /></div>
           </div>
         </header>
-        <main id="app-main-content" tabIndex={-1} className="mx-auto w-full min-w-0 max-w-[1680px] flex-1 px-2 pb-7 pt-5 outline-hidden sm:px-3 lg:px-5">
+        <main id="app-main-content" tabIndex={-1} className="mx-auto w-full min-w-0 max-w-[1680px] flex-1 px-4 pb-16 pt-6 outline-hidden sm:px-5 lg:pl-6 lg:pr-7 lg:pt-8">
           <section className="min-w-0" key={renderedPanel}>
             <Suspense fallback={<PanelLoading />}>
               <ActivePanel panel={renderedPanel} initializing={initializing} onInitializeDatabase={requestInitializeDatabase} />
@@ -168,8 +168,8 @@ function DashboardContent() {
         isOpen={initConfirmOpen}
         onClose={() => setInitConfirmOpen(false)}
         onConfirm={initializeDatabase}
-        title="初始化数据库"
-        description="将按当前配置重建并初始化数据库结构，该操作可能影响现有数据，执行后无法撤销。确定继续吗？"
+        title="初始化数据库？"
+        description="将按当前配置重建并初始化数据库结构，可能影响现有数据，执行后无法撤销。"
         confirmLabel="执行初始化"
         danger
       />
@@ -199,26 +199,26 @@ function MobileNav({ open, groups, active, onSelect, onClose, triggerRef }: { op
   }, [open, triggerRef]);
 
   return (<>
-    <div aria-hidden="true" className={`fixed inset-0 z-40 bg-black/40 backdrop-blur-xs transition-opacity duration-200 lg:hidden ${open ? "opacity-100" : "pointer-events-none opacity-0"}`} onClick={onClose} />
+    <div aria-hidden="true" className={`app-overlay fixed inset-0 z-40 transition-opacity duration-200 lg:hidden ${open ? "opacity-100" : "pointer-events-none opacity-0"}`} onClick={onClose} />
     <aside
       ref={panelRef}
       aria-hidden={!open}
       aria-label="导航菜单"
       aria-modal={open ? true : undefined}
       role={open ? "dialog" : undefined}
-      className={`app-apple-sidebar fixed inset-y-0 left-0 z-50 flex w-64 max-w-[86vw] flex-col bg-background transition-transform duration-200 lg:hidden ${open ? "translate-x-0" : "-translate-x-full"}`}
+      className={`app-apple-sidebar app-apple-sidebar-drawer fixed inset-y-2 left-2 z-50 flex w-[272px] max-w-[86vw] flex-col p-2.5 transition-transform duration-200 lg:hidden ${open ? "translate-x-0" : "-translate-x-[calc(100%+16px)]"}`}
     >
-      <div className="app-apple-nav-brand flex h-14 items-center justify-between gap-2 px-3">
-        <AppLogo className="min-w-0 shrink" label="specus" markClassName="h-8 w-8" />
-        <Button isIconOnly aria-label="关闭" className="h-9 w-9 min-w-9" radius="sm" variant="light" onPress={onClose}><CloseIcon /></Button>
+      <div className="app-apple-nav-brand flex h-12 items-center justify-between gap-2">
+        <AppLogo className="min-w-0 shrink" label="specus" />
+        <Button isIconOnly aria-label="关闭" className="h-9 w-9 min-w-9" radius="full" variant="light" onPress={onClose}><CloseIcon /></Button>
       </div>
       <Sidebar groups={groups} active={active} onSelect={onSelect} variant="mobile" onClose={onClose} />
     </aside>
   </>);
 }
 
-function HamburgerIcon() { return <svg className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h16" /></svg>; }
-function CloseIcon() { return <svg className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M6 6l12 12M6 18L18 6" /></svg>; }
+function HamburgerIcon() { return <svg aria-hidden="true" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="1.75" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h16" /></svg>; }
+function CloseIcon() { return <svg aria-hidden="true" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="1.75" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M6 6l12 12M6 18L18 6" /></svg>; }
 
 function UserMenu({ profile, onLogout, variant = "icon" }: { profile: ReturnType<typeof useAuth>["profile"]; onLogout: () => void; variant?: "icon" | "block" }) {
   const name = profile?.username || "user";
@@ -233,8 +233,8 @@ function UserMenu({ profile, onLogout, variant = "icon" }: { profile: ReturnType
     <Dropdown placement={variant === "block" ? "top-start" : "bottom-end"} shouldBlockScroll={false}>
       <DropdownTrigger>
         {variant === "block" ? (
-          <Button aria-label="个人菜单" className="h-auto w-full justify-start gap-2.5 px-2.5 py-2" radius="sm" variant="light">
-            <Avatar className="h-8 w-8 shrink-0 bg-primary-500 text-primary-foreground" name={initials} size="sm" />
+          <Button aria-label="个人菜单" className="h-auto w-full justify-start gap-2.5 px-2 py-1.5" radius="md" variant="light">
+            <Avatar className="h-8 w-8 shrink-0 bg-[var(--surface-muted)] text-[var(--text-muted)]" name={initials} size="sm" />
             <span className="flex min-w-0 flex-col items-start">
               <span className="w-full truncate text-left text-small font-medium text-foreground">{name}</span>
               <span className="w-full truncate text-left text-tiny text-default-500">{profile?.admin ? "管理员" : "普通用户"}</span>
@@ -242,7 +242,7 @@ function UserMenu({ profile, onLogout, variant = "icon" }: { profile: ReturnType
           </Button>
         ) : (
           <Button isIconOnly aria-label="个人菜单" className="h-10 w-10 min-w-10 rounded-full" radius="full" variant="flat">
-            <Avatar className="h-7 w-7 bg-primary-500 text-primary-foreground" name={initials} size="sm" />
+            <Avatar className="h-7 w-7 bg-[var(--surface-muted)] text-[var(--text-muted)]" name={initials} size="sm" />
           </Button>
         )}
       </DropdownTrigger>
@@ -254,12 +254,12 @@ function UserMenu({ profile, onLogout, variant = "icon" }: { profile: ReturnType
         else if (key === "docs") window.location.hash = "/help";
       }}>
         <DropdownSection aria-label="主题" showDivider>
-          <DropdownItem key="theme-dark" textValue="深色" endContent={mode === "dark" ? <CheckIcon /> : null}>{"\uD83C\uDF19"} 深色模式</DropdownItem>
-          <DropdownItem key="theme-light" textValue="浅色" endContent={mode === "light" ? <CheckIcon /> : null}>{"\u2600\uFE0F"} 浅色模式</DropdownItem>
-          <DropdownItem key="theme-system" textValue="系统" endContent={mode === "system" ? <CheckIcon /> : null}>{"\uD83D\uDDA5\uFE0F"} 跟随系统</DropdownItem>
+          <DropdownItem key="theme-dark" textValue="深色" startContent={<MenuIcon name="moon" />} endContent={mode === "dark" ? <CheckIcon /> : null}>深色模式</DropdownItem>
+          <DropdownItem key="theme-light" textValue="浅色" startContent={<MenuIcon name="sun" />} endContent={mode === "light" ? <CheckIcon /> : null}>浅色模式</DropdownItem>
+          <DropdownItem key="theme-system" textValue="系统" startContent={<MenuIcon name="monitor" />} endContent={mode === "system" ? <CheckIcon /> : null}>跟随系统</DropdownItem>
         </DropdownSection>
         <DropdownSection aria-label="快捷" showDivider>
-          <DropdownItem key="docs" textValue="帮助">{"\uD83D\uDCD6"} 帮助文档</DropdownItem>
+          <DropdownItem key="docs" textValue="帮助" startContent={<MenuIcon name="book" />}>帮助文档</DropdownItem>
         </DropdownSection>
         <DropdownSection aria-label="账户">
           <DropdownItem key="profile" textValue="信息" isReadOnly>
@@ -276,7 +276,17 @@ function UserMenu({ profile, onLogout, variant = "icon" }: { profile: ReturnType
     </Dropdown>
   );
 }
-function CheckIcon() { return <svg className="h-4 w-4 text-primary" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>; }
+function CheckIcon() { return <svg aria-hidden="true" className="h-4 w-4 text-[var(--accent)]" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>; }
+// Line icons of the design (24 canvas, 1.75 stroke) for the personal menu.
+function MenuIcon({ name }: { name: "moon" | "sun" | "monitor" | "book" }) {
+  const paths = {
+    moon: <path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z" />,
+    sun: <><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></>,
+    monitor: <><rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8M12 16v4" /></>,
+    book: <><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" /><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z" /></>,
+  };
+  return <svg aria-hidden="true" className="h-4 w-4 text-[var(--text-muted)]" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.75" viewBox="0 0 24 24">{paths[name]}</svg>;
+}
 
 function ActivePanel({ panel, initializing, onInitializeDatabase }: { panel: PanelKey; initializing: boolean; onInitializeDatabase: () => Promise<void> }) {
   switch (panel) {
@@ -295,4 +305,4 @@ function ActivePanel({ panel, initializing, onInitializeDatabase }: { panel: Pan
     default: return <LazyWorkbenchPanel />;
   }
 }
-function PanelLoading() { return <div className="flex min-h-[240px] items-center justify-center rounded-md border border-default-200 bg-content1" role="status"><Spinner label="加载页面…" /></div>; }
+function PanelLoading() { return <div className="flex min-h-[240px] items-center justify-center rounded-2xl border border-default-200 bg-content1" role="status"><Spinner label="加载页面…" /></div>; }

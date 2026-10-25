@@ -1,15 +1,71 @@
 <resources>
+    <!-- Liquid Glass Base, light theme. Colour values are the design system's tokens
+         (tokens.json); rgba() tokens are written as #AARRGGBB with alpha rounded to 0-255. -->
     <style name="SpecusTheme" parent="android:style/Theme.Material.Light.NoActionBar">
         <item name="android:fontFamily">sans</item>
-        <item name="android:colorAccent">#1D776D</item>
+        <item name="android:colorAccent">@color/gui_accent</item>
+        <item name="android:colorControlActivated">@color/gui_accent</item>
+        <item name="android:colorControlHighlight">@color/gui_pressed</item>
+        <item name="android:windowBackground">@color/gui_bg</item>
+        <item name="android:statusBarColor">@color/gui_bg</item>
         <item name="android:windowLightStatusBar">true</item>
         <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:alertDialogTheme">@style/SpecusDialog</item>
     </style>
-    <color name="gui_ink">#121E26</color>
-    <color name="gui_muted">#526571</color>
-    <color name="gui_page">#F0F4F6</color>
-    <color name="gui_panel">#FFFFFF</color>
-    <color name="gui_line">#DBE4E9</color>
-    <color name="gui_accent">#1D776D</color>
-    <color name="gui_danger">#B03E47</color>
+
+    <!-- Dialogs: surface, radius-2xl, the accent on the action buttons. -->
+    <style name="SpecusDialog" parent="android:style/Theme.Material.Light.Dialog.Alert">
+        <item name="android:windowBackground">@drawable/gui_dialog_background</item>
+        <item name="android:colorAccent">@color/gui_accent</item>
+        <item name="android:colorBackground">@color/gui_surface</item>
+        <item name="android:textColorPrimary">@color/gui_text</item>
+        <item name="android:textColorSecondary">@color/gui_text_muted</item>
+    </style>
+
+    <!-- Surfaces -->
+    <color name="gui_bg">#F5F5F7</color>
+    <color name="gui_surface">#FFFFFF</color>
+    <color name="gui_surface_muted">#EDEDF0</color>
+    <color name="gui_border">#14000000</color>
+    <color name="gui_field_bg">#FFFFFF</color>
+    <color name="gui_field_border">#24000000</color>
+    <color name="gui_pressed">#14000000</color>
+    <color name="gui_selected">#FFFFFF</color>
+
+    <!-- Text -->
+    <color name="gui_text">#1D1D1F</color>
+    <color name="gui_text_muted">#5C5C63</color>
+    <color name="gui_text_subtle">#6F6F76</color>
+
+    <!-- Accent: primary buttons, links, selection, progress -->
+    <color name="gui_accent">#0071E3</color>
+    <color name="gui_accent_hover">#0062C4</color>
+    <color name="gui_accent_soft">#1F0071E3</color>
+    <color name="gui_on_primary">#FFFFFF</color>
+    <color name="gui_focus_ring">#800071E3</color>
+
+    <!-- Status: only for status, always with text -->
+    <color name="gui_success">#1A7F37</color>
+    <color name="gui_success_bg">#2434C759</color>
+    <color name="gui_info">#0062C4</color>
+    <color name="gui_info_bg">#1A0071E3</color>
+    <color name="gui_warning">#A35200</color>
+    <color name="gui_warning_bg">#29FF9F0A</color>
+    <color name="gui_danger">#C4161C</color>
+    <color name="gui_danger_bg">#1AFF3B30</color>
+    <color name="gui_danger_solid">#E5342B</color>
+    <color name="gui_on_danger">#FFFFFF</color>
+
+    <!-- Per-theme component values from bundle.css (they differ between light and dark):
+         secondary button, muted fill, switch track (off), neutral tag, shadow-sm. -->
+    <color name="gui_secondary_bg">#FFFFFF</color>
+    <color name="gui_secondary_pressed">#EDEDF0</color>
+    <!-- danger-solid at brightness(.94), the danger button's hover in bundle.css -->
+    <color name="gui_danger_pressed">#D73128</color>
+    <!-- segmented track and empty-state icon: surface-muted here, translucent white in dark -->
+    <color name="gui_muted_fill">#EDEDF0</color>
+    <color name="gui_switch_off">#E8E8EC</color>
+    <color name="gui_tag_bg">#EDEDF0</color>
+    <!-- shadow-sm, drawn as a 1dp lip under cards and the selected segment -->
+    <color name="gui_shadow">#0D000000</color>
 </resources>

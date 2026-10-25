@@ -10,6 +10,24 @@ const COLOR: Record<ToastKind, "success" | "danger" | "primary"> = {
   info: "primary",
 };
 
+// The design's Toast: dark translucent glass in both themes, the icon in the toast status colors.
+// These replace the ToastProvider defaults rather than merging with them, so every slot is named.
+const ICON_CLASS: Record<ToastKind, string> = {
+  success: "text-[var(--toast-success)]",
+  error: "text-[var(--toast-error)]",
+  info: "text-[var(--on-toast)]",
+};
+
+function toastClassNames(kind: ToastKind) {
+  return {
+    base: "app-toast",
+    title: "app-toast-title",
+    description: "app-toast-desc",
+    closeButton: "app-toast-close",
+    icon: ICON_CLASS[kind],
+  };
+}
+
 // notify shows a HeroUI toast. Errors linger longer than success/info messages.
 export function notify(message: string, kind: ToastKind = "success"): void {
   if (isDuplicateToast(message, kind)) {
@@ -18,6 +36,7 @@ export function notify(message: string, kind: ToastKind = "success"): void {
   addToast({
     title: message,
     color: COLOR[kind],
+    classNames: toastClassNames(kind),
     timeout: kind === "error" ? 8000 : 4000,
   });
 }

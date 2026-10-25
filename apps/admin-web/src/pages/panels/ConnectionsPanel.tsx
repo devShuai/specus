@@ -31,6 +31,7 @@ import { useNowTick } from "../../hooks/useNowTick";
 import { useAuth } from "../../auth/AuthContext";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 import { EmptyState } from "../../components/EmptyState";
+import { PageHeader } from "../../components/PageHeader";
 
 const PAGE_SIZE = 50;
 const FILTER_POPOVER_CLASS_NAMES = {
@@ -245,28 +246,24 @@ export function ConnectionsPanel() {
   const hasActiveFilters = activeFilterCount > 0;
 
   return (
-    <div className="mt-2 flex min-w-0 flex-col gap-4">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <h2 className="text-lg font-semibold text-foreground">连接记录</h2>
-            <Chip radius="sm" size="sm" variant="flat">
-              {total} 条
-            </Chip>
-          </div>
-          <p className="mt-1 text-small text-default-500">查看客户端连接结果、来源地址与在线时长。</p>
-        </div>
-        <Button
-          className="w-full shrink-0 sm:w-auto"
-          color="primary"
-          isLoading={loading}
-          radius="sm"
-          variant="flat"
-          onPress={() => void load()}
-        >
-          刷新记录
-        </Button>
-      </div>
+    <div className="flex min-w-0 flex-col gap-4">
+      <PageHeader
+        title="连接记录"
+        meta={<Chip size="sm" variant="flat">{total} 条</Chip>}
+        description="客户端连接结果、来源地址与在线时长。"
+        actions={
+          <Button
+            className="w-full shrink-0 sm:w-auto"
+            color="primary"
+            isLoading={loading}
+            radius="sm"
+            variant="flat"
+            onPress={() => void load()}
+          >
+            刷新记录
+          </Button>
+        }
+      />
 
       {/* mobile: 卡片堆叠 */}
       <div className="xl:hidden">

@@ -1,155 +1,239 @@
 // HeroUI's Tailwind plugin, loaded by src/tailwind.css through @plugin.
 import { heroui } from "@heroui/react";
 
-// The site-wide semantic colors share the diagram editor's Apple-style palette, so HeroUI
-// components and the public tool pages match. Every scale carries 50–900: HeroUI's flat/subtle
-// variants (Chip, Badge) rely on -100/-200 backgrounds and -600/-700 text.
-// The palette is passed to heroui() (the same shape extendTheme takes), which emits the CSS
-// variables and semantic utilities. Light and dark switch on the .dark/.light class of <html>
-// (see ThemeContext.tsx), which the `dark` custom variant in src/tailwind.css follows.
+// HeroUI's semantic colors follow the Liquid Glass Base tokens in src/design-tokens.css: one system
+// blue accent, status colors only for status, Apple neutrals for everything else. Every scale
+// carries 50–900 because HeroUI's flat variants read them: primary text-primary-600, success and
+// warning text-*-700 (dark: the DEFAULT), danger text-danger-600 (dark: -500). So DEFAULT is the
+// bright system color and those steps are the token's text color. Dark scales run dark to light, as
+// HeroUI's own dark theme does, so -50/-100 tints stay dark on a dark page.
+// Light and dark switch on the .dark/.light class of <html> (see ThemeContext.tsx), which the
+// `dark` custom variant in src/tailwind.css follows.
 
-// src/tailwind.css maps the legacy cyan-* utilities onto these same values; keep the two in sync.
-const appleBlueScale = {
-  50: "#f0f7ff",
-  100: "#e1efff",
-  200: "#bfddff",
-  300: "#8ec4ff",
-  400: "#5aa8ff",
-  500: "#2997ff",
-  600: "#0077ed",
-  700: "#0066cc",
-  800: "#0055aa",
-  900: "#00447f",
-};
-
-// The primary color keeps enough contrast; status colors keep their own hues so the UI does not
-// collapse into a single color.
-const semanticColors = {
-  // primary = Apple blue
+// src/tailwind.css maps the legacy cyan-* utilities onto the light blue scale; keep the two in sync.
+const lightColors = {
   primary: {
-    ...appleBlueScale,
-    DEFAULT: "#0066cc",
+    50: "#eef6ff",
+    100: "#dcecff",
+    200: "#b8d8ff",
+    300: "#85bcff",
+    400: "#4d9cff",
+    500: "#1a82f5",
+    600: "#0071e3",
+    700: "#0062c4",
+    800: "#004f9e",
+    900: "#003c78",
+    DEFAULT: "#0071e3",
     foreground: "#ffffff",
   },
-  // secondary = Apple neutral (secondary actions; no separate cool hue)
   secondary: {
-    50: "#f5f5f7",
-    100: "#e8e8ed",
-    200: "#d2d2d7",
-    300: "#b8b8bd",
-    400: "#8e8e93",
-    500: "#6e6e73",
-    600: "#515154",
-    700: "#3a3a3c",
-    800: "#2c2c2e",
+    50: "#f7f7f9",
+    100: "#ededf0",
+    200: "#e1e1e6",
+    300: "#d1d1d6",
+    400: "#a1a1a8",
+    500: "#6f6f76",
+    600: "#5c5c63",
+    700: "#3a3a3e",
+    800: "#2a2a2e",
     900: "#1d1d1f",
-    DEFAULT: "#6e6e73",
+    DEFAULT: "#6f6f76",
     foreground: "#ffffff",
   },
-  // success = emerald
   success: {
-    50: "#ecfdf5",
-    100: "#d1fae5",
-    200: "#a7f3d0",
-    300: "#6ee7b7",
-    400: "#34d399",
-    500: "#10b981",
-    600: "#059669",
-    700: "#047857",
-    800: "#065f46",
-    900: "#064e3b",
-    DEFAULT: "#10b981",
-    foreground: "#ffffff",
+    50: "#edfbf1",
+    100: "#d3f5dd",
+    200: "#a8ebbb",
+    300: "#6fdb8f",
+    400: "#3ccb67",
+    500: "#34c759",
+    600: "#1f9a45",
+    700: "#1a7f37",
+    800: "#15652c",
+    900: "#104d22",
+    DEFAULT: "#34c759",
+    foreground: "#0b2914",
   },
-  // warning = amber (a solid amber fill needs dark text to reach the contrast ratio)
+  // A solid orange needs dark text to reach the contrast ratio.
   warning: {
-    50: "#fffbeb",
-    100: "#fef3c7",
-    200: "#fde68a",
-    300: "#fcd34d",
-    400: "#fbbf24",
-    500: "#f59e0b",
-    600: "#d97706",
-    700: "#b45309",
-    800: "#92400e",
-    900: "#78350f",
-    DEFAULT: "#f59e0b",
+    50: "#fff7eb",
+    100: "#ffecd0",
+    200: "#ffd9a1",
+    300: "#ffc266",
+    400: "#ffad33",
+    500: "#ff9f0a",
+    600: "#cc7400",
+    700: "#a35200",
+    800: "#7d3f00",
+    900: "#5c2e00",
+    DEFAULT: "#ff9f0a",
     foreground: "#1a1205",
   },
-  // danger = rose
   danger: {
-    50: "#fff1f2",
-    100: "#ffe4e6",
-    200: "#fecdd3",
-    300: "#fda4af",
-    400: "#fb7185",
-    500: "#f43f5e",
-    600: "#e11d48",
-    700: "#be123c",
-    800: "#9f1239",
-    900: "#881337",
-    DEFAULT: "#f43f5e",
+    50: "#fff1f0",
+    100: "#ffe0de",
+    200: "#ffc0bc",
+    300: "#ff958e",
+    400: "#f6635a",
+    500: "#e5342b",
+    600: "#c4161c",
+    700: "#a11218",
+    800: "#7f0e13",
+    900: "#5e0a0e",
+    DEFAULT: "#e5342b",
     foreground: "#ffffff",
   },
+  default: {
+    50: "#f7f7f9",
+    100: "#ededf0",
+    200: "#e1e1e6",
+    300: "#d1d1d6",
+    400: "#a1a1a8",
+    500: "#6f6f76",
+    600: "#5c5c63",
+    700: "#3a3a3e",
+    800: "#2a2a2e",
+    900: "#1d1d1f",
+    DEFAULT: "#e5e5ea",
+    foreground: "#1d1d1f",
+  },
+  background: "#f5f5f7",
+  foreground: "#1d1d1f",
+  content1: "#ffffff",
+  content2: "#f7f7f9",
+  content3: "#ededf0",
+  content4: "#e8e8ec",
+  divider: "#e5e5e9",
+  overlay: "#141418",
+  focus: "#0071e3",
 };
 
-// default = the zinc scale (neutral borders and fills). The light theme uses stock zinc.
-const zincScale = {
-  50: "#fafafa",
-  100: "#f4f4f5",
-  200: "#e4e4e7",
-  300: "#d4d4d8",
-  400: "#a1a1aa",
-  500: "#71717a",
-  600: "#52525b",
-  700: "#3f3f46",
-  800: "#27272a",
-  900: "#18181b",
+const darkColors = {
+  primary: {
+    50: "#001a33",
+    100: "#00264d",
+    200: "#003d7a",
+    300: "#0057ad",
+    400: "#0071e3",
+    500: "#0a84ff",
+    600: "#3d9bff",
+    700: "#64a8ff",
+    800: "#9ec5ff",
+    900: "#cfe3ff",
+    DEFAULT: "#0a84ff",
+    foreground: "#ffffff",
+  },
+  secondary: {
+    50: "#141416",
+    100: "#1c1c1f",
+    200: "#2a2a2e",
+    300: "#3a3a3e",
+    400: "#6f6f76",
+    500: "#8e8e94",
+    600: "#a8a8ad",
+    700: "#d1d1d6",
+    800: "#e5e5ea",
+    900: "#f5f5f7",
+    DEFAULT: "#8e8e94",
+    foreground: "#0c0c0e",
+  },
+  success: {
+    50: "#0b2914",
+    100: "#0f3a1c",
+    200: "#155227",
+    300: "#1c6e34",
+    400: "#248a3d",
+    500: "#2fb24f",
+    600: "#30d158",
+    700: "#5fdc7f",
+    800: "#97e8ab",
+    900: "#cdf4d6",
+    DEFAULT: "#30d158",
+    foreground: "#0b2914",
+  },
+  warning: {
+    50: "#2e1a00",
+    100: "#452700",
+    200: "#663a00",
+    300: "#8f5200",
+    400: "#c27000",
+    500: "#ff9f0a",
+    600: "#ffb340",
+    700: "#ffc56e",
+    800: "#ffdaa1",
+    900: "#ffeed3",
+    DEFAULT: "#ffb340",
+    foreground: "#1a1205",
+  },
+  danger: {
+    50: "#2d0b0a",
+    100: "#45100e",
+    200: "#6b1712",
+    300: "#9c2019",
+    400: "#d52c22",
+    500: "#ff6961",
+    600: "#ff8a84",
+    700: "#ffaaa5",
+    800: "#ffcbc8",
+    900: "#ffe5e3",
+    DEFAULT: "#ff453a",
+    foreground: "#ffffff",
+  },
+  default: {
+    50: "#141416",
+    100: "#1c1c1f",
+    200: "#2a2a2e",
+    300: "#3a3a3e",
+    400: "#6f6f76",
+    500: "#8e8e94",
+    600: "#a8a8ad",
+    700: "#d1d1d6",
+    800: "#e5e5ea",
+    900: "#f5f5f7",
+    DEFAULT: "#3a3a3e",
+    foreground: "#f5f5f7",
+  },
+  background: "#0c0c0e",
+  foreground: "#f5f5f7",
+  content1: { DEFAULT: "#1c1c1f", foreground: "#f5f5f7" },
+  content2: { DEFAULT: "#232327", foreground: "#d1d1d6" },
+  content3: { DEFAULT: "#2a2a2e", foreground: "#d1d1d6" },
+  content4: { DEFAULT: "#3a3a3e", foreground: "#d1d1d6" },
+  divider: "#2a2a2e",
+  overlay: "#000000",
+  focus: "#0a84ff",
 };
 
-// Apple-style dark layers: dark surfaces first, readable text last. HeroUI's dark semantic scale
-// must run opposite to the light one, or text-default-600 lands on dark gray and
-// bg/border-default-* invert as well.
-const appleDarkScale = {
-  50: "#0f1011",
-  100: "#141516",
-  200: "#23252a",
-  300: "#34343a",
-  400: "#8a8f98",
-  500: "#a8adb6",
-  600: "#d0d6e0",
-  700: "#e0e4ea",
-  800: "#eef0f3",
-  900: "#f7f8f8",
+// Radii, borders and shadows of the design: buttons and fields radius-md, small controls
+// radius-sm, popovers radius-lg (cards and dialogs get radius-xl/2xl in index.css); 1px borders;
+// disabled at 45%.
+const layout = {
+  radius: { small: "8px", medium: "10px", large: "14px" },
+  borderWidth: { small: "1px", medium: "1px", large: "2px" },
+  disabledOpacity: "0.45",
 };
 
 export default heroui({
+  layout,
   themes: {
     light: {
-      colors: {
-        ...semanticColors,
-        default: { ...zincScale, DEFAULT: "#e8e8ed", foreground: "#1d1d1f" },
-        background: "#f5f5f7",
-        foreground: "#1d1d1f",
-        content1: "#ffffff",
-        content2: "#fbfbfd",
-        content3: "#f5f5f7",
-        divider: "#e5e5e7",
-        focus: "#0066cc",
+      colors: lightColors,
+      layout: {
+        boxShadow: {
+          small: "0 1px 2px rgba(0, 0, 0, 0.05), 0 0 0 0.5px rgba(0, 0, 0, 0.03)",
+          medium: "0 8px 24px rgba(0, 0, 0, 0.08), 0 1px 3px rgba(0, 0, 0, 0.05)",
+          large: "0 24px 64px rgba(0, 0, 0, 0.18), 0 2px 8px rgba(0, 0, 0, 0.06)",
+        },
       },
     },
     dark: {
-      colors: {
-        ...semanticColors,
-        default: { ...appleDarkScale, DEFAULT: "#34343a", foreground: "#f7f8f8" },
-        background: "#1d1d1f",
-        foreground: { ...appleDarkScale, DEFAULT: "#f5f5f7" },
-        content1: { DEFAULT: "#2c2c2e", foreground: "#f5f5f7" },
-        content2: { DEFAULT: "#242426", foreground: "#d1d1d6" },
-        content3: { DEFAULT: "#323234", foreground: "#d1d1d6" },
-        content4: { DEFAULT: "#3a3a3c", foreground: "#d1d1d6" },
-        divider: "#3a3a3c",
-        focus: "#2997ff",
+      colors: darkColors,
+      layout: {
+        boxShadow: {
+          small: "0 1px 2px rgba(0, 0, 0, 0.5)",
+          medium: "0 8px 24px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.4)",
+          large: "0 24px 64px rgba(0, 0, 0, 0.65), 0 2px 8px rgba(0, 0, 0, 0.4)",
+        },
       },
     },
   },

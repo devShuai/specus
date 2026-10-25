@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { PageHeader } from "../../components/PageHeader";
 import {
   Button,
   Card,
@@ -300,15 +301,11 @@ export function PeerMeshPanel() {
   };
 
   return (
-    <div className="mt-4 flex min-w-0 flex-col gap-3">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h2 className="text-lg font-semibold text-foreground">私有组网</h2>
-          <p className="text-small text-default-500">
-            设备通过虚拟 IP 互联；RFC 5780 双轴结果辅助选路，直连失败后切换认证 TURN。
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
+    <div className="flex min-w-0 flex-col gap-3">
+      <PageHeader
+        title="私有组网"
+        description="设备通过虚拟 IP 互联；RFC 5780 双轴结果辅助选路，直连失败后切换认证 TURN。"
+        actions={<>
           <Button
             color="danger"
             variant="flat"
@@ -321,8 +318,8 @@ export function PeerMeshPanel() {
           <Button variant="flat" isLoading={refreshing} onPress={() => void refresh()}>
             刷新
           </Button>
-        </div>
-      </div>
+        </>}
+      />
 
       <div className="grid grid-cols-1 gap-2 md:grid-cols-3 xl:grid-cols-6">
         <MetricCard

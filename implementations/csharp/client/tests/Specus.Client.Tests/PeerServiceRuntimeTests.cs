@@ -389,14 +389,18 @@ public class PeerServiceRuntimeTests
         }
         using (var echo = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0)))
         {
-            var responder = Task.Run(async () =>
+            // ProbeUdp blocks the test thread, so the echo runs on its own thread: a thread-pool task
+            // can start after the probe's timeout while parallel tests keep the pool busy.
+            var responder = new Thread(() =>
             {
-                var request = await echo.ReceiveAsync();
-                await echo.SendAsync([1], 1, request.RemoteEndPoint);
-            });
+                var remote = new IPEndPoint(IPAddress.Any, 0);
+                echo.Receive(ref remote);
+                echo.Send([1], 1, remote);
+            }) { IsBackground = true };
+            responder.Start();
             Assert.True(PeerServiceDiscovery.ProbeUdp("localhost",
-                ((IPEndPoint)echo.Client.LocalEndPoint!).Port, 500));
-            await responder;
+                ((IPEndPoint)echo.Client.LocalEndPoint!).Port, 5000));
+            Assert.True(responder.Join(TimeSpan.FromSeconds(5)));
         }
         Assert.False(PeerServiceDiscovery.TryResolveLocalInterfaceTarget("example.invalid", out _));
         Assert.False(PeerServiceDiscovery.TryResolveLocalInterfaceTarget("10.255.255.254", out _));
