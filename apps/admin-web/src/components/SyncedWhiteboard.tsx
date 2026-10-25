@@ -16,6 +16,7 @@ import {
   fitWhiteboardImageDataUrl,
 } from "../lib/whiteboardImageCompression";
 import { useTheme } from "../theme/ThemeContext";
+import { Tag } from "./ui";
 import {
   createWhiteboardDocument,
   decodeWhiteboardDocument,
@@ -1620,7 +1621,7 @@ export function SyncedWhiteboard({
       className={
         (isExpanded
           ? "fixed inset-0 z-[90] m-0 h-[100dvh] overflow-hidden rounded-none border-0 bg-zinc-100 dark:bg-zinc-950"
-          : "mt-5 rounded-xl glass glass-border border p-3 sm:p-4")
+          : "tr-board")
         + (isActive ? "" : " hidden")
       }
       aria-hidden={!isActive}
@@ -1635,42 +1636,39 @@ export function SyncedWhiteboard({
         disabled={isReadOnly}
         onChange={handleDocumentInput}
       />
-      {!isExpanded ? <div className="flex shrink-0 flex-wrap items-start justify-between gap-3">
+      {!isExpanded ? <div className="tr-board-head">
         <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <h2 className="text-base font-semibold text-zinc-950 dark:text-white">多人白板</h2>
-            <Chip size="sm" radius="sm" variant="flat" color={isConnected ? "success" : "default"}>
+          <div className="tr-board-tags">
+            <Tag tone={isConnected ? "success" : "neutral"} plain={!isConnected}>
               {isConnected ? "实时同步" : "本地绘制"}
-            </Chip>
-            <Chip size="sm" radius="sm" variant="flat">
+            </Tag>
+            <Tag plain>
               {totalPeers} 台 · {boardCountLabel}
-            </Chip>
-            {isReadOnly ? <Chip size="sm" radius="sm" variant="flat" color="warning">访客只读</Chip> : null}
+            </Tag>
+            {isReadOnly ? <Tag tone="warning">访客只读</Tag> : null}
           </div>
-          <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
+          <p className="tr-note">
             可滚动画布支持文本、图片、图形和流程图，可导入导出可编辑白板文件。
-          </div>
+          </p>
         </div>
-        <Button
-          size="sm"
-          radius="sm"
-          color={isExpanded ? "primary" : "default"}
-          variant="flat"
-          onPress={() => setIsExpanded((value) => !value)}
+        <button
+          type="button"
+          className="bd-btn bd-btn--secondary bd-btn--sm"
+          onClick={() => setIsExpanded((value) => !value)}
         >
-          <span className="mr-1.5"><ToolGlyph name={isExpanded ? "collapse" : "fullscreen"} /></span>
-          {isExpanded ? "退出全屏" : "全屏白板"}
-        </Button>
+          <ToolGlyph name={isExpanded ? "collapse" : "fullscreen"} />
+          <span>{isExpanded ? "退出全屏" : "全屏白板"}</span>
+        </button>
       </div> : null}
 
       <div
         className={
           (isExpanded
             ? "absolute inset-0 overflow-hidden bg-zinc-100 dark:bg-zinc-950"
-            : "mt-3 flex min-h-0 flex-col overflow-hidden rounded-xl border border-black/10 bg-white/70 shadow-xs dark:border-white/10 dark:bg-white/[0.04]")
+            : "tr-board-frame")
         }
       >
-        {!isExpanded ? <div className="shrink-0 border-b border-black/10 bg-white/80 p-2 dark:border-white/10 dark:bg-zinc-900/90 sm:p-2.5">
+        {!isExpanded ? <div className="tr-board-toolbar">
           <div className="flex items-center gap-0.5 overflow-x-auto [scrollbar-width:none]" role="toolbar" aria-label="白板工具">
             <WhiteboardToolButton tool="pan" label="移动" activeTool={selectedTool} onSelect={selectTool} />
             <WhiteboardToolButton tool="select" label="选择" activeTool={selectedTool} onSelect={selectTool} />
@@ -2374,7 +2372,7 @@ export function SyncedWhiteboard({
           </>
         ) : null}
 
-        {!isExpanded ? <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-t border-black/10 bg-white/80 px-3 py-2 text-tiny text-zinc-500 dark:border-white/10 dark:bg-zinc-900/90 dark:text-zinc-400">
+        {!isExpanded ? <div className="tr-board-foot">
           <span>{boardMessage}</span>
           <span className="hidden font-mono text-[10px] sm:inline">H 移动 · V 选择 · P 画笔 · T 文本 · Delete 删除</span>
         </div> : null}

@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ClipboardEvent as ReactClipboardEvent } from "react";
-import { Button, Chip, Switch } from "@heroui/react";
+import { useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import type { ClipboardEvent as ReactClipboardEvent, Ref } from "react";
+import { Switch } from "@heroui/react";
+import { Icon, RelativeTime, Tag } from "./ui";
 import { clipboardQuickSendAllowed } from "../lib/transferExperience";
 import {
   CLIPBOARD_TEXT_MAX_CHARS,
@@ -30,7 +31,24 @@ class ClipboardWriteTimeoutError extends Error {
   }
 }
 
+/** What the page's send bar can do with the composer, which lives in this component. */
+export interface SyncedClipboardHandle {
+  /** Sends the composer's text to the selected device: the same as Ctrl/⌘ Enter in the text box. */
+  submitComposer: () => void;
+  /** Puts text pasted elsewhere on the page into the composer as a draft; never sends. */
+  insertDraft: (text: string, html?: string) => void;
+}
+
+export interface ClipboardComposerState {
+  hasDraft: boolean;
+  withinLimits: boolean;
+  sending: boolean;
+}
+
 interface SyncedClipboardProps {
+  ref?: Ref<SyncedClipboardHandle>;
+  /** Reports whether the composer can be sent, so the page's send bar can say why not. */
+  onComposerStateChange?: (state: ClipboardComposerState) => void;
   syncKey: string;
   isActive: boolean;
   focusRequest: number;
@@ -52,6 +70,8 @@ interface SuccessfulClipboardWrite {
 }
 
 export function SyncedClipboard({
+  ref,
+  onComposerStateChange,
   syncKey,
   isActive,
   focusRequest,
@@ -87,7 +107,7 @@ export function SyncedClipboard({
   const [blocks, setBlocks] = useState<ClipboardTextBlock[]>([]);
   const [latestInbound, setLatestInbound] = useState<ClipboardInboundEvent | null>(null);
   const [viewState, setViewState] = useState<ClipboardViewState>("idle");
-  const [statusMessage, setStatusMessage] = useState("先粘贴或读取内容，检查接收方后点击发送。");
+  const [statusMessage, setStatusMessage] = useState("先粘贴或读取内容，检查接收方后再发送。");
   const [isSending, setSending] = useState(false);
   const [sendingBlockId, setSendingBlockId] = useState("");
   const [isClipboardWritePending, setClipboardWritePending] = useState(false);
@@ -108,7 +128,7 @@ export function SyncedClipboard({
   const sendClipboardFiles = (files: File[]) => {
     if (fileTargetRequired && !targetPeerId) {
       setViewState("failed");
-      setStatusMessage("剪贴板中包含文件，请先从“发送给谁”选择一台设备。");
+      setStatusMessage("剪贴板中包含文件：先在“选择接收方”里选一台设备。");
       return false;
     }
     return onFiles(files);
@@ -141,11 +161,11 @@ export function SyncedClipboard({
         lastSuccessfulWriteRef.current = "";
         if (current.generation !== syncGenerationRef.current) {
           setViewState("failed");
-          setStatusMessage("上一会话的迟到剪贴板写入未能自动纠正，请检查本机剪贴板。");
+          setStatusMessage("上一会话的迟到剪贴板写入未能自动纠正：检查本机剪贴板里的内容。");
           return;
         }
         setViewState("needs-copy");
-        setStatusMessage("浏览器未能自动恢复剪贴板，请点击“复制到剪贴板”重试。");
+        setStatusMessage("浏览器未能自动恢复剪贴板：用“复制到剪贴板”重试。");
       });
     };
 
@@ -199,7 +219,7 @@ export function SyncedClipboard({
     setViewState(clipboardWritePendingRef.current ? "writing" : "idle");
     setStatusMessage(clipboardWritePendingRef.current
       ? "正在等待浏览器完成上一条剪贴板写入；完成前不会发起新的本机写入。"
-      : "先粘贴或读取内容，检查接收方后点击发送。");
+      : "先粘贴或读取内容，检查接收方后再发送。");
   }, [onDraftStateChange, syncKey]);
 
   useEffect(() => {
@@ -287,8 +307,8 @@ export function SyncedClipboard({
             && latestInboundRef.current?.eventId === candidate.eventId) {
             setViewState("needs-copy");
             setStatusMessage(error instanceof ClipboardWriteTimeoutError
-              ? "自动写入等待超时，请点击“复制到剪贴板”重试。"
-              : "浏览器阻止了自动写入，请点击“复制到剪贴板”。");
+              ? "自动写入等待超时：用“复制到剪贴板”重试。"
+              : "浏览器阻止了自动写入：用“复制到剪贴板”手动写入。");
           }
         })
         .finally(() => {
@@ -331,7 +351,7 @@ export function SyncedClipboard({
     }
     if (!targetPeerId) {
       setViewState("failed");
-      setStatusMessage("还没有可发送的目标，请先邀请并选择一台设备。");
+      setStatusMessage("还没有可发送的目标：先邀请并选择一台设备。");
       return;
     }
     if (sendTokenRef.current) {
@@ -373,7 +393,7 @@ export function SyncedClipboard({
   ) => {
     if (!text) {
       setViewState("failed");
-      setStatusMessage("请输入或粘贴内容后再创建剪贴板项。");
+      setStatusMessage("先输入或粘贴内容，再发送。");
       return;
     }
     if (!isClipboardContentWithinLimits(text, content.html ?? "")) {
@@ -430,7 +450,7 @@ export function SyncedClipboard({
           setComposerHtml(html);
         }
         setViewState("ready");
-        setStatusMessage("已读取到草稿，尚未发送。检查内容后点击发送。");
+        setStatusMessage("已读取到草稿，尚未发送。检查内容后再发送。");
       })
       .catch((error) => {
         if (generation !== syncGenerationRef.current) {
@@ -496,8 +516,8 @@ export function SyncedClipboard({
     if (filesStaged) {
       setViewState("ready");
       setStatusMessage(clipboardQuickSendAllowed(quickSend, canSend, targetPeerId)
-        ? "文件尚未发送，已保留为草稿；请检查连接后点击“发送这些文件”。"
-        : "文字和文件已保留为草稿，检查接收方后分别点击发送。");
+        ? "文件尚未发送，已保留为草稿；检查连接后用“发送这些文件”发送。"
+        : "文字和文件已保留为草稿，检查接收方后分别发送。");
     }
   };
 
@@ -509,7 +529,7 @@ export function SyncedClipboard({
     }
     if (clipboardWritePendingRef.current) {
       setViewState("writing");
-      setStatusMessage("浏览器仍在完成上一条剪贴板写入，请稍候再复制。");
+      setStatusMessage("浏览器仍在完成上一条剪贴板写入，稍候再复制。");
       return;
     }
     clipboardWritePendingRef.current = true;
@@ -540,7 +560,7 @@ export function SyncedClipboard({
         }
         setViewState("failed");
         setStatusMessage(error instanceof ClipboardWriteTimeoutError
-          ? "写入等待超时，已解除占用；可以再次点击“复制到剪贴板”。"
+          ? "写入等待超时，已解除占用；可以再用“复制到剪贴板”重试。"
           : systemClipboardErrorMessage(error, "写入"));
       })
       .finally(() => {
@@ -589,6 +609,40 @@ export function SyncedClipboard({
     textareaRef.current?.focus();
   };
 
+  const canSubmitComposer = Boolean(composerDraft) && composerWithinLimits && canSend && Boolean(targetPeerId) && !isSending;
+  const submitComposer = () => {
+    if (canSubmitComposer) addLocalBlock(composerDraft, classifyClipboardContent(composerDraft, composerHtml));
+  };
+  const insertDraft = (text: string, html = "") => {
+    if (!text) return;
+    const content = classifyClipboardContent(text, html);
+    if (!isClipboardContentWithinLimits(text, content.html ?? "")) {
+      setViewState("failed");
+      setStatusMessage(`剪贴板内容超过 ${CLIPBOARD_TEXT_MAX_CHARS.toLocaleString()} 个字符或 ${formatByteCount(CLIPBOARD_TEXT_MAX_UTF8_BYTES)}，未放入草稿。`);
+      return;
+    }
+    setComposerDraft(text);
+    setComposerHtml(content.html ?? "");
+    setViewState("ready");
+    setStatusMessage("内容已放入草稿，尚未发送。");
+    window.requestAnimationFrame(() => textareaRef.current?.focus());
+  };
+  const submitComposerRef = useRef(submitComposer);
+  const insertDraftRef = useRef(insertDraft);
+  submitComposerRef.current = submitComposer;
+  insertDraftRef.current = insertDraft;
+  useImperativeHandle(ref, () => ({
+    submitComposer: () => submitComposerRef.current(),
+    insertDraft: (text, html) => insertDraftRef.current(text, html),
+  }), []);
+
+  const composerHasDraft = Boolean(composerDraft);
+  useEffect(() => {
+    onComposerStateChange?.({ hasDraft: composerHasDraft, withinLimits: composerWithinLimits, sending: isSending });
+  }, [composerHasDraft, composerWithinLimits, isSending, onComposerStateChange]);
+
+  const statusTone = clipboardStatusTone(viewState);
+
   return (
     <section
       id="transfer-panel-clipboard"
@@ -596,243 +650,204 @@ export function SyncedClipboard({
       aria-labelledby="transfer-tab-clipboard"
       hidden={!isActive}
       onPaste={handlePaste}
-      className="mt-3 overflow-hidden rounded-xl border border-black/[0.07] bg-white/40 dark:border-white/[0.08] dark:bg-white/[0.02]"
+      className="tr-panel tr-clipboard"
     >
-      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 border-b border-black/[0.06] px-4 py-3 dark:border-white/[0.07]">
-        <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <h2 className="text-base font-semibold text-zinc-950 dark:text-white">文字与链接</h2>
-          <Chip size="sm" radius="sm" variant="flat" color={canSend && targetPeerId ? "success" : "default"}>
-            {canSend ? (targetPeerId ? quickSend ? "粘贴即发送" : "确认后发送" : "等待选择设备") : "只读"}
-          </Chip>
-          {blocks.length > 0 && (
-            <Chip size="sm" radius="sm" variant="flat">
-              {blocks.length} 项
-            </Chip>
-          )}
-        </div>
-        <p className="text-tiny text-zinc-500 dark:text-zinc-400">
-          {!canSend
-            ? "只读房间：可查看和复制收到的内容"
-            : targetPeerId
-              ? <>同步到 <span title={targetLabel} className="font-medium text-zinc-700 [overflow-wrap:anywhere] dark:text-zinc-200">{targetLabel}</span></>
-              : "选择一台在线设备即可同步"}
-        </p>
-      </div>
-
-      <div className="flex flex-col gap-3 px-4 py-3">
-        <Switch size="sm" isSelected={quickSend} onValueChange={setQuickSend} isDisabled={!canSend || !targetPeerId}>粘贴即发送（仅本次页面，读取剪贴板仍需确认）</Switch>
-        <div className="rounded-xl border border-black/[0.06] bg-linear-to-b from-white/90 to-white/50 p-3 shadow-xs dark:border-white/[0.08] dark:from-white/[0.05] dark:to-white/[0.02]">
-          <textarea
-            ref={textareaRef}
-            id="public-transfer-clipboard-text"
-            data-testid="public-transfer-clipboard-text"
-            aria-label="添加剪贴板内容"
-            value={composerDraft}
-            maxLength={CLIPBOARD_TEXT_MAX_CHARS}
-            spellCheck={false}
-            onChange={(event) => {
-              const value = event.currentTarget.value;
-              setComposerDraft(value);
-              setComposerHtml("");
-              if (!isClipboardContentWithinLimits(value, "")) {
-                setViewState("failed");
-                setStatusMessage(`文本的 UTF-8 大小超过 ${formatByteCount(CLIPBOARD_TEXT_MAX_UTF8_BYTES)}，请删减后再创建文本块。`);
-              }
-            }}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-                event.preventDefault();
-                if (canSend && targetPeerId && !isSending) addLocalBlock(composerDraft, classifyClipboardContent(composerDraft, composerHtml));
-              }
-            }}
-            placeholder="粘贴或输入内容，检查后点击发送；Ctrl/⌘ + Enter 发送"
-            className="min-h-24 w-full resize-y rounded-lg border border-transparent bg-black/[0.035] px-3.5 py-2.5 font-mono text-small text-zinc-950 outline-hidden transition placeholder:text-zinc-400 hover:bg-black/[0.05] focus:border-primary-500/50 focus:bg-white focus:shadow-[0_0_0_4px_rgba(0,102,204,0.08)] dark:bg-white/[0.05] dark:text-zinc-100 dark:placeholder:text-zinc-500 dark:hover:bg-white/[0.07] dark:focus:border-primary-400/50 dark:focus:bg-black/30"
-          />
-          <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
-            <span className={`text-tiny ${composerDraft && !composerWithinLimits ? "font-medium text-rose-600 dark:text-rose-300" : "text-zinc-400 dark:text-zinc-500"}`}>
-              {composerDraft
-                ? `${composerDraft.length.toLocaleString()} / ${CLIPBOARD_TEXT_MAX_CHARS.toLocaleString()} 字符 · ${formatByteCount(composerByteLength)}`
-                : "文本、富文本、链接；文件走文件通道"}
-            </span>
-            <div className="flex items-center gap-1.5">
-              <Button
-                radius="sm"
-                size="sm"
-                variant="flat"
-                isLoading={isSystemClipboardReading}
-                onPress={readSystemClipboard}
-              >
-                读取剪贴板
-              </Button>
-              <Button
-                color="primary"
-                radius="sm"
-                size="sm"
-                isDisabled={!composerDraft || !composerWithinLimits || !canSend || !targetPeerId || isSending}
-                onPress={() => addLocalBlock(composerDraft, classifyClipboardContent(composerDraft, composerHtml))}
-              >
-                发送文字
-              </Button>
-            </div>
-          </div>
-        </div>
-
-        {draftFiles.length > 0 ? <div className="rounded-lg border border-default-200 p-3 text-small">
-          <p className="break-words">待发送文件：{draftFiles.map((file) => file.name).join("、")}</p>
-          <div className="mt-2 flex gap-2">
-            <Button size="sm" color="primary" isDisabled={!canSend || (fileTargetRequired && !targetPeerId)} onPress={() => {
-              if (sendClipboardFiles(draftFiles)) setDraftFiles([]);
-            }}>发送这些文件</Button>
-            <Button size="sm" variant="light" onPress={() => setDraftFiles([])}>移除文件</Button>
-          </div>
-        </div> : null}
-
-        {blocks.length === 0 ? (
-          <div className="rounded-lg border border-dashed border-black/15 px-4 py-6 text-center text-small text-zinc-500 dark:border-white/15 dark:text-zinc-400">
-            暂无内容。读取系统剪贴板或直接粘贴即可开始。
-          </div>
-        ) : (
-          <div className="flex flex-col gap-2">
-            <div className="flex items-center justify-between gap-2">
-              <p className="text-tiny text-zinc-400 dark:text-zinc-500">最新在前 · 最多保留 80 条</p>
-              <Button
-                radius="sm"
-                size="sm"
-                variant="light"
-                isDisabled={isSending || isClipboardWritePending}
-                onPress={clearAllBlocks}
-              >
-                清空记录
-              </Button>
-            </div>
-            {blocks.map((block) => {
-              const withinLimits = isClipboardContentWithinLimits(block.text, block.html ?? "");
-              const isLatestInbound = Boolean(block.sourceEventId && latestInbound?.eventId === block.sourceEventId);
-              const needsCopy = viewState === "needs-copy" && isLatestInbound;
-              const isEditing = editingBlockId === block.id;
-              return (
-                <article key={block.id} className="min-w-0 rounded-lg border border-black/[0.07] bg-white/55 p-3 dark:border-white/[0.08] dark:bg-white/[0.03]">
-                  <div className="flex min-w-0 items-center gap-2">
-                    <Chip size="sm" radius="sm" variant="flat" color={block.origin === "remote" ? "success" : "primary"}>
-                      {block.origin === "remote" ? "收到" : "本机"}
-                    </Chip>
-                    <Chip size="sm" radius="sm" variant="flat">
-                      {clipboardKindLabel(block.kind)}
-                    </Chip>
-                    <span className="min-w-0 flex-1 truncate text-tiny font-medium text-zinc-600 dark:text-zinc-300">
-                      {block.origin === "remote" ? `来自 ${block.sourceDisplayName || "未命名设备"}` : "本机剪贴板"}
-                    </span>
-                    <time className="shrink-0 font-mono text-[10px] text-zinc-400 dark:text-zinc-500" dateTime={new Date(block.createdAt).toISOString()} title={new Date(block.createdAt).toLocaleString()}>
-                      {formatClipboardTime(block.createdAt)}
-                    </time>
-                  </div>
-                  {block.kind === "html" && block.html ? (
-                    <div
-                      className="clipboard-rich-preview mt-2 max-h-40 overflow-auto rounded-md border border-black/[0.07] bg-white px-3 py-2 text-small text-zinc-900 dark:border-white/[0.08] dark:bg-white/[0.04] dark:text-zinc-100"
-                      dangerouslySetInnerHTML={{ __html: sanitizeClipboardHtml(block.html) }}
-                    />
-                  ) : null}
-                  {block.kind === "link" ? (
-                    <a
-                      href={block.text}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="mt-2 block truncate text-small font-medium text-primary-600 underline decoration-primary-500/30 underline-offset-2 dark:text-primary-300"
-                    >
-                      {block.text}
-                    </a>
-                  ) : null}
-                  <div className="relative mt-2">
-                    {isEditing ? (
-                      <textarea
-                        data-clipboard-block-editor="true"
-                        aria-label={block.origin === "remote" ? `编辑来自 ${block.sourceDisplayName || "未命名设备"} 的剪贴板内容` : "编辑本机剪贴板内容"}
-                        value={block.text}
-                        maxLength={CLIPBOARD_TEXT_MAX_CHARS}
-                        spellCheck={false}
-                        autoFocus
-                        onChange={(event) => updateBlockText(block.id, event.currentTarget.value)}
-                        className="block min-h-20 w-full resize-y rounded-md bg-black/[0.045] px-3 py-2 pr-10 font-mono text-small text-zinc-800 outline-hidden ring-1 ring-primary-500/50 transition dark:bg-white/[0.06] dark:text-zinc-200"
-                      />
-                    ) : (
-                      <div className="rounded-md bg-black/[0.03] px-3 py-2 pr-10 transition hover:bg-black/[0.045] dark:bg-white/[0.04] dark:hover:bg-white/[0.055]">
-                        <span className="line-clamp-3 whitespace-pre-wrap break-words font-mono text-small text-zinc-800 dark:text-zinc-200">
-                          {block.text}
-                        </span>
-                      </div>
-                    )}
-                    <button
-                      type="button"
-                      aria-label={isEditing ? "完成编辑" : "编辑内容"}
-                      title={isEditing ? "完成编辑" : "编辑内容"}
-                      onClick={() => setEditingBlockId(isEditing ? "" : block.id)}
-                      className={`absolute right-1.5 top-1.5 grid h-7 w-7 place-items-center rounded-md transition ${
-                        isEditing
-                          ? "bg-primary-500/10 text-primary-600 hover:bg-primary-500/20 dark:text-primary-300"
-                          : "text-zinc-400 hover:bg-black/[0.06] hover:text-zinc-700 dark:hover:bg-white/[0.08] dark:hover:text-zinc-200"
-                      }`}
-                    >
-                      {isEditing ? <CheckGlyph /> : <PencilGlyph />}
-                    </button>
-                  </div>
-                  {!withinLimits && (
-                    <p className="mt-1.5 text-tiny font-medium text-rose-600 dark:text-rose-300">
-                      内容超过上限，请删减后再同步。
-                    </p>
-                  )}
-                  <div className="mt-2 flex flex-wrap items-center justify-end gap-1.5">
-                    <Button
-                      color="primary"
-                      radius="sm"
-                      size="sm"
-                      variant="flat"
-                      isLoading={sendingBlockId === block.id}
-                      isDisabled={!block.text || !withinLimits || !canSend || !targetPeerId || isSending}
-                      onPress={() => void submitText(block.text, block.id, block.kind, block.html)}
-                    >
-                      发送到设备
-                    </Button>
-                    <Button
-                      radius="sm"
-                      size="sm"
-                      variant={needsCopy ? "solid" : "flat"}
-                      color={needsCopy ? "warning" : "default"}
-                      isLoading={clipboardWriteBlockId === block.id}
-                      isDisabled={isClipboardWritePending && clipboardWriteBlockId !== block.id}
-                      onPress={() => handleManualCopy(block)}
-                    >
-                      复制到剪贴板
-                    </Button>
-                    <Button
-                      radius="sm"
-                      size="sm"
-                      variant="light"
-                      isDisabled={sendingBlockId === block.id || clipboardWriteBlockId === block.id}
-                      onPress={() => removeBlock(block)}
-                    >
-                      删除
-                    </Button>
-                  </div>
-                </article>
-              );
-            })}
-          </div>
-        )}
-
-        <div
-          aria-live="polite"
-          className={`rounded-lg border px-3 py-2 text-small ${statusClassName(viewState)}`}
+      <div className="tr-panel-toolbar">
+        <Switch
+          size="sm"
+          classNames={{ base: "tr-switch", label: "tr-switch-label" }}
+          isSelected={quickSend}
+          onValueChange={setQuickSend}
+          isDisabled={!canSend || !targetPeerId}
         >
-          {statusMessage}
-          {latestInbound && (
-            <span className="ml-1 text-tiny opacity-75">来源：{sourceLabel}</span>
-          )}
-        </div>
-
-        <p className="text-tiny text-zinc-400 dark:text-zinc-500">
-          文字草稿临时保存在当前浏览器标签页，刷新后可恢复；未发送文件刷新后需重新选择。不会持续读取系统剪贴板，请勿发送密码或令牌。
-        </p>
+          粘贴即发送（仅本次页面，读取剪贴板仍需确认）
+        </Switch>
+        <button
+          type="button"
+          className={`bd-btn bd-btn--secondary bd-btn--sm${isSystemClipboardReading ? " is-busy" : ""}`}
+          aria-busy={isSystemClipboardReading}
+          onClick={readSystemClipboard}
+        >
+          <Icon name="clipboard" />
+          <span>读取剪贴板</span>
+        </button>
       </div>
+
+      <div className={`tr-composer-box${composerDraft && !composerWithinLimits ? " is-invalid" : ""}`}>
+        <textarea
+          ref={textareaRef}
+          id="public-transfer-clipboard-text"
+          data-testid="public-transfer-clipboard-text"
+          aria-label="要发送的文字与链接"
+          aria-describedby="public-transfer-clipboard-hint"
+          value={composerDraft}
+          maxLength={CLIPBOARD_TEXT_MAX_CHARS}
+          spellCheck={false}
+          onChange={(event) => {
+            const value = event.currentTarget.value;
+            setComposerDraft(value);
+            setComposerHtml("");
+            if (!isClipboardContentWithinLimits(value, "")) {
+              setViewState("failed");
+              setStatusMessage(`文本的 UTF-8 大小超过 ${formatByteCount(CLIPBOARD_TEXT_MAX_UTF8_BYTES)}，删减后再发送。`);
+            }
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+              event.preventDefault();
+              if (canSend && targetPeerId && !isSending) addLocalBlock(composerDraft, classifyClipboardContent(composerDraft, composerHtml));
+            }
+          }}
+          placeholder="输入或粘贴文字、链接。粘贴只放进草稿，按发送才会发出。"
+          className="tr-textarea"
+        />
+        <div className="tr-composer-foot" id="public-transfer-clipboard-hint">
+          <span className={`bd-num ${composerDraft && !composerWithinLimits ? "tr-text-danger" : ""}`}>
+            {composerDraft
+              ? `${composerDraft.length.toLocaleString()} / ${CLIPBOARD_TEXT_MAX_CHARS.toLocaleString()} 字符 · ${formatByteCount(composerByteLength)}`
+              : "文本、富文本、链接；文件放到“文件”里发送"}
+          </span>
+        </div>
+      </div>
+
+      {draftFiles.length > 0 ? (
+        <div className="tr-inline-draft">
+          <Icon name="file" />
+          <p className="min-w-0 flex-1 [overflow-wrap:anywhere]">待发送文件：{draftFiles.map((file) => file.name).join("、")}</p>
+          <div className="bd-row">
+            <button type="button" className="bd-btn bd-btn--ghost bd-btn--sm" onClick={() => setDraftFiles([])}>移除文件</button>
+            <button
+              type="button"
+              className="bd-btn bd-btn--secondary bd-btn--sm"
+              disabled={!canSend || (fileTargetRequired && !targetPeerId)}
+              onClick={() => {
+                if (sendClipboardFiles(draftFiles)) setDraftFiles([]);
+              }}
+            >
+              <Icon name="send" />
+              <span>发送这些文件</span>
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      <div aria-live="polite" className={`tr-clip-status is-${statusTone}`}>
+        <Icon name={statusTone === "success" ? "circle-check" : statusTone === "danger" ? "circle-alert" : statusTone === "warning" ? "alert" : "info-circle"} />
+        <span className="min-w-0">
+          {statusMessage}
+          {latestInbound && <span className="tr-clip-status-source">来源：{sourceLabel}</span>}
+        </span>
+      </div>
+
+      {blocks.length > 0 ? (
+        <div className="tr-clip-history">
+          <div className="tr-subsection-head">
+            <div className="min-w-0">
+              <h3>记录 <span className="tr-count bd-num">{blocks.length}</span></h3>
+              <p>最新在前 · 最多保留 80 条</p>
+            </div>
+            <button
+              type="button"
+              className="bd-btn bd-btn--ghost bd-btn--sm"
+              disabled={isSending || isClipboardWritePending}
+              onClick={clearAllBlocks}
+            >
+              清空记录
+            </button>
+          </div>
+          {blocks.map((block) => {
+            const withinLimits = isClipboardContentWithinLimits(block.text, block.html ?? "");
+            const isLatestInbound = Boolean(block.sourceEventId && latestInbound?.eventId === block.sourceEventId);
+            const needsCopy = viewState === "needs-copy" && isLatestInbound;
+            const isEditing = editingBlockId === block.id;
+            const busyHere = sendingBlockId === block.id || clipboardWriteBlockId === block.id;
+            return (
+              <article key={block.id} className="tr-clip-block">
+                <div className="tr-clip-block-head">
+                  <Tag tone={block.origin === "remote" ? "success" : "info"}>{block.origin === "remote" ? "收到" : "本机"}</Tag>
+                  <Tag plain>{clipboardKindLabel(block.kind)}</Tag>
+                  <span className="tr-clip-block-source">
+                    {block.origin === "remote" ? `来自 ${block.sourceDisplayName || "未命名设备"}` : "本机剪贴板"}
+                  </span>
+                  <RelativeTime className="tr-clip-block-time" value={block.createdAt} />
+                </div>
+                {block.kind === "html" && block.html ? (
+                  <div
+                    className="clipboard-rich-preview"
+                    dangerouslySetInnerHTML={{ __html: sanitizeClipboardHtml(block.html) }}
+                  />
+                ) : null}
+                {block.kind === "link" ? (
+                  <a href={block.text} target="_blank" rel="noreferrer" className="jd-link tr-clip-link">
+                    {block.text}
+                  </a>
+                ) : null}
+                <div className="tr-clip-body">
+                  {isEditing ? (
+                    <textarea
+                      data-clipboard-block-editor="true"
+                      aria-label={block.origin === "remote" ? `编辑来自 ${block.sourceDisplayName || "未命名设备"} 的剪贴板内容` : "编辑本机剪贴板内容"}
+                      value={block.text}
+                      maxLength={CLIPBOARD_TEXT_MAX_CHARS}
+                      spellCheck={false}
+                      autoFocus
+                      onChange={(event) => updateBlockText(block.id, event.currentTarget.value)}
+                      className="tr-textarea tr-textarea--edit"
+                    />
+                  ) : (
+                    <div className="tr-clip-text">{block.text}</div>
+                  )}
+                  <button
+                    type="button"
+                    aria-label={isEditing ? "完成编辑" : "编辑内容"}
+                    title={isEditing ? "完成编辑" : "编辑内容"}
+                    aria-pressed={isEditing}
+                    onClick={() => setEditingBlockId(isEditing ? "" : block.id)}
+                    className="bd-icon-btn tr-clip-edit"
+                  >
+                    <Icon name={isEditing ? "check" : "edit"} />
+                  </button>
+                </div>
+                {!withinLimits && (
+                  <p className="tr-text-danger tr-clip-limit">内容超过上限：删减后再发送。</p>
+                )}
+                <div className="tr-clip-actions">
+                  <button
+                    type="button"
+                    className="bd-btn bd-btn--ghost bd-btn--sm"
+                    disabled={busyHere}
+                    onClick={() => removeBlock(block)}
+                  >
+                    删除
+                  </button>
+                  <button
+                    type="button"
+                    className={`bd-btn bd-btn--sm ${needsCopy ? "bd-btn--primary" : "bd-btn--ghost"}${clipboardWriteBlockId === block.id ? " is-busy" : ""}`}
+                    disabled={isClipboardWritePending && clipboardWriteBlockId !== block.id}
+                    onClick={() => handleManualCopy(block)}
+                  >
+                    <Icon name="copy" />
+                    <span>复制到剪贴板</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={`bd-btn bd-btn--secondary bd-btn--sm${sendingBlockId === block.id ? " is-busy" : ""}`}
+                    disabled={!block.text || !withinLimits || !canSend || !targetPeerId || isSending}
+                    onClick={() => void submitText(block.text, block.id, block.kind, block.html)}
+                  >
+                    <Icon name="send" />
+                    <span>发送到设备</span>
+                  </button>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      ) : null}
+
+      <p className="tr-note">
+        文字草稿临时保存在当前浏览器标签页，刷新后可恢复；未发送文件刷新后需重新选择。不会持续读取系统剪贴板，不要发送密码或令牌。
+      </p>
     </section>
   );
 }
@@ -841,30 +856,9 @@ function clipboardContentByteLength(text: string, html = "") {
   return new TextEncoder().encode(text).byteLength + new TextEncoder().encode(html).byteLength;
 }
 
-function PencilGlyph() {
-  return (
-    <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <path d="M16.8 3.8a2.1 2.1 0 0 1 3 3L8.5 18.1 4 19.5l1.4-4.5L16.8 3.8Z" />
-      <path d="m14.8 5.8 3 3" />
-    </svg>
-  );
-}
-
-function CheckGlyph() {
-  return (
-    <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <path d="m4.5 12.5 5 5 10-11" />
-    </svg>
-  );
-}
-
-function formatClipboardTime(timestamp: number) {
-  return new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
-
 async function writeClipboardContent(text: string, html = "") {
   if (!window.isSecureContext || !navigator.clipboard?.writeText) {
-    throw new Error("当前浏览器不允许写入系统剪贴板，请使用 HTTPS 或 localhost");
+    throw new Error("当前浏览器不允许写入系统剪贴板：改用 HTTPS 或 localhost 打开本页");
   }
   const safeHtml = html ? sanitizeClipboardHtml(html) : "";
   if (safeHtml && navigator.clipboard.write && typeof ClipboardItem !== "undefined") {
@@ -881,7 +875,7 @@ async function writeClipboardContent(text: string, html = "") {
 
 async function readSystemClipboardContent(): Promise<{ text: string; html: string; files: File[] }> {
   if (!window.isSecureContext || !navigator.clipboard?.readText) {
-    throw new Error("当前浏览器不允许读取系统剪贴板，请使用 HTTPS 或 localhost");
+    throw new Error("当前浏览器不允许读取系统剪贴板：改用 HTTPS 或 localhost 打开本页");
   }
   if (!navigator.clipboard.read) {
     return { text: await navigator.clipboard.readText(), html: "", files: [] };
@@ -988,22 +982,16 @@ function isSafeRichTextLink(value: string) {
 
 function systemClipboardErrorMessage(error: unknown, action: "读取" | "写入") {
   if (error instanceof DOMException && (error.name === "NotAllowedError" || error.name === "SecurityError")) {
-    return `浏览器未授权${action}系统剪贴板，请允许剪贴板权限后重试。`;
+    return `浏览器未授权${action}系统剪贴板：在浏览器里允许剪贴板权限后重试。`;
   }
   return error instanceof Error ? error.message : `${action}系统剪贴板失败`;
 }
 
-function statusClassName(state: ClipboardViewState) {
-  if (state === "written" || state === "sent") {
-    return "border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-400/25 dark:bg-emerald-500/10 dark:text-emerald-100";
-  }
-  if (state === "needs-copy") {
-    return "border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-400/25 dark:bg-amber-500/10 dark:text-amber-100";
-  }
-  if (state === "failed") {
-    return "border-rose-300 bg-rose-50 text-rose-700 dark:border-rose-400/25 dark:bg-rose-500/10 dark:text-rose-100";
-  }
-  return "border-primary-300/70 bg-primary-50/70 text-primary-900 dark:border-primary-300/20 dark:bg-primary-300/[0.07] dark:text-primary-100";
+function clipboardStatusTone(state: ClipboardViewState): "success" | "warning" | "danger" | "info" {
+  if (state === "written" || state === "sent") return "success";
+  if (state === "needs-copy") return "warning";
+  if (state === "failed") return "danger";
+  return "info";
 }
 
 function formatByteCount(bytes: number) {
