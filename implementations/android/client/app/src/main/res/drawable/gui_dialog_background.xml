@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Dialog surface: radius-2xl on surface. Same inset as the platform Material dialog so the
+     window keeps its shadow and margins. -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:inset="@dimen/gui_dialog_inset">
+    <shape android:shape="rectangle">
+        <corners android:radius="@dimen/gui_radius_2xl" />
+        <solid android:color="@color/gui_surface" />
+    </shape>
+</inset>

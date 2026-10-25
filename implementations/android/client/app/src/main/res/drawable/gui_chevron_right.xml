@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Line icon "chevron-right": 24 canvas, stroke 1.75, round caps and joins. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="20dp"
+    android:height="20dp"
+    android:autoMirrored="true"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M9,6 L15,12 L9,18"
+        android:strokeWidth="1.75"
+        android:strokeColor="@color/gui_text_subtle"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>
