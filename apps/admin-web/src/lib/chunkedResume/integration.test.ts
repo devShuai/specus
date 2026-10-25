@@ -683,7 +683,10 @@ describe("chunked resume between two pages", { timeout: 30_000 }, () => {
       peer.sendContent(x1.transferId, x1.manifest, x1Bytes, first);
     }
     peer.sendContent(x2, x2Manifest, x2Bytes, peer.answers(x2, "file-accept")[0]);
-    await eventually(() => receiver.completed.length === 1 || peer.inbox.some((message) => message.kind === "transfer-error"));
+    // The receiver sends transfer-complete before it hands the file over, but the message reaches
+    // this hand-driven sender asynchronously, so wait for both rather than assume their order.
+    await eventually(() => (receiver.completed.length === 1 && peer.answers(x2, "transfer-complete").length === 1)
+      || peer.inbox.some((message) => message.kind === "transfer-error"));
     expect(peer.inbox.filter((message) => message.kind === "transfer-error")).toEqual([]);
     expect(first).toEqual({ kind: "resume-reject", transferId: x1.transferId, code: "BUSY" });
     expect(peer.answers(x2).map((message) => message.kind)).toContain("transfer-complete");
