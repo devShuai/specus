@@ -1,0 +1,510 @@
+/* Clients, messages, port mappings, HTTP routes and client downloads. Written with the design tokens and classes (liquid-glass.css). */
+
+/* ---- Design classes the foundation does not carry yet (same rules as the design's bundle.css) ---- */
+.jd-table-title { display: flex; flex-direction: column; min-width: 0; max-width: 520px; }
+.jd-table-title > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.jd-table-sub { font-size: 12px; line-height: 18px; color: var(--text-muted); }
+.jd-row-actions { display: flex; justify-content: flex-end; gap: var(--space-1); }
+.bd-table td.jd-wrap { white-space: normal; }
+.jd-col-actions { width: 1%; }
+.jd-danger-text { color: var(--danger); }
+
+/* ---- Page frame ---- */
+.acc-page { display: flex; flex-direction: column; min-width: 0; }
+.acc-page > .bd-page-header { margin-bottom: var(--space-6); }
+.acc-page > .acc-onboard,
+.acc-page > .bd-alert { margin-bottom: var(--space-8); }
+.acc-page .jd-section { min-width: 0; }
+.acc-page .jd-section > * + * { margin-top: var(--space-4); }
+.acc-head-count { font-size: 12px; line-height: 18px; color: var(--text-subtle); white-space: nowrap; }
+/* HeroUI fields already draw the design's focus ring on their wrapper (index.css); the inner
+ * input's own outline would draw a second ring inside it. */
+:is(.acc-page, .acc-dialog-body) [data-slot="input-wrapper"] :is(input, textarea):focus-visible { outline: none; }
+.acc-pager { display: flex; align-items: center; justify-content: flex-end; gap: var(--space-3); color: var(--text-muted); font-size: 13px; }
+
+/* Row actions are small buttons; the danger one is last. */
+.acc-page .jd-row-actions, .app-list-card-actions { align-items: center; flex-wrap: nowrap; }
+.acc-page .jd-row-actions > button, .acc-page .jd-row-actions > a,
+.app-list-card-actions > button, .app-list-card-actions > a { min-width: 0; padding-inline: 10px; gap: 4px; }
+.acc-page .bd-table td.jd-cell-actions { text-align: right; }
+.acc-page .bd-table th, .acc-page .bd-table td { padding-inline: 12px; }
+.acc-page .bd-table th:first-child, .acc-page .bd-table td:first-child { padding-left: 16px; }
+.acc-page .bd-table th:last-child, .acc-page .bd-table td:last-child { padding-right: 16px; }
+/* The console's older table rules (index.css) paint the row on hover; the design paints the cells. */
+.acc-page .bd-table tbody tr:hover { background: transparent; }
+.acc-status-cell { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
+.acc-page .bd-table .font-mono { font-size: 13px; }
+
+/* Loading placeholder: skeleton lines and what is being read. */
+.acc-page .bd-card > .bd-empty { padding: var(--space-8) var(--space-6); }
+.acc-loading { display: flex; flex-direction: column; gap: var(--space-3); padding: var(--space-5); border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); }
+
+/* ---- Onboarding guide: a card with the four steps as a numbered step list ---- */
+.acc-onboard { padding: 18px 20px; }
+.acc-onboard-head { display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--space-3) var(--space-4); }
+.acc-onboard-icon {
+  width: 36px; height: 36px; flex: none; display: grid; place-items: center; border-radius: var(--radius-full);
+  background: var(--accent-soft); color: var(--accent);
+}
+.acc-onboard.is-ready .acc-onboard-icon { background: var(--success-bg); color: var(--success); }
+.acc-onboard.is-error .acc-onboard-icon { background: var(--danger-bg); color: var(--danger); }
+.acc-onboard-title { margin: 0; font-size: 16px; line-height: 24px; font-weight: 600; }
+.acc-onboard-status { margin: 2px 0 0; color: var(--text-muted); }
+.acc-onboard.is-error .acc-onboard-status { color: var(--danger); }
+.acc-onboard-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); flex: none; }
+.acc-steps {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--space-4);
+  margin: var(--space-5) 0 0; padding: var(--space-5) 0 0; list-style: none; border-top: 1px solid var(--border);
+}
+.acc-step { position: relative; display: flex; gap: var(--space-3); min-width: 0; }
+.acc-step-mark {
+  width: 26px; height: 26px; flex: none; display: grid; place-items: center; border-radius: var(--radius-full);
+  background: var(--surface-muted); color: var(--text-muted); font-size: 13px; font-weight: 600;
+}
+[data-theme="dark"] .acc-step-mark { background: rgba(255, 255, 255, 0.08); }
+.acc-step.is-done .acc-step-mark { background: var(--success-bg); color: var(--success); }
+.acc-step.is-current .acc-step-mark { background: var(--accent); color: var(--on-primary); }
+.acc-step-title { margin: 2px 0 0; font-size: 14px; line-height: 22px; font-weight: 600; }
+.acc-step.is-done .acc-step-title { color: var(--text-muted); }
+.acc-step-detail { margin: 2px 0 0; font-size: 12px; line-height: 18px; color: var(--text-muted); }
+.acc-step-links { display: flex; flex-wrap: wrap; gap: 0 var(--space-3); margin-top: var(--space-1); font-size: 13px; }
+.acc-step-links .jd-link { display: inline-flex; align-items: center; min-height: 28px; font-weight: 500; }
+.acc-step-links .jd-link:focus-visible { outline: none; border-radius: var(--radius-xs); box-shadow: 0 0 0 3px var(--focus-ring); }
+
+/* ---- Inline create form in a card: labels above, help below, the submit on the field row ---- */
+.acc-inline-form {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) auto; align-items: start; gap: var(--space-4);
+  padding: var(--space-5);
+}
+/* The submit sits on the input row: below the field label (HeroUI outside-top label and its gap). */
+.acc-inline-form-submit { padding-top: 28px; }
+.acc-inline-form-submit .bd-btn, .acc-inline-form-submit button { min-height: 40px; }
+
+/* ---- Dialog bodies ---- */
+.acc-dialog-body { gap: var(--space-4) !important; font-size: 14px; line-height: 22px; }
+.acc-dialog-body .bd-alert { margin: 0; }
+.acc-dialog-body .bd-alert p { margin: 0; }
+/* Dialogs render outside the console's root, so their HeroUI fields miss the Input styling that
+ * index.css gives fields under .app-apple; the same rules, for the fields of these dialogs. */
+.acc-dialog-body :where([data-slot="input-wrapper"], [data-slot="trigger"]) {
+  border: 1px solid var(--field-border) !important; background: var(--field-bg) !important; box-shadow: none !important;
+  transition: border-color .15s ease, box-shadow .15s ease !important;
+}
+.acc-dialog-body :where([data-slot="input-wrapper"], [data-slot="trigger"]):hover { border-color: var(--border-strong) !important; }
+.acc-dialog-body :where([data-slot="input-wrapper"], [data-slot="trigger"]):focus-within,
+.acc-dialog-body :where([data-slot="trigger"])[data-open="true"] { border-color: var(--accent) !important; box-shadow: 0 0 0 3px var(--accent-soft) !important; }
+.acc-dialog-body :where([data-invalid="true"]) :where([data-slot="input-wrapper"], [data-slot="trigger"]) { border-color: var(--danger) !important; }
+.acc-dialog-body :where([data-slot="label"]) { color: var(--text) !important; font-weight: 500; }
+.acc-dialog-body :where([data-slot="description"]) { color: var(--text-muted); }
+
+/* ---- Choice controls ---- */
+.acc-switch { min-height: 22px; }
+.acc-switch.is-disabled { cursor: not-allowed; }
+.acc-switch-label { color: var(--text); }
+.acc-check { align-items: flex-start; }
+.acc-check .bd-check-box { margin-top: 2px; }
+.acc-radio-fieldset > legend { margin-bottom: var(--space-2); }
+.acc-radio-row { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-5); }
+.acc-radio-cards .bd-radio-card b { color: var(--text); }
+.acc-radio-cards .bd-radio-card:hover { border-color: var(--border-strong); }
+.acc-radio-cards .bd-radio-card:has(input:checked) { background: var(--accent-soft); }
+.acc-switch-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-3) var(--space-6); }
+.acc-switch-list > legend { width: 100%; margin-bottom: var(--space-1); }
+.acc-field-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4); align-items: start; }
+.acc-tight { margin: calc(-1 * var(--space-2)) 0 0; }
+.acc-confirm-box { align-items: flex-start; }
+.acc-confirm-box > svg { color: var(--warning); }
+.acc-break { overflow-wrap: anywhere; word-break: break-all; }
+.acc-icon-btn-sm { width: 30px; height: 30px; border-radius: var(--radius-sm); }
+.acc-icon-btn-sm svg { width: 14px; height: 14px; }
+.acc-dialog-sub { font-size: 13px; line-height: 20px; font-weight: 400; color: var(--text-muted); overflow-wrap: anywhere; letter-spacing: 0; }
+.acc-stack-only { display: none; }
+.acc-client-cell { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-2); min-width: 0; }
+.acc-client-cell.is-column { flex-direction: column; align-items: flex-start; flex-wrap: nowrap; }
+.acc-client-cell.is-column > .jd-ellipsis { max-width: 100%; }
+
+/* ---- Messages: a two-pane chat ---- */
+.acc-chat { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: var(--space-4); min-height: calc(100dvh - 260px); min-width: 0; }
+.acc-chat > .bd-card { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
+.acc-chat-pane-head { display: flex; align-items: center; gap: var(--space-3); min-width: 0; padding: 14px 16px; border-bottom: 1px solid var(--border); }
+.acc-chat-pane-head > .bd-card-title { flex: none; }
+.acc-chat-pane-head > .acc-head-count { flex: 1; }
+.acc-chat-refresh { flex: none; }
+.acc-chat-sub { font-size: 12px; line-height: 18px; color: var(--text-subtle); }
+.acc-chat-peer-list { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; padding: var(--space-2); }
+.acc-chat-peer-list .bd-empty { padding: var(--space-8) var(--space-3); }
+.acc-chat-peer-state { display: flex; flex-direction: column; gap: var(--space-3); padding: var(--space-3); }
+.acc-chat-peer {
+  display: flex; align-items: center; gap: var(--space-3); width: 100%; min-height: 52px; padding: 8px 10px;
+  border: 0; border-radius: var(--radius-md); background: none; color: var(--text); font: inherit; text-align: left; cursor: pointer;
+  transition: background-color .15s ease;
+}
+.acc-chat-peer:hover { background: var(--hover); }
+.acc-chat-peer:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--focus-ring); }
+/* The selected conversation is a raised chip, like the selected tab. */
+.acc-chat-peer.is-selected { background: var(--selected); box-shadow: var(--shadow-sm); }
+[data-theme="dark"] .acc-chat-peer.is-selected { background: rgba(255, 255, 255, 0.1); box-shadow: none; }
+.acc-chat-peer.is-selected .acc-chat-peer-name { font-weight: 600; }
+.acc-chat-peer-main { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+.acc-chat-peer-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.acc-chat-peer-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; line-height: 18px; color: var(--text-subtle); }
+.acc-chat-peer-tags { display: flex; align-items: center; gap: var(--space-1); flex: none; }
+.acc-chat-unread {
+  min-width: 20px; height: 20px; padding: 0 6px; display: inline-grid; place-items: center; border-radius: var(--radius-full);
+  background: var(--danger-solid); color: var(--on-danger); font-size: 11px; line-height: 1; font-weight: 600;
+}
+.acc-chat-thread .acc-chat-pane-head { padding: 12px 16px; }
+.acc-chat-scroll-wrap { position: relative; flex: 1; min-height: 260px; display: flex; flex-direction: column; }
+.acc-chat-messages { flex: 1; min-height: 0; max-height: calc(100dvh - 380px); overflow-y: auto; padding: var(--space-5) var(--space-5) var(--space-4); background: var(--bg); }
+.acc-chat-messages > .bd-empty { padding: var(--space-10) var(--space-4); }
+.acc-chat-list { display: flex; flex-direction: column; gap: var(--space-4); }
+.acc-chat-new { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); box-shadow: var(--shadow-md); }
+.acc-msg { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; max-width: min(680px, 88%); }
+.acc-msg.is-mine { align-self: flex-end; align-items: flex-end; }
+.acc-msg-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 2px var(--space-2); padding: 0 4px; font-size: 12px; line-height: 18px; color: var(--text-subtle); }
+.acc-msg-who { font-weight: 500; color: var(--text-muted); }
+.acc-msg-status.is-failed { color: var(--danger); font-weight: 500; }
+.acc-msg-resend { height: 22px; min-width: 0; padding: 0 6px; font-size: 12px; }
+/* Others' messages on surface-muted, own messages on the accent. */
+.acc-msg-bubble {
+  display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; max-width: 100%; padding: 9px 14px;
+  border-radius: 18px 18px 18px 6px; background: var(--surface-muted); color: var(--text);
+}
+[data-theme="dark"] .acc-msg-bubble { background: rgba(255, 255, 255, 0.09); }
+.acc-msg.is-mine .acc-msg-bubble { border-radius: 18px 18px 6px 18px; background: var(--accent); color: var(--on-primary); }
+.acc-msg-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.acc-msg-media { display: block; max-height: 256px; width: 100%; object-fit: contain; border-radius: var(--radius-md); }
+.acc-msg-media.is-video { background: #000; }
+.acc-msg-hint { font-size: 12px; line-height: 18px; opacity: .8; }
+/* An attachment is a file row: icon, name, type and size, and its action. */
+.acc-file-row {
+  display: flex; align-items: center; gap: var(--space-3); min-width: min(320px, 100%); padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); color: var(--text);
+}
+.acc-file-icon { width: 34px; height: 34px; flex: none; display: grid; place-items: center; border-radius: var(--radius-md); background: var(--accent-soft); color: var(--accent); }
+.acc-file-main { flex: 1; min-width: 0; }
+.acc-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.acc-file-meta { font-size: 12px; line-height: 18px; color: var(--text-subtle); overflow-wrap: anywhere; }
+.acc-file-row .bd-progress { margin-top: 6px; }
+.acc-chat-composer { display: flex; flex-direction: column; gap: var(--space-2); padding: 12px 16px 16px; border-top: 1px solid var(--border); }
+.acc-chat-note { margin: 0; font-size: 13px; line-height: 20px; color: var(--text-muted); }
+.acc-chat-compose-bar { display: flex; align-items: flex-end; gap: var(--space-2); }
+.acc-chat-input { flex: 1; min-width: 0; }
+.acc-chat-attach, .acc-chat-send { flex: none; height: 40px; }
+
+/* ---- Port mappings ---- */
+.acc-mapping-form { grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.8fr) minmax(0, 1.2fr) minmax(0, 0.8fr) auto; }
+.acc-mapping-arrow { color: var(--text-subtle); }
+
+/* ---- HTTP routes: the publish form ---- */
+.acc-publish { display: flex; flex-direction: column; }
+.acc-publish-body { display: flex; flex-direction: column; gap: var(--space-5); padding: var(--space-5); }
+.acc-publish-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.5fr); gap: var(--space-4); align-items: start; }
+.acc-publish-tls { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-4); }
+.acc-publish-auth { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4); padding: var(--space-4); border-radius: var(--radius-lg); background: var(--surface-muted); }
+[data-theme="dark"] .acc-publish-auth { background: rgba(255, 255, 255, 0.04); }
+.acc-publish-foot {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-3) var(--space-5);
+  padding: 14px 20px; border-top: 1px solid var(--border); background: var(--surface-muted); border-radius: 0 0 var(--radius-xl) var(--radius-xl);
+}
+[data-theme="dark"] .acc-publish-foot { background: rgba(255, 255, 255, 0.03); }
+.acc-publish-summary { flex: 1 1 320px; min-width: 0; display: flex; flex-direction: column; gap: 2px; font-size: 13px; line-height: 20px; overflow-wrap: anywhere; }
+.acc-publish-summary-line { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-2); }
+.acc-publish-target { margin: 0; color: var(--text-muted); word-break: break-all; }
+.acc-publish-warn { display: flex; align-items: flex-start; gap: 6px; margin: 0; color: var(--warning); font-size: 13px; line-height: 20px; }
+.acc-publish-warn svg { flex: none; margin-top: 3px; }
+.acc-publish-submit { flex: none; min-height: 40px; }
+.acc-created .bd-alert-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.acc-created-hint { font-size: 12px; line-height: 18px; }
+
+/* ---- HTTP routes: the list ---- */
+.acc-filter-select { width: 200px; }
+.acc-filter-trigger { min-height: 32px !important; height: 32px !important; border-radius: var(--radius-full) !important; padding-inline: 14px 10px !important; }
+.acc-routes-cards { display: block; }
+.acc-routes-table { display: none; }
+@media (min-width: 1360px) {
+  .acc-routes-cards { display: none; }
+  .acc-routes-table { display: block; }
+}
+.acc-routes { table-layout: fixed; }
+.acc-routes .acc-col-client { width: 13%; }
+.acc-routes .acc-col-auth { width: 86px; }
+.acc-routes .acc-col-switch { width: 54px; }
+.acc-routes .acc-col-time { width: 132px; }
+.acc-routes .acc-col-actions { width: 286px; }
+.acc-page .acc-routes th.acc-col-center, .acc-page .acc-routes td.acc-col-center { padding-inline: 4px; text-align: center; }
+.acc-routes td { vertical-align: middle; }
+.acc-route-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.acc-route-name { display: flex; align-items: baseline; gap: var(--space-2); min-width: 0; }
+.acc-route-name code { overflow: hidden; text-overflow: ellipsis; font-weight: 600; color: var(--text); }
+.acc-route-name .jd-table-sub { flex: none; }
+.acc-route-target { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: 12px; line-height: 18px; color: var(--text-subtle); }
+.acc-route-target > svg { flex: none; }
+.acc-route-target code { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: 12px !important; color: var(--text-muted); }
+.acc-routes .acc-tls-tag { height: 20px; flex: none; }
+.acc-routes .acc-link-cell > a { flex: 0 1 auto; }
+/* Inline code reads as text here; index.css gives every code element a tinted box. */
+.acc-page code { background: none !important; color: inherit; padding: 0; }
+.acc-routes td.jd-cell-actions { white-space: normal; }
+.acc-route-actions { flex-wrap: wrap !important; }
+.acc-link-cell { display: flex; align-items: center; gap: var(--space-1); min-width: 0; }
+.acc-link-cell > a { flex: 1; min-width: 0; font-size: 13px; }
+.acc-link-cell.is-stacked { flex-direction: column; align-items: flex-start; gap: var(--space-2); }
+.acc-auth-tag { gap: 4px; }
+.acc-auth-tag.is-public { background: var(--warning-bg) !important; color: var(--warning); }
+.acc-card-title-row { display: flex; align-items: baseline; gap: var(--space-2); min-width: 0; }
+.acc-card-sub { display: flex; flex-direction: column; gap: 4px; }
+.acc-card-switches { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-2) var(--space-4); padding-top: var(--space-3); border-top: 1px solid var(--border); }
+.acc-cc-result { gap: 6px; }
+.acc-cc-result .bd-tag { height: 20px; }
+
+/* ---- Connectivity check: the staged list 已配置 → 设备在线 → 目标可达 → 访问成功 ---- */
+.acc-cc { display: flex; flex-direction: column; gap: var(--space-3); }
+.acc-cc-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-3); }
+.acc-cc-outcome { height: 26px; padding: 0 12px; font-size: 13px; font-weight: 600; }
+.acc-cc-summary { color: var(--text); font-weight: 500; }
+.acc-cc-meta { margin: 0; font-size: 12px; line-height: 18px; color: var(--text-subtle); }
+.acc-cc-note { margin: 0; font-size: 13px; line-height: 20px; color: var(--text-muted); }
+.acc-cc-running { display: flex; align-items: center; gap: var(--space-2); margin: 0; color: var(--info); }
+.acc-stages { display: flex; flex-direction: column; margin: 0; padding: 0; list-style: none; }
+.acc-stage { position: relative; display: flex; gap: var(--space-3); padding-bottom: var(--space-4); }
+.acc-stage:last-child { padding-bottom: 0; }
+/* The line joining one stage to the next. */
+.acc-stage:not(:last-child)::before { content: ""; position: absolute; left: 13px; top: 28px; bottom: 2px; width: 2px; border-radius: 1px; background: var(--border); }
+.acc-stage.is-passed:not(:last-child)::before { background: var(--success-bg); }
+.acc-stage-mark {
+  position: relative; width: 28px; height: 28px; flex: none; display: grid; place-items: center; border-radius: var(--radius-full);
+  background: var(--surface-muted); color: var(--text-subtle);
+}
+.acc-stage.is-passed .acc-stage-mark { background: var(--success-bg); color: var(--success); }
+.acc-stage.is-failed .acc-stage-mark { background: var(--danger-bg); color: var(--danger); }
+.acc-stage.is-unverified .acc-stage-mark { background: var(--warning-bg); color: var(--warning); }
+.acc-stage-body { flex: 1; min-width: 0; padding-top: 3px; }
+.acc-stage.is-decisive .acc-stage-body { margin-top: -6px; padding: 8px 12px 10px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); }
+.acc-stage.is-decisive.is-failed .acc-stage-body { border-color: var(--danger); box-shadow: 0 0 0 1px var(--danger-bg); }
+.acc-stage.is-decisive.is-unverified .acc-stage-body { border-color: var(--warning); box-shadow: 0 0 0 1px var(--warning-bg); }
+.acc-stage-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-2); }
+.acc-stage-label { font-weight: 600; }
+.acc-stage.is-skipped .acc-stage-label { color: var(--text-muted); font-weight: 500; }
+.acc-stage-time { margin-left: auto; font-size: 12px; color: var(--text-subtle); }
+.acc-stage-code { margin: 2px 0 0; font-size: 13px; line-height: 20px; color: var(--text-muted); overflow-wrap: anywhere; }
+.acc-stage-code code { font-size: 12px; color: var(--text-subtle); }
+.acc-stage-next { margin: 4px 0 0; font-size: 13px; line-height: 20px; font-weight: 500; color: var(--text); }
+
+/* ---- Shares dialog ---- */
+.acc-share-form { display: flex; flex-direction: column; gap: var(--space-4); padding: var(--space-4) var(--space-5); box-shadow: none; }
+.acc-share-custom { display: grid; grid-template-columns: 140px 130px; gap: var(--space-2) var(--space-3); }
+.acc-share-custom-help { grid-column: 1 / -1; }
+.acc-share-created { align-items: flex-start; }
+.acc-code-line { display: block; margin-top: 4px; font-size: 12px; line-height: 18px; color: var(--text); overflow-wrap: anywhere; word-break: break-all; }
+.acc-dialog-section { display: flex; flex-direction: column; gap: var(--space-2); }
+.acc-dialog-section-head { display: flex; align-items: center; gap: var(--space-2); }
+.acc-dialog-section-head h3 { margin: 0; font-size: 15px; line-height: 22px; font-weight: 600; color: var(--text); }
+.acc-dialog-section-head .acc-head-count { flex: 1; }
+.acc-dialog-empty { margin: 0; padding: var(--space-4); border: 1px dashed var(--border-strong); border-radius: var(--radius-lg); color: var(--text-muted); font-size: 13px; text-align: center; }
+.acc-share-table .font-mono { font-size: 12px; }
+.acc-audit { display: flex; flex-direction: column; margin: 0; padding: 0; list-style: none; border: 1px solid var(--border); border-radius: var(--radius-lg); font-size: 13px; line-height: 20px; }
+.acc-audit li { display: flex; flex-wrap: wrap; gap: 0 var(--space-3); padding: 6px 12px; }
+.acc-audit li + li { border-top: 1px solid var(--border); }
+.acc-audit-time { flex: none; min-width: 88px; color: var(--text-subtle); }
+.acc-audit-actor { font-weight: 500; }
+.acc-audit-text { flex: 1 1 200px; min-width: 0; color: var(--text-muted); }
+
+/* ---- Client downloads ---- */
+.acc-dl-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: var(--space-4); }
+.acc-dl-card { display: flex; flex-direction: column; min-width: 0; }
+.acc-dl-card .bd-card-header { align-items: flex-start; }
+.acc-dl-card .app-card-desc { color: var(--text-muted); }
+.acc-dl-empty { margin: 0; padding: var(--space-5); color: var(--text-muted); font-size: 13px; }
+.acc-dl-list { display: flex; flex-direction: column; margin: 0; padding: var(--space-2); list-style: none; }
+.acc-dl-row {
+  display: flex; align-items: center; gap: var(--space-3); min-width: 0; padding: 10px 12px; border-radius: var(--radius-lg);
+  color: var(--text); text-decoration: none; transition: background-color .15s ease;
+}
+.acc-dl-row:hover { background: var(--hover); }
+.acc-dl-row:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--focus-ring); }
+.acc-dl-icon { width: 36px; height: 36px; flex: none; display: grid; place-items: center; border-radius: var(--radius-md); background: var(--surface-muted); color: var(--text-muted); }
+[data-theme="dark"] .acc-dl-icon { background: rgba(255, 255, 255, 0.07); }
+.acc-dl-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.acc-dl-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.acc-dl-row:hover .acc-dl-name { color: var(--accent); }
+.acc-dl-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px var(--space-2); font-size: 12px; line-height: 18px; color: var(--text-subtle); }
+.acc-dl-meta .bd-tag { height: 20px; }
+.acc-dl-time { margin-left: auto; }
+.acc-dl-go { flex: none; color: var(--text-subtle); }
+.acc-dl-row:hover .acc-dl-go { color: var(--accent); }
+
+/* ---- macOS Homebrew guide: a card with a code block, one copy button per command ---- */
+.acc-mac { display: flex; flex-direction: column; gap: var(--space-4); padding: var(--space-5); }
+.acc-mac-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: var(--space-3); }
+.acc-mac-tags { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.acc-mac-title { margin: var(--space-2) 0 0; font-size: 16px; line-height: 24px; font-weight: 600; }
+.acc-mac-desc { margin: 2px 0 0; font-size: 13px; line-height: 20px; color: var(--text-muted); }
+.acc-mac-cask { display: inline-flex; align-items: center; gap: 4px; flex: none; min-height: 32px; font-size: 13px; font-weight: 500; }
+.acc-mac-foot { margin: 0; font-size: 12px; line-height: 18px; color: var(--text-muted); }
+.acc-mac-foot code { color: var(--text); }
+.acc-code { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface-muted); overflow: hidden; }
+[data-theme="dark"] .acc-code { background: rgba(0, 0, 0, 0.28); }
+.acc-code-row { display: grid; grid-template-columns: 40px minmax(0, 1fr) auto; align-items: center; gap: var(--space-3); min-width: 0; padding: 6px 6px 6px 14px; }
+.acc-code-row + .acc-code-row { border-top: 1px solid var(--border); }
+.acc-code-label { font-size: 12px; line-height: 18px; color: var(--text-subtle); }
+.acc-code-text { min-width: 0; overflow-x: auto; white-space: nowrap; font-size: 13px; line-height: 20px; color: var(--text); scrollbar-width: thin; }
+.acc-code-prompt { color: var(--text-subtle); user-select: none; }
+.acc-code-copy { color: var(--accent); }
+.acc-code-copy.is-done { color: var(--success); }
+.acc-code-copy.is-error { color: var(--danger); }
+.acc-mac.is-landing .acc-code { background: color-mix(in srgb, currentColor 4%, transparent); }
+
+/* ---- Client detail drawer: a solid side panel with radius-2xl, sections as description lists ---- */
+.acc-drawer-scrim {
+  position: fixed; inset: 0; z-index: 40; background: var(--overlay); opacity: 0; pointer-events: none;
+  -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); transition: opacity .2s var(--ease);
+}
+.acc-drawer-scrim.is-open { opacity: 1; pointer-events: auto; }
+.acc-drawer {
+  position: fixed; top: 12px; right: 12px; bottom: 12px; z-index: 50; width: min(440px, calc(100vw - 24px));
+  display: flex; flex-direction: column; background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius-2xl); box-shadow: var(--shadow-lg);
+  transform: translateX(calc(100% + 24px)); visibility: hidden;
+  transition: transform .24s var(--ease), visibility 0s linear .24s;
+}
+.acc-drawer.is-open { transform: none; visibility: visible; transition: transform .24s var(--ease); }
+.acc-drawer-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-3); padding: 20px 20px 16px 24px; border-bottom: 1px solid var(--border); }
+.acc-drawer-title { margin: 0; font-size: 18px; line-height: 26px; font-weight: 700; letter-spacing: -0.01em; overflow-wrap: anywhere; }
+.acc-drawer-sub { margin: 2px 0 0; font-size: 12px; line-height: 18px; color: var(--text-subtle); }
+.acc-drawer-body { flex: 1; min-height: 0; overflow-y: auto; padding: var(--space-5) 24px; display: flex; flex-direction: column; gap: var(--space-6); }
+.acc-drawer-body .acc-loading { border: 0; padding: 0; }
+.acc-drawer-section { display: flex; flex-direction: column; gap: var(--space-3); }
+.acc-drawer-section-title { display: flex; align-items: baseline; gap: var(--space-2); margin: 0; font-size: 14px; line-height: 22px; font-weight: 600; }
+.acc-drawer-section-title span { font-size: 12px; font-weight: 400; color: var(--text-subtle); }
+.acc-desc { --cols: 2; }
+.acc-drawer-list { display: flex; flex-direction: column; margin: 0; padding: 0; list-style: none; border: 1px solid var(--border); border-radius: var(--radius-lg); }
+.acc-drawer-list li { display: flex; align-items: center; gap: var(--space-2); min-width: 0; padding: 8px 12px; font-size: 13px; }
+.acc-drawer-list li + li { border-top: 1px solid var(--border); }
+.acc-drawer-list li > svg { flex: none; color: var(--text-subtle); }
+.acc-drawer-item-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acc-drawer-empty { margin: 0; }
+.acc-drawer-foot { display: flex; justify-content: flex-end; gap: var(--space-2); padding: 12px 24px 16px; border-top: 1px solid var(--border); }
+
+/* ---- MobileListCard (shared): the design's card with a title, tags, a field list and actions ---- */
+.app-list-card-list { display: flex; flex-direction: column; gap: var(--space-2); }
+.app-list-card { display: flex; flex-direction: column; gap: var(--space-3); width: 100%; min-width: 0; padding: var(--space-4); }
+.app-list-card.is-pressable { cursor: pointer; transition: border-color .15s ease; }
+.app-list-card.is-pressable:hover { border-color: var(--accent); }
+.app-list-card.is-pressable:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--focus-ring); }
+.app-list-card-head { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.app-list-card-title { min-width: 0; overflow-wrap: anywhere; font-size: 15px; line-height: 22px; font-weight: 600; color: var(--text); }
+.app-list-card-sub { min-width: 0; overflow-wrap: anywhere; font-size: 12px; line-height: 18px; color: var(--text-muted); }
+.app-list-card-badges { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-3); }
+.app-list-card-fields {
+  display: grid; grid-template-columns: minmax(72px, max-content) minmax(0, 1fr); gap: 6px var(--space-4); margin: 0;
+  padding-top: var(--space-3); border-top: 1px solid var(--border); font-size: 13px; line-height: 20px;
+}
+.app-list-card-field { display: contents; }
+.app-list-card-field dt { color: var(--text-subtle); }
+.app-list-card-field dd { margin: 0; min-width: 0; overflow-wrap: anywhere; color: var(--text); }
+.app-list-card-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.app-list-card-state { display: flex; flex-direction: column; gap: var(--space-3); padding: var(--space-5); }
+.app-list-card-state .bd-empty { padding: var(--space-6) var(--space-2); }
+.app-list-card-skeleton-short { --w: 60%; }
+
+/* ---- Phones and narrow windows ---- */
+@media (max-width: 1100px) {
+  .acc-inline-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .acc-inline-form-submit { padding-top: 0; }
+  .acc-steps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 767px) {
+  .acc-page > .acc-onboard, .acc-page > .bd-alert { margin-bottom: var(--space-6); }
+  .acc-onboard { padding: var(--space-4); }
+  .acc-onboard-icon { display: none; }
+  .acc-onboard-actions { flex: 1 1 100%; }
+  .acc-onboard-actions > * { flex: 1 1 auto; min-height: 44px; }
+  .acc-steps { grid-template-columns: 1fr; gap: var(--space-3); }
+  .acc-step-links .jd-link { min-height: 44px; }
+  .acc-inline-form { grid-template-columns: 1fr; padding: var(--space-4); }
+  .acc-inline-form-submit button { width: 100%; min-height: 44px; }
+  .acc-page .jd-section-head { flex-wrap: wrap; }
+  .acc-page .jd-stack tbody tr:not(:last-child) td { border-bottom: 0; }
+  .acc-page .bd-table.jd-stack th, .acc-page .bd-table.jd-stack td { padding: 0; }
+  .acc-page .bd-table.jd-stack tr { padding: var(--space-3) var(--space-4); }
+  .acc-page .jd-stack td.jd-cell-actions { flex: 1 0 100%; margin-left: 0; padding-top: var(--space-1); }
+  .acc-page .jd-stack .jd-row-actions { justify-content: flex-start; flex-wrap: wrap; }
+  .acc-page .jd-stack .jd-row-actions > button { min-height: 44px; }
+  .acc-page .jd-stack td[data-label]::before { margin-right: 2px; }
+  .acc-status-cell { flex-direction: row; align-items: center; gap: var(--space-2); }
+  .acc-pager { justify-content: center; flex-wrap: wrap; }
+  .acc-switch { min-height: 44px; }
+  .acc-drawer { top: auto; left: 8px; right: 8px; bottom: 8px; width: auto; max-height: calc(100dvh - 48px); transform: translateY(calc(100% + 16px)); }
+  .acc-drawer-head { padding: 16px 12px 12px 16px; }
+  .acc-drawer-body { padding: var(--space-4) 16px; }
+  .acc-drawer-foot { padding: 12px 16px calc(12px + env(safe-area-inset-bottom)); }
+  .acc-drawer-foot > * { flex: 1; min-height: 44px; }
+  .acc-drawer .bd-icon-btn { width: 44px; height: 44px; }
+  .app-list-card { padding: var(--space-3) var(--space-4); }
+  .app-list-card-actions { flex-wrap: wrap; }
+  .app-list-card-actions > button, .app-list-card-actions > a { min-height: 44px; }
+  .acc-stack-only { display: inline; }
+  .acc-field-pair { grid-template-columns: 1fr; }
+  .acc-switch-list { grid-template-columns: 1fr; gap: 0; }
+  .acc-icon-btn-sm { width: 44px; height: 44px; }
+
+  .acc-chat { grid-template-columns: 1fr; min-height: 0; }
+  .acc-chat-peer-list { max-height: 232px; }
+  .acc-chat-peer { min-height: 56px; }
+  .acc-chat-refresh { min-height: 44px; }
+  .acc-chat-messages { max-height: none; min-height: 300px; padding: var(--space-4) var(--space-3); }
+  .acc-msg { max-width: 92%; }
+  .acc-chat-composer { padding: 10px 12px 12px; }
+  .acc-chat-compose-bar { flex-wrap: wrap; }
+  .acc-chat-input { flex: 1 1 100%; order: -1; }
+  .acc-chat-attach, .acc-chat-send { flex: 1; height: 44px; }
+  .acc-file-row { min-width: 0; }
+
+  .acc-publish-body { padding: var(--space-4); gap: var(--space-4); }
+  .acc-publish-grid { grid-template-columns: 1fr; }
+  .acc-publish-auth { grid-template-columns: 1fr; padding: var(--space-3); }
+  .acc-publish-foot { padding: var(--space-3) var(--space-4); }
+  .acc-publish-summary { flex-basis: 100%; }
+  .acc-publish-submit { width: 100%; min-height: 44px; }
+  /* Alerts put their actions on a row of their own, under the text. */
+  .acc-page .bd-alert, .acc-dialog-body .bd-alert { flex-wrap: wrap; }
+  .acc-page .bd-alert > div + div, .acc-dialog-body .bd-alert > div + div { flex-basis: 100%; padding-left: 28px; }
+  .acc-page .bd-alert > div + div > *, .acc-dialog-body .bd-alert > div + div > * { min-height: 44px; }
+  .acc-page .bd-alert > .min-w-0 { flex-basis: calc(100% - 28px); }
+  .acc-page .bd-filterbar > .acc-filter-select { flex: 1 1 auto; width: auto; min-width: 0; }
+  .acc-filter-trigger { min-height: 40px !important; height: 40px !important; }
+  .acc-card-switches .acc-switch { min-height: 40px; }
+  .acc-link-cell.is-stacked > button { min-height: 44px; }
+
+  .acc-stage-time { margin-left: 0; }
+  .acc-share-custom { grid-template-columns: 1fr 1fr; }
+
+  .acc-dl-grid { grid-template-columns: 1fr; }
+  .acc-dl-list { padding: var(--space-1); }
+  .acc-dl-row { min-height: 56px; padding: 10px; }
+  .acc-dl-time { margin-left: 0; }
+  .acc-dl-name { white-space: normal; overflow-wrap: anywhere; }
+
+  .acc-mac { padding: var(--space-4); }
+  .acc-mac-cask { min-height: 44px; }
+  .acc-code-row { grid-template-columns: minmax(0, 1fr) auto; padding: 8px 6px 8px 12px; row-gap: 2px; }
+  .acc-code-label { grid-column: 1; grid-row: 1; }
+  .acc-code-text { grid-column: 1 / -1; grid-row: 2; padding: 0 6px 4px 0; white-space: normal; overflow-wrap: anywhere; }
+  .acc-code-copy { grid-column: 2; grid-row: 1; min-height: 44px; min-width: 44px; }
+}
+@media (max-width: 479px) {
+  .acc-radio-cards { grid-template-columns: 1fr; }
+}
+@media (max-width: 359px) {
+  .acc-card-switches { grid-template-columns: 1fr; }
+}
+@media (min-width: 768px) and (max-width: 1100px) {
+  .acc-chat { grid-template-columns: 240px minmax(0, 1fr); }
+  .acc-publish-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .acc-publish-grid > :last-child { grid-column: 1 / -1; }
+  .acc-dl-grid { grid-template-columns: 1fr; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .acc-drawer, .acc-drawer-scrim { transition: none; }
+}

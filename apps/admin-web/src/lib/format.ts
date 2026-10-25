@@ -72,3 +72,63 @@ export function formatSince(loginTimeMs: number | null | undefined, nowMillis = 
   const seconds = Math.max(0, Math.floor((nowMillis - loginTimeMs) / 1000));
   return humanizeSeconds(seconds);
 }
+
+const pad2 = (value: number) => String(value).padStart(2, "0");
+
+// formatAbsoluteTime renders the design's full timestamp, "2026-10-23 16:02".
+export function formatAbsoluteTime(value: string | number | Date | null | undefined): string {
+  if (value === null || value === undefined || value === "") {
+    return "";
+  }
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return typeof value === "string" ? value : "";
+  }
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+}
+
+// formatRelativeTime follows the design's copy rule: within 24 hours a relative time ("3 分钟前",
+// "40 分钟后", "刚刚", "马上"), otherwise the full timestamp.
+export function formatRelativeTime(value: string | number | Date | null | undefined, nowMillis = Date.now()): string {
+  if (value === null || value === undefined || value === "") {
+    return "";
+  }
+  const date = value instanceof Date ? value : new Date(value);
+  const time = date.getTime();
+  if (Number.isNaN(time)) {
+    return typeof value === "string" ? value : "";
+  }
+  const delta = time - nowMillis;
+  const seconds = Math.round(Math.abs(delta) / 1000);
+  if (seconds >= 86400) {
+    return formatAbsoluteTime(date);
+  }
+  const future = delta > 0;
+  if (seconds < 60) {
+    return future ? "马上" : "刚刚";
+  }
+  const amount = seconds < 3600 ? `${Math.floor(seconds / 60)} 分钟` : `${Math.floor(seconds / 3600)} 小时`;
+  return future ? `${amount}后` : `${amount}前`;
+}
+
+// formatElapsed renders a span of time the way the design writes durations: "2 秒", "3 分 20 秒",
+// "1 小时 5 分", "2 天 3 小时".
+export function formatElapsed(totalSeconds: number | null | undefined): string {
+  if (totalSeconds === null || totalSeconds === undefined || !Number.isFinite(totalSeconds) || totalSeconds < 0) {
+    return "";
+  }
+  const seconds = Math.floor(totalSeconds);
+  if (seconds < 60) {
+    return `${seconds} 秒`;
+  }
+  if (seconds < 3600) {
+    const rest = seconds % 60;
+    return rest ? `${Math.floor(seconds / 60)} 分 ${rest} 秒` : `${Math.floor(seconds / 60)} 分`;
+  }
+  if (seconds < 86400) {
+    const minutes = Math.floor((seconds % 3600) / 60);
+    return minutes ? `${Math.floor(seconds / 3600)} 小时 ${minutes} 分` : `${Math.floor(seconds / 3600)} 小时`;
+  }
+  const hours = Math.floor((seconds % 86400) / 3600);
+  return hours ? `${Math.floor(seconds / 86400)} 天 ${hours} 小时` : `${Math.floor(seconds / 86400)} 天`;
+}

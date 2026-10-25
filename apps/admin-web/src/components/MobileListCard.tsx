@@ -1,14 +1,13 @@
-import type { ReactNode } from "react";
-import { Card, CardBody } from "@heroui/react";
+import type { KeyboardEvent, ReactNode } from "react";
 
 /**
- * 移动端列表卡片模板。桌面端继续用 <Table>，< lg 断点下用卡片堆叠。
+ * 移动端列表卡片模板。桌面端继续用表格，窄屏下用卡片堆叠。
  *
- * 字段格式：title + 可选 subtitle + 可选 chip 行 + label-value 字段表 + 底部操作行。
+ * 设计规范的卡片（bd-card：surface 底、发丝线、radius-xl）：标题 + 可选副标题 + 可选标签行 +
+ * 名称/取值字段表 + 底部操作行。样式在 styles/area-access.css 的 app-list-card 一节。
  *
- * 设计要点：
- *  - grid-cols-[80px_1fr] 左侧标签固定宽度，右侧 value 允许换行、截断。
- *  - actions 行用 flex-wrap，按钮多时自动换行。
+ *  - 字段表左列固定宽度的 text-subtle 名称，右列取值可换行；数字用等宽数字。
+ *  - 操作行 flex-wrap，按钮多时自动换行；危险操作放在最后。
  *  - 卡片本身不固定宽度，跟随父容器流式布局。
  */
 export interface MobileListCardField {
@@ -38,43 +37,45 @@ export function MobileListCard({
   onPress,
 }: MobileListCardProps) {
   const clickable = typeof onPress === "function";
+  const pressProps = clickable
+    ? {
+      role: "button",
+      tabIndex: 0,
+      onClick: onPress,
+      onKeyDown: (event: KeyboardEvent<HTMLElement>) => {
+        if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) {
+          event.preventDefault();
+          onPress?.();
+        }
+      },
+    }
+    : {};
   return (
-    <Card
-      shadow="none"
-      isPressable={clickable}
-      onPress={onPress}
-      className={`w-full rounded-md border border-default-200 bg-content1 ${
-        clickable ? "cursor-pointer hover:border-primary" : ""
-      }`}
-    >
-      <CardBody className="gap-3 p-3">
-        <div className="flex flex-col gap-1">
-          <div className="min-w-0 break-words text-small font-semibold text-foreground">{title}</div>
-          {subtitle ? (
-            <div className="min-w-0 break-words text-tiny text-default-500">{subtitle}</div>
-          ) : null}
-        </div>
-        {badges ? <div className="flex flex-wrap gap-1.5">{badges}</div> : null}
-        {fields && fields.length > 0 ? (
-          <div className="grid grid-cols-[80px_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-tiny">
-            {fields.map((field) => (
-              <FieldRow key={field.label} label={field.label} value={field.value} />
-            ))}
-          </div>
-        ) : null}
-        {extra}
-        {actions ? <div className="flex flex-wrap items-center gap-2 pt-1">{actions}</div> : null}
-      </CardBody>
-    </Card>
+    <article className={`bd-card app-list-card${clickable ? " is-pressable" : ""}`} {...pressProps}>
+      <div className="app-list-card-head">
+        <div className="app-list-card-title">{title}</div>
+        {subtitle ? <div className="app-list-card-sub">{subtitle}</div> : null}
+      </div>
+      {badges ? <div className="app-list-card-badges">{badges}</div> : null}
+      {fields && fields.length > 0 ? (
+        <dl className="app-list-card-fields">
+          {fields.map((field) => (
+            <FieldRow key={field.label} label={field.label} value={field.value} />
+          ))}
+        </dl>
+      ) : null}
+      {extra}
+      {actions ? <div className="app-list-card-actions">{actions}</div> : null}
+    </article>
   );
 }
 
 function FieldRow({ label, value }: MobileListCardField) {
   return (
-    <>
-      <div className="text-default-500">{label}</div>
-      <div className="min-w-0 break-words text-foreground">{value ?? <span className="text-default-400">-</span>}</div>
-    </>
+    <div className="app-list-card-field">
+      <dt>{label}</dt>
+      <dd className="bd-num">{value ?? <span className="jd-subtle">—</span>}</dd>
+    </div>
   );
 }
 
@@ -94,20 +95,18 @@ export function MobileListCardList({
 }) {
   if (isLoading && items.length === 0) {
     return (
-      <div className="rounded-md border border-default-200 bg-content1 p-6 text-center text-small text-default-500">
-        加载中…
+      <div className="bd-card app-list-card-state" role="status">
+        <span className="bd-skeleton" />
+        <span className="bd-skeleton app-list-card-skeleton-short" />
+        <span className="bd-skeleton-note">正在加载…</span>
       </div>
     );
   }
   if (!isLoading && items.length === 0) {
-    return (
-      <div className="rounded-md border border-default-200 bg-content1 p-6 text-center text-small text-default-500">
-        {emptyContent ?? "暂无数据"}
-      </div>
-    );
+    return <div className="bd-card app-list-card-state">{emptyContent ?? <p className="jd-muted">还没有数据</p>}</div>;
   }
   return (
-    <div className="flex flex-col gap-2">
+    <div className="app-list-card-list">
       {items.map((item, index) => renderCard(item, index))}
     </div>
   );

@@ -17,6 +17,17 @@
  */
 @import "./index.css" layer(utilities);
 
+/* The design system's component and shell classes (bd-*, jd-*). In the components layer, so a
+ * Tailwind utility on the same element still wins. */
+@import "./styles/liquid-glass.css" layer(components);
+
+/* Page-area styles written on top of the design classes, one file per area. */
+@import "./styles/area-ops.css" layer(utilities);
+@import "./styles/area-access.css" layer(utilities);
+@import "./styles/area-mesh-system.css" layer(utilities);
+@import "./styles/public-pages.css" layer(utilities);
+@import "./styles/transfer.css" layer(utilities);
+
 @plugin "../hero.ts";
 
 /* The files the Tailwind 3 config listed under `content`; automatic detection would add public/. */

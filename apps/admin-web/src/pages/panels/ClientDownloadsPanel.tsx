@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
-import { Button, Card, CardBody, CardHeader, Chip, Spinner } from "@heroui/react";
+import { Button } from "@heroui/react";
 import type { ClientDownloadLink, ClientImplementation } from "../../api/types";
 import { fetchPublicClientDownloads } from "../../api/client";
 import { MacosInstallGuide } from "../../components/MacosInstallGuide";
-import { formatBytes, formatDateTime } from "../../lib/format";
+import { formatBytes } from "../../lib/format";
 import { PageHeader } from "../../components/PageHeader";
+import { Alert, Icon, RelativeTime, Section, Tag } from "../../components/ui";
+import { ListLoading } from "./accessUi";
 
 const IMPLEMENTATION_LABELS: Record<ClientImplementation, string> = {
   java: "Java 客户端",
@@ -51,93 +53,92 @@ export function ClientDownloadsPanel() {
     implementation: impl,
     links: links.filter((link) => link.implementation === impl),
   }));
+  const latestVersion = links.find((link) => link.isLatest && link.version)?.version;
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="acc-page">
       <PageHeader
         title="客户端下载"
         description="macOS 推荐 Homebrew；GitHub Releases 提供各平台手动下载包"
         actions={<>
-          <Button as="a" href="/download" rel="noopener noreferrer" size="sm" target="_blank" variant="bordered">
-            打开公开下载页 ↗
+          <Button as="a" href="/download" rel="noopener noreferrer" target="_blank" variant="bordered" endContent={<Icon name="external" size={14} />}>
+            打开公开下载页
           </Button>
-          <Button size="sm" variant="flat" isLoading={loading} onPress={() => void load(true)}>
+          <Button variant="flat" isLoading={loading} startContent={loading ? null : <Icon name="refresh" />} onPress={() => void load(true)}>
             刷新
           </Button>
         </>}
       />
 
-      <MacosInstallGuide />
-      <div className="rounded-md border border-primary-200 bg-primary-50/40 p-3 text-small">
-        下载完成后，先 <a className="font-medium text-primary underline" href="#/clients">创建接入凭证并保存配置</a>，再按 <a className="font-medium text-primary underline" href="#/help/quickstart">启动说明</a> 运行客户端。首次登录生成实例后即可选择它发布服务，建议先确认设备在线。
-      </div>
+      <Alert tone="info" title="下载之后">
+        先 <a className="jd-link" href="#/clients">创建接入凭证并保存配置</a>，再按 <a className="jd-link" href="#/help/quickstart">启动说明</a> 运行客户端。首次登录生成实例后即可选择它发布服务，建议先确认设备在线。
+      </Alert>
 
-      {error ? (
-        <div
-          className="flex flex-col items-center gap-3 rounded-md border border-danger-200 bg-danger-50 px-4 py-8 text-center dark:border-danger-400/30 dark:bg-danger-500/10"
-          role="alert"
-        >
-          <p className="text-small text-danger">下载链接加载失败：{error}</p>
-          <Button color="danger" size="sm" variant="flat" isLoading={loading} onPress={() => void load()}>
-            重试
-          </Button>
-        </div>
-      ) : loading && links.length === 0 ? (
-        <Spinner className="my-8" label="加载中…" />
-      ) : (
-        <div className="grid gap-4 lg:grid-cols-2 2xl:grid-cols-4">
-          {grouped.map(({ implementation, links: implLinks }) => (
-            <Card key={implementation} shadow="none" className="rounded-md border border-default-200">
-              <CardHeader className="flex flex-col items-start gap-1 px-5 pb-2 pt-4">
-                <h3 className="text-base font-semibold">{IMPLEMENTATION_LABELS[implementation]}</h3>
-                <p className="text-tiny text-default-500">{IMPLEMENTATION_DESCRIPTIONS[implementation]}</p>
-              </CardHeader>
-              <CardBody className="gap-3 px-5 pb-5 pt-2">
+      <Section title="macOS" description="Homebrew 一条命令安装和升级，Apple Silicon 与 Intel 通用。">
+        <MacosInstallGuide />
+      </Section>
+
+      <Section
+        title="全部下载"
+        description="各平台的安装包来自服务端版本编目，缺少的目标从 GitHub Releases 补齐；在新窗口打开下载。"
+        actions={latestVersion ? <Tag tone="success">最新 v{latestVersion.replace(/^v/, "")}</Tag> : null}
+      >
+        {error ? (
+          <Alert
+            tone="danger"
+            role="alert"
+            title="下载链接加载失败"
+            actions={<Button size="sm" variant="flat" isLoading={loading} startContent={loading ? null : <Icon name="refresh" size={14} />} onPress={() => void load()}>重试</Button>}
+          >
+            {error}
+          </Alert>
+        ) : loading && links.length === 0 ? (
+          <ListLoading label="正在读取下载链接…" rows={4} />
+        ) : (
+          <div className="acc-dl-grid">
+            {grouped.map(({ implementation, links: implLinks }) => (
+              <section key={implementation} className="bd-card acc-dl-card" aria-label={IMPLEMENTATION_LABELS[implementation]}>
+                <div className="bd-card-header">
+                  <div className="min-w-0">
+                    <h3 className="bd-card-title">{IMPLEMENTATION_LABELS[implementation]}</h3>
+                    <p className="app-card-desc">{IMPLEMENTATION_DESCRIPTIONS[implementation]}</p>
+                  </div>
+                  <span className="acc-head-count bd-num">{implLinks.length ? `${implLinks.length} 个` : ""}</span>
+                </div>
                 {implLinks.length === 0 ? (
-                  <p className="rounded-md border border-default-200 bg-default-50 p-3 text-tiny text-default-500">
-                    当前未获取到对应产物，请稍后刷新
-                  </p>
+                  <p className="acc-dl-empty">还没有读到这个客户端的下载包；过一会儿用右上角的“刷新”再取一次。</p>
                 ) : (
-                  implLinks.map((link) => <DownloadCard key={link.id} link={link} />)
+                  <ul className="acc-dl-list">
+                    {implLinks.map((link) => <DownloadRow key={link.id} link={link} />)}
+                  </ul>
                 )}
-              </CardBody>
-            </Card>
-          ))}
-        </div>
-      )}
+              </section>
+            ))}
+          </div>
+        )}
+      </Section>
     </div>
   );
 }
 
-function DownloadCard({ link }: { link: ClientDownloadLink }) {
+function DownloadRow({ link }: { link: ClientDownloadLink }) {
   return (
-    <a
-      className="group block rounded-md border border-default-200 bg-content1 p-3 transition hover:border-primary hover:shadow-xs"
-      href={link.downloadUrl}
-      rel="noopener noreferrer"
-      target="_blank"
-    >
-      <div className="flex items-start justify-between gap-2">
-        <div className="min-w-0 flex-1">
-          <div className="truncate font-medium text-foreground group-hover:text-primary">{link.displayName}</div>
-          {link.description ? (
-            <p className="mt-1 text-tiny text-default-500">{link.description}</p>
-          ) : null}
-        </div>
-        <span className="shrink-0 text-tiny text-default-400 group-hover:text-primary">↗</span>
-      </div>
-      <div className="mt-2 flex flex-wrap items-center gap-1">
-        <Chip size="sm" variant="flat" color="primary">
-          {platformLabel(link.platform)}
-        </Chip>
-        <Chip size="sm" variant="flat">
-          {archLabel(link.arch)}
-        </Chip>
-        {link.version ? <Chip size="sm" color={link.isLatest ? "success" : "default"} variant="flat">v{link.version}</Chip> : null}
-        {link.fileSize ? <span className="text-tiny text-default-400">{formatBytes(link.fileSize)}</span> : null}
-        <span className="ml-auto text-tiny text-default-400">更新 {formatDateTime(link.updatedAt)}</span>
-      </div>
-    </a>
+    <li>
+      <a className="acc-dl-row" href={link.downloadUrl} rel="noopener noreferrer" target="_blank">
+        <span className="acc-dl-icon" aria-hidden="true"><Icon name="archive" size={16} /></span>
+        <span className="acc-dl-main">
+          <span className="acc-dl-name">{link.displayName}</span>
+          <span className="acc-dl-meta">
+            <span className="bd-tag bd-tag--plain">{platformLabel(link.platform)}</span>
+            <span className="bd-tag bd-tag--plain">{archLabel(link.arch)}</span>
+            {link.version ? <span className={`bd-tag ${link.isLatest ? "bd-tag--success" : ""}`}>v{link.version.replace(/^v/, "")}</span> : null}
+            {link.fileSize ? <span className="bd-num">{formatBytes(link.fileSize)}</span> : null}
+            <span className="acc-dl-time">更新 <RelativeTime value={link.updatedAt} /></span>
+          </span>
+        </span>
+        <span className="acc-dl-go" aria-hidden="true"><Icon name="download" size={16} /></span>
+      </a>
+    </li>
   );
 }
 

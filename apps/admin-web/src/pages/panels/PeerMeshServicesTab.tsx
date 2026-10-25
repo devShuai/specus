@@ -1,18 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  Button,
-  Chip,
-  Input,
-  Select,
-  SelectItem,
-  Switch,
-  Table,
-  TableBody,
-  TableCell,
-  TableColumn,
-  TableHeader,
-  TableRow,
-} from "@heroui/react";
+import { Button } from "@heroui/react";
 import { adminApi, recordWorkbenchOpenAsCaller } from "../../api/client";
 import type {
   PeerMeshDevice,
@@ -22,10 +9,9 @@ import type {
 } from "../../api/types";
 import { useAuth } from "../../auth/AuthContext";
 import { ConfirmModal } from "../../components/ConfirmModal";
-import { EmptyState } from "../../components/EmptyState";
+import { Alert, Card, CardBody, Empty, Icon, RelativeTime, Section, TableWrap } from "../../components/ui";
 import { notify, notifyError } from "../../components/toast";
 import { copyTextWithFeedback } from "../../lib/clipboard";
-import { formatDateTime } from "../../lib/format";
 import { copyThenRecord } from "../../lib/workbenchRecording";
 import {
   groupPeerMeshServices,
@@ -35,6 +21,7 @@ import {
   peerDirectoryCheckGuidance,
   type PeerMeshServiceInstanceRow,
 } from "./peerMeshServicesModel";
+import { CheckGroup, ModelTag, RadioCards, SelectField, SettingRow, TextField, Toggle } from "./meshSystemParts";
 
 const applications = ["http", "https", "ssh", "tcp", "udp"] as const;
 
@@ -206,7 +193,7 @@ export function PeerMeshServicesTab({
     setSavingService(true);
     const clientId = Number(draft.clientId);
     if (!clientId) {
-      notifyError(new Error("请选择设备"), "新增服务失败");
+      notifyError(new Error("还没选发布设备：先在“设备”里选一台"), "新增服务失败");
       setSavingService(false);
       operationLocks.current.release("save");
       return;
@@ -244,7 +231,7 @@ export function PeerMeshServicesTab({
   const importMdns = async () => {
     const clientId = Number(draft.clientId);
     if (!clientId) {
-      notifyError(new Error("请选择设备"), "导入失败");
+      notifyError(new Error("还没选发布设备：先在“设备”里选一台"), "导入失败");
       return;
     }
     setImporting(true);
@@ -272,7 +259,7 @@ export function PeerMeshServicesTab({
   const importCandidates = async () => {
     const clientId = Number(draft.clientId);
     if (!clientId) {
-      notifyError(new Error("请选择设备"), "导入失败");
+      notifyError(new Error("还没选发布设备：先在“设备”里选一台"), "导入失败");
       return;
     }
     setImporting(true);
@@ -404,7 +391,7 @@ export function PeerMeshServicesTab({
       notify(`目录检查：${availability.available ? "目录有效，目标连通性未检测" : availability.reason}`, availability.available ? undefined : "error");
     } catch (error) {
       setLoadError(error instanceof Error ? error.message : "无法读取 Peer 服务状态");
-      setDirectoryChecks((current) => ({ ...current, [row.key]: { checkedAt: new Date().toISOString(), result: "检查失败，状态未知", detail: "请检查后台连接后重试；本次没有验证目标连通性。" } }));
+      setDirectoryChecks((current) => ({ ...current, [row.key]: { checkedAt: new Date().toISOString(), result: "检查失败，状态未知", detail: "读不到后台：检查网络后重新检查；本次没有验证目标连通性。" } }));
       notifyError(error, "目录检查失败");
     } finally {
       setTestingInstances((current) => {
@@ -425,301 +412,341 @@ export function PeerMeshServicesTab({
     sharing,
   });
 
+  const setMdnsImportEnabled = async (enabled: boolean) => {
+    if (!operationLocks.current.acquire("sharing")) {
+      return;
+    }
+    setUpdatingShare(true);
+    try {
+      const next = await adminApi.updatePeerMeshServiceSharing(undefined, enabled);
+      setSharing(next);
+      notify(enabled ? "已允许 mDNS 候选导入" : "已关闭 mDNS 候选导入");
+    } catch (error) {
+      notifyError(error, "更新 mDNS 导入失败");
+    } finally {
+      setUpdatingShare(false);
+      operationLocks.current.release("sharing");
+    }
+  };
+
   return (
-    <section className="space-y-4" aria-busy={loading || updatingShare}>
-      <p className="rounded-md border border-default-200 bg-default-50 p-3 text-small text-default-600">目录状态仅说明设备上报是否在线、服务记录是否有效，不代表目标应用可连接。请在已加入私有组网的设备上打开或连接发布地址，验证实际访问。</p>
+    <div className="ms-tab" aria-busy={loading || updatingShare}>
+      <Alert tone="info" title="目录状态不等于目标可连接" className="ms-block">
+        目录状态只说明设备上报是否在线、服务记录是否有效。在已加入私有组网的设备上打开或连接发布地址，才能验证实际访问。
+      </Alert>
       {loadError && (
-        <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-danger-200 bg-danger-50 p-3 text-small text-danger-700">
-          <span>Peer 服务状态未知：{loadError}</span>
-          <Button size="sm" color="danger" variant="flat" onPress={() => void load()}>
-            重新加载
-          </Button>
-        </div>
+        <Alert
+          tone="danger"
+          role="alert"
+          title="Peer 服务状态未知"
+          className="ms-block"
+          actions={<Button size="sm" color="danger" variant="flat" startContent={<Icon name="refresh" />} onPress={() => void load()}>重新加载</Button>}
+        >
+          {loadError}。检查后台连接后重新加载；在此之前各服务的状态都按未知处理。
+        </Alert>
       )}
-      <div className="flex flex-col gap-2 rounded-md border border-default-200 p-3">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h3 className="text-base font-semibold">Peer 服务共享</h3>
-            <p id="peer-service-sharing-help" className="text-small text-default-500">
-              {sharingControl.label}
-            </p>
-          </div>
-          <Switch
-            aria-label="Peer 服务共享"
-            aria-describedby="peer-service-sharing-help"
-            aria-busy={updatingShare}
-            isSelected={sharingControl.selected}
-            isDisabled={sharingControl.disabled}
-            onValueChange={(enabled) => setSharingEnabled(enabled)}
+
+      <Section title="服务共享" description="两个开关都立即生效，作用于本组织的全部设备。">
+        <Card className="ms-settings">
+          <SettingRow
+            title="Peer 服务共享"
+            description={sharingControl.label}
+            descriptionId="peer-service-sharing-help"
+            control={(
+              <Toggle
+                label="Peer 服务共享"
+                describedBy="peer-service-sharing-help"
+                busy={updatingShare}
+                checked={sharingControl.selected}
+                disabled={sharingControl.disabled}
+                onChange={(enabled) => setSharingEnabled(enabled)}
+              />
+            )}
           />
-        </div>
-        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-default-200 pt-2">
-          <p id="peer-mdns-help" className="text-small text-default-500">
-            允许 mDNS 候选导入（默认关闭）。开启后发布端才浏览本机 DNS-SD，候选不会进入对端目录。
-          </p>
-          <Switch
-            aria-label="允许 mDNS 候选导入"
-            aria-describedby="peer-mdns-help"
-            aria-busy={updatingShare}
-            isSelected={Boolean(sharing?.mdnsImportEnabled)}
-            isDisabled={sharingControl.disabled || !sharing?.configuredEnabled}
-            onValueChange={async (enabled) => {
-              if (!operationLocks.current.acquire("sharing")) {
-                return;
-              }
-              setUpdatingShare(true);
-              try {
-                const next = await adminApi.updatePeerMeshServiceSharing(undefined, enabled);
-                setSharing(next);
-                notify(enabled ? "已允许 mDNS 候选导入" : "已关闭 mDNS 候选导入");
-              } catch (error) {
-                notifyError(error, "更新 mDNS 导入失败");
-              } finally {
-                setUpdatingShare(false);
-                operationLocks.current.release("sharing");
-              }
-            }}
+          <SettingRow
+            title="允许 mDNS 候选导入"
+            description="默认关闭。开启后发布端才浏览本机 DNS-SD，候选不会进入对端目录。"
+            descriptionId="peer-mdns-help"
+            control={(
+              <Toggle
+                label="允许 mDNS 候选导入"
+                describedBy="peer-mdns-help"
+                busy={updatingShare}
+                checked={Boolean(sharing?.mdnsImportEnabled)}
+                disabled={sharingControl.disabled || !sharing?.configuredEnabled}
+                onChange={(enabled) => void setMdnsImportEnabled(enabled)}
+              />
+            )}
           />
-        </div>
-      </div>
+        </Card>
+      </Section>
 
       {isAdmin && (
-        <div className="grid grid-cols-1 gap-2 md:grid-cols-3 xl:grid-cols-7">
-          <Select
-            aria-label="发布设备"
-            label="设备"
-            selectedKeys={draft.clientId ? [draft.clientId] : []}
-            onSelectionChange={(keys) => setDraft((current) => ({ ...current, clientId: String([...keys][0] ?? "") }))}
-          >
-            {devices.map((device) => (
-              <SelectItem key={String(device.clientId)}>{device.clientName}</SelectItem>
-            ))}
-          </Select>
-          <Input label="名称" value={draft.name} onValueChange={(name) => setDraft((current) => ({ ...current, name }))} />
-          <Select
-            aria-label="应用类型"
-            label="类型"
-            selectedKeys={[draft.application]}
-            onSelectionChange={(keys) =>
-              setDraft((current) => ({ ...current, application: String([...keys][0] ?? "tcp") }))
-            }
-          >
-            {applications.map((item) => (
-              <SelectItem key={item}>{item}</SelectItem>
-            ))}
-          </Select>
-          <Input
-            label="本机目标"
-            value={draft.targetHost}
-            onValueChange={(targetHost) => setDraft((current) => ({ ...current, targetHost }))}
-          />
-          <Input
-            label="目标端口"
-            value={draft.targetPort}
-            onValueChange={(targetPort) => setDraft((current) => ({ ...current, targetPort }))}
-          />
-          <Input
-            label="发布端口"
-            value={draft.publishedPort}
-            onValueChange={(publishedPort) => setDraft((current) => ({ ...current, publishedPort }))}
-          />
-          <Select
-            aria-label="可见范围"
-            label="可见范围"
-            selectedKeys={[draft.visibility]}
-            onSelectionChange={(keys) =>
-              setDraft((current) => ({ ...current, visibility: String([...keys][0] ?? "OWNER") }))
-            }
-          >
-            <SelectItem key="OWNER">同归属</SelectItem>
-            <SelectItem key="ACL">ACL</SelectItem>
-          </Select>
-          {draft.visibility === "ACL" && (
-            <Select
-              aria-label="允许的客户端"
-              label="允许的客户端"
-              selectionMode="multiple"
-              selectedKeys={new Set(draft.allowedClientIds)}
-              onSelectionChange={(keys) =>
-                setDraft((current) => ({ ...current, allowedClientIds: [...keys].map(String) }))
-              }
-            >
-              {devices
-                .filter((device) => String(device.clientId) !== draft.clientId)
-                .map((device) => (
-                  <SelectItem key={String(device.clientId)}>{device.clientName}</SelectItem>
-                ))}
-            </Select>
-          )}
-          <div className="flex items-end">
-            <Button color="primary" isLoading={savingService} isDisabled={savingService} onPress={() => void saveService()}>
-              {editingId == null ? "新增（默认关闭）" : "保存更改"}
-            </Button>
-            {editingId != null && (
-              <Button variant="light" isDisabled={savingService} onPress={() => setEditingId(null)}>取消编辑</Button>
-            )}
-          </div>
-          <div className="flex items-end gap-2">
-            <Button
-              variant="flat"
-              isDisabled={!draft.clientId || importing}
-              onPress={() => void importCandidates()}
-            >
-              从 TCP/HTTP 导入候选
-            </Button>
-            <Button
-              variant="flat"
-              isDisabled={!draft.clientId || importing || !sharing?.mdnsImportEnabled}
-              onPress={() => void importMdns()}
-            >
-              导入 mDNS 候选
-            </Button>
-          </div>
-        </div>
+        <Section
+          title={editingId == null ? "新增服务" : "编辑服务"}
+          description="新增的服务默认关闭；在服务目录里启用后，才向获授权的对端发布。"
+        >
+          <Card>
+            <CardBody>
+              <div className="bd-form-grid ms-service-form">
+                <SelectField
+                  label="设备"
+                  value={draft.clientId}
+                  placeholder="选择发布设备"
+                  onChange={(clientId) => setDraft((current) => ({ ...current, clientId }))}
+                  options={devices.map((device) => ({ value: String(device.clientId), label: device.clientName }))}
+                />
+                <TextField label="名称" value={draft.name} placeholder="grafana" onChange={(name) => setDraft((current) => ({ ...current, name }))} />
+                <SelectField
+                  label="类型"
+                  value={draft.application}
+                  onChange={(application) => setDraft((current) => ({ ...current, application: application || "tcp" }))}
+                  options={applications.map((item) => ({ value: item, label: item }))}
+                />
+                <TextField
+                  label="本机目标"
+                  value={draft.targetHost}
+                  help="发布端本机能访问到的地址"
+                  onChange={(targetHost) => setDraft((current) => ({ ...current, targetHost }))}
+                />
+                <TextField
+                  label="目标端口"
+                  inputMode="numeric"
+                  value={draft.targetPort}
+                  onChange={(targetPort) => setDraft((current) => ({ ...current, targetPort }))}
+                />
+                <TextField
+                  label="发布端口"
+                  inputMode="numeric"
+                  value={draft.publishedPort}
+                  help="对端通过虚拟 IP 的这个端口访问"
+                  onChange={(publishedPort) => setDraft((current) => ({ ...current, publishedPort }))}
+                />
+                <div className="bd-col-full">
+                  <RadioCards
+                    legend="可见范围"
+                    value={draft.visibility === "ACL" ? "ACL" : "OWNER"}
+                    onChange={(visibility) => setDraft((current) => ({ ...current, visibility }))}
+                    options={[
+                      { value: "OWNER", title: "同归属", description: "同一用户的设备都能在目录里看到它" },
+                      { value: "ACL", title: "ACL", description: "只有下面勾选的客户端能看到它" },
+                    ]}
+                  />
+                </div>
+                {draft.visibility === "ACL" && (
+                  <div className="bd-col-full">
+                    <CheckGroup
+                      legend="允许的客户端"
+                      values={draft.allowedClientIds}
+                      onChange={(allowedClientIds) => setDraft((current) => ({ ...current, allowedClientIds }))}
+                      options={devices
+                        .filter((device) => String(device.clientId) !== draft.clientId)
+                        .map((device) => ({ value: String(device.clientId), label: device.clientName }))}
+                      empty="除发布设备外没有其他组网设备"
+                    />
+                  </div>
+                )}
+              </div>
+            </CardBody>
+            <div className="bd-card-footer ms-form-foot">
+              <div className="ms-row-actions">
+                <Button
+                  size="sm"
+                  variant="flat"
+                  startContent={<Icon name="download" size={14} />}
+                  isDisabled={!draft.clientId || importing}
+                  onPress={() => void importCandidates()}
+                >
+                  导入 TCP/HTTP 候选
+                </Button>
+                <Button
+                  size="sm"
+                  variant="flat"
+                  startContent={<Icon name="download" size={14} />}
+                  isDisabled={!draft.clientId || importing || !sharing?.mdnsImportEnabled}
+                  onPress={() => void importMdns()}
+                >
+                  导入 mDNS 候选
+                </Button>
+              </div>
+              <div className="ms-form-foot-end">
+                {editingId != null && (
+                  <Button variant="light" isDisabled={savingService} onPress={() => setEditingId(null)}>取消编辑</Button>
+                )}
+                <Button color="primary" isLoading={savingService} isDisabled={savingService} onPress={() => void saveService()}>
+                  {editingId == null ? "新增（默认关闭）" : "保存更改"}
+                </Button>
+              </div>
+            </div>
+          </Card>
+        </Section>
       )}
 
-      {grouped.length === 0 ? (
-        <EmptyState title="暂无本机服务" description="服务默认关闭。管理员添加并显式启用后，才会向获授权对端发布。" />
-      ) : (
-        grouped.map((group) => (
-          <div key={group.key} className="space-y-2 rounded-md border border-default-200 p-3">
-            <div className="flex flex-wrap items-baseline justify-between gap-2">
-              <h4 className="text-small font-semibold text-default-700">
-                {group.publisherClientName} · 客户端 #{group.publisherClientId}
-              </h4>
-              <span className="font-mono text-tiny text-default-500">
-                {group.publisherSessionId == null
-                  ? "尚无运行实例"
-                  : `会话 ${group.publisherSessionId}${group.instanceId ? ` · 实例 ${group.instanceId}` : ""}`}
-              </span>
-            </div>
-            <Table aria-label={`${group.publisherClientName} 会话 ${group.publisherSessionId ?? "未上报"} 的 Peer 服务`} removeWrapper>
-              <TableHeader>
-                <TableColumn>服务</TableColumn>
-                <TableColumn>类型</TableColumn>
-                <TableColumn>发布地址</TableColumn>
-                <TableColumn>可见范围</TableColumn>
-                <TableColumn>状态</TableColumn>
-                <TableColumn>运行实例</TableColumn>
-                <TableColumn>操作</TableColumn>
-              </TableHeader>
-              <TableBody>
-                {group.rows.map((row) => {
-                  const service = row.service;
-                  const chip = loadError ? { color: "default" as const, text: "状态未知" } : statusChip(row);
-                  const rowBusy = updatingServices.has(service.id)
-                    || deletingServices.has(service.id)
-                    || testingInstances.has(row.key);
-                  return (
-                  <TableRow key={row.key} aria-busy={rowBusy}>
-                    <TableCell>
-                      <div className="flex flex-col">
-                        <span>{service.name}</span>
-                        <span className="font-mono text-tiny text-default-400">{service.serviceId}</span>
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      {service.application}
-                      {service.transport === "udp" ? " / udp" : ""}
-                    </TableCell>
-                    <TableCell className="font-mono">{service.publishedAddress || "-"}</TableCell>
-                    <TableCell>
-                      {service.visibility === "ACL"
-                        ? `ACL${service.allowedClientIds?.length ? ` · ${service.allowedClientIds.length} 台` : ""}`
-                        : "同归属"}
-                    </TableCell>
-                    <TableCell>
-                      <Chip size="sm" color={chip.color} variant="flat">
-                        {chip.text}
-                      </Chip>
-                      {directoryChecks[row.key] ? <p role="status" className="mt-2 max-w-64 text-tiny text-default-500">
-                        上次检查：{formatDateTime(directoryChecks[row.key].checkedAt)} · {directoryChecks[row.key].result}<br />{directoryChecks[row.key].detail}
-                      </p> : <p className="mt-1 text-tiny text-default-500">目标连通性未检测</p>}
-                    </TableCell>
-                    <TableCell>
-                      <span className="text-tiny text-default-500">{instanceSummary(row)}</span>
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex flex-wrap items-center gap-2">
-                        {isAdmin && (
-                          <Switch
-                            aria-label={`启用 ${service.name}`}
-                            aria-busy={updatingServices.has(service.id)}
-                            isSelected={service.enabled}
-                            isDisabled={rowBusy || updatingShare || loadError != null}
-                            onValueChange={(enabled) => void toggleService(service, enabled)}
-                          />
-                        )}
-                        {isAdmin && (
-                          <Button size="sm" variant="light" isDisabled={rowBusy} onPress={() => editService(service)}>
-                            编辑
-                          </Button>
-                        )}
-                        {isAdmin && service.enabled && (
-                          <Button
-                            size="sm"
-                            color="warning"
-                            variant="light"
-                            isDisabled={rowBusy || updatingShare || loadError != null}
-                            onPress={() => void toggleService(service, false)}
-                          >
-                            撤回
-                          </Button>
-                        )}
-                        <Button
-                          size="sm"
-                          variant="flat"
-                          title={row.availability.available ? "复制当前发布地址" : row.availability.reason}
-                          isDisabled={rowBusy || !row.availability.available}
-                          onPress={() => void copyAddress(row)}
-                        >
-                          复制地址
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="flat"
-                          title="刷新共享开关与实例上报状态，不检测目标连通性"
-                          isLoading={testingInstances.has(row.key)}
-                          isDisabled={rowBusy || updatingShare}
-                          onPress={() => void checkDirectoryStatus(row)}
-                        >
-                          检查目录状态
-                        </Button>
-                        {isAdmin && (
-                          <Button
-                            size="sm"
-                            color="danger"
-                            variant="light"
-                            isLoading={deletingServices.has(service.id)}
-                            isDisabled={rowBusy}
-                            onPress={() => removeService(service)}
-                          >
-                            删除
-                          </Button>
-                        )}
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                  );
-                })}
-              </TableBody>
-            </Table>
+      <Section title="服务目录" description="按发布设备和运行实例分组；复制的是对端用来访问的虚拟地址。">
+        {grouped.length === 0 ? (
+          <Card>
+            <Empty icon="server" title="暂无本机服务" description="服务默认关闭。管理员添加并显式启用后，才会向获授权对端发布。" />
+          </Card>
+        ) : (
+          <div className="ms-groups">
+            {grouped.map((group) => (
+              <div key={group.key} className="ms-group">
+                <div className="ms-group-head">
+                  <h3 className="ms-group-title">
+                    {group.publisherClientName}
+                    <span className="ms-cell-sub bd-num">客户端 #{group.publisherClientId}</span>
+                  </h3>
+                  <span className="ms-mono ms-cell-sub">
+                    {group.publisherSessionId == null
+                      ? "尚无运行实例"
+                      : `会话 ${group.publisherSessionId}${group.instanceId ? ` · 实例 ${group.instanceId}` : ""}`}
+                  </span>
+                </div>
+                <TableWrap>
+                  <table className="bd-table jd-stack ms-table" aria-label={`${group.publisherClientName} 会话 ${group.publisherSessionId ?? "未上报"} 的 Peer 服务`}>
+                    <thead>
+                      <tr>
+                        <th scope="col">服务</th>
+                        <th scope="col">类型</th>
+                        <th scope="col">发布地址</th>
+                        <th scope="col">可见范围</th>
+                        <th scope="col">状态</th>
+                        <th scope="col">运行实例</th>
+                        <th scope="col" className="ms-col-actions">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {group.rows.map((row) => {
+                        const service = row.service;
+                        const chip = loadError ? { color: "default" as const, text: "状态未知" } : statusChip(row);
+                        const rowBusy = updatingServices.has(service.id)
+                          || deletingServices.has(service.id)
+                          || testingInstances.has(row.key);
+                        const check = directoryChecks[row.key];
+                        return (
+                          <tr key={row.key} aria-busy={rowBusy}>
+                            <td>
+                              <div className="ms-cell-main">
+                                <span className="ms-cell-title">{service.name}</span>
+                                <span className="ms-mono ms-cell-sub">{service.serviceId}</span>
+                              </div>
+                            </td>
+                            <td data-label="类型">
+                              {service.application}
+                              {service.transport === "udp" ? " / udp" : ""}
+                            </td>
+                            <td data-label="地址" className={service.publishedAddress ? "ms-wrap" : "is-empty"}>
+                              <span className="ms-mono ms-break">{service.publishedAddress || "—"}</span>
+                            </td>
+                            <td data-label="可见">
+                              {service.visibility === "ACL"
+                                ? `ACL${service.allowedClientIds?.length ? ` · ${service.allowedClientIds.length} 台` : ""}`
+                                : "同归属"}
+                            </td>
+                            <td className="ms-wrap jd-cell-full">
+                              <div className="ms-cell-main">
+                                <ModelTag color={chip.color}>{chip.text}</ModelTag>
+                                {check ? (
+                                  <p role="status" className="ms-cell-sub ms-check-result">
+                                    上次检查 <RelativeTime value={check.checkedAt} /> · <span className="ms-strong">{check.result}</span>
+                                    <br />{check.detail}
+                                  </p>
+                                ) : <p className="ms-cell-sub">目标连通性未检测</p>}
+                              </div>
+                            </td>
+                            <td data-label="实例" className="ms-wrap">
+                              <span className="ms-cell-sub">{instanceSummary(row)}</span>
+                            </td>
+                            <td className="jd-cell-actions ms-actions-row ms-col-actions">
+                              <div className="ms-row-actions">
+                                {isAdmin && (
+                                  <Toggle
+                                    label={`启用 ${service.name}`}
+                                    busy={updatingServices.has(service.id)}
+                                    checked={service.enabled}
+                                    disabled={rowBusy || updatingShare || loadError != null}
+                                    onChange={(enabled) => void toggleService(service, enabled)}
+                                  />
+                                )}
+                                {isAdmin && (
+                                  <Button size="sm" variant="light" isDisabled={rowBusy} onPress={() => editService(service)}>
+                                    编辑
+                                  </Button>
+                                )}
+                                {isAdmin && service.enabled && (
+                                  <Button
+                                    size="sm"
+                                    color="warning"
+                                    variant="light"
+                                    isDisabled={rowBusy || updatingShare || loadError != null}
+                                    onPress={() => void toggleService(service, false)}
+                                  >
+                                    撤回
+                                  </Button>
+                                )}
+                                <Button
+                                  size="sm"
+                                  variant="flat"
+                                  title={row.availability.available ? "复制当前发布地址" : row.availability.reason}
+                                  startContent={<Icon name="copy" size={14} />}
+                                  isDisabled={rowBusy || !row.availability.available}
+                                  onPress={() => void copyAddress(row)}
+                                >
+                                  复制地址
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="flat"
+                                  title="刷新共享开关与实例上报状态，不检测目标连通性"
+                                  isLoading={testingInstances.has(row.key)}
+                                  isDisabled={rowBusy || updatingShare}
+                                  onPress={() => void checkDirectoryStatus(row)}
+                                >
+                                  检查目录状态
+                                </Button>
+                                {isAdmin && (
+                                  <Button
+                                    size="sm"
+                                    color="danger"
+                                    variant="light"
+                                    isLoading={deletingServices.has(service.id)}
+                                    isDisabled={rowBusy}
+                                    onPress={() => removeService(service)}
+                                  >
+                                    删除
+                                  </Button>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </TableWrap>
+              </div>
+            ))}
           </div>
-        ))
-      )}
+        )}
+      </Section>
 
       {audits.length > 0 && (
-        <div className="rounded-md border border-default-200 p-3">
-          <h4 className="mb-2 text-small font-semibold text-default-600">最近审计</h4>
-          <ul className="space-y-1 text-tiny text-default-500">
-            {audits.slice(0, 8).map((item, index) => (
-              <li key={`${item.at}-${item.action}-${index}`}>
-                {item.action} · {item.reason ?? "-"}
-                {item.serviceId ? ` · ${item.serviceId}` : ""}
-              </li>
-            ))}
-          </ul>
-        </div>
+        <Section title="最近审计" description="服务共享相关的最近 8 条操作与拒绝。">
+          <Card>
+            <ul className="ms-log">
+              {audits.slice(0, 8).map((item, index) => (
+                <li key={`${item.at}-${item.action}-${index}`}>
+                  <span className="ms-mono ms-log-action">{item.action}</span>
+                  <span className="ms-log-text">
+                    {item.reason ?? ""}
+                    {item.serviceId ? <span className="ms-mono ms-cell-sub"> {item.serviceId}</span> : null}
+                  </span>
+                  {item.at ? <RelativeTime value={item.at} className="ms-log-time" /> : null}
+                </li>
+              ))}
+            </ul>
+          </Card>
+        </Section>
       )}
 
       <ConfirmModal
@@ -736,6 +763,6 @@ export function PeerMeshServicesTab({
           await confirm.action();
         }}
       />
-    </section>
+    </div>
   );
 }

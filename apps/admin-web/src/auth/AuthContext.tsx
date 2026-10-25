@@ -61,7 +61,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [authed, setAuthed] = useState(false);
   const [profile, setProfile] = useState<ManagementUser | null>(null);
   const [oidcConfig, setOidcConfig] = useState<OidcConfig | null>(null);
-  const [loginHint, setLoginHint] = useState("请登录");
+  const [loginHint, setLoginHint] = useState("用账号登录管理台");
   const [loginOpen, setLoginOpen] = useState(false);
   const [loginInitialTab, setLoginInitialTab] = useState<"login" | "register">("login");
   const refreshTimer = useRef<number | null>(null);
@@ -113,7 +113,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     stopRefresh();
     setProfile(null);
     setAuthed(false);
-    setLoginHint("登录已过期，请重新登录");
+    setLoginHint("登录已过期，重新登录后继续");
   }, [stopRefresh]);
 
   const logout = useCallback(() => {
@@ -232,7 +232,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         } catch (error) {
           tokenStore.clear();
           setProfile(null);
-          setLoginHint(error instanceof Error ? error.message : "登录已过期，请重新登录");
+          setLoginHint(error instanceof Error ? error.message : "登录已过期，重新登录后继续");
         }
       } else if (launchReturnPath !== null) {
         if (config?.configured) {
@@ -242,7 +242,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         }
         setLoginHint("OIDC 登录未配置");
       } else if (config && !config.passwordLoginEnabled && !config.configured) {
-        setLoginHint("未配置任何登录方式：请设置用户名/密码或 OIDC");
+        setLoginHint("未配置任何登录方式：在服务端启用用户名/密码或 OIDC 登录");
       }
       setReady(true);
     };
@@ -306,7 +306,7 @@ async function completeOidcRedirect(
 ): Promise<void> {
   const expectedState = sessionStorage.getItem(OIDC_STATE_KEY);
   if (!expectedState || params.get("state") !== expectedState) {
-    setHint("登录状态校验失败，请重试");
+    setHint("登录状态校验失败（回调的 state 不匹配），重新登录即可");
     cleanUrl();
     return;
   }

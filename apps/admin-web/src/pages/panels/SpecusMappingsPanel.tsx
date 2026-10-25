@@ -11,23 +11,15 @@ import {
   Pagination,
   Select,
   SelectItem,
-  Switch,
-  Table,
-  TableBody,
-  TableCell,
-  TableColumn,
-  TableHeader,
-  TableRow,
   useDisclosure,
 } from "@heroui/react";
 import { adminApi } from "../../api/client";
 import type { Specus } from "../../api/types";
-import { formatDateTime } from "../../lib/format";
 import { notify, notifyError } from "../../components/toast";
-import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 import { ConfirmModal } from "../../components/ConfirmModal";
-import { EmptyState } from "../../components/EmptyState";
+import { Empty, Icon, Section, TableWrap, Tag } from "../../components/ui";
 import { useClients } from "../../hooks/useClients";
+import { DesignSwitch, ListLoading, TimeText } from "./accessUi";
 
 const PAGE_SIZE = 10;
 
@@ -139,155 +131,131 @@ export function SpecusMappingsPanel() {
   const totalPages = Math.max(1, Math.ceil(specusMappings.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
   const pagedSpecusMappings = specusMappings.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+  const enabledCount = specusMappings.filter((item) => item.enabled).length;
 
   return (
-    <div className="flex min-w-0 flex-col gap-4">
-      <PageHeader title="端口映射" description="把客户端所在网络里的 TCP 服务映射到服务端的公网端口。" />
-      <form className="flex flex-wrap items-end gap-3" onSubmit={onCreate}>
-        <Select
-          className="w-full sm:w-48"
-          label="客户端"
-          selectedKeys={clientId ? [clientId] : []}
-          onChange={(event) => setClientId(event.target.value)}
-          isRequired
-        >
-          {clients.map((client) => (
-            <SelectItem key={String(client.id)}>{client.clientName}</SelectItem>
-          ))}
-        </Select>
-        <Input className="w-full sm:w-32" type="number" label="公网端口" value={listenPort} onValueChange={setListenPort} min={1} max={65535} isRequired />
-        <Input className="w-full sm:w-44" label="内网目标地址" placeholder="127.0.0.1" value={targetAddress} onValueChange={setTargetAddress} isRequired />
-        <Input className="w-full sm:w-32" type="number" label="内网端口" value={targetPort} onValueChange={setTargetPort} min={1} max={65535} isRequired />
-        <Button className="h-10 w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
-          新建映射
-        </Button>
-        <Button className="h-10 w-full sm:w-auto" variant="flat" isLoading={loading} onPress={() => void load()}>
-          刷新
-        </Button>
-      </form>
+    <div className="acc-page">
+      <PageHeader
+        title="端口映射"
+        description="把客户端所在网络里的 TCP 服务映射到服务端的公网端口。"
+        actions={<Button variant="flat" isLoading={loading} startContent={loading ? null : <Icon name="refresh" />} onPress={() => void load()}>刷新</Button>}
+      />
 
-      {/* mobile: 卡片 */}
-      <div className="lg:hidden">
-        <MobileListCardList
-          items={pagedSpecusMappings}
-          isLoading={loading}
-          emptyContent={<EmptyState icon="connections" title="暂无端口映射" description="创建映射后公网端口将转发到内网目标" />}
-          renderCard={(raw) => {
-            const specus = raw as Specus;
-            const pending = pendingIds.has(specus.id);
-            return (
-              <MobileListCard
-                key={specus.id}
-                title={
-                  <div className="flex items-center gap-2">
-                    <code className="break-all">:{specus.listenPort} → {specus.targetAddress}:{specus.targetPort}</code>
-                  </div>
-                }
-                subtitle={`${specus.clientName} · #${specus.id}`}
-                badges={
-                  <>
-                    <Switch
-                      size="sm"
-                      isSelected={specus.enabled}
-                      isDisabled={pending}
-                      onValueChange={() => void toggle(specus)}
-                    >
-                      启用
-                    </Switch>
-                    <Switch
-                      size="sm"
-                      isSelected={Boolean(specus.detailCaptureEnabled)}
-                      isDisabled={pending}
-                      onValueChange={() => void toggleDetailCapture(specus)}
-                    >
-                      明细采集
-                    </Switch>
-                  </>
-                }
-                fields={[
-                  { label: "更新时间", value: formatDateTime(specus.updatedAt || specus.createdAt) },
-                ]}
-                actions={
-                  <>
-                    <Button size="sm" variant="flat" onPress={() => { setEditing(specus); editModal.onOpen(); }}>
-                      编辑
-                    </Button>
-                    <Button size="sm" color="danger" variant="flat" onPress={() => remove(specus)}>
-                      删除
-                    </Button>
-                  </>
-                }
-              />
-            );
-          }}
-        />
-      </div>
+      <Section title="新建映射" description="公网端口收到的 TCP 连接，经所选客户端转发到它所在网络里的目标地址和端口。">
+        <form className="bd-card acc-inline-form acc-mapping-form" onSubmit={onCreate} aria-label="新建端口映射">
+          <Select
+            label="客户端"
+            selectedKeys={clientId ? [clientId] : []}
+            onChange={(event) => setClientId(event.target.value)}
+            description="转发经过的设备"
+            isRequired
+          >
+            {clients.map((client) => (
+              <SelectItem key={String(client.id)}>{client.clientName}</SelectItem>
+            ))}
+          </Select>
+          <Input type="number" label="公网端口" value={listenPort} onValueChange={setListenPort} min={1} max={65535} description="1–65535，在服务端监听" isRequired />
+          <Input label="内网目标地址" placeholder="127.0.0.1" value={targetAddress} onValueChange={setTargetAddress} description="从客户端能访问到的地址" isRequired />
+          <Input type="number" label="内网端口" placeholder="22" value={targetPort} onValueChange={setTargetPort} min={1} max={65535} description="1–65535" isRequired />
+          <div className="acc-inline-form-submit">
+            <Button type="submit" color="primary" isLoading={creating} startContent={creating ? null : <Icon name="plus" />}>
+              新建映射
+            </Button>
+          </div>
+        </form>
+      </Section>
 
-      {/* desktop: 表格 */}
-      <div className="hidden min-w-0 overflow-x-auto lg:block">
-      <Table aria-label="端口映射列表" isHeaderSticky removeWrapper>
-        <TableHeader>
-          <TableColumn>ID</TableColumn>
-          <TableColumn>客户端</TableColumn>
-          <TableColumn>公网端口</TableColumn>
-          <TableColumn>内网目标</TableColumn>
-          <TableColumn>启用</TableColumn>
-          <TableColumn>明细采集</TableColumn>
-          <TableColumn>更新时间</TableColumn>
-          <TableColumn>操作</TableColumn>
-        </TableHeader>
-        <TableBody items={pagedSpecusMappings} isLoading={loading} emptyContent={<EmptyState icon="connections" title="暂无端口映射" description="创建映射后公网端口将转发到内网目标" />}>
-          {(specus) => {
-            const pending = pendingIds.has(specus.id);
-            return (
-            <TableRow key={specus.id}>
-              <TableCell>{specus.id}</TableCell>
-              <TableCell>{specus.clientName}</TableCell>
-              <TableCell>{specus.listenPort}</TableCell>
-              <TableCell>
-                <code>{specus.targetAddress}:{specus.targetPort}</code>
-              </TableCell>
-              <TableCell>
-                <Switch
-                  aria-label="启用"
-                  size="sm"
-                  isSelected={specus.enabled}
-                  isDisabled={pending}
-                  onValueChange={() => void toggle(specus)}
-                />
-              </TableCell>
-              <TableCell>
-                <Switch
-                  aria-label="明细采集"
-                  size="sm"
-                  isSelected={Boolean(specus.detailCaptureEnabled)}
-                  isDisabled={pending}
-                  onValueChange={() => void toggleDetailCapture(specus)}
-                />
-              </TableCell>
-              <TableCell>{formatDateTime(specus.updatedAt || specus.createdAt)}</TableCell>
-              <TableCell>
-                <div className="flex gap-2">
-                  <Button size="sm" variant="flat" onPress={() => { setEditing(specus); editModal.onOpen(); }}>
-                    编辑
-                  </Button>
-                  <Button size="sm" color="danger" variant="flat" onPress={() => remove(specus)}>
-                    删除
-                  </Button>
-                </div>
-              </TableCell>
-            </TableRow>
-            );
-          }}
-        </TableBody>
-      </Table>
-      </div>
+      <Section
+        title="映射列表"
+        description="开关立即生效：关掉“启用”会停止转发，“明细采集”记录每条连接的内容。"
+        actions={!loading || specusMappings.length > 0 ? (
+          <>
+            {enabledCount > 0 ? <Tag tone="success">{enabledCount} 条转发中</Tag> : null}
+            <span className="acc-head-count bd-num">共 {specusMappings.length} 条</span>
+          </>
+        ) : null}
+      >
+        {loading && specusMappings.length === 0 ? <ListLoading label="正在读取端口映射…" /> : specusMappings.length === 0 ? (
+          <div className="bd-card"><Empty icon="shuffle" title="还没有端口映射" description="在上面选好客户端和目标，新建映射后公网端口就会转发到内网目标。" /></div>
+        ) : (
+          <TableWrap className={loading ? "bd-refetching" : undefined}>
+            <table className="bd-table jd-stack" aria-label="端口映射列表">
+              <thead>
+                <tr>
+                  <th>公网端口 → 内网目标</th>
+                  <th>客户端</th>
+                  <th>启用</th>
+                  <th>明细采集</th>
+                  <th>更新时间</th>
+                  <th className="jd-col-actions"><span className="jd-sr-only">操作</span></th>
+                </tr>
+              </thead>
+              <tbody>
+                {pagedSpecusMappings.map((specus) => {
+                  const pending = pendingIds.has(specus.id);
+                  const client = clients.find((item) => item.id === specus.clientId);
+                  return (
+                    <tr key={specus.id}>
+                      <td>
+                        <div className="jd-table-title">
+                          <span className="font-mono bd-num"><span className="font-semibold">:{specus.listenPort}</span> <span className="acc-mapping-arrow">→</span> {specus.targetAddress}:{specus.targetPort}</span>
+                          <span className="jd-table-sub bd-num">#{specus.id}</span>
+                        </div>
+                      </td>
+                      <td>
+                        <div className="acc-client-cell">
+                          <span>{specus.clientName}</span>
+                          {client ? (
+                            <Tag tone={client.enabled && client.online ? "success" : "neutral"} plain={!client.enabled}>
+                              {!client.enabled ? "停用" : client.online ? "在线" : "离线"}
+                            </Tag>
+                          ) : null}
+                        </div>
+                      </td>
+                      <td>
+                        <DesignSwitch
+                          ariaLabel="启用"
+                          label={<span className="acc-stack-only">启用</span>}
+                          checked={specus.enabled}
+                          disabled={pending}
+                          onChange={() => void toggle(specus)}
+                        />
+                      </td>
+                      <td>
+                        <DesignSwitch
+                          ariaLabel="明细采集"
+                          label={<span className="acc-stack-only">明细采集</span>}
+                          checked={Boolean(specus.detailCaptureEnabled)}
+                          disabled={pending}
+                          onChange={() => void toggleDetailCapture(specus)}
+                        />
+                      </td>
+                      <td data-label="更新"><TimeText value={specus.updatedAt || specus.createdAt} /></td>
+                      <td className="jd-cell-actions">
+                        <div className="jd-row-actions">
+                          <Button size="sm" variant="flat" startContent={<Icon name="edit" size={14} />} onPress={() => { setEditing(specus); editModal.onOpen(); }}>
+                            编辑
+                          </Button>
+                          <Button size="sm" color="danger" variant="flat" startContent={<Icon name="trash" size={14} />} onPress={() => remove(specus)}>
+                            删除
+                          </Button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </TableWrap>
+        )}
 
-      {totalPages > 1 ? (
-        <div className="flex justify-end">
-          <Pagination showControls page={safePage} total={totalPages} onChange={setPage} />
-        </div>
-      ) : null}
+        {totalPages > 1 ? (
+          <div className="acc-pager">
+            <span className="bd-num">共 {specusMappings.length} 条</span>
+            <Pagination showControls size="sm" page={safePage} total={totalPages} onChange={setPage} />
+          </div>
+        ) : null}
+      </Section>
 
       <EditSpecusModal disclosure={editModal} specus={editing} onSaved={() => void load()} />
       <ConfirmModal
@@ -356,16 +324,16 @@ function EditSpecusModal({ disclosure, specus, onSaved }: EditSpecusModalProps) 
         {(onClose) => (
           <>
             <ModalHeader>编辑端口映射 #{specus?.id}</ModalHeader>
-            <ModalBody className="gap-3">
-              <Input type="number" label="公网端口" value={listenPort} onValueChange={setListenPort} min={1} max={65535} isRequired />
-              <Input label="内网目标地址" value={targetAddress} onValueChange={setTargetAddress} maxLength={255} isRequired />
-              <Input type="number" label="内网端口" value={targetPort} onValueChange={setTargetPort} min={1} max={65535} isRequired />
-              <Switch isSelected={enabled} onValueChange={setEnabled}>
-                启用
-              </Switch>
-              <Switch isSelected={detailCaptureEnabled} onValueChange={setDetailCaptureEnabled}>
-                明细采集
-              </Switch>
+            <ModalBody className="acc-dialog-body">
+              <Input type="number" label="公网端口" value={listenPort} onValueChange={setListenPort} min={1} max={65535} description="1–65535，在服务端监听" isRequired />
+              <div className="acc-field-pair">
+                <Input label="内网目标地址" value={targetAddress} onValueChange={setTargetAddress} maxLength={255} isRequired />
+                <Input type="number" label="内网端口" value={targetPort} onValueChange={setTargetPort} min={1} max={65535} isRequired />
+              </div>
+              <div className="acc-switch-list">
+                <DesignSwitch checked={enabled} onChange={setEnabled} label="启用" />
+                <DesignSwitch checked={detailCaptureEnabled} onChange={setDetailCaptureEnabled} label="明细采集" />
+              </div>
             </ModalBody>
             <ModalFooter>
               <Button variant="flat" onPress={onClose}>

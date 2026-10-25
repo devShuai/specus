@@ -1,7 +1,8 @@
 import { useRef } from "react";
-import { Button, Chip, Progress } from "@heroui/react";
-import { formatBytes, formatDateTime } from "../lib/format";
+import { formatBytes } from "../lib/format";
 import type { DirectOutgoingResume, DirectStoredReceive } from "../hooks/useDirectTransfer";
+import { Icon, Progress, RelativeTime, Tag } from "./ui";
+import { fileKindIcon } from "./transferFileKind";
 
 interface Props {
   storedReceives: DirectStoredReceive[];
@@ -18,13 +19,15 @@ function percent(done: number, total: number) {
   return total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 100;
 }
 
-function expiryLabel(expiresAt: number | null) {
-  return expiresAt ? `${formatDateTime(new Date(expiresAt).toISOString())} 前有效` : "";
+/** True when there is something for the panel to show; the page uses it to decide on the tasks section. */
+export function hasResumableTransfers(storedReceives: DirectStoredReceive[], outgoingResumes: DirectOutgoingResume[]) {
+  return storedReceives.length > 0 || outgoingResumes.some((item) => !item.running || item.background);
 }
 
 /**
  * Interrupted chunked-resume transfers (protocol/spec/chunked-resume.md §9): receives kept in
- * this browser and sends that need the file selected again after a reload.
+ * this browser and sends that need the file selected again after a reload. Drawn as task rows, in
+ * the same list language as the page's transfer tasks.
  */
 export function ResumableTransfersPanel({
   storedReceives,
@@ -49,17 +52,15 @@ export function ResumableTransfersPanel({
   };
 
   return (
-    <section className="mt-5 rounded-lg glass glass-border border p-4" aria-label="未完成的设备传输">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div>
-          <h2 className="text-base font-semibold text-zinc-950 dark:text-white">未完成的设备传输</h2>
-          <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
-            已校验的分块保存在本机浏览器，24 小时内可从中断处继续；浏览器可能自行清除这些数据，过期数据在下次打开本页时删除。
-          </div>
+    <section className="tr-subsection" aria-label="未完成的设备传输">
+      <div className="tr-subsection-head">
+        <div className="min-w-0">
+          <h3>未完成的设备传输</h3>
+          <p>已校验的分块保存在本机浏览器，24 小时内可从中断处继续；浏览器可能自行清除这些数据，过期数据在下次打开本页时删除。</p>
         </div>
-        <Button size="sm" radius="sm" variant="light" onPress={onClearAll}>
-          清除互传本地数据
-        </Button>
+        <button type="button" className="bd-btn bd-btn--ghost bd-btn--sm" onClick={onClearAll}>
+          <Icon name="trash" /><span>清除互传本地数据</span>
+        </button>
       </div>
       <input
         ref={fileInputRef}
@@ -74,82 +75,76 @@ export function ResumableTransfersPanel({
           reselectForRef.current = "";
         }}
       />
-      {storedReceives.length > 0 ? (
-        <div className="mt-3 grid gap-2 md:grid-cols-2">
-          {storedReceives.map((item) => (
-            <div key={`receive:${item.transferId}`} className="rounded-lg border border-black/[0.07] p-3 dark:border-white/[0.08]">
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0">
-                  <div className="truncate text-small font-medium">{item.fileName}</div>
-                  <div className="mt-1 text-tiny text-zinc-500">
-                    来自 {peerDisplayNames[item.sourcePeerId] ?? (item.sourceName || "对方设备")} · {formatBytes(item.receivedBytes)} / {formatBytes(item.sizeBytes)}
-                  </div>
-                </div>
-                <Chip size="sm" radius="sm" variant="flat">{item.storage === "persistent" ? "已暂停" : "已暂停（仅内存）"}</Chip>
+      <div className="tr-task-list">
+        {storedReceives.map((item) => (
+          <article key={`receive:${item.transferId}`} className="tr-task">
+            <span className="tr-task-thumb" aria-hidden="true"><Icon name={fileKindIcon(item.fileName)} size={18} /></span>
+            <div className="tr-task-main">
+              <div className="tr-task-head">
+                <span className="tr-task-kind is-receive">接收</span>
+                <span className="tr-task-title">{item.fileName}</span>
               </div>
-              <Progress className="mt-2" aria-label={`${item.fileName} 已接收`} size="sm" value={percent(item.receivedBytes, item.sizeBytes)} />
-              <div className="mt-2 text-tiny text-zinc-500">
-                对方重新连接并继续发送后会自动续传，无需再次同意。{expiryLabel(item.expiresAt)}
-              </div>
-              <div className="mt-2 flex justify-end">
-                <Button size="sm" radius="sm" variant="flat" onPress={() => onAbandonReceive(item.transferId)}>
-                  放弃并删除
-                </Button>
+              <Progress value={percent(item.receivedBytes, item.sizeBytes)} label={`${item.fileName} 已接收`} />
+              <p className="tr-task-msg">对方重新连接并继续发送后会自动续传，无需再次同意。</p>
+              <div className="tr-task-meta">
+                <Tag tone="warning">{item.storage === "persistent" ? "已暂停" : "已暂停（仅内存）"}</Tag>
+                <span>来自 {peerDisplayNames[item.sourcePeerId] ?? (item.sourceName || "对方设备")}</span>
+                <span className="bd-num">{formatBytes(item.receivedBytes)} / {formatBytes(item.sizeBytes)}</span>
+                {item.expiresAt ? <span>到期 <RelativeTime value={item.expiresAt} /></span> : null}
               </div>
             </div>
-          ))}
-        </div>
-      ) : null}
-      {outgoing.length > 0 ? (
-        <div className="mt-3 grid gap-2 md:grid-cols-2">
-          {outgoing.map((item) => (
-            <div key={`send:${item.transferId}`} className="rounded-lg border border-black/[0.07] p-3 dark:border-white/[0.08]">
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0">
-                  <div className="truncate text-small font-medium">{item.fileName}</div>
-                  <div className="mt-1 text-tiny text-zinc-500">
-                    发给 {peerDisplayNames[item.targetPeerId] ?? (item.targetName || "对方设备")} · 对方已收 {formatBytes(item.ackedBytes)} / {formatBytes(item.sizeBytes)}
-                  </div>
-                </div>
-                <Chip size="sm" radius="sm" variant="flat" color={item.running ? "primary" : "default"}>
-                  {item.running ? "续传中" : "未完成的发送"}
-                </Chip>
+            <div className="tr-task-actions">
+              <button type="button" className="bd-btn bd-btn--ghost bd-btn--sm" onClick={() => onAbandonReceive(item.transferId)}>
+                <Icon name="trash" /><span>放弃并删除</span>
+              </button>
+            </div>
+          </article>
+        ))}
+        {outgoing.map((item) => (
+          <article key={`send:${item.transferId}`} className={`tr-task${item.running ? " is-running" : ""}`}>
+            <span className="tr-task-thumb" aria-hidden="true"><Icon name={fileKindIcon(item.fileName)} size={18} /></span>
+            <div className="tr-task-main">
+              <div className="tr-task-head">
+                <span className="tr-task-kind is-send">发送</span>
+                <span className="tr-task-title">{item.fileName}</span>
               </div>
-              <Progress className="mt-2" aria-label={`${item.fileName} 对方已收`} size="sm" value={percent(item.ackedBytes, item.sizeBytes)} />
-              <div className="mt-2 text-tiny text-zinc-500">
+              <Progress value={percent(item.ackedBytes, item.sizeBytes)} label={`${item.fileName} 对方已收`} />
+              <p className="tr-task-msg">
                 {item.hasSource
                   ? "原文件仍在本页，可以继续发送。"
                   : "页面刷新后需要重新选择同一文件（大小必须一致，内容会逐块核对）。"}
-                {expiryLabel(item.expiresAt)}
+              </p>
+              <div className="tr-task-meta">
+                <Tag tone={item.running ? "info" : "warning"}>{item.running ? "续传中" : "未完成的发送"}</Tag>
+                <span>发给 {peerDisplayNames[item.targetPeerId] ?? (item.targetName || "对方设备")}</span>
+                <span className="bd-num">对方已收 {formatBytes(item.ackedBytes)} / {formatBytes(item.sizeBytes)}</span>
+                {item.expiresAt ? <span>到期 <RelativeTime value={item.expiresAt} /></span> : null}
               </div>
-              {!item.running ? (
-                <div className="mt-2 flex justify-end gap-2">
-                  <Button size="sm" radius="sm" variant="flat" onPress={() => onAbandonOutgoing(item.transferId)}>
-                    放弃
-                  </Button>
-                  {item.hasSource ? (
-                    <Button size="sm" radius="sm" color="primary" onPress={() => resume(item.transferId)}>
-                      继续发送
-                    </Button>
-                  ) : (
-                    <Button
-                      size="sm"
-                      radius="sm"
-                      color="primary"
-                      onPress={() => {
-                        reselectForRef.current = item.transferId;
-                        fileInputRef.current?.click();
-                      }}
-                    >
-                      重新选择文件继续
-                    </Button>
-                  )}
-                </div>
-              ) : null}
             </div>
-          ))}
-        </div>
-      ) : null}
+            {!item.running ? (
+              <div className="tr-task-actions">
+                <button type="button" className="bd-btn bd-btn--ghost bd-btn--sm" onClick={() => onAbandonOutgoing(item.transferId)}>放弃</button>
+                {item.hasSource ? (
+                  <button type="button" className="bd-btn bd-btn--secondary bd-btn--sm" onClick={() => resume(item.transferId)}>
+                    <Icon name="play" /><span>继续发送</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="bd-btn bd-btn--secondary bd-btn--sm"
+                    onClick={() => {
+                      reselectForRef.current = item.transferId;
+                      fileInputRef.current?.click();
+                    }}
+                  >
+                    <Icon name="folder" /><span>重新选择文件继续</span>
+                  </button>
+                )}
+              </div>
+            ) : null}
+          </article>
+        ))}
+      </div>
     </section>
   );
 }

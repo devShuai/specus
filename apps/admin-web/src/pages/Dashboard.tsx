@@ -1,16 +1,16 @@
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
-  Avatar, Button, Dropdown, DropdownItem, DropdownMenu,
+  Dropdown, DropdownItem, DropdownMenu,
   DropdownSection, DropdownTrigger, Spinner,
 } from "@heroui/react";
 import { useAuth } from "../auth/AuthContext";
-import { useTheme } from "../theme/ThemeContext";
 import { adminApi } from "../api/client";
 import { notify, notifyError } from "../components/toast";
-import { AppLogo } from "../components/AppLogo";
 import { ConfirmModal } from "../components/ConfirmModal";
 import { HeroRuntime } from "../components/HeroRuntime";
-import { Sidebar, type NavGroup } from "../components/Sidebar";
+import { Sidebar, navIcon, type NavGroup } from "../components/Sidebar";
+import { GlobalSearch, type SearchEntry } from "../components/GlobalSearch";
+import { Icon, Tabs } from "../components/ui";
 import { ProductMetricsMemberNotice } from "../components/ProductMetricsDisclosure";
 import { useProductMetricsCollecting } from "../hooks/useProductMetricsCollecting";
 
@@ -72,16 +72,56 @@ function readPanelFromLocation(): PanelKey {
 
 export function Dashboard() { return <HeroRuntime><DashboardContent /></HeroRuntime>; }
 
+const SIDEBAR_COLLAPSED_KEY = "specus_sidebar_collapsed";
+const PHONE_QUERY = "(max-width: 767px)";
+
+// What the topbar search finds besides the page names.
+const PANEL_KEYWORDS: Partial<Record<PanelKey, string>> = {
+  workbench: "首页 服务 收藏 最近 问题",
+  overview: "统计 运行 状态",
+  clients: "设备 接入 凭证 apiKey secret 实例 上线",
+  messages: "聊天 文件",
+  specusMappings: "tcp 端口 公网",
+  "http-routes": "web 发布 分享 认证 域名",
+  downloads: "安装 下载 homebrew release",
+  transfer: "互传 文件 发送 剪贴板 白板",
+  diagram: "流程图 绘图 drawio",
+  traffic: "流量 http tcp 记录 排行",
+  connections: "连接 日志 登录",
+  "peer-mesh": "组网 虚拟 ip 出口 nat turn 服务",
+  system: "用户 数据库 发布 客户端版本",
+  metrics: "指标 统计",
+  help: "文档 帮助 启动 配置",
+};
+
+function useMediaQuery(query: string) {
+  const [matches, setMatches] = useState(() => window.matchMedia(query).matches);
+  useEffect(() => {
+    const mq = window.matchMedia(query);
+    const onChange = () => setMatches(mq.matches);
+    onChange();
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, [query]);
+  return matches;
+}
+
 function DashboardContent() {
   const { logout, profile } = useAuth();
   const [initializing, setInitializing] = useState(false);
   const [initConfirmOpen, setInitConfirmOpen] = useState(false);
   const [activePanel, setActivePanel] = useState<PanelKey>(() => readPanelFromLocation());
-  const [mobileNavOpen, setMobileNavOpen] = useState(false);
-  const mobileMenuButtonRef = useRef<HTMLButtonElement>(null);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [searching, setSearching] = useState(false);
+  const [collapsed, setCollapsed] = useState(() => {
+    try { return window.localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1"; } catch { return false; }
+  });
+  const phone = useMediaQuery(PHONE_QUERY);
+  const drawerButtonRef = useRef<HTMLButtonElement>(null);
+  const sidebarRef = useRef<HTMLElement>(null);
 
   const activatePanel = useCallback((panel: PanelKey) => {
-    setActivePanel(panel); setMobileNavOpen(false);
+    setActivePanel(panel); setDrawerOpen(false);
     if (panel === "transfer" || panel === "diagram") {
       window.location.hash = "/" + panel;
       return;
@@ -89,12 +129,30 @@ function DashboardContent() {
     if (window.location.hash !== "#/" + panel) window.location.hash = "/" + panel;
   }, []);
 
+  const toggleCollapsed = useCallback(() => {
+    setCollapsed((value) => {
+      try { window.localStorage.setItem(SIDEBAR_COLLAPSED_KEY, value ? "0" : "1"); } catch { /* per-viewer convenience only */ }
+      return !value;
+    });
+  }, []);
+
   const visibleGroups = navGroups.map(g => ({
     ...g, items: g.items.filter(i => !adminOnly(i.key) || profile?.admin)
   })).filter(g => g.items.length > 0);
 
   const renderedPanel = adminOnly(activePanel) && !profile?.admin ? defaultPanel : activePanel;
-  const activeTitle = panels.find(p => p.key === renderedPanel)?.title ?? "工作台";
+  // Hub tabs (the design's area tabs): the sibling pages of the current page's group.
+  const activeGroup = visibleGroups.find(g => g.items.some(i => i.key === renderedPanel));
+  const hubItems = (activeGroup?.items ?? []).filter(i => !i.external);
+
+  const searchEntries = useMemo<SearchEntry[]>(() => visibleGroups.flatMap(group => group.items.map(item => ({
+    key: item.key,
+    title: item.title,
+    subtitle: item.external ? `${group.label} · 新页面` : group.label,
+    icon: navIcon(item.key),
+    keywords: PANEL_KEYWORDS[item.key],
+    run: () => activatePanel(item.key),
+  }))), [visibleGroups, activatePanel]);
 
   useEffect(() => {
     const sync = () => setActivePanel(readPanelFromLocation());
@@ -114,13 +172,34 @@ function DashboardContent() {
   }, [renderedPanel]);
 
   useEffect(() => {
-    if (!mobileNavOpen) return;
+    if (!phone) setDrawerOpen(false);
+  }, [phone]);
+
+  useEffect(() => {
+    if (!drawerOpen) return;
     const prev = document.body.style.overflow;
     document.body.style.overflow = "hidden";
-    const esc = (e: KeyboardEvent) => { if (e.key === "Escape") setMobileNavOpen(false); };
+    const esc = (e: KeyboardEvent) => { if (e.key === "Escape") setDrawerOpen(false); };
     window.addEventListener("keydown", esc);
     return () => { document.body.style.overflow = prev; window.removeEventListener("keydown", esc); };
-  }, [mobileNavOpen]);
+  }, [drawerOpen]);
+
+  // H-8: on phones the closed drawer leaves the tab order and the accessibility tree; opening it
+  // moves focus to the first link, closing it (Esc, scrim, a choice) returns focus to the menu button.
+  useLayoutEffect(() => {
+    const panel = sidebarRef.current;
+    if (!panel) return;
+    if (!phone || drawerOpen) {
+      panel.removeAttribute("inert");
+      if (phone && drawerOpen) {
+        const focusTimer = window.setTimeout(() => panel.querySelector<HTMLElement>(".bd-nav [href]")?.focus(), 50);
+        return () => window.clearTimeout(focusTimer);
+      }
+      return;
+    }
+    panel.setAttribute("inert", "");
+    if (panel.contains(window.document.activeElement)) drawerButtonRef.current?.focus();
+  }, [phone, drawerOpen]);
 
   // S-1: 原生 confirm 换成共享 ConfirmModal；SystemPanel 的入口先打开确认框，确认后才真正执行。
   const requestInitializeDatabase = useCallback(async () => {
@@ -134,36 +213,60 @@ function DashboardContent() {
     finally { setInitializing(false); }
   };
 
+  const shellClass = ["app-apple-dashboard jd-shell bd-root", collapsed && !phone ? "bd-shell--collapsed" : "", drawerOpen ? "jd-drawer-open" : ""].filter(Boolean).join(" ");
   return (
-    <div className="app-apple app-apple-dashboard flex min-h-screen">
+    <div className={shellClass}>
       <a className="app-skip-link" href="#app-main-content">跳到主内容</a>
-      <aside className="app-apple-sidebar hidden shrink-0 p-2.5 lg:fixed lg:inset-y-3 lg:left-3 lg:z-30 lg:flex lg:w-[236px] lg:flex-col">
+      <aside
+        ref={sidebarRef}
+        className="bd-sidebar"
+        aria-label={phone ? "导航菜单" : undefined}
+        role={phone && drawerOpen ? "dialog" : undefined}
+        aria-modal={phone && drawerOpen ? true : undefined}
+      >
         <Sidebar
           groups={visibleGroups}
           active={renderedPanel}
-          onSelect={activatePanel}
-          variant="desktop"
-          footer={<UserMenu profile={profile} onLogout={logout} variant="block" />}
+          onSelect={(key) => activatePanel(key as PanelKey)}
+          collapsed={collapsed && !phone}
+          onToggleCollapsed={phone ? undefined : toggleCollapsed}
+          onClose={phone ? () => setDrawerOpen(false) : undefined}
+          footer={<UserMenu profile={profile} onLogout={logout} variant={collapsed && !phone ? "compact" : "block"} />}
         />
       </aside>
-      <div className="flex min-w-0 flex-1 flex-col lg:ml-[248px]">
-        <header className="app-apple-mobile-header sticky top-0 z-30 lg:hidden">
-          <div className="flex items-center gap-2 px-3 py-2 sm:px-4">
-            <Button ref={mobileMenuButtonRef} isIconOnly aria-label="打开菜单" className="h-10 w-10 min-w-10" radius="full" variant="flat" onPress={() => setMobileNavOpen(true)}><HamburgerIcon /></Button>
-            <AppLogo className="min-w-0 shrink" label="specus" />
-            <span className="ml-auto truncate text-tiny font-medium text-default-500">{activeTitle}</span>
-            <div className="flex shrink-0 items-center gap-1.5"><UserMenu profile={profile} onLogout={logout} /></div>
-          </div>
-        </header>
-        <main id="app-main-content" tabIndex={-1} className="mx-auto w-full min-w-0 max-w-[1680px] flex-1 px-4 pb-16 pt-6 outline-hidden sm:px-5 lg:pl-6 lg:pr-7 lg:pt-8">
+      <div className="jd-drawer-scrim" aria-hidden="true" onClick={() => setDrawerOpen(false)} />
+      <header className={`bd-topbar jd-topbar${searching ? " is-searching" : ""}`}>
+        <button ref={drawerButtonRef} type="button" className="bd-icon-btn jd-glass-btn jd-drawer-btn" aria-label="打开菜单" aria-expanded={drawerOpen} onClick={() => setDrawerOpen(true)}>
+          <Icon name="menu" size={19} />
+        </button>
+        <GlobalSearch entries={searchEntries} searching={searching} onSearchingChange={setSearching} />
+        <div className="jd-topbar-tools">
+          <button type="button" className="bd-icon-btn jd-glass-btn jd-search-open" aria-label="搜索" onClick={() => setSearching(true)}>
+            <Icon name="search" size={19} />
+          </button>
+          <a className="bd-icon-btn jd-glass-btn" href="#/help" aria-label="帮助文档" title="帮助文档" onClick={(event) => { event.preventDefault(); activatePanel("help"); }}>
+            <Icon name="info-circle" size={19} />
+          </a>
+          <UserMenu profile={profile} onLogout={logout} variant="icon" />
+        </div>
+      </header>
+      <main id="app-main-content" tabIndex={-1} className="bd-main outline-hidden">
+        <div className="mx-auto w-full min-w-0 max-w-[1680px]">
+          {hubItems.length > 1 ? (
+            <Tabs
+              variant="hub"
+              label={activeGroup?.label ?? "页面"}
+              value={renderedPanel}
+              items={hubItems.map(item => ({ key: item.key, label: item.title, icon: navIcon(item.key), href: "#/" + item.key }))}
+            />
+          ) : null}
           <section className="min-w-0" key={renderedPanel}>
             <Suspense fallback={<PanelLoading />}>
               <ActivePanel panel={renderedPanel} initializing={initializing} onInitializeDatabase={requestInitializeDatabase} />
             </Suspense>
           </section>
-        </main>
-      </div>
-      <MobileNav open={mobileNavOpen} groups={visibleGroups} active={renderedPanel} onSelect={activatePanel} onClose={() => setMobileNavOpen(false)} triggerRef={mobileMenuButtonRef} />
+        </div>
+      </main>
       <ConfirmModal
         isOpen={initConfirmOpen}
         onClose={() => setInitConfirmOpen(false)}
@@ -177,115 +280,53 @@ function DashboardContent() {
   );
 }
 
-function MobileNav({ open, groups, active, onSelect, onClose, triggerRef }: { open: boolean; groups: NavGroup[]; active: PanelKey; onSelect: (p: PanelKey) => void; onClose: () => void; triggerRef: React.RefObject<HTMLButtonElement | null> }) {
-  const panelRef = useRef<HTMLElement | null>(null);
-
-  // H-8: 关闭态从 Tab 序列与读屏树中移除；打开时焦点移入首个导航项，
-  // 关闭（含 Esc/遮罩/选中）后焦点归还汉堡按钮。
-  useLayoutEffect(() => {
-    const panel = panelRef.current;
-    if (!panel) return;
-    if (open) {
-      panel.removeAttribute("inert");
-      const focusTimer = window.setTimeout(() => {
-        panel.querySelector<HTMLElement>("button:not([disabled]), [href]")?.focus();
-      }, 50);
-      return () => window.clearTimeout(focusTimer);
-    }
-    panel.setAttribute("inert", "");
-    if (panel.contains(window.document.activeElement)) {
-      triggerRef.current?.focus();
-    }
-  }, [open, triggerRef]);
-
-  return (<>
-    <div aria-hidden="true" className={`app-overlay fixed inset-0 z-40 transition-opacity duration-200 lg:hidden ${open ? "opacity-100" : "pointer-events-none opacity-0"}`} onClick={onClose} />
-    <aside
-      ref={panelRef}
-      aria-hidden={!open}
-      aria-label="导航菜单"
-      aria-modal={open ? true : undefined}
-      role={open ? "dialog" : undefined}
-      className={`app-apple-sidebar app-apple-sidebar-drawer fixed inset-y-2 left-2 z-50 flex w-[272px] max-w-[86vw] flex-col p-2.5 transition-transform duration-200 lg:hidden ${open ? "translate-x-0" : "-translate-x-[calc(100%+16px)]"}`}
-    >
-      <div className="app-apple-nav-brand flex h-12 items-center justify-between gap-2">
-        <AppLogo className="min-w-0 shrink" label="specus" />
-        <Button isIconOnly aria-label="关闭" className="h-9 w-9 min-w-9" radius="full" variant="light" onPress={onClose}><CloseIcon /></Button>
-      </div>
-      <Sidebar groups={groups} active={active} onSelect={onSelect} variant="mobile" onClose={onClose} />
-    </aside>
-  </>);
-}
-
-function HamburgerIcon() { return <svg aria-hidden="true" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="1.75" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h16" /></svg>; }
-function CloseIcon() { return <svg aria-hidden="true" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="1.75" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M6 6l12 12M6 18L18 6" /></svg>; }
-
-function UserMenu({ profile, onLogout, variant = "icon" }: { profile: ReturnType<typeof useAuth>["profile"]; onLogout: () => void; variant?: "icon" | "block" }) {
+function UserMenu({ profile, onLogout, variant = "icon" }: { profile: ReturnType<typeof useAuth>["profile"]; onLogout: () => void; variant?: "icon" | "block" | "compact" }) {
   const name = profile?.username || "user";
   const initials = name.slice(0, 1).toUpperCase();
-  const { theme, setTheme, resetToSystem, userOverride } = useTheme();
-  // E-2: 与 UserMenuButton 同一套 mode 计算——跟随系统时只有"跟随系统"一个对勾，
-  // 不再因为系统恰好是暗色/浅色而出现双对勾。
-  const mode = userOverride ? theme : "system";
   // The standing member notice of product metrics (protocol/spec/product-metrics.md section 3.1).
   const metricsCollecting = useProductMetricsCollecting(Boolean(profile));
+  const role = profile?.admin ? "管理员" : "普通用户";
   return (
-    <Dropdown placement={variant === "block" ? "top-start" : "bottom-end"} shouldBlockScroll={false}>
+    <Dropdown placement={variant === "icon" ? "bottom-end" : "top-start"} shouldBlockScroll={false}>
       <DropdownTrigger>
         {variant === "block" ? (
-          <Button aria-label="个人菜单" className="h-auto w-full justify-start gap-2.5 px-2 py-1.5" radius="md" variant="light">
-            <Avatar className="h-8 w-8 shrink-0 bg-[var(--surface-muted)] text-[var(--text-muted)]" name={initials} size="sm" />
-            <span className="flex min-w-0 flex-col items-start">
-              <span className="w-full truncate text-left text-small font-medium text-foreground">{name}</span>
-              <span className="w-full truncate text-left text-tiny text-default-500">{profile?.admin ? "管理员" : "普通用户"}</span>
+          <button type="button" aria-label="个人菜单" className="bd-nav-item app-user-block">
+            <span className="bd-avatar" aria-hidden="true">{initials}</span>
+            <span className="flex min-w-0 flex-1 flex-col text-left leading-tight">
+              <span className="truncate text-[13px] font-semibold text-[var(--text)]">{name}</span>
+              <span className="truncate text-[12px] text-[var(--text-subtle)]">{role}</span>
             </span>
-          </Button>
+          </button>
+        ) : variant === "compact" ? (
+          <button type="button" aria-label="个人菜单" title={name} className="bd-nav-item app-user-block">
+            <span className="bd-avatar" aria-hidden="true">{initials}</span>
+          </button>
         ) : (
-          <Button isIconOnly aria-label="个人菜单" className="h-10 w-10 min-w-10 rounded-full" radius="full" variant="flat">
-            <Avatar className="h-7 w-7 bg-[var(--surface-muted)] text-[var(--text-muted)]" name={initials} size="sm" />
-          </Button>
+          <button type="button" aria-label="个人菜单" className="bd-icon-btn jd-glass-btn">
+            <span className="bd-avatar bd-avatar--sm" aria-hidden="true">{initials}</span>
+          </button>
         )}
       </DropdownTrigger>
       <DropdownMenu aria-label="个人菜单" onAction={(key) => {
         if (key === "logout") onLogout();
-        else if (key === "theme-dark") setTheme("dark");
-        else if (key === "theme-light") setTheme("light");
-        else if (key === "theme-system") resetToSystem();
         else if (key === "docs") window.location.hash = "/help";
       }}>
-        <DropdownSection aria-label="主题" showDivider>
-          <DropdownItem key="theme-dark" textValue="深色" startContent={<MenuIcon name="moon" />} endContent={mode === "dark" ? <CheckIcon /> : null}>深色模式</DropdownItem>
-          <DropdownItem key="theme-light" textValue="浅色" startContent={<MenuIcon name="sun" />} endContent={mode === "light" ? <CheckIcon /> : null}>浅色模式</DropdownItem>
-          <DropdownItem key="theme-system" textValue="系统" startContent={<MenuIcon name="monitor" />} endContent={mode === "system" ? <CheckIcon /> : null}>跟随系统</DropdownItem>
-        </DropdownSection>
-        <DropdownSection aria-label="快捷" showDivider>
-          <DropdownItem key="docs" textValue="帮助" startContent={<MenuIcon name="book" />}>帮助文档</DropdownItem>
-        </DropdownSection>
-        <DropdownSection aria-label="账户">
+        <DropdownSection aria-label="账户" showDivider>
           <DropdownItem key="profile" textValue="信息" isReadOnly>
             <div className="min-w-48 space-y-1 py-1">
               <div className="text-small font-semibold text-foreground">{name}</div>
-              <div className="text-tiny text-default-500">租户: {profile?.tenantId || "-"}</div>
-              <div className="text-tiny text-default-500">角色: {profile?.admin ? "管理员" : "普通用户"}</div>
+              <div className="text-tiny text-default-500">租户：{profile?.tenantId || "default"} · {role}</div>
               {metricsCollecting ? <ProductMetricsMemberNotice className="max-w-64 whitespace-normal pt-1" /> : null}
             </div>
           </DropdownItem>
-          <DropdownItem key="logout" className="text-danger" color="danger" textValue="退出">退出登录</DropdownItem>
+        </DropdownSection>
+        <DropdownSection aria-label="操作">
+          <DropdownItem key="docs" textValue="帮助" startContent={<Icon name="info-circle" />}>帮助文档</DropdownItem>
+          <DropdownItem key="logout" className="text-danger" color="danger" textValue="退出" startContent={<Icon name="logout" />}>退出登录</DropdownItem>
         </DropdownSection>
       </DropdownMenu>
     </Dropdown>
   );
-}
-function CheckIcon() { return <svg aria-hidden="true" className="h-4 w-4 text-[var(--accent)]" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>; }
-// Line icons of the design (24 canvas, 1.75 stroke) for the personal menu.
-function MenuIcon({ name }: { name: "moon" | "sun" | "monitor" | "book" }) {
-  const paths = {
-    moon: <path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z" />,
-    sun: <><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></>,
-    monitor: <><rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8M12 16v4" /></>,
-    book: <><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" /><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z" /></>,
-  };
-  return <svg aria-hidden="true" className="h-4 w-4 text-[var(--text-muted)]" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.75" viewBox="0 0 24 24">{paths[name]}</svg>;
 }
 
 function ActivePanel({ panel, initializing, onInitializeDatabase }: { panel: PanelKey; initializing: boolean; onInitializeDatabase: () => Promise<void> }) {
@@ -305,4 +346,10 @@ function ActivePanel({ panel, initializing, onInitializeDatabase }: { panel: Pan
     default: return <LazyWorkbenchPanel />;
   }
 }
-function PanelLoading() { return <div className="flex min-h-[240px] items-center justify-center rounded-2xl border border-default-200 bg-content1" role="status"><Spinner label="加载页面…" /></div>; }
+function PanelLoading() {
+  return (
+    <div className="bd-card flex min-h-[240px] items-center justify-center" role="status">
+      <Spinner label="加载页面…" />
+    </div>
+  );
+}

@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type KeyboardEvent } from "react";
 import { PageHeader } from "../../components/PageHeader";
-import { Button, Card, CardBody, Chip, Progress, Textarea, Tooltip } from "@heroui/react";
+import { Button, Textarea } from "@heroui/react";
 import { adminApi, tokenStore } from "../../api/client";
 import type { AttachmentPresignUploadResponse, Client, TransferAttachment } from "../../api/types";
 import { notify, notifyError } from "../../components/toast";
-import { formatBytes, formatDateTime } from "../../lib/format";
+import { formatAbsoluteTime, formatBytes } from "../../lib/format";
+import { Empty, Icon, Progress, RelativeTime, Tag } from "../../components/ui";
 
 type ChatDirection = "in" | "out";
 type ChatStatus = "sending" | "written" | "delivered" | "failed" | "received";
@@ -434,175 +435,168 @@ export function AdminMessagesPanel() {
     }
   };
 
+  const attachmentHint = selectedClient
+    ? `附件 ${selectedClient.messageAttachmentsCapable ? "支持" : "不支持"} · 预览 ${selectedClient.messageMediaPreviewCapable ? "支持" : "不支持"}`
+    : undefined;
+
   return (
-    <div className="flex min-w-0 flex-col">
-    <PageHeader title="消息" description="和在线的消息客户端互发文字与文件。" />
-    <div className="grid min-h-[calc(100vh-210px)] min-w-0 gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
-      <Card shadow="none" className="rounded-md border border-default-200">
-        <CardBody className="gap-3 p-3">
-          <div className="flex items-center justify-between gap-2">
-            <h2 className="text-base font-semibold text-foreground">消息客户端</h2>
-            <div className="flex items-center gap-2">
-              <Chip size="sm" color={connected ? "success" : "default"} variant="flat">
-                {connected ? "已连接" : "未连接"}
-              </Chip>
-              <Button size="sm" variant="flat" onPress={() => void loadClients()}>
-                刷新
-              </Button>
-            </div>
-          </div>
+    <div className="acc-page">
+    <PageHeader
+      title="消息"
+      description="和在线的消息客户端互发文字与文件。"
+      meta={<Tag tone={connected ? "success" : "neutral"} plain={!connected}>{connected ? "通道已连接" : "通道未连接"}</Tag>}
+    />
+    <div className="acc-chat">
+      <section className="bd-card acc-chat-peers" aria-label="消息客户端">
+        <div className="acc-chat-pane-head">
+          <h2 className="bd-card-title">消息客户端</h2>
+          <span className="acc-head-count bd-num">{loading ? "" : `${messageClients.length} 台`}</span>
+          <Button className="acc-chat-refresh" size="sm" variant="light" startContent={<Icon name="refresh" size={14} />} onPress={() => void loadClients()}>
+            刷新
+          </Button>
+        </div>
 
-          <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto">
-            {messageClients.length === 0 ? (
-              <div className="rounded-md border border-default-200 bg-content2 px-3 py-4 text-small text-default-500">
-                {loading ? "加载中…" : "暂无可发送客户端"}
-              </div>
-            ) : messageClients.map((client) => {
-              const unread = unreadByPeer[client.clientName] ?? 0;
-              return (
-                <button
-                  key={client.id}
-                  type="button"
-                  aria-pressed={selectedClient?.id === client.id}
-                  onClick={() => selectClient(client)}
-                  className={[
-                    "rounded-md border px-3 py-2 text-left transition-colors",
-                    selectedClient?.id === client.id
-                      ? "border-primary bg-primary-50 text-primary-700 dark:bg-primary-400/10 dark:text-primary-300"
-                      : "border-default-200 bg-content1 text-foreground hover:bg-default-100",
-                  ].join(" ")}
-                >
-                  <div className="flex min-w-0 items-center justify-between gap-2">
-                    <span className="truncate text-small font-medium">{client.clientName}</span>
-                    <span className="flex shrink-0 items-center gap-1">
-                      {unread > 0 && (
-                        <Chip size="sm" color="danger" variant="solid" aria-label={`${unread} 条未读消息`}>
-                          {unread > 99 ? "99+" : unread}
-                        </Chip>
-                      )}
-                      <Chip size="sm" color="success" variant="flat">
-                        在线
-                      </Chip>
-                    </span>
-                  </div>
-                  <div className="mt-1 flex flex-wrap gap-1 text-tiny text-default-500">
-                    {client.messageAttachmentsCapable && <span>附件 {formatBytes(client.messageMaxAttachmentBytes)}</span>}
-                    {client.messageMediaPreviewCapable && <span>预览</span>}
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        </CardBody>
-      </Card>
-
-      <Card shadow="none" className="rounded-md border border-default-200">
-        <CardBody className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] gap-3 p-3">
-          <div className="flex min-w-0 items-center justify-between gap-3 border-b border-default-200 pb-3">
-            <div className="min-w-0">
-              <h2 className="truncate text-base font-semibold text-foreground">{selectedClientInfo?.clientName ?? "未选择客户端"}</h2>
-              <div className="mt-1 text-tiny text-default-500">
-                {selectedClientInfo ? `#${selectedClientInfo.id} · ${selectedClientInfo.ownerUsername || "-"}` : "-"}
-              </div>
-            </div>
-            {selectedClient && (
-              <Tooltip content={`附件 ${selectedClient.messageAttachmentsCapable ? "支持" : "不支持"} · 预览 ${selectedClient.messageMediaPreviewCapable ? "支持" : "不支持"}`}>
-                <Chip size="sm" color="primary" variant="flat">
-                  可聊天
-                </Chip>
-              </Tooltip>
-            )}
-            {selectedOffline && (
-              <Chip size="sm" color="default" variant="flat">
-                已离线
-              </Chip>
-            )}
-          </div>
-
-          <div className="relative min-h-0">
-            <div
-              ref={messageListRef}
-              className="h-full overflow-y-auto rounded-md bg-default-50 p-3 dark:bg-content2/40"
-              onScroll={handleMessageListScroll}
-            >
-              {activeMessages.length === 0 ? (
-                <div className="flex h-full min-h-[220px] items-center justify-center text-small text-default-500">
-                  暂无消息
-                </div>
-              ) : (
-                <div className="flex flex-col gap-3">
-                  {activeMessages.map((message) => (
-                    <MessageBubble
-                      key={message.id}
-                      message={message}
-                      downloading={downloadingId === message.id}
-                      onDownload={() => void downloadAttachment(message)}
-                      onResend={() => resend(message)}
-                    />
-                  ))}
-                </div>
-              )}
-            </div>
-            {hasNewBelow && (
-              <Button
-                className="absolute bottom-3 left-1/2 -translate-x-1/2 shadow-md"
-                color="primary"
-                size="sm"
-                variant="solid"
-                onPress={scrollToBottom}
+        <div className="acc-chat-peer-list">
+          {messageClients.length === 0 ? (
+            loading ? (
+              <div className="acc-chat-peer-state" role="status"><span className="bd-skeleton" /><span className="bd-skeleton" /><span className="bd-skeleton-note">正在读取客户端…</span></div>
+            ) : (
+              <Empty icon="message" title="没有可发消息的客户端" description="客户端在线并上报消息能力后会出现在这里。" />
+            )
+          ) : messageClients.map((client) => {
+            const unread = unreadByPeer[client.clientName] ?? 0;
+            const selected = selectedClient?.id === client.id;
+            return (
+              <button
+                key={client.id}
+                type="button"
+                aria-pressed={selected}
+                onClick={() => selectClient(client)}
+                className={`acc-chat-peer${selected ? " is-selected" : ""}`}
               >
-                ↓ 有新消息
-              </Button>
+                <span className="bd-avatar" aria-hidden="true">{client.clientName.slice(0, 1).toUpperCase()}</span>
+                <span className="acc-chat-peer-main">
+                  <span className="acc-chat-peer-name">{client.clientName}</span>
+                  <span className="acc-chat-peer-sub bd-num">
+                    {client.messageAttachmentsCapable ? `附件 ${formatBytes(client.messageMaxAttachmentBytes)}` : "只收文字"}
+                    {client.messageMediaPreviewCapable ? " · 预览" : ""}
+                  </span>
+                </span>
+                <span className="acc-chat-peer-tags">
+                  {unread > 0 && (
+                    <span className="acc-chat-unread bd-num" aria-label={`${unread} 条未读消息`}>
+                      {unread > 99 ? "99+" : unread}
+                    </span>
+                  )}
+                  <Tag tone="success">在线</Tag>
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </section>
+
+      <section className="bd-card acc-chat-thread" aria-label="会话">
+        <div className="acc-chat-pane-head">
+          {selectedClientInfo ? <span className="bd-avatar" aria-hidden="true">{selectedClientInfo.clientName.slice(0, 1).toUpperCase()}</span> : null}
+          <div className="min-w-0 flex-1">
+            <h2 className="bd-card-title jd-ellipsis">{selectedClientInfo?.clientName ?? "未选择客户端"}</h2>
+            {selectedClientInfo ? (
+              <div className="acc-chat-sub bd-num">#{selectedClientInfo.id}{selectedClientInfo.ownerUsername ? ` · ${selectedClientInfo.ownerUsername}` : ""}</div>
+            ) : null}
+          </div>
+          {selectedClient && <Tag tone="info" title={attachmentHint}>可聊天</Tag>}
+          {selectedOffline && <Tag plain>已离线</Tag>}
+        </div>
+
+        <div className="acc-chat-scroll-wrap">
+          <div
+            ref={messageListRef}
+            className="acc-chat-messages"
+            onScroll={handleMessageListScroll}
+          >
+            {activeMessages.length === 0 ? (
+              <Empty
+                icon="message"
+                title="还没有消息"
+                description={selectedClientInfo ? "在下面输入文字或选择附件，按 Ctrl+Enter 发送。" : "先在左边选一台在线的客户端。"}
+              />
+            ) : (
+              <div className="acc-chat-list">
+                {activeMessages.map((message) => (
+                  <MessageBubble
+                    key={message.id}
+                    message={message}
+                    downloading={downloadingId === message.id}
+                    onDownload={() => void downloadAttachment(message)}
+                    onResend={() => resend(message)}
+                  />
+                ))}
+              </div>
             )}
           </div>
+          {hasNewBelow && (
+            <Button
+              className="acc-chat-new"
+              color="primary"
+              size="sm"
+              variant="solid"
+              startContent={<Icon name="arrow-down" size={14} />}
+              onPress={scrollToBottom}
+            >
+              有新消息
+            </Button>
+          )}
+        </div>
 
-          <div className="space-y-2 border-t border-default-200 pt-3">
-            {selectedOffline && (
-              <div className="rounded-md border border-default-200 bg-default-50 px-3 py-2 text-small text-default-500">
-                目标已离线，恢复在线后可继续发送；历史消息保留。
-              </div>
-            )}
-            {uploadProgress != null && (
-              <Progress aria-label="上传进度" size="sm" color="primary" value={uploadProgress} />
-            )}
-            {file && (
-              <div className="flex items-center justify-between gap-2 rounded-md border border-default-200 bg-content2 px-3 py-2 text-small">
-                <span className="min-w-0 truncate">{file.name}</span>
-                <span className="shrink-0 text-tiny text-default-500">{formatBytes(file.size)}</span>
-              </div>
-            )}
-            <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
-              <Textarea
-                aria-label="消息内容"
-                minRows={2}
-                maxRows={5}
-                radius="sm"
-                variant="bordered"
-                placeholder={selectedOffline ? "目标已离线" : "输入消息"}
-                value={body}
-                isDisabled={selectedOffline}
-                onValueChange={setBody}
-                onKeyDown={onComposerKeyDown}
-              />
-              <div className="flex gap-2 sm:flex-col">
-                <input ref={fileInputRef} className="hidden" type="file" aria-label="选择附件" onChange={chooseFile} />
-                <Button className="flex-1 sm:flex-none" variant="flat" isDisabled={selectedOffline} onPress={() => fileInputRef.current?.click()}>
-                  附件
-                </Button>
-                <Button
-                  className="flex-1 sm:flex-none"
-                  color="primary"
-                  isLoading={sending}
-                  isDisabled={!selectedClient || !connected || (!body.trim() && !file)}
-                  onPress={() => void send()}
-                >
-                  发送
-                </Button>
+        <div className="acc-chat-composer">
+          {selectedOffline && (
+            <p className="acc-chat-note">
+              目标已离线，恢复在线后可继续发送；历史消息保留。
+            </p>
+          )}
+          {file && (
+            <div className="acc-file-row is-pending">
+              <span className="acc-file-icon" aria-hidden="true"><Icon name="file" size={16} /></span>
+              <div className="acc-file-main">
+                <div className="acc-file-name">{file.name}</div>
+                <div className="acc-file-meta bd-num">
+                  {formatBytes(file.size)}
+                  {uploadProgress != null ? ` · 已上传 ${uploadProgress}%` : " · 发送时上传"}
+                </div>
+                {uploadProgress != null && <Progress label="上传进度" value={uploadProgress} />}
               </div>
             </div>
+          )}
+          <div className="acc-chat-compose-bar">
+            <input ref={fileInputRef} className="hidden" type="file" aria-label="选择附件" onChange={chooseFile} />
+            <Button className="acc-chat-attach" variant="flat" isDisabled={selectedOffline} startContent={<Icon name="file" />} onPress={() => fileInputRef.current?.click()}>
+              附件
+            </Button>
+            <Textarea
+              aria-label="消息内容"
+              className="acc-chat-input"
+              minRows={1}
+              maxRows={5}
+              placeholder={selectedOffline ? "目标已离线" : "输入消息，Ctrl+Enter 发送"}
+              value={body}
+              isDisabled={selectedOffline}
+              onValueChange={setBody}
+              onKeyDown={onComposerKeyDown}
+            />
+            <Button
+              className="acc-chat-send"
+              color="primary"
+              isLoading={sending}
+              isDisabled={!selectedClient || !connected || (!body.trim() && !file)}
+              startContent={sending ? null : <Icon name="send" />}
+              onPress={() => void send()}
+            >
+              发送
+            </Button>
           </div>
-        </CardBody>
-      </Card>
+        </div>
+      </section>
     </div>
     </div>
   );
@@ -618,50 +612,44 @@ function MessageBubble({ message, downloading, onDownload, onResend }: {
   const attachment = message.attachment;
   const failed = message.status === "failed";
   return (
-    <div className={`flex ${mine ? "justify-end" : "justify-start"}`}>
-      <div className={[
-        "max-w-[min(680px,92%)] rounded-md border px-3 py-2 shadow-xs",
-        mine
-          ? "border-primary-200 bg-primary-50 text-primary-950 dark:border-primary-400/30 dark:bg-primary-400/10 dark:text-primary-50"
-          : "border-default-200 bg-content1 text-foreground",
-      ].join(" ")}>
-        <div className="mb-1 flex flex-wrap items-center gap-2 text-tiny text-default-500">
-          <span>{mine ? "我" : message.peerName}</span>
-          <span>{formatDateTime(message.createdAt)}</span>
-          <span className={failed ? "font-medium text-danger" : undefined}>{statusText(message.status)}</span>
-          {failed && mine && (
-            <Button className="h-5 min-w-0 px-1.5 text-tiny" size="sm" color="danger" variant="light" onPress={onResend}>
-              重发
-            </Button>
-          )}
-        </div>
-        {message.body && <div className="whitespace-pre-wrap break-words text-small">{message.body}</div>}
+    <div className={`acc-msg${mine ? " is-mine" : ""}`}>
+      <div className="acc-msg-meta">
+        <span className="acc-msg-who">{mine ? "我" : message.peerName}</span>
+        <RelativeTime value={message.createdAt} />
+        <span className={failed ? "acc-msg-status is-failed" : "acc-msg-status"}>{statusText(message.status)}</span>
+        {failed && mine && (
+          <Button className="acc-msg-resend" size="sm" color="danger" variant="light" startContent={<Icon name="refresh" size={12} />} onPress={onResend}>
+            重发
+          </Button>
+        )}
+      </div>
+      <div className="acc-msg-bubble">
+        {message.body && <div className="acc-msg-text">{message.body}</div>}
         {attachment && (
-          <div className="mt-2 rounded-md border border-default-200 bg-background/70 p-2">
-            <div className="flex min-w-0 items-center justify-between gap-2">
-              <div className="min-w-0">
-                <div className="truncate text-small font-medium">{attachment.fileName || attachment.objectId || "attachment"}</div>
-                <div className="mt-0.5 text-tiny text-default-500">
-                  {attachment.mimeType || "application/octet-stream"} · {formatBytes(attachment.sizeBytes)}
-                </div>
+          <div className="acc-file-row">
+            <span className="acc-file-icon" aria-hidden="true"><Icon name="file" size={16} /></span>
+            <div className="acc-file-main">
+              <div className="acc-file-name">{attachment.fileName || attachment.objectId || "attachment"}</div>
+              <div className="acc-file-meta bd-num">
+                {attachment.mimeType || "application/octet-stream"} · {formatBytes(attachment.sizeBytes)}
               </div>
-              {attachment.attachmentId && (
-                <Button size="sm" variant="flat" isLoading={downloading} onPress={onDownload}>
-                  {downloading ? "下载中…" : "下载"}
-                </Button>
-              )}
             </div>
-            {message.previewUrl && attachment.mimeType?.startsWith("image/") && (
-              <img className="mt-2 max-h-64 w-full rounded-sm object-contain" src={message.previewUrl} alt={attachment.fileName || "attachment"} />
+            {attachment.attachmentId && (
+              <Button size="sm" variant="flat" isLoading={downloading} startContent={downloading ? null : <Icon name="download" size={14} />} onPress={onDownload}>
+                {downloading ? "下载中…" : "下载"}
+              </Button>
             )}
-            {message.previewUrl && attachment.mimeType?.startsWith("video/") && (
-              <video className="mt-2 max-h-64 w-full rounded-sm bg-black object-contain" src={message.previewUrl} controls />
-            )}
-            {message.downloadUrl && message.downloadExpiresAt && (
-              <div className="mt-2 text-tiny text-default-500">
-                链接有效期至 {formatDateTime(message.downloadExpiresAt)}，过期后点下载自动重新换签
-              </div>
-            )}
+          </div>
+        )}
+        {attachment && message.previewUrl && attachment.mimeType?.startsWith("image/") && (
+          <img className="acc-msg-media" src={message.previewUrl} alt={attachment.fileName || "attachment"} />
+        )}
+        {attachment && message.previewUrl && attachment.mimeType?.startsWith("video/") && (
+          <video className="acc-msg-media is-video" src={message.previewUrl} controls />
+        )}
+        {attachment && message.downloadUrl && message.downloadExpiresAt && (
+          <div className="acc-msg-hint">
+            链接有效期至 {formatAbsoluteTime(message.downloadExpiresAt)}，过期后再点“下载”会自动重新换签
           </div>
         )}
       </div>

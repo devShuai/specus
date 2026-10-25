@@ -17,17 +17,17 @@ export interface StatusChipProps {
 }
 
 const TONE_CLASS: Record<StatusTone, string> = {
-  success: "app-tag--success",
-  warning: "app-tag--warning",
-  danger: "app-tag--danger",
-  primary: "app-tag--info",
+  success: "bd-tag--success",
+  warning: "bd-tag--warning",
+  danger: "bd-tag--danger",
+  primary: "bd-tag--info",
   default: "",
-  secondary: "app-tag--plain",
+  secondary: "bd-tag--plain",
 };
 
 /** 统一的状态徽章（设计规范的 Tag 组件：胶囊 + 圆点 + 文字），颜色只能从语义 tone 进入。 */
 export function StatusChip({ tone = "default", children, className = "" }: StatusChipProps) {
-  return <span className={["app-tag", TONE_CLASS[tone], className].filter(Boolean).join(" ")}>{children}</span>;
+  return <span className={["bd-tag", TONE_CLASS[tone], className].filter(Boolean).join(" ")}>{children}</span>;
 }
 
 /** 启用/停用的标准 tone：停用不闯红灯。 */

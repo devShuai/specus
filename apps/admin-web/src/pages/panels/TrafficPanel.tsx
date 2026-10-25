@@ -2,6 +2,7 @@ import {
   Component,
   lazy,
   Suspense,
+  type CSSProperties,
   type ReactNode,
   useCallback,
   useEffect,
@@ -11,28 +12,14 @@ import {
 } from "react";
 import {
   Button,
-  Card,
-  CardBody,
-  Chip,
-  Input,
   Modal,
   ModalBody,
   ModalContent,
   ModalFooter,
   ModalHeader,
-  Pagination,
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
   Switch,
   Tab,
-  Table,
-  TableBody,
-  TableCell,
-  TableColumn,
-  TableHeader,
-  TableRow,
-  Tabs,
+  Tabs as HeroTabs,
 } from "@heroui/react";
 import { adminApi } from "../../api/client";
 import type {
@@ -46,17 +33,32 @@ import type {
   TrafficInspectionStatus,
   TrafficUsage,
 } from "../../api/types";
-import { formatBytes, formatDateTime } from "../../lib/format";
+import { formatAbsoluteTime, formatBytes } from "../../lib/format";
 import { notifyError } from "../../components/toast";
 import { PageHeader } from "../../components/PageHeader";
-import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
+import {
+  Alert,
+  Empty,
+  FilterBar,
+  Icon,
+  RelativeTime,
+  Section,
+  Stat,
+  StatGrid,
+  TableWrap,
+  Tabs,
+  Tag,
+  type IconName,
+  type Tone,
+} from "../../components/ui";
+import { KpiLabel, Pagination, TableEmptyRow, TableLoadingRow, TypeTag, rangeText } from "./opsUi";
 import {
   aggregateResources,
   formatElapsedMs,
   HTTP_EXCHANGE_PAGE_SIZE,
   HTTP_RESPONSE_BODY_TYPES,
   HTTP_SEARCH_FIELDS,
-  httpResponseTypeChipClass,
+  httpResponseTypeColor,
   httpResponseTypeLabel,
   httpResponseTypeOption,
   httpSearchFieldOption,
@@ -65,7 +67,6 @@ import {
   normalizeHttpSearchField,
   TCP_FRAME_PAGE_SIZE,
   TCP_STREAM_PAGE_SIZE,
-  trafficFilterControlClass,
   TRAFFIC_MODAL_CLASS_NAMES,
   TRAFFIC_VIEW_TABS,
   type BodyPreviewTarget,
@@ -97,6 +98,13 @@ import { isHttpImageBody, resolveHttpImageDataUrl } from "./traffic/httpBodyPrev
 const LazyMediaCapturePanel = lazy(() =>
   import("./traffic/MediaCapturePanel").then((module) => ({ default: module.MediaCapturePanel })),
 );
+
+const VIEW_ICONS: Record<TrafficViewKey, IconName> = {
+  client: "monitor",
+  tcp: "shuffle",
+  http: "globe",
+  media: "film",
+};
 
 export function TrafficPanel() {
   const [clientRows, setClientRows] = useState<TrafficUsage[]>([]);
@@ -378,36 +386,33 @@ export function TrafficPanel() {
   }, [selectedTcpStream]);
 
   return (
-    <div className="flex min-w-0 flex-col gap-2">
-      <PageHeader title="流量使用" description="按资源和协议查看流量排行、HTTP 记录与 TCP 帧。" />
-      <div className="flex min-h-10 flex-wrap items-center justify-between gap-3">
-        <Tabs
-          aria-label="流量观测维度"
-          classNames={{ base: "min-w-0 max-w-full overflow-x-auto", tabList: "gap-4 sm:gap-6" }}
-          selectedKey={trafficView}
-          variant="underlined"
-          onSelectionChange={(key) => setTrafficView(String(key) as TrafficViewKey)}
-        >
-          {TRAFFIC_VIEW_TABS.map((item) => (
-            <Tab key={item.key} title={item.label} />
-          ))}
-        </Tabs>
-        <div className="flex shrink-0 items-center gap-3">
+    <div className="ops-page">
+      <PageHeader
+        title="流量使用"
+        description="按资源和协议查看流量排行、HTTP 记录与 TCP 帧。"
+        actions={<>
           <Switch aria-label="自动刷新" isSelected={autoRefresh} size="sm" onValueChange={setAutoRefresh}>
             自动刷新
           </Switch>
-          <Button className="shrink-0" size="sm" variant="flat" isLoading={refreshing} onPress={() => void refresh()}>
+          <Button variant="flat" isLoading={refreshing} startContent={refreshing ? null : <Icon name="refresh" />} onPress={() => void refresh()}>
             刷新
           </Button>
-        </div>
-      </div>
+        </>}
+      />
+      <Tabs
+        variant="section"
+        label="流量观测维度"
+        value={trafficView}
+        onChange={setTrafficView}
+        items={TRAFFIC_VIEW_TABS.map((item) => ({ key: item.key, label: item.label, icon: VIEW_ICONS[item.key] }))}
+      />
 
       <TrafficInspectionStatusBar status={inspectionStatus} />
 
       {trafficView === "client" && <ClientTrafficTable rows={clientRows} loading={loading} />}
 
       {trafficView === "tcp" && (
-        <div className="flex flex-col gap-2">
+        <>
           <ResourceTrafficSection
             rows={tcpRows}
             loading={loading}
@@ -427,11 +432,11 @@ export function TrafficPanel() {
             onOpenDetails={openTcpFrameDetails}
             onOpenStream={openTcpStream}
           />
-        </div>
+        </>
       )}
 
       {trafficView === "http" && (
-        <div className="flex flex-col gap-2">
+        <>
           <ResourceTrafficSection
             rows={httpRows}
             loading={loading}
@@ -460,7 +465,7 @@ export function TrafficPanel() {
             onResetSearch={resetHttpSearch}
             onOpenDetails={openHttpExchangeDetails}
           />
-        </div>
+        </>
       )}
       {trafficView === "media" && (
         <MediaCaptureLoadBoundary>
@@ -496,33 +501,27 @@ class MediaCaptureLoadBoundary extends Component<
       return this.props.children;
     }
     return (
-      <div
-        className="rounded-large border border-danger-200 bg-danger-50 px-4 py-6 text-center dark:bg-danger-50/10"
-        role="alert"
-      >
-        <p className="text-small font-medium text-danger">媒体采集模块加载失败</p>
-        <p className="mt-1 text-tiny text-default-500">网络可能中断，或站点刚刚完成版本更新。</p>
-        <button
-          className="mt-3 rounded-medium bg-danger px-3 py-2 text-small font-medium text-danger-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-danger"
-          type="button"
-          onClick={() => window.location.reload()}
+      <Section>
+        <Alert
+          tone="danger"
+          role="alert"
+          title="媒体采集模块加载失败"
+          actions={<Button color="danger" size="sm" onPress={() => window.location.reload()}>重新加载页面</Button>}
         >
-          重新加载页面
-        </button>
-      </div>
+          网络可能中断，或站点刚刚完成版本更新；重新加载页面后再试。
+        </Alert>
+      </Section>
     );
   }
 }
 
 function MediaCaptureLoading() {
   return (
-    <div
-      aria-live="polite"
-      className="rounded-large border border-default-200 bg-content1 px-4 py-8 text-center text-small text-default-500"
-      role="status"
-    >
-      正在加载媒体采集模块…
-    </div>
+    <Section>
+      <div className="bd-card px-4 py-8 text-center" aria-live="polite">
+        <span className="ops-loading" role="status"><Icon name="loader" />正在加载媒体采集模块…</span>
+      </div>
+    </Section>
   );
 }
 
@@ -538,59 +537,46 @@ function ClientTrafficTable({ rows, loading }: { rows: TrafficUsage[]; loading: 
   );
 
   return (
-    <div className="mt-3 flex min-w-0 flex-col gap-3">
+    <>
       <MetricCards summary={summary} resourceLabel="客户端" />
-
-      {/* mobile: 卡片 */}
-      <div className="lg:hidden">
-        <MobileListCardList
-          items={rows}
-          isLoading={loading}
-          emptyContent="暂无数据"
-          renderCard={(raw) => {
-            const row = raw as TrafficUsage;
-            return (
-              <MobileListCard
-                key={row.id}
-                title={<span className="break-all">{row.clientName}</span>}
-                subtitle={`${row.usageDate} · #${row.id}`}
-                fields={[
-                  { label: "上传", value: formatBytes(row.uploadBytes) },
-                  { label: "下载", value: formatBytes(row.downloadBytes) },
-                  { label: "更新时间", value: formatDateTime(row.updatedAt) },
-                ]}
-              />
-            );
-          }}
-        />
-      </div>
-
-      {/* desktop: 表格 */}
-      <div className="hidden min-w-0 overflow-x-auto lg:block">
-      <Table aria-label="客户端流量使用" isHeaderSticky removeWrapper>
-        <TableHeader>
-          <TableColumn>ID</TableColumn>
-          <TableColumn>客户端</TableColumn>
-          <TableColumn>日期（UTC）</TableColumn>
-          <TableColumn>上传</TableColumn>
-          <TableColumn>下载</TableColumn>
-          <TableColumn>更新时间</TableColumn>
-        </TableHeader>
-        <TableBody items={rows} isLoading={loading} emptyContent="暂无数据">
-          {(row) => (
-            <TableRow key={row.id}>
-              <TableCell>{row.id}</TableCell>
-              <TableCell>{row.clientName}</TableCell>
-              <TableCell>{row.usageDate}</TableCell>
-              <TableCell>{formatBytes(row.uploadBytes)}</TableCell>
-              <TableCell>{formatBytes(row.downloadBytes)}</TableCell>
-              <TableCell>{formatDateTime(row.updatedAt)}</TableCell>
-            </TableRow>
-          )}
-        </TableBody>
-      </Table>
-      </div>
-    </div>
+      <Section title="客户端流量明细" description="每个客户端每天一行，日期按 UTC">
+        <TableWrap className="ops-table-wrap">
+          <table className="bd-table jd-stack" aria-label="客户端流量使用">
+            <thead>
+              <tr>
+                <th>客户端</th>
+                <th>日期（UTC）</th>
+                <th className="bd-col-num">上传</th>
+                <th className="bd-col-num">下载</th>
+                <th>更新时间</th>
+              </tr>
+            </thead>
+            <tbody>
+              {loading && rows.length === 0 ? <TableLoadingRow colSpan={5} /> : null}
+              {!loading && rows.length === 0 ? (
+                <TableEmptyRow colSpan={5}>
+                  <Empty icon="bar-chart" title="暂无数据" description="客户端转发流量后，按天汇总到这里。" />
+                </TableEmptyRow>
+              ) : null}
+              {rows.map((row) => (
+                <tr key={row.id}>
+                  <td>
+                    <span className="inline-flex min-w-0 items-baseline gap-2">
+                      <span className="jd-strong [overflow-wrap:anywhere]">{row.clientName}</span>
+                      <span className="bd-num text-[12px] text-[var(--text-subtle)]">#{row.id}</span>
+                    </span>
+                  </td>
+                  <td className="bd-num" data-label="日期">{row.usageDate}</td>
+                  <td className="bd-col-num" data-label="上传">{formatBytes(row.uploadBytes)}</td>
+                  <td className="bd-col-num" data-label="下载">{formatBytes(row.downloadBytes)}</td>
+                  <td data-label="更新于"><RelativeTime value={row.updatedAt} /></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </TableWrap>
+      </Section>
+    </>
   );
 }
 
@@ -599,38 +585,37 @@ function TrafficInspectionStatusBar({ status }: { status: TrafficInspectionStatu
   const droppedTotal = (status?.droppedHttp ?? 0) + (status?.droppedTcp ?? 0);
 
   return (
-    <Card shadow="none" className="rounded-md border border-default-200">
-      <CardBody className="grid gap-2 p-3 md:grid-cols-4">
+    <section className="jd-section" aria-label="明细采集状态">
+      <dl className="bd-card ops-inspection">
         <TrafficStatusItem
           label="明细采集"
           value={status?.enabled ? "全局开启" : "已关闭"}
-          tone={status?.enabled ? "success" : "default"}
+          tone={status?.enabled ? "success" : "neutral"}
           hint="仍需通道级开关开启"
         />
         <TrafficStatusItem
           label="待写入"
           value={`${pendingTotal}`}
-          tone={pendingTotal > 0 ? "warning" : "default"}
+          tone={pendingTotal > 0 ? "warning" : "neutral"}
           hint={`HTTP ${status?.pendingHttp ?? 0} / TCP ${status?.pendingTcp ?? 0}`}
         />
         <TrafficStatusItem
           label="已丢弃"
           value={`${droppedTotal}`}
-          tone={droppedTotal > 0 ? "danger" : "default"}
+          tone={droppedTotal > 0 ? "danger" : "neutral"}
           hint={`HTTP ${status?.droppedHttp ?? 0} / TCP ${status?.droppedTcp ?? 0}`}
         />
-        <TrafficStatusItem
-          label="最近 flush"
-          value={formatDateTime(status?.lastFlushedAt)}
-          tone="default"
-          hint="查询不再强制 flush"
-        />
-      </CardBody>
-    </Card>
+        <div>
+          <dt>最近 flush</dt>
+          <dd>{status?.lastFlushedAt ? <RelativeTime value={status.lastFlushedAt} /> : <span className="ops-subtle">—</span>}</dd>
+          <p>查询不再强制 flush</p>
+        </div>
+      </dl>
+    </section>
   );
 }
 
-function trafficToneLabel(tone: "default" | "success" | "warning" | "danger") {
+function trafficToneLabel(tone: Tone) {
   switch (tone) {
     case "warning":
       return "注意";
@@ -649,19 +634,17 @@ function TrafficStatusItem({
 }: {
   hint: string;
   label: string;
-  tone: "default" | "success" | "warning" | "danger";
+  tone: Tone;
   value: string;
 }) {
+  const numeric = /^\d+$/.test(value);
   return (
-    <div className="flex min-w-0 items-center justify-between gap-2 rounded-small bg-default-50 px-3 py-2">
-      <div className="min-w-0">
-        <div className="text-tiny text-default-500">{label}</div>
-        <div className="truncate text-small font-semibold text-foreground">{value}</div>
-        <div className="truncate text-tiny text-default-400">{hint}</div>
-      </div>
-      <Chip color={tone} size="sm" variant="flat">
-        {trafficToneLabel(tone)}
-      </Chip>
+    <div>
+      <dt>{label}</dt>
+      <dd>
+        {numeric ? <><span className="bd-num">{value}</span><Tag tone={tone}>{trafficToneLabel(tone)}</Tag></> : <Tag tone={tone}>{value}</Tag>}
+      </dd>
+      <p>{hint}</p>
     </div>
   );
 }
@@ -689,88 +672,60 @@ function ResourceTrafficSection({
   );
 
   return (
-    <div className="flex flex-col gap-2">
+    <>
       <MetricCards summary={summary} resourceLabel={type === "TCP_SPECUS" ? "映射" : "路由"} />
 
-      <Card shadow="none" className="rounded-md border border-default-200">
-        <CardBody className="gap-2 p-2.5">
-          <div>
-            <h3 className="text-small font-semibold">资源流量排行</h3>
-            <p className="text-tiny text-default-500">
-              {type === "TCP_SPECUS" ? "按公网监听端口聚合" : "按 HTTP 路由名聚合"}
-              {totals.length > 8 ? `，仅展示前 8 个（共 ${totals.length} 个）` : ""}
-            </p>
+      <Section
+        title="资源流量排行"
+        description={`${type === "TCP_SPECUS" ? "按公网监听端口聚合" : "按 HTTP 路由名聚合"}${totals.length > 8 ? `，仅展示前 8 个（共 ${totals.length} 个）` : ""}`}
+      >
+        <div className="bd-chart-card">
+          <div className="bd-chart-card-body">
+            <ResourceBars items={totals.slice(0, 8)} />
           </div>
-          <ResourceBars items={totals.slice(0, 8)} />
-        </CardBody>
-      </Card>
+        </div>
+      </Section>
 
-      {/* mobile: 卡片 */}
-      <div className="lg:hidden">
-        <MobileListCardList
-          items={rows}
-          isLoading={loading}
-          emptyContent={emptyContent}
-          renderCard={(raw) => {
-            const row = raw as ResourceTrafficUsage;
-            return (
-              <MobileListCard
-                key={row.id}
-                title={<span className="break-all">{row.resourceName}</span>}
-                subtitle={
-                  <div className="flex flex-col gap-0.5 break-all">
-                    <span>{row.clientName} · {row.usageDate}</span>
-                    <span className="text-tiny text-default-400">{row.resourceKey}</span>
-                  </div>
-                }
-                fields={[
-                  { label: "上传", value: formatBytes(row.uploadBytes) },
-                  { label: "下载", value: formatBytes(row.downloadBytes) },
-                  { label: "更新时间", value: formatDateTime(row.updatedAt) },
-                ]}
-              />
-            );
-          }}
-        />
-      </div>
-
-      {/* desktop: 表格 */}
-      <div className="hidden min-w-0 overflow-x-auto lg:block">
-      <Table aria-label={`${type} 流量明细`} isHeaderSticky removeWrapper>
-        <TableHeader>
-          <TableColumn>ID</TableColumn>
-          <TableColumn>资源</TableColumn>
-          <TableColumn>客户端</TableColumn>
-          <TableColumn>日期（UTC）</TableColumn>
-          <TableColumn>上传</TableColumn>
-          <TableColumn>下载</TableColumn>
-          <TableColumn>更新时间</TableColumn>
-        </TableHeader>
-        <TableBody items={rows} isLoading={loading} emptyContent={emptyContent}>
-          {(row) => (
-            <TableRow key={row.id}>
-              <TableCell>{row.id}</TableCell>
-              <TableCell>
-                <div className="flex min-w-0 flex-col">
-                  <span className="max-w-96 whitespace-normal break-all font-medium" title={row.resourceName}>
-                    {row.resourceName}
-                  </span>
-                  <span className="break-all text-tiny text-default-400" title={row.resourceKey}>
-                    {row.resourceKey}
-                  </span>
-                </div>
-              </TableCell>
-              <TableCell>{row.clientName}</TableCell>
-              <TableCell>{row.usageDate}</TableCell>
-              <TableCell>{formatBytes(row.uploadBytes)}</TableCell>
-              <TableCell>{formatBytes(row.downloadBytes)}</TableCell>
-              <TableCell>{formatDateTime(row.updatedAt)}</TableCell>
-            </TableRow>
-          )}
-        </TableBody>
-      </Table>
-      </div>
-    </div>
+      <Section title="流量明细" description="每个资源每天一行，日期按 UTC">
+        <TableWrap className="ops-table-wrap">
+          <table className="bd-table jd-stack" aria-label={`${type} 流量明细`}>
+            <thead>
+              <tr>
+                <th>资源</th>
+                <th>客户端</th>
+                <th>日期（UTC）</th>
+                <th className="bd-col-num">上传</th>
+                <th className="bd-col-num">下载</th>
+                <th>更新时间</th>
+              </tr>
+            </thead>
+            <tbody>
+              {loading && rows.length === 0 ? <TableLoadingRow colSpan={6} /> : null}
+              {!loading && rows.length === 0 ? (
+                <TableEmptyRow colSpan={6}>
+                  <Empty icon="bar-chart" title={emptyContent} description="资源转发流量后，按天汇总到这里。" />
+                </TableEmptyRow>
+              ) : null}
+              {rows.map((row) => (
+                <tr key={row.id}>
+                  <td>
+                    <div className="jd-table-title">
+                      <span className="jd-strong" title={row.resourceName}>{row.resourceName}</span>
+                      <span className="jd-table-sub" title={row.resourceKey}>#{row.id} · {row.resourceKey}</span>
+                    </div>
+                  </td>
+                  <td data-label="客户端">{row.clientName}</td>
+                  <td className="bd-num" data-label="日期">{row.usageDate}</td>
+                  <td className="bd-col-num" data-label="上传">{formatBytes(row.uploadBytes)}</td>
+                  <td className="bd-col-num" data-label="下载">{formatBytes(row.downloadBytes)}</td>
+                  <td data-label="更新于"><RelativeTime value={row.updatedAt} /></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </TableWrap>
+      </Section>
+    </>
   );
 }
 
@@ -817,8 +772,6 @@ function HttpExchangeTable({
   total: number;
   totalPages: number;
 }) {
-  const rangeStart = total === 0 ? 0 : page * pageSize + 1;
-  const rangeEnd = Math.min(total, (page + 1) * pageSize);
   const searchFieldOption = httpSearchFieldOption(searchField);
   const activeSearchFieldOption = httpSearchFieldOption(activeSearchField);
   const hasActiveFilters = Boolean(activeSearch || activeSearchField !== "summary" || activeResponseType);
@@ -834,465 +787,158 @@ function HttpExchangeTable({
       })),
     [rows, tableScopeKey],
   );
-  const tableCollectionKey = useMemo(() => {
-    const first = rows[0];
-    const last = rows[rows.length - 1];
-    return [
-      tableScopeKey,
-      rows.length,
-      first ? `${first.id}:${first.capturedAt}` : "empty",
-      last ? `${last.id}:${last.capturedAt}` : "empty",
-    ].join("|");
-  }, [rows, tableScopeKey]);
 
   return (
-    <Card shadow="none" className="rounded-md border border-default-200">
-      <CardBody className="gap-3 p-3">
-        <div className="flex flex-col gap-1">
-          <div>
-            <h3 className="text-small font-semibold">HTTP 协议记录</h3>
-            <p className="text-tiny text-default-500">请求行、响应状态、headers 与 body 预览</p>
-          </div>
-          <div className="flex flex-wrap items-end gap-2 lg:hidden" aria-label="HTTP 协议记录筛选">
-            <label className="flex min-w-[6.5rem] flex-1 flex-col gap-1 sm:flex-none sm:w-32">
-              <span className="text-tiny text-default-500">搜索字段</span>
-              <select
-                className={trafficFilterControlClass}
-                value={searchField}
-                onChange={(event) => onSearchFieldChange(normalizeHttpSearchField(event.target.value))}
-              >
-                {HTTP_SEARCH_FIELDS.map((field) => (
-                  <option key={field.value} value={field.value}>
-                    {field.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="flex min-w-[6rem] flex-1 flex-col gap-1 sm:flex-none sm:w-28">
-              <span className="text-tiny text-default-500">返回类型</span>
-              <select
-                className={trafficFilterControlClass}
-                value={responseType}
-                onChange={(event) => onResponseTypeChange(normalizeHttpResponseType(event.target.value))}
-              >
-                {HTTP_RESPONSE_BODY_TYPES.map((type) => (
-                  <option key={type.value || "all"} value={type.value}>
-                    {type.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <Input
-              classNames={{ inputWrapper: "h-9 min-h-9" }}
-              className="w-full sm:w-64 lg:w-72"
-              label="搜索"
-              placeholder={searchFieldOption.placeholder}
-              size="sm"
-              value={searchDraft}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  onSearch();
-                }
-              }}
-              onValueChange={onSearchDraftChange}
-            />
-            <div className="flex items-center gap-2">
-              <Button className="h-9" size="sm" variant="flat" onPress={onSearch}>
-                搜索
-              </Button>
-              <Button className="h-9" size="sm" variant="flat" onPress={onResetSearch}>
-                重置
-              </Button>
-            </div>
-          </div>
+    <Section title="HTTP 协议记录" description="请求行、响应状态、headers 与 body 预览">
+      <FilterBar
+        className="ops-filterbar"
+        end={<span className="ops-count">共 {total} 条</span>}
+      >
+        <label className="ops-filter-field">
+          <span className="ops-filter-label">搜索字段</span>
+          <select
+            className="bd-select"
+            value={searchField}
+            onChange={(event) => onSearchFieldChange(normalizeHttpSearchField(event.target.value))}
+          >
+            {HTTP_SEARCH_FIELDS.map((field) => (
+              <option key={field.value} value={field.value}>
+                {field.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="ops-filter-field">
+          <span className="ops-filter-label">返回类型</span>
+          <select
+            className="bd-select"
+            value={responseType}
+            onChange={(event) => onResponseTypeChange(normalizeHttpResponseType(event.target.value))}
+          >
+            {HTTP_RESPONSE_BODY_TYPES.map((type) => (
+              <option key={type.value || "all"} value={type.value}>
+                {type.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="ops-filter-field ops-filter-field--wide">
+          <span className="jd-sr-only">搜索内容</span>
+          <input
+            className="bd-input jd-filter-search"
+            type="search"
+            placeholder={searchFieldOption.placeholder}
+            value={searchDraft}
+            onChange={(event) => onSearchDraftChange(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                onSearch();
+              }
+            }}
+          />
+        </label>
+        <div className="ops-filter-actions">
+          <Button size="sm" color="primary" variant="flat" startContent={<Icon name="search" size={14} />} onPress={onSearch}>
+            搜索
+          </Button>
+          <Button size="sm" variant="light" onPress={onResetSearch}>
+            重置
+          </Button>
         </div>
-        {hasActiveFilters && (
-          <div className="flex flex-wrap items-center gap-2 text-tiny text-default-500">
-            <span>当前搜索</span>
-            <Chip size="sm" variant="flat">
-              {activeSearchFieldOption.label}
-            </Chip>
-            {activeSearch && (
-              <Chip size="sm" variant="flat">
-                {activeSearch}
-              </Chip>
-            )}
-            {activeResponseType && (
-              <HttpResponseTypeChip value={activeResponseType} contentType={null} bytes={0} />
-            )}
-          </div>
-        )}
+      </FilterBar>
+      {hasActiveFilters && (
+        <div className="ops-active-filters" aria-label="当前搜索">
+          <span className="ops-filter-label">当前搜索</span>
+          <span className="jd-filter-chip ops-filter-chip"><span>{activeSearchFieldOption.label}</span></span>
+          {activeSearch && <span className="jd-filter-chip ops-filter-chip"><span>{activeSearch}</span></span>}
+          {activeResponseType && (
+            <span className="jd-filter-chip ops-filter-chip"><span>{httpResponseTypeOption(activeResponseType).label}</span></span>
+          )}
+        </div>
+      )}
 
-        {/* mobile: HTTP 协议记录卡片 */}
-        <div className="lg:hidden">
-          <MobileListCardList
-            items={tableRows}
-            isLoading={loading}
-            emptyContent="暂无 HTTP 协议记录"
-            renderCard={(raw) => {
-              const row = raw as (typeof tableRows)[number];
-              return (
-                <MobileListCard
-                  key={row.tableKey}
-                  title={
-                    <div className="flex items-baseline gap-2 break-all">
-                      <span className="font-mono">{row.method}</span>
-                      <span className="font-mono text-tiny text-default-500">{httpPath(row)}</span>
-                    </div>
-                  }
-                  subtitle={
-                    <div className="flex flex-col gap-0.5 break-all">
-                      <span>{row.clientName} · {formatDateTime(row.capturedAt)}</span>
-                      {row.remoteAddress ? (
-                        <span className="text-tiny text-default-400">{row.remoteAddress}</span>
-                      ) : null}
-                    </div>
-                  }
-                  badges={
-                    <>
-                      <Chip color={httpStatusColor(row)} size="sm" variant="flat">
-                        {row.statusCode}
-                      </Chip>
-                      <HttpResponseTypeChip
-                        value={row.responseBodyType}
-                        contentType={row.responseContentType}
-                        bytes={row.responseBytes}
-                      />
-                    </>
-                  }
-                  fields={[
-                    {
-                      label: "资源",
-                      value: <span className="break-all">{row.resourceName}</span>,
-                    },
-                    {
-                      label: "流量",
-                      value: (
-                        <div className="flex flex-col">
-                          <span>请求 {formatBytes(row.requestBytes)}</span>
-                          <span>响应 {formatBytes(row.responseBytes)}</span>
-                        </div>
-                      ),
-                    },
-                    { label: "耗时", value: formatElapsedMs(row.elapsedMs) },
-                  ]}
-                  actions={
+      <TableWrap className="ops-table-wrap">
+        <table className="bd-table jd-stack" aria-label="HTTP 协议记录">
+          <thead>
+            <tr>
+              <th>请求</th>
+              <th>状态</th>
+              <th>返回类型</th>
+              <th>资源</th>
+              <th className="bd-col-num">请求 / 响应</th>
+              <th className="bd-col-num">耗时</th>
+              <th>时间</th>
+              <th className="jd-col-actions"><span className="jd-sr-only">协议详情</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading && tableRows.length === 0 ? <TableLoadingRow colSpan={8} /> : null}
+            {!loading && tableRows.length === 0 ? (
+              <TableEmptyRow colSpan={8}>
+                <Empty
+                  icon="globe"
+                  title={hasActiveFilters ? "当前筛选没有匹配的 HTTP 协议记录" : "暂无 HTTP 协议记录"}
+                  description={hasActiveFilters ? "换一个搜索字段或关键词，或重置筛选。" : "HTTP 路由开启明细采集后，请求会记在这里。"}
+                  actions={hasActiveFilters ? <Button size="sm" variant="flat" onPress={onResetSearch}>重置筛选</Button> : null}
+                />
+              </TableEmptyRow>
+            ) : null}
+            {tableRows.map((row) => (
+              <tr key={row.tableKey}>
+                <td>
+                  <div className="jd-table-title ops-request">
+                    <span className="ops-request-line">
+                      <b className="ops-mono">{row.method}</b>
+                      <span className="ops-mono ops-request-path" title={httpPath(row)}>{httpPath(row)}</span>
+                    </span>
+                    {row.remoteAddress && <span className="jd-table-sub bd-num" title={row.remoteAddress}>{row.remoteAddress}</span>}
+                  </div>
+                </td>
+                <td data-label="状态">
+                  <Tag tone={httpStatusTone(row)}>{row.statusCode}</Tag>
+                </td>
+                <td data-label="返回类型">
+                  <HttpResponseTypeChip value={row.responseBodyType} contentType={row.responseContentType} bytes={row.responseBytes} />
+                </td>
+                <td data-label="资源">
+                  <div className="jd-table-title">
+                    <span title={row.resourceName}>{row.resourceName}</span>
+                    <span className="jd-table-sub" title={row.clientName}>{row.clientName}</span>
+                  </div>
+                </td>
+                <td className="bd-col-num" data-label="流量">
+                  <span className="ops-cell-stack">
+                    <span>请求 {formatBytes(row.requestBytes)}</span>
+                    <span>响应 {formatBytes(row.responseBytes)}</span>
+                  </span>
+                </td>
+                <td className="bd-col-num" data-label="耗时">{formatElapsedMs(row.elapsedMs)}</td>
+                <td data-label="时间"><RelativeTime value={row.capturedAt} /></td>
+                <td className="jd-cell-actions">
+                  <div className="jd-row-actions">
                     <Button
                       isLoading={detailLoadingId === row.id}
                       size="sm"
                       variant="flat"
                       onPress={() => onOpenDetails(row)}
                     >
-                      协议详情
+                      查看详情
                     </Button>
-                  }
-                />
-              );
-            }}
-          />
-        </div>
-
-        <div className="hidden min-w-0 lg:block">
-        <Table
-          aria-label="HTTP 协议记录"
-          classNames={{ table: "w-full table-fixed", th: "px-2", td: "px-2 align-middle" }}
-          isHeaderSticky
-          removeWrapper
-        >
-          <TableHeader>
-            <TableColumn className="w-[14%]">时间</TableColumn>
-            <TableColumn className="w-[22%]">
-              <HttpSearchFilterHeader
-                activeSearch={activeSearch}
-                activeSearchField={activeSearchField}
-                onResetSearch={onResetSearch}
-                onSearch={onSearch}
-                onSearchDraftChange={onSearchDraftChange}
-                onSearchFieldChange={onSearchFieldChange}
-                searchDraft={searchDraft}
-                searchField={searchField}
-                searchFieldOption={searchFieldOption}
-              />
-            </TableColumn>
-            <TableColumn className="w-[8%]">状态</TableColumn>
-            <TableColumn className="w-[11%]">
-              <HttpResponseTypeFilterHeader
-                activeResponseType={activeResponseType}
-                onResetSearch={onResetSearch}
-                onSearch={onSearch}
-                onResponseTypeChange={onResponseTypeChange}
-                responseType={responseType}
-              />
-            </TableColumn>
-            <TableColumn className="w-[21%]">资源</TableColumn>
-            <TableColumn className="w-[10%]">流量</TableColumn>
-            <TableColumn className="w-[6%]">耗时</TableColumn>
-            <TableColumn className="w-[8%]">协议详情</TableColumn>
-          </TableHeader>
-          <TableBody
-            key={tableCollectionKey}
-            items={tableRows}
-            isLoading={loading}
-            emptyContent={
-              <div className="flex flex-col items-center gap-2 py-3">
-                <span>{hasActiveFilters ? "当前筛选没有匹配的 HTTP 协议记录" : "暂无 HTTP 协议记录"}</span>
-                {hasActiveFilters && (
-                  <Button size="sm" variant="light" onPress={onResetSearch}>
-                    重置筛选
-                  </Button>
-                )}
-              </div>
-            }
-          >
-            {(row) => (
-              <TableRow key={row.tableKey}>
-                <TableCell>
-                  <span className="block truncate" title={formatDateTime(row.capturedAt)}>
-                    {formatDateTime(row.capturedAt)}
-                  </span>
-                </TableCell>
-                <TableCell>
-                  <div className="flex min-w-0 flex-col">
-                    <span className="font-mono text-small font-semibold">{row.method}</span>
-                    <span className="block max-w-full truncate font-mono text-tiny text-default-500" title={httpPath(row)}>{httpPath(row)}</span>
-                    {row.remoteAddress && <span className="block truncate text-tiny text-default-400" title={row.remoteAddress}>{row.remoteAddress}</span>}
                   </div>
-                </TableCell>
-                <TableCell>
-                  <Chip color={httpStatusColor(row)} size="sm" variant="flat">
-                    {row.statusCode}
-                  </Chip>
-                </TableCell>
-                <TableCell>
-                  <HttpResponseTypeChip
-                    value={row.responseBodyType}
-                    contentType={row.responseContentType}
-                    bytes={row.responseBytes}
-                  />
-                </TableCell>
-                <TableCell>
-                  <div className="flex min-w-0 flex-col">
-                    <span className="block max-w-full truncate font-medium" title={row.resourceName}>
-                      {row.resourceName}
-                    </span>
-                    <span className="block truncate text-tiny text-default-400" title={row.clientName}>{row.clientName}</span>
-                  </div>
-                </TableCell>
-                <TableCell>
-                  <div className="flex flex-col text-small">
-                    <span>请求 {formatBytes(row.requestBytes)}</span>
-                    <span>响应 {formatBytes(row.responseBytes)}</span>
-                  </div>
-                </TableCell>
-                <TableCell>{formatElapsedMs(row.elapsedMs)}</TableCell>
-                <TableCell>
-                  <Button
-                    isLoading={detailLoadingId === row.id}
-                    size="sm"
-                    variant="flat"
-                    onPress={() => onOpenDetails(row)}
-                  >
-                    详情
-                  </Button>
-                </TableCell>
-              </TableRow>
-            )}
-          </TableBody>
-        </Table>
-        </div>
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <span className="text-small text-default-500">
-            {total === 0 ? "共 0 条" : `第 ${rangeStart}-${rangeEnd} 条，共 ${total} 条`}
-          </span>
-          <Pagination
-            showControls
-            page={page + 1}
-            total={Math.max(1, totalPages)}
-            onChange={(value) => onPageChange(value - 1)}
-          />
-        </div>
-      </CardBody>
-    </Card>
-  );
-}
-
-function HttpSearchFilterHeader({
-  activeSearch,
-  activeSearchField,
-  onResetSearch,
-  onSearch,
-  onSearchDraftChange,
-  onSearchFieldChange,
-  searchDraft,
-  searchField,
-  searchFieldOption,
-}: {
-  activeSearch: string;
-  activeSearchField: HttpTrafficSearchField;
-  onResetSearch: () => void;
-  onSearch: () => void;
-  onSearchDraftChange: (value: string) => void;
-  onSearchFieldChange: (field: HttpTrafficSearchField) => void;
-  searchDraft: string;
-  searchField: HttpTrafficSearchField;
-  searchFieldOption: { label: string; placeholder: string; value: HttpTrafficSearchField };
-}) {
-  const active = Boolean(activeSearch || activeSearchField !== "summary");
-  const label = active ? `请求: ${httpSearchFieldOption(activeSearchField).label}` : "请求";
-  const [popoverOpen, setPopoverOpen] = useState(false);
-
-  return (
-    <TrafficTableFilterHeader label={label} active={active} title="搜索 HTTP 记录">
-      <Popover isOpen={popoverOpen} placement="bottom-start" shouldBlockScroll={false} onOpenChange={setPopoverOpen}>
-        <PopoverTrigger>
-          <Button
-            isIconOnly
-            aria-label="搜索 HTTP 记录"
-            className="h-7 min-w-7 text-default-500"
-            color={active ? "primary" : "default"}
-            size="sm"
-            title="搜索 HTTP 记录"
-            variant={active ? "flat" : "light"}
-          >
-            <TrafficFilterIcon />
-          </Button>
-        </PopoverTrigger>
-        <PopoverContent className="w-80 p-3">
-          <div className="flex w-full flex-col gap-3">
-            <div className="text-small font-semibold">HTTP 记录搜索</div>
-            <label className="flex flex-col gap-1">
-              <span className="text-tiny text-default-500">搜索字段</span>
-              <select
-                className={trafficFilterControlClass}
-                value={searchField}
-                onChange={(event) => onSearchFieldChange(normalizeHttpSearchField(event.target.value))}
-              >
-                {HTTP_SEARCH_FIELDS.map((field) => (
-                  <option key={field.value} value={field.value}>
-                    {field.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <Input
-              label="搜索内容"
-              placeholder={searchFieldOption.placeholder}
-              size="sm"
-              value={searchDraft}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  onSearch();
-                }
-              }}
-              onValueChange={onSearchDraftChange}
-            />
-            <div className="flex justify-end gap-2">
-              <Button className="h-9" size="sm" variant="flat" onPress={() => { onResetSearch(); setPopoverOpen(false); }}>
-                重置
-              </Button>
-              <Button className="h-9" color="primary" size="sm" variant="flat" onPress={() => { onSearch(); setPopoverOpen(false); }}>
-                应用
-              </Button>
-            </div>
-          </div>
-        </PopoverContent>
-      </Popover>
-    </TrafficTableFilterHeader>
-  );
-}
-
-function HttpResponseTypeFilterHeader({
-  activeResponseType,
-  onResetSearch,
-  onResponseTypeChange,
-  onSearch,
-  responseType,
-}: {
-  activeResponseType: "" | HttpResponseBodyType;
-  onResetSearch: () => void;
-  onResponseTypeChange: (type: "" | HttpResponseBodyType) => void;
-  onSearch: () => void;
-  responseType: "" | HttpResponseBodyType;
-}) {
-  const active = Boolean(activeResponseType);
-  const label = active ? `返回: ${httpResponseTypeOption(activeResponseType).label}` : "返回类型";
-  const [popoverOpen, setPopoverOpen] = useState(false);
-
-  return (
-    <TrafficTableFilterHeader label={label} active={active} title="筛选返回类型">
-      <Popover isOpen={popoverOpen} placement="bottom-start" shouldBlockScroll={false} onOpenChange={setPopoverOpen}>
-        <PopoverTrigger>
-          <Button
-            isIconOnly
-            aria-label="筛选返回类型"
-            className="h-7 min-w-7 text-default-500"
-            color={active ? "primary" : "default"}
-            size="sm"
-            title="筛选返回类型"
-            variant={active ? "flat" : "light"}
-          >
-            <TrafficFilterIcon />
-          </Button>
-        </PopoverTrigger>
-        <PopoverContent className="w-64 p-3">
-          <div className="flex w-full flex-col gap-3">
-            <div className="text-small font-semibold">返回类型筛选</div>
-            <label className="flex flex-col gap-1">
-              <span className="text-tiny text-default-500">返回类型</span>
-              <select
-                className={trafficFilterControlClass}
-                value={responseType}
-                onChange={(event) => onResponseTypeChange(normalizeHttpResponseType(event.target.value))}
-              >
-                {HTTP_RESPONSE_BODY_TYPES.map((type) => (
-                  <option key={type.value || "all"} value={type.value}>
-                    {type.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <div className="flex justify-end gap-2">
-              <Button className="h-9" size="sm" variant="flat" onPress={() => { onResetSearch(); setPopoverOpen(false); }}>
-                重置
-              </Button>
-              <Button className="h-9" color="primary" size="sm" variant="flat" onPress={() => { onSearch(); setPopoverOpen(false); }}>
-                应用
-              </Button>
-            </div>
-          </div>
-        </PopoverContent>
-      </Popover>
-    </TrafficTableFilterHeader>
-  );
-}
-
-function TrafficTableFilterHeader({
-  active,
-  children,
-  label,
-  title,
-}: {
-  active: boolean;
-  children: ReactNode;
-  label: string;
-  title: string;
-}) {
-  return (
-    <div className="flex min-w-0 items-center gap-1">
-      <span className="truncate" title={label}>
-        {label}
-      </span>
-      <span className="relative z-10" title={title}>{children}</span>
-      {active ? <span className="h-1.5 w-1.5 rounded-full bg-primary" aria-hidden /> : null}
-    </div>
-  );
-}
-
-function TrafficFilterIcon() {
-  return (
-    <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" viewBox="0 0 24 24">
-      <path d="M4 5h16l-6 7v5l-4 2v-7L4 5z" />
-    </svg>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </TableWrap>
+      <Pagination
+        page={page}
+        totalPages={Math.max(1, totalPages)}
+        total={rangeText(page, pageSize, total)}
+        onChange={onPageChange}
+        label="HTTP 协议记录分页"
+      />
+    </Section>
   );
 }
 
@@ -1306,13 +952,9 @@ function HttpResponseTypeChip({
   value: string | null | undefined;
 }) {
   return (
-    <Chip
-      className={httpResponseTypeChipClass(value, contentType, bytes)}
-      size="sm"
-      variant="flat"
-    >
+    <TypeTag color={httpResponseTypeColor(value, contentType, bytes)}>
       {httpResponseTypeLabel(value, contentType, bytes)}
-    </Chip>
+    </TypeTag>
   );
 }
 
@@ -1328,47 +970,38 @@ function HttpExchangeModal({ row, onClose }: { row: HttpTrafficExchange | null; 
   return (
     <>
       <Modal classNames={TRAFFIC_MODAL_CLASS_NAMES} isOpen={Boolean(row)} onClose={onClose} size="5xl" scrollBehavior="inside">
-        <ModalContent className="max-w-[min(96vw,1180px)] overflow-hidden">
+        <ModalContent className="ops-dialog max-w-[min(96vw,1180px)] overflow-hidden">
           {row && (
             <>
-              <ModalHeader className="flex min-w-0 flex-col gap-2 pr-12">
-                <div className="grid min-w-0 grid-cols-[auto_auto_minmax(0,1fr)] items-start gap-2">
-                  <Chip className="mt-0.5" color="primary" size="sm" variant="flat">
-                    {row.method}
-                  </Chip>
-                  <Chip className="mt-0.5" color={httpStatusColor(row)} size="sm" variant="flat">
-                    {row.statusCode}
-                  </Chip>
-                  <span
-                    className="max-h-16 min-w-0 overflow-y-auto break-all pr-1 font-mono text-small"
-                    title={httpPath(row)}
-                  >
-                    {httpPath(row)}
-                  </span>
-                </div>
-                <div className="flex flex-wrap gap-x-4 gap-y-1 text-tiny font-normal text-default-500">
-                  <span>{formatDateTime(row.capturedAt)}</span>
-                  <span>{row.clientName}</span>
-                  <span>{row.route}</span>
-                  {row.remoteAddress && <span>{row.remoteAddress}</span>}
+              <ModalHeader className="pr-12">
+                <div className="ops-detail-head">
+                  <div className="ops-detail-title">
+                    <Tag tone="info" plain>{row.method}</Tag>
+                    <Tag tone={httpStatusTone(row)}>{row.statusCode}</Tag>
+                    <span className="ops-mono min-w-0" title={httpPath(row)}>{httpPath(row)}</span>
+                  </div>
+                  <div className="ops-detail-meta">
+                    <RelativeTime value={row.capturedAt} />
+                    <span>{row.clientName}</span>
+                    <span>{row.route}</span>
+                    {row.remoteAddress && <span className="bd-num">{row.remoteAddress}</span>}
+                  </div>
                 </div>
               </ModalHeader>
               <ModalBody className="gap-3 overflow-y-auto">
-                <div className="grid grid-cols-2 gap-2 lg:grid-cols-5">
-                  <HttpSummaryTile label="请求大小" value={formatBytes(row.requestBytes)} />
-                  <HttpSummaryTile label="响应大小" value={formatBytes(row.responseBytes)} />
-                  <HttpSummaryTile
-                    label="返回类型"
-                    value={httpResponseTypeLabel(row.responseBodyType, row.responseContentType, row.responseBytes)}
-                  />
-                  <HttpSummaryTile label="耗时" value={formatElapsedMs(row.elapsedMs)} />
-                  <HttpSummaryTile label="资源" value={row.resourceName} wrapValue />
-                </div>
+                <SummaryList
+                  cols={5}
+                  items={[
+                    { label: "请求大小", value: formatBytes(row.requestBytes) },
+                    { label: "响应大小", value: formatBytes(row.responseBytes) },
+                    { label: "返回类型", value: httpResponseTypeLabel(row.responseBodyType, row.responseContentType, row.responseBytes) },
+                    { label: "耗时", value: formatElapsedMs(row.elapsedMs) },
+                    { label: "资源", value: row.resourceName, wrap: true },
+                  ]}
+                />
 
                 {row.error && (
-                  <div className="rounded-small border border-danger-200 bg-danger-50 p-3 text-small text-danger">
-                    {row.error}
-                  </div>
+                  <Alert tone="danger" role="alert" title="请求出错">{row.error}</Alert>
                 )}
 
                 <div className="grid items-stretch gap-3 xl:grid-cols-2">
@@ -1416,15 +1049,25 @@ function HttpExchangeModal({ row, onClose }: { row: HttpTrafficExchange | null; 
   );
 }
 
-function HttpSummaryTile({ label, value, wrapValue = false }: { label: string; value: string; wrapValue?: boolean }) {
+/** A row of labelled values in hairline cells (the record's summary in the detail dialogs). */
+function SummaryList({ items, cols }: {
+  items: Array<{ label: string; value: string; wrap?: boolean }>;
+  cols: number;
+}) {
   return (
-    <div className="min-w-0 rounded-small border border-default-200 bg-default-50 p-2">
-      <div className="text-tiny text-default-500">{label}</div>
-      <div className={`mt-1 text-small font-semibold ${wrapValue ? "break-all leading-relaxed" : "truncate"}`} title={value}>
-        {value}
-      </div>
-    </div>
+    <dl className="ops-desc" style={{ "--cols": cols } as CSSProperties}>
+      {items.map((item) => (
+        <div key={item.label}>
+          <dt>{item.label}</dt>
+          <dd className={item.wrap ? "ops-wrap" : undefined} title={item.value}>{item.value}</dd>
+        </div>
+      ))}
+    </dl>
   );
+}
+
+function decodeTone(status: HttpBodyDecodeStatus): "warning" | "info" {
+  return status === "failed" || status === "unsupported" ? "warning" : "info";
 }
 
 function HttpMessagePanel({
@@ -1461,47 +1104,37 @@ function HttpMessagePanel({
   const previewKind = detectBodyPreviewKind(contentType, bodyDisplay.content);
 
   return (
-    <div className="grid h-full min-h-[min(68dvh,44rem)] min-w-0 grid-rows-[4.75rem_17rem_minmax(14rem,1fr)] gap-3 overflow-hidden rounded-small border border-default-200 p-3">
+    <div className="ops-message">
       <div className="flex min-h-0 items-start justify-between gap-3 overflow-hidden">
         <div className="min-w-0">
-          <h4 className="text-small font-semibold">{title}</h4>
-          <div className="mt-1 flex min-w-0 flex-col gap-1 text-tiny text-default-500">
+          <h4>{title}</h4>
+          <div className="ops-message-meta">
             {meta.filter(Boolean).map((item) => (
-              <span key={item ?? ""} className="block max-w-full truncate" title={item ?? ""}>
+              <span key={item ?? ""} title={item ?? ""}>
                 {item}
               </span>
             ))}
           </div>
         </div>
-        <Chip className="shrink-0" size="sm" variant="flat">
-          {formatBytes(bytes)}
-        </Chip>
+        <Tag plain className="bd-num shrink-0">{formatBytes(bytes)}</Tag>
       </div>
       <HeaderBlock content={headers} />
       <div className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)] gap-2">
-        {bodyDisplay.message && (
-          <div
-            className={`max-h-20 overflow-y-auto rounded-small border p-2 text-tiny ${
-              bodyDisplay.status === "failed" || bodyDisplay.status === "unsupported"
-                ? "border-warning-200 bg-warning-50 text-warning-700"
-                : "border-primary-100 bg-primary-50 text-primary-700"
-            }`}
-          >
+        {bodyDisplay.message ? (
+          <Alert tone={decodeTone(bodyDisplay.status)} className="max-h-24 overflow-y-auto text-[12px] leading-[18px]">
             {bodyDisplay.message}
-          </div>
-        )}
+          </Alert>
+        ) : <span />}
         <ProtocolBlock
           title={truncated ? "Body Preview / truncated" : "Body"}
           content={bodyDisplay.content}
           className="min-h-0 grid-rows-[auto_minmax(0,1fr)]"
           maxHeightClass={bodyMaxHeightClass}
-          contentClassName="min-h-0"
+          contentClassName="min-h-[12rem]"
           action={
             <div className="flex flex-wrap items-center justify-end gap-2">
               {contentEncoding && (
-                <Chip color="secondary" size="sm" variant="flat">
-                  Content-Encoding {contentEncoding}
-                </Chip>
+                <Tag plain>Content-Encoding {contentEncoding}</Tag>
               )}
               <Button
                 isDisabled={!hasBody || bodyDisplay.status === "pending"}
@@ -1538,45 +1171,31 @@ function BodyPreviewModal({ target, onClose }: { target: BodyPreviewTarget | nul
 
   return (
     <Modal classNames={TRAFFIC_MODAL_CLASS_NAMES} isOpen={Boolean(target)} onClose={onClose} size="5xl" scrollBehavior="inside">
-      <ModalContent className="max-w-[min(96vw,1180px)]">
+      <ModalContent className="ops-dialog max-w-[min(96vw,1180px)]">
         {target && (
           <>
-            <ModalHeader className="flex flex-col gap-2">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="font-semibold">{target.title}</span>
-                <Chip color="primary" size="sm" variant="flat">
-                  {label}
-                </Chip>
-                <Chip size="sm" variant="flat">
-                  {formatBytes(target.bytes)}
-                </Chip>
-                {target.contentEncoding && (
-                  <Chip color="secondary" size="sm" variant="flat">
-                    Content-Encoding {target.contentEncoding}
-                  </Chip>
+            <ModalHeader className="pr-12">
+              <div className="ops-detail-head">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span>{target.title}</span>
+                  <Tag tone="info" plain>{label}</Tag>
+                  <Tag plain className="bd-num">{formatBytes(target.bytes)}</Tag>
+                  {target.contentEncoding && (
+                    <Tag plain>Content-Encoding {target.contentEncoding}</Tag>
+                  )}
+                  {target.truncated && (
+                    <Tag tone="warning">已截断</Tag>
+                  )}
+                </div>
+                {target.contentType && (
+                  <span className="ops-mono ops-detail-meta">{target.contentType}</span>
                 )}
-                {target.truncated && (
-                  <Chip color="warning" size="sm" variant="flat">
-                    已截断
-                  </Chip>
+                {target.decodeMessage && (
+                  <Alert tone={decodeTone(target.decodeStatus)} className="text-[12px] font-normal leading-[18px]">
+                    {target.decodeMessage}
+                  </Alert>
                 )}
               </div>
-              {target.contentType && (
-                <span className="break-all font-mono text-tiny font-normal text-default-500">
-                  {target.contentType}
-                </span>
-              )}
-              {target.decodeMessage && (
-                <div
-                  className={`rounded-small border p-2 text-tiny font-normal ${
-                    target.decodeStatus === "failed" || target.decodeStatus === "unsupported"
-                      ? "border-warning-200 bg-warning-50 text-warning-700"
-                      : "border-primary-100 bg-primary-50 text-primary-700"
-                  }`}
-                >
-                  {target.decodeMessage}
-                </div>
-              )}
             </ModalHeader>
             <ModalBody className="overflow-y-auto">
               <BodyPreviewContent kind={kind} content={content} contentType={target.contentType} />
@@ -1905,9 +1524,7 @@ function JsonBodyPreview({ content }: { content: string }) {
   if (!parsed.ok) {
     return (
       <div className="grid gap-3">
-        <Chip color="warning" size="sm" variant="flat">
-          JSON 解析失败
-        </Chip>
+        <div><Tag tone="warning">JSON 解析失败</Tag></div>
         <TextPreview content={content} maxHeightClass="max-h-[52dvh]" />
       </div>
     );
@@ -1915,12 +1532,15 @@ function JsonBodyPreview({ content }: { content: string }) {
 
   return (
     <div className="grid gap-3">
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <HttpSummaryTile label="类型" value={jsonRootType(parsed.value)} />
-        <HttpSummaryTile label="节点" value={String(countJsonNodes(parsed.value))} />
-        <HttpSummaryTile label="字符" value={String(content.length)} />
-        <HttpSummaryTile label="格式" value="JSON" />
-      </div>
+      <SummaryList
+        cols={4}
+        items={[
+          { label: "类型", value: jsonRootType(parsed.value) },
+          { label: "节点", value: String(countJsonNodes(parsed.value)) },
+          { label: "字符", value: String(content.length) },
+          { label: "格式", value: "JSON" },
+        ]}
+      />
       <JsonHighlightedPreview content={JSON.stringify(parsed.value, null, 2)} maxHeightClass="max-h-[52dvh]" />
     </div>
   );
@@ -1953,19 +1573,11 @@ function MultipartBodyPreview({ content, contentType }: { content: string; conte
   return (
     <div className="grid gap-3">
       {parts.map((part) => (
-        <div key={part.id} className="grid gap-2 rounded-small border border-default-200 p-3">
+        <div key={part.id} className="ops-header-item">
           <div className="flex flex-wrap items-center gap-2">
-            <Chip color="primary" size="sm" variant="flat">
-              {part.name || `part ${part.id}`}
-            </Chip>
-            {part.filename && (
-              <Chip size="sm" variant="flat">
-                {part.filename}
-              </Chip>
-            )}
-            {part.contentType && (
-              <span className="break-all font-mono text-tiny text-default-500">{part.contentType}</span>
-            )}
+            <Tag tone="info" plain>{part.name || `part ${part.id}`}</Tag>
+            {part.filename && <Tag plain>{part.filename}</Tag>}
+            {part.contentType && <span className="ops-mono ops-subtle [overflow-wrap:anywhere]">{part.contentType}</span>}
           </div>
           <TextPreview content={part.value} maxHeightClass="max-h-64" />
         </div>
@@ -1976,18 +1588,17 @@ function MultipartBodyPreview({ content, contentType }: { content: string; conte
 
 function HtmlBodyPreview({ content }: { content: string }) {
   return (
-    <Tabs aria-label="HTML body preview" destroyInactiveTabPanel={false} variant="underlined">
+    <HeroTabs aria-label="HTML body preview" destroyInactiveTabPanel={false} size="sm">
       <Tab key="rendered" title="渲染">
-        <div className="mt-3 overflow-hidden rounded-small border border-default-200 bg-white">
-          <iframe className="h-[52dvh] w-full bg-white" sandbox="" srcDoc={content} title="HTML body preview" />
+        {/* The captured page renders on a white canvas, as a browser would show it. */}
+        <div className="ops-html-frame">
+          <iframe className="h-[52dvh] w-full" sandbox="" srcDoc={content} title="HTML body preview" />
         </div>
       </Tab>
       <Tab key="source" title="源码">
-        <div className="mt-3">
-          <TextPreview content={content} maxHeightClass="max-h-[52dvh]" />
-        </div>
+        <TextPreview content={content} maxHeightClass="max-h-[52dvh]" />
       </Tab>
-    </Tabs>
+    </HeroTabs>
   );
 }
 
@@ -2000,7 +1611,7 @@ function ImageBodyPreview({ content, contentType }: { content: string; contentTy
   const imageDataUrl = resolveHttpImageDataUrl(trimmed, contentType);
   if (imageDataUrl) {
     return (
-      <div className="flex min-h-52 items-center justify-center rounded-small border border-default-200 bg-default-50 p-3">
+      <div className="ops-image-stage">
         <img alt="HTTP body preview" className="max-h-[52dvh] max-w-full object-contain" src={imageDataUrl} />
       </div>
     );
@@ -2010,9 +1621,7 @@ function ImageBodyPreview({ content, contentType }: { content: string; contentTy
   }
   return (
     <div className="grid gap-3">
-      <Chip color="warning" size="sm" variant="flat">
-        图片二进制无法直接渲染
-      </Chip>
+      <div><Tag tone="warning">图片二进制无法直接渲染</Tag></div>
       <TextPreview content={content} maxHeightClass="max-h-[52dvh]" />
     </div>
   );
@@ -2024,32 +1633,32 @@ function KeyValuePreviewTable({
   rows: Array<{ id: string; name: string; meta: string; value: string }>;
 }) {
   return (
-    <div className="max-h-[52dvh] overflow-auto rounded-small border border-default-200">
-      <table className="w-full min-w-[680px] border-collapse text-left text-small">
-        <thead className="sticky top-0 bg-default-100 text-tiny uppercase text-default-500">
+    <TableWrap className="max-h-[52dvh]">
+      <table className="ops-kv">
+        <thead>
           <tr>
-            <th className="w-56 border-b border-default-200 px-3 py-2 font-semibold">Name</th>
-            <th className="w-52 border-b border-default-200 px-3 py-2 font-semibold">Meta</th>
-            <th className="border-b border-default-200 px-3 py-2 font-semibold">Value</th>
+            <th className="w-56">Name</th>
+            <th className="w-52">Meta</th>
+            <th>Value</th>
           </tr>
         </thead>
         <tbody>
           {rows.map((row) => (
-            <tr key={row.id} className="border-b border-default-100 last:border-b-0">
-              <td className="break-all px-3 py-2 font-mono text-tiny">{row.name || "-"}</td>
-              <td className="break-all px-3 py-2 font-mono text-tiny text-default-500">{row.meta || "-"}</td>
-              <td className="whitespace-pre-wrap break-all px-3 py-2 font-mono text-tiny">{row.value || "-"}</td>
+            <tr key={row.id}>
+              <td>{row.name || "—"}</td>
+              <td className="ops-subtle">{row.meta || "—"}</td>
+              <td className="whitespace-pre-wrap">{row.value || "—"}</td>
             </tr>
           ))}
         </tbody>
       </table>
-    </div>
+    </TableWrap>
   );
 }
 
 function TextPreview({ content, maxHeightClass }: { content: string; maxHeightClass: string }) {
   return (
-    <pre className={`${maxHeightClass} overflow-auto whitespace-pre-wrap break-all rounded-small bg-background p-3 font-mono text-tiny`}>
+    <pre className={`ops-pre ${maxHeightClass}`}>
       {content.length === 0 ? "-" : content}
     </pre>
   );
@@ -2057,9 +1666,7 @@ function TextPreview({ content, maxHeightClass }: { content: string; maxHeightCl
 
 function JsonHighlightedPreview({ content, maxHeightClass }: { content: string; maxHeightClass: string }) {
   return (
-    <pre
-      className={`${maxHeightClass} overflow-auto rounded-small border border-default-200 bg-default-50 p-3 font-mono text-tiny`}
-    >
+    <pre className={`ops-pre ops-pre--code ${maxHeightClass}`}>
       <code className="block min-w-max">{highlightJson(content)}</code>
     </pre>
   );
@@ -2090,46 +1697,31 @@ function highlightJson(content: string): ReactNode[] {
   return nodes;
 }
 
+// JSON tokens wear the text-safe status tokens of the design, so they hold contrast in both themes.
 function jsonTokenNode(token: string, index: number): ReactNode {
   if (token.startsWith("\"") && token.trimEnd().endsWith(":")) {
-    return (
-      <span key={index} className="font-semibold text-primary">
-        {token}
-      </span>
-    );
+    return <span key={index} className="ops-json-key">{token}</span>;
   }
   if (token.startsWith("\"")) {
-    return (
-      <span key={index} className="text-success-600">
-        {token}
-      </span>
-    );
+    return <span key={index} className="ops-json-string">{token}</span>;
   }
   if (/^-?\d/.test(token)) {
-    return (
-      <span key={index} className="text-warning-600">
-        {token}
-      </span>
-    );
+    return <span key={index} className="ops-json-number">{token}</span>;
   }
   if (token === "true" || token === "false") {
-    return (
-      <span key={index} className="text-secondary-600">
-        {token}
-      </span>
-    );
+    return <span key={index} className="ops-json-bool">{token}</span>;
   }
   if (token === "null") {
-    return (
-      <span key={index} className="italic text-default-400">
-        {token}
-      </span>
-    );
+    return <span key={index} className="ops-json-null">{token}</span>;
   }
+  return <span key={index} className="ops-json-punct">{token}</span>;
+}
+
+function DirectionTag({ direction }: { direction: string }) {
   return (
-    <span key={index} className="text-default-500">
-      {token}
-    </span>
+    <TypeTag color={direction === "PUBLIC_TO_CLIENT" ? 1 : 3}>
+      {directionLabel(direction)}
+    </TypeTag>
   );
 }
 
@@ -2158,8 +1750,6 @@ function TcpFrameTable({
   onOpenDetails: (row: TcpTrafficFrame) => void;
   onOpenStream: (row: TcpTrafficFrame) => void;
 }) {
-  const rangeStart = total === 0 ? 0 : page * pageSize + 1;
-  const rangeEnd = Math.min(total, (page + 1) * pageSize);
   const tableScopeKey = useMemo(() => `${page}:${pageSize}`, [page, pageSize]);
   const tableRows = useMemo(
     () =>
@@ -2171,218 +1761,90 @@ function TcpFrameTable({
   );
 
   return (
-    <Card shadow="none" className="rounded-md border border-default-200">
-      <CardBody className="gap-3 p-3">
-        <div>
-          <h3 className="text-small font-semibold">TCP 数据帧</h3>
-          <p className="text-tiny text-default-500">按公网连接 channelId 展示双向 payload 预览</p>
-        </div>
-
-        {/* mobile: 卡片 */}
-        <div className="lg:hidden">
-          <MobileListCardList
-            items={tableRows}
-            isLoading={loading}
-            emptyContent="暂无 TCP 数据帧"
-            renderCard={(raw) => {
-              const row = raw as (typeof tableRows)[number];
-              return (
-                <MobileListCard
-                  key={row.tableKey}
-                  title={
-                    <div className="flex items-baseline gap-2">
-                      <span>{formatDateTime(row.frameTime)}</span>
-                      <span className="text-tiny font-normal text-default-400">#{row.frameIndex ?? 0}</span>
-                    </div>
-                  }
-                  subtitle={
-                    <div className="flex flex-col gap-0.5 break-all">
-                      <span>{row.clientName} · :{row.listenPort}</span>
-                      <span className="text-tiny text-default-400" title={row.resourceName}>{row.resourceName}</span>
-                    </div>
-                  }
-                  badges={
-                    <Chip
-                      color={row.direction === "PUBLIC_TO_CLIENT" ? "primary" : "secondary"}
-                      size="sm"
-                      variant="flat"
-                    >
-                      {directionLabel(row.direction)}
-                    </Chip>
-                  }
-                  fields={[
-                    {
-                      label: "连接",
-                      value: (
-                        <div className="flex flex-col gap-0.5 break-all font-mono text-tiny">
-                          <span>{shortChannel(row.channelId)}</span>
-                          <span className="text-default-500">{tcpFlowLabel(row)}</span>
-                          {row.remoteAddress ? <span className="text-default-400">peer {row.remoteAddress}</span> : null}
-                        </div>
-                      ),
-                    },
-                    {
-                      label: "流位置",
-                      value: <span className="font-mono text-tiny">{tcpStreamRange(row)}</span>,
-                    },
-                    {
-                      label: "长度",
-                      value: (
-                        <span>
-                          {formatBytes(row.payloadBytes)}
-                          {row.truncated && !row.payloadBase64 ? <span className="ml-1 text-tiny text-warning">仅预览</span> : null}
-                        </span>
-                      ),
-                    },
-                  ]}
-                  extra={
-                    <details className="rounded-small border border-default-200 bg-default-50">
-                      <summary className="cursor-pointer px-2 py-1 text-tiny text-default-500">展开 ASCII / HEX</summary>
-                      <div className="flex flex-col gap-2 p-2">
-                        <div>
-                          <div className="text-tiny text-default-500">ASCII / 文本</div>
-                          <pre className="max-h-36 overflow-auto whitespace-pre-wrap break-all rounded-small bg-content1 p-2 font-mono text-tiny">
-                            {row.payloadPreviewText || "-"}
-                          </pre>
-                        </div>
-                        <div>
-                          <div className="text-tiny text-default-500">HEX</div>
-                          <pre className="max-h-36 overflow-auto whitespace-pre-wrap break-all rounded-small bg-content1 p-2 font-mono text-tiny">
-                            {row.payloadPreviewHex || "-"}
-                          </pre>
-                        </div>
-                      </div>
-                    </details>
-                  }
-                  actions={
-                    <>
-                      <Button
-                        isLoading={detailLoadingId === row.id}
-                        size="sm"
-                        variant="flat"
-                        onPress={() => onOpenDetails(row)}
-                      >
-                        详情
-                      </Button>
-                      <Button
-                        isLoading={streamLoadingChannel === row.channelId}
-                        size="sm"
-                        variant="flat"
-                        onPress={() => onOpenStream(row)}
-                      >
-                        串流
-                      </Button>
-                    </>
-                  }
-                />
-              );
-            }}
-          />
-        </div>
-
-        {/* desktop: 表格 */}
-        <div className="hidden min-w-0 overflow-x-auto lg:block">
-        <Table aria-label="TCP 数据帧" isHeaderSticky removeWrapper>
-          <TableHeader>
-            <TableColumn>时间</TableColumn>
-            <TableColumn>方向</TableColumn>
-            <TableColumn>端口</TableColumn>
-            <TableColumn>连接</TableColumn>
-            <TableColumn>流位置</TableColumn>
-            <TableColumn>长度</TableColumn>
-            <TableColumn>ASCII / 文本</TableColumn>
-            <TableColumn>HEX</TableColumn>
-            <TableColumn>解析</TableColumn>
-          </TableHeader>
-          <TableBody items={tableRows} isLoading={loading} emptyContent="暂无 TCP 数据帧">
-            {(row) => (
-              <TableRow key={row.tableKey}>
-                <TableCell>{formatDateTime(row.frameTime)}</TableCell>
-                <TableCell>
-                  <Chip
-                    color={row.direction === "PUBLIC_TO_CLIENT" ? "primary" : "secondary"}
-                    size="sm"
-                    variant="flat"
-                  >
-                    {directionLabel(row.direction)}
-                  </Chip>
-                </TableCell>
-                <TableCell>
-                  <div className="flex min-w-0 flex-col">
-                    <span className="font-semibold">{row.listenPort}</span>
-                    <span className="max-w-64 whitespace-normal break-all text-tiny text-default-400" title={row.resourceName}>
-                      {row.resourceName}
+    <Section title="TCP 数据帧" description="按公网连接 channelId 展示双向 payload 预览" actions={<span className="ops-count ops-subtle">共 {total} 条</span>}>
+      <TableWrap className={`ops-table-wrap${loading && tableRows.length > 0 ? " bd-refetching" : ""}`}>
+        <table className="bd-table jd-stack ops-frames" aria-label="TCP 数据帧">
+          <thead>
+            <tr>
+              <th>连接</th>
+              <th>时间</th>
+              <th>方向</th>
+              <th>端口</th>
+              <th>流位置</th>
+              <th className="bd-col-num">长度</th>
+              <th>ASCII / 文本 · HEX</th>
+              <th className="jd-col-actions"><span className="jd-sr-only">解析</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading && tableRows.length === 0 ? <TableLoadingRow colSpan={8} /> : null}
+            {!loading && tableRows.length === 0 ? (
+              <TableEmptyRow colSpan={8}>
+                <Empty icon="shuffle" title="暂无 TCP 数据帧" description="端口映射开启明细采集后，双向数据帧会记在这里。" />
+              </TableEmptyRow>
+            ) : null}
+            {tableRows.map((row) => (
+              <tr key={row.tableKey}>
+                <td>
+                  <div className="jd-table-title">
+                    <span className="ops-mono jd-strong" title={row.channelId}>{shortChannel(row.channelId)}</span>
+                    <span className="jd-table-sub bd-num" title={tcpFlowLabel(row)}>{tcpFlowLabel(row)}</span>
+                    <span className="jd-table-sub">
+                      {[row.remoteAddress ? `peer ${row.remoteAddress}` : null, row.clientName].filter(Boolean).join(" · ")}
                     </span>
                   </div>
-                </TableCell>
-                <TableCell>
-                  <div className="flex min-w-0 flex-col">
-                    <span className="max-w-48 truncate font-mono text-tiny">{shortChannel(row.channelId)}</span>
-                    <span className="max-w-72 whitespace-normal break-all text-tiny text-default-500" title={tcpFlowLabel(row)}>
-                      {tcpFlowLabel(row)}
-                    </span>
-                    {row.remoteAddress && <span className="max-w-48 truncate text-tiny text-default-400">peer {row.remoteAddress}</span>}
-                    <span className="text-tiny text-default-400">{row.clientName}</span>
-                  </div>
-                </TableCell>
-                <TableCell>
-                  <div className="flex min-w-0 flex-col font-mono text-tiny">
-                    <span>#{row.frameIndex ?? 0}</span>
-                    <span className="text-default-400">{tcpStreamRange(row)}</span>
-                  </div>
-                </TableCell>
-                <TableCell>
-                  {formatBytes(row.payloadBytes)}
-                  {row.truncated && !row.payloadBase64 && <span className="ml-1 text-tiny text-warning">仅预览</span>}
-                </TableCell>
-                <TableCell>
-                  <pre className="max-h-24 max-w-80 overflow-auto whitespace-pre-wrap break-all rounded-small bg-default-50 p-2 font-mono text-tiny">
-                    {row.payloadPreviewText || "-"}
-                  </pre>
-                </TableCell>
-                <TableCell>
-                  <pre className="max-h-24 max-w-96 overflow-auto whitespace-pre-wrap break-all rounded-small bg-default-50 p-2 font-mono text-tiny">
-                    {row.payloadPreviewHex || "-"}
-                  </pre>
-                </TableCell>
-                <TableCell>
-                  <div className="flex flex-wrap gap-2">
+                </td>
+                <td data-label="时间"><RelativeTime value={row.frameTime} /></td>
+                <td data-label="方向"><DirectionTag direction={row.direction} /></td>
+                <td data-label="端口">
+                  <span className="bd-num jd-strong" title={row.resourceName}>{row.listenPort}</span>
+                </td>
+                <td data-label="流位置">
+                  <span className="ops-mono">#{row.frameIndex ?? 0} · {tcpStreamRange(row)}</span>
+                </td>
+                <td className="bd-col-num" data-label="长度">
+                  <span className="ops-cell-stack">
+                    <span>{formatBytes(row.payloadBytes)}</span>
+                    {row.truncated && !row.payloadBase64 && <span><Tag tone="warning">仅预览</Tag></span>}
+                  </span>
+                </td>
+                <td className="jd-cell-full ops-payload-cell">
+                  <pre className="ops-payload" title="ASCII / 文本">{row.payloadPreviewText || "-"}</pre>
+                  <pre className="ops-payload ops-payload--hex" title="HEX">{row.payloadPreviewHex || "-"}</pre>
+                </td>
+                <td className="jd-cell-actions">
+                  <div className="jd-row-actions ops-row-actions--column">
                     <Button
                       isLoading={detailLoadingId === row.id}
                       size="sm"
                       variant="flat"
                       onPress={() => onOpenDetails(row)}
                     >
-                      详情
+                      查看详情
                     </Button>
                     <Button
                       isLoading={streamLoadingChannel === row.channelId}
                       size="sm"
-                      variant="flat"
+                      variant="light"
                       onPress={() => onOpenStream(row)}
                     >
-                      串流
+                      查看串流
                     </Button>
                   </div>
-                </TableCell>
-              </TableRow>
-            )}
-          </TableBody>
-        </Table>
-        </div>
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <span className="text-small text-default-500">
-            {total === 0 ? "共 0 条" : `第 ${rangeStart}-${rangeEnd} 条，共 ${total} 条`}
-          </span>
-          <Pagination
-            showControls
-            page={page + 1}
-            total={Math.max(1, totalPages)}
-            onChange={(value) => onPageChange(value - 1)}
-          />
-        </div>
-      </CardBody>
-    </Card>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </TableWrap>
+      <Pagination
+        page={page}
+        totalPages={Math.max(1, totalPages)}
+        total={rangeText(page, pageSize, total)}
+        onChange={onPageChange}
+        label="TCP 数据帧分页"
+      />
+    </Section>
   );
 }
 
@@ -2391,39 +1853,42 @@ function TcpFrameModal({ row, onClose }: { row: TcpTrafficFrame | null; onClose:
 
   return (
     <Modal classNames={TRAFFIC_MODAL_CLASS_NAMES} isOpen={row != null} size="5xl" scrollBehavior="inside" onOpenChange={(open) => !open && onClose()}>
-      <ModalContent className="max-w-[min(96vw,1180px)]">
+      <ModalContent className="ops-dialog max-w-[min(96vw,1180px)]">
         {(close) =>
           row && analysis ? (
             <>
-              <ModalHeader className="flex flex-col gap-2">
-                <div className="flex flex-wrap items-center gap-2">
-                  <Chip color={row.direction === "PUBLIC_TO_CLIENT" ? "primary" : "secondary"} size="sm" variant="flat">
-                    {directionLabel(row.direction)}
-                  </Chip>
-                  <span className="font-semibold">TCP 数据帧 #{row.id}</span>
-                </div>
-                <div className="flex flex-wrap gap-4 text-small font-normal text-default-500">
-                  <span>{formatDateTime(row.frameTime)}</span>
-                  <span>{row.listenPort}</span>
-                  <span>{row.clientName}</span>
-                  <span>{tcpFlowLabel(row)}</span>
+              <ModalHeader className="pr-12">
+                <div className="ops-detail-head">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <DirectionTag direction={row.direction} />
+                    <span>TCP 数据帧 #{row.id}</span>
+                  </div>
+                  <div className="ops-detail-meta">
+                    <span>{formatAbsoluteTime(row.frameTime)}</span>
+                    <span className="bd-num">{row.listenPort}</span>
+                    <span>{row.clientName}</span>
+                    <span className="bd-num">{tcpFlowLabel(row)}</span>
+                  </div>
                 </div>
               </ModalHeader>
               <ModalBody className="gap-3 overflow-y-auto">
-                <div className="grid gap-2 md:grid-cols-4 xl:grid-cols-6">
-                  <HttpSummaryTile label="长度" value={formatBytes(row.payloadBytes)} />
-                  <HttpSummaryTile label="解析类型" value={tcpPayloadKindLabel(analysis.kind)} />
-                  <HttpSummaryTile label="资源" value={row.resourceName || "-"} />
-                  <HttpSummaryTile label="Channel" value={shortChannel(row.channelId)} />
-                  <HttpSummaryTile label="Frame" value={`#${row.frameIndex ?? 0}`} />
-                  <HttpSummaryTile label="Offset" value={tcpStreamRange(row)} />
-                </div>
+                <SummaryList
+                  cols={6}
+                  items={[
+                    { label: "长度", value: formatBytes(row.payloadBytes) },
+                    { label: "解析类型", value: tcpPayloadKindLabel(analysis.kind) },
+                    { label: "资源", value: row.resourceName || "—" },
+                    { label: "Channel", value: shortChannel(row.channelId) },
+                    { label: "Frame", value: `#${row.frameIndex ?? 0}` },
+                    { label: "Offset", value: tcpStreamRange(row) },
+                  ]}
+                />
                 {!analysis.fullAvailable && (
-                  <div className="rounded-small border border-warning-200 bg-warning-50 px-3 py-2 text-small text-warning-700">
+                  <Alert tone="warning" role="status">
                     这条历史记录没有完整二进制字段，只能展示旧版保存的 payload 预览。
-                  </div>
+                  </Alert>
                 )}
-                <Tabs aria-label="TCP payload 预览" destroyInactiveTabPanel={false} variant="underlined">
+                <HeroTabs aria-label="TCP payload 预览" destroyInactiveTabPanel={false} size="sm">
                   <Tab key="parsed" title="解析">
                     <TcpParsedPayload analysis={analysis} />
                   </Tab>
@@ -2433,7 +1898,7 @@ function TcpFrameModal({ row, onClose }: { row: TcpTrafficFrame | null; onClose:
                   <Tab key="hex" title="Hexdump">
                     <TextPreview content={analysis.hexDump || row.payloadPreviewHex || ""} maxHeightClass="max-h-[52dvh]" />
                   </Tab>
-                </Tabs>
+                </HeroTabs>
               </ModalBody>
               <ModalFooter>
                 <Button variant="flat" onPress={close}>
@@ -2481,41 +1946,42 @@ function TcpStreamModal({
 
   return (
     <Modal classNames={TRAFFIC_MODAL_CLASS_NAMES} isOpen={stream != null} size="5xl" scrollBehavior="inside" onOpenChange={(open) => !open && onClose()}>
-      <ModalContent className="max-w-[min(96vw,1180px)]">
+      <ModalContent className="ops-dialog max-w-[min(96vw,1180px)]">
         {(close) =>
           stream ? (
             <>
-              <ModalHeader className="flex flex-col gap-2">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-semibold">TCP 数据流</span>
-                  <Chip color="primary" size="sm" variant="flat">
-                    {shortChannel(stream.channelId)}
-                  </Chip>
-                  {stream.truncated && (
-                    <Chip color="warning" size="sm" variant="flat">
-                      后续分页可用
-                    </Chip>
-                  )}
-                </div>
-                <div className="flex flex-wrap gap-x-4 gap-y-1 text-small font-normal text-default-500">
-                  <span>
-                    第 {stream.page + 1} / {Math.max(1, stream.totalPages)} 页
-                  </span>
-                  <span>
-                    {stream.total} 帧中的 {frames.length} 帧
-                  </span>
-                  <span>{formatBytes(totalBytes)}</span>
-                  {frames[0] && <span>{frames[0].resourceName}</span>}
+              <ModalHeader className="pr-12">
+                <div className="ops-detail-head">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span>TCP 数据流</span>
+                    <Tag tone="info" plain className="ops-mono">{shortChannel(stream.channelId)}</Tag>
+                    {stream.truncated && (
+                      <Tag tone="warning">后续分页可用</Tag>
+                    )}
+                  </div>
+                  <div className="ops-detail-meta">
+                    <span className="bd-num">
+                      第 {stream.page + 1} / {Math.max(1, stream.totalPages)} 页
+                    </span>
+                    <span className="bd-num">
+                      {stream.total} 帧中的 {frames.length} 帧
+                    </span>
+                    <span className="bd-num">{formatBytes(totalBytes)}</span>
+                    {frames[0] && <span>{frames[0].resourceName}</span>}
+                  </div>
                 </div>
               </ModalHeader>
-              <ModalBody className="gap-3 overflow-y-auto">
-                <div className="grid gap-2 md:grid-cols-4">
-                  <HttpSummaryTile label="总帧数" value={`${frames.length}`} />
-                  <HttpSummaryTile label="总流量" value={formatBytes(totalBytes)} />
-                  <HttpSummaryTile label="公网 -> 内网" value={`${publicFrames.length} 帧`} />
-                  <HttpSummaryTile label="内网 -> 公网" value={`${clientFrames.length} 帧`} />
-                </div>
-                <Tabs aria-label="TCP 数据流视图" destroyInactiveTabPanel={false} variant="underlined">
+              <ModalBody className={`gap-3 overflow-y-auto${loading ? " bd-refetching" : ""}`}>
+                <SummaryList
+                  cols={4}
+                  items={[
+                    { label: "总帧数", value: `${frames.length}` },
+                    { label: "总流量", value: formatBytes(totalBytes) },
+                    { label: "公网 -> 内网", value: `${publicFrames.length} 帧` },
+                    { label: "内网 -> 公网", value: `${clientFrames.length} 帧` },
+                  ]}
+                />
+                <HeroTabs aria-label="TCP 数据流视图" destroyInactiveTabPanel={false} size="sm">
                   <Tab key="timeline" title="时间线">
                     <TcpStreamTimeline frames={frames} />
                   </Tab>
@@ -2525,16 +1991,17 @@ function TcpStreamModal({
                   <Tab key="client" title="内网 -> 公网">
                     <TcpStreamPayload frames={clientFrames} />
                   </Tab>
-                </Tabs>
+                </HeroTabs>
               </ModalBody>
-              <ModalFooter>
+              <ModalFooter className="flex-wrap items-center">
                 {stream.totalPages > 1 && (
                   <Pagination
-                    showControls
-                    isDisabled={loading}
-                    page={stream.page + 1}
-                    total={Math.max(1, stream.totalPages)}
-                    onChange={(page) => onPageChange(Math.max(0, page - 1))}
+                    page={stream.page}
+                    totalPages={Math.max(1, stream.totalPages)}
+                    total={`${stream.total} 帧`}
+                    disabled={loading}
+                    onChange={(page) => onPageChange(Math.max(0, page))}
+                    label="TCP 数据流分页"
                   />
                 )}
                 <Button variant="flat" onPress={close}>
@@ -2554,38 +2021,34 @@ function TcpStreamTimeline({ frames }: { frames: TcpTrafficFrame[] }) {
     return <TextPreview content="" maxHeightClass="max-h-40" />;
   }
   return (
-    <div className="max-h-[52dvh] overflow-auto rounded-small border border-default-200">
-      <table className="w-full min-w-[900px] border-collapse text-left text-small">
-        <thead className="sticky top-0 bg-default-100 text-tiny uppercase text-default-500">
+    <TableWrap className="max-h-[52dvh]">
+      <table className="bd-table bd-table--compact">
+        <thead>
           <tr>
-            <th className="border-b border-default-200 px-3 py-2 font-semibold">时间</th>
-            <th className="border-b border-default-200 px-3 py-2 font-semibold">方向</th>
-            <th className="border-b border-default-200 px-3 py-2 font-semibold">端点</th>
-            <th className="border-b border-default-200 px-3 py-2 font-semibold">Frame / Offset</th>
-            <th className="border-b border-default-200 px-3 py-2 font-semibold">长度</th>
-            <th className="border-b border-default-200 px-3 py-2 font-semibold">文本预览</th>
+            <th>时间</th>
+            <th>方向</th>
+            <th>端点</th>
+            <th>Frame / Offset</th>
+            <th className="bd-col-num">长度</th>
+            <th>文本预览</th>
           </tr>
         </thead>
         <tbody>
           {frames.map((frame) => (
-            <tr key={frame.id} className="border-b border-default-100 last:border-b-0">
-              <td className="whitespace-nowrap px-3 py-2 text-tiny">{formatDateTime(frame.frameTime)}</td>
-              <td className="px-3 py-2">
-                <Chip color={frame.direction === "PUBLIC_TO_CLIENT" ? "primary" : "secondary"} size="sm" variant="flat">
-                  {directionLabel(frame.direction)}
-                </Chip>
-              </td>
-              <td className="max-w-96 break-all px-3 py-2 font-mono text-tiny">{tcpFlowLabel(frame)}</td>
-              <td className="px-3 py-2 font-mono text-tiny">
+            <tr key={frame.id}>
+              <td className="bd-num">{formatAbsoluteTime(frame.frameTime)}</td>
+              <td><DirectionTag direction={frame.direction} /></td>
+              <td className="jd-wrap ops-mono max-w-96 [overflow-wrap:anywhere]">{tcpFlowLabel(frame)}</td>
+              <td className="ops-mono">
                 #{frame.frameIndex ?? 0} / {tcpStreamRange(frame)}
               </td>
-              <td className="whitespace-nowrap px-3 py-2">{formatBytes(frame.payloadBytes)}</td>
-              <td className="max-w-96 break-all px-3 py-2 font-mono text-tiny">{frame.payloadPreviewText || "-"}</td>
+              <td className="bd-col-num">{formatBytes(frame.payloadBytes)}</td>
+              <td className="jd-wrap ops-mono max-w-96 [overflow-wrap:anywhere]">{frame.payloadPreviewText || "-"}</td>
             </tr>
           ))}
         </tbody>
       </table>
-    </div>
+    </TableWrap>
   );
 }
 
@@ -2604,19 +2067,13 @@ function TcpStreamPayload({ frames }: { frames: TcpTrafficFrame[] }) {
   return (
     <div className="grid gap-3">
       <div className="flex flex-wrap items-center gap-2">
-        <Chip color="primary" size="sm" variant="flat">
-          {frames.length} 帧
-        </Chip>
-        <Chip size="sm" variant="flat">
-          {formatBytes(bytes.length)}
-        </Chip>
+        <Tag tone="info" plain className="bd-num">{frames.length} 帧</Tag>
+        <Tag plain className="bd-num">{formatBytes(bytes.length)}</Tag>
         {!fullAvailable && (
-          <Chip color="warning" size="sm" variant="flat">
-            含旧版预览数据
-          </Chip>
+          <Tag tone="warning">含旧版预览数据</Tag>
         )}
       </div>
-      <Tabs aria-label="TCP 拼接 payload 预览" destroyInactiveTabPanel={false} variant="underlined">
+      <HeroTabs aria-label="TCP 拼接 payload 预览" destroyInactiveTabPanel={false} size="sm">
         <Tab key="parsed" title="解析">
           {http ? (
             <TcpParsedPayload
@@ -2647,7 +2104,7 @@ function TcpStreamPayload({ frames }: { frames: TcpTrafficFrame[] }) {
         <Tab key="hex" title="Hexdump">
           <TextPreview content={hexDump} maxHeightClass="max-h-[52dvh]" />
         </Tab>
-      </Tabs>
+      </HeroTabs>
     </div>
   );
 }
@@ -2658,13 +2115,13 @@ function TcpParsedPayload({ analysis }: { analysis: TcpPayloadAnalysis }) {
     const bodyKind = detectBodyPreviewKind(contentType, analysis.http.body);
     return (
       <div className="grid gap-4">
-        <div className="rounded-small border border-default-200 bg-default-50 p-3">
-          <div className="text-tiny font-semibold uppercase text-default-500">Start line</div>
-          <div className="mt-1 break-all font-mono text-small">{analysis.http.startLine}</div>
+        <div className="ops-header-item">
+          <div className="ops-block-title">Start line</div>
+          <div className="ops-mono [overflow-wrap:anywhere]">{analysis.http.startLine}</div>
         </div>
         <TcpHeaderPreview headers={analysis.http.headers} />
         <div className="grid gap-2">
-          <div className="text-small font-semibold">Body</div>
+          <div className="ops-block-title">Body</div>
           {analysis.http.body ? (
             <BodyPreviewContent kind={bodyKind} content={analysis.http.body} contentType={contentType} />
           ) : (
@@ -2683,12 +2140,10 @@ function TcpParsedPayload({ analysis }: { analysis: TcpPayloadAnalysis }) {
     return (
       <div className="grid gap-3">
         <div className="flex flex-wrap items-center gap-2">
-          <Chip color="primary" size="sm" variant="flat">
-            {analysis.imageMime}
-          </Chip>
-          <span className="text-small text-default-500">已按图片魔数识别并渲染</span>
+          <Tag tone="info" plain>{analysis.imageMime}</Tag>
+          <span className="ops-muted">已按图片魔数识别并渲染</span>
         </div>
-        <div className="flex max-h-[52dvh] items-center justify-center overflow-auto rounded-small border border-default-200 bg-default-50 p-3">
+        <div className="ops-image-stage max-h-[52dvh] overflow-auto">
           <img alt="TCP payload preview" className="max-h-[48dvh] max-w-full object-contain" src={analysis.imageDataUrl} />
         </div>
       </div>
@@ -2702,10 +2157,8 @@ function TcpParsedPayload({ analysis }: { analysis: TcpPayloadAnalysis }) {
   return (
     <div className="grid gap-3">
       <div className="flex flex-wrap items-center gap-2">
-        <Chip color="default" size="sm" variant="flat">
-          {analysis.binaryLabel}
-        </Chip>
-        <span className="text-small text-default-500">无法可靠解析为文本协议，展示二进制 hexdump。</span>
+        <Tag plain>{analysis.binaryLabel}</Tag>
+        <span className="ops-muted">无法可靠解析为文本协议，展示二进制 hexdump。</span>
       </div>
       <TextPreview content={analysis.hexDump} maxHeightClass="max-h-[52dvh]" />
     </div>
@@ -2717,24 +2170,24 @@ function TcpHeaderPreview({ headers }: { headers: TcpHeaderPair[] }) {
     return <TextPreview content="" maxHeightClass="max-h-40" />;
   }
   return (
-    <div className="max-h-52 overflow-auto rounded-small border border-default-200">
-      <table className="w-full min-w-[560px] border-collapse text-left text-small">
-        <thead className="sticky top-0 bg-default-100 text-tiny uppercase text-default-500">
+    <TableWrap className="max-h-52">
+      <table className="ops-kv">
+        <thead>
           <tr>
-            <th className="w-56 border-b border-default-200 px-3 py-2 font-semibold">Header</th>
-            <th className="border-b border-default-200 px-3 py-2 font-semibold">Value</th>
+            <th className="w-56">Header</th>
+            <th>Value</th>
           </tr>
         </thead>
         <tbody>
           {headers.map((header, index) => (
-            <tr key={`${header.name}-${index}`} className="border-b border-default-100 last:border-b-0">
-              <td className="break-all px-3 py-2 font-mono text-tiny">{header.name}</td>
-              <td className="whitespace-pre-wrap break-all px-3 py-2 font-mono text-tiny">{header.value}</td>
+            <tr key={`${header.name}-${index}`}>
+              <td>{header.name}</td>
+              <td className="whitespace-pre-wrap">{header.value}</td>
             </tr>
           ))}
         </tbody>
       </table>
-    </div>
+    </TableWrap>
   );
 }
 
@@ -2763,36 +2216,33 @@ function HeaderBlock({ content }: { content: string | null }) {
   return (
     <div className="grid min-h-0 min-w-0 grid-rows-[auto_minmax(0,1fr)] gap-1">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="text-tiny font-semibold text-default-500">Headers</span>
-        <Chip size="sm" variant="flat">
-          {rows.length} 项
-        </Chip>
+        <span className="ops-block-title">Headers</span>
+        <Tag plain className="bd-num">{rows.length} 项</Tag>
       </div>
-      <Tabs
+      <HeroTabs
         aria-label="Header 展示方式"
         classNames={{ base: "min-h-0", panel: "min-h-0 py-0" }}
         destroyInactiveTabPanel={false}
         size="sm"
-        variant="underlined"
       >
         <Tab key="form" title="表单">
-          <div className="mt-2 grid h-[12.75rem] min-w-0 gap-2 overflow-y-auto rounded-small border border-default-200 bg-default-50 p-2">
+          <div className="ops-header-list mt-2">
             {rows.length === 0 ? (
-              <div className="rounded-small bg-background p-3 text-tiny text-default-400">暂无 Header</div>
+              <div className="ops-header-item ops-subtle">暂无 Header</div>
             ) : (
               rows.map((row) => (
-                <div key={row.id} className="grid min-w-0 gap-2 rounded-small border border-default-100 bg-background p-3">
+                <div key={row.id} className="ops-header-item">
                   <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
                     <div className="min-w-0">
-                      <div className="break-all font-mono text-tiny font-semibold">{row.name}</div>
-                      <div className="mt-1 text-tiny text-default-500">{row.info.summary}</div>
+                      <div className="ops-header-name">{row.name}</div>
+                      <div className="ops-problem-note mt-1">{row.info.summary}</div>
                     </div>
                     {row.info.links.length > 0 && (
                       <div className="flex shrink-0 flex-wrap gap-1">
                         {row.info.links.map((link) => (
                           <a
                             key={link.url}
-                            className="rounded-small bg-primary-50 px-2 py-1 text-[11px] font-medium text-primary hover:bg-primary-100"
+                            className="ops-spec-link"
                             href={link.url}
                             rel="noreferrer"
                             target="_blank"
@@ -2803,10 +2253,10 @@ function HeaderBlock({ content }: { content: string | null }) {
                       </div>
                     )}
                   </div>
-                  <pre className="max-h-28 min-w-0 overflow-auto whitespace-pre-wrap break-all rounded-small bg-default-50 p-2 font-mono text-[11px] leading-relaxed">
+                  <pre className="ops-pre">
                     {row.value || "-"}
                   </pre>
-                  <p className="text-tiny text-default-500">{row.info.details}</p>
+                  <p className="ops-problem-note">{row.info.details}</p>
                 </div>
               ))
             )}
@@ -2822,7 +2272,7 @@ function HeaderBlock({ content }: { content: string | null }) {
             />
           </div>
         </Tab>
-      </Tabs>
+      </HeroTabs>
     </div>
   );
 }
@@ -2847,10 +2297,10 @@ function ProtocolBlock({
   return (
     <div className={`grid min-w-0 gap-1 ${className}`}>
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="text-tiny font-semibold text-default-500">{title}</span>
+        <span className="ops-block-title">{title}</span>
         {action}
       </div>
-      <pre className={`${maxHeightClass} ${contentClassName} overflow-auto whitespace-pre-wrap break-all rounded-small bg-background p-2 font-mono text-tiny`}>
+      <pre className={`ops-pre ${maxHeightClass} ${contentClassName}`}>
         {value}
       </pre>
     </div>
@@ -3423,65 +2873,50 @@ function formatXml(content: string): string {
 }
 
 function MetricCards({ resourceLabel, summary }: { resourceLabel: string; summary: TrafficSummary }) {
-  const cards = [
-    { label: `活跃${resourceLabel}`, value: String(summary.resources), hint: "当前查询窗口内" },
-    { label: "上传", value: formatBytes(summary.uploadBytes), hint: "查询窗口累计" },
-    { label: "下载", value: formatBytes(summary.downloadBytes), hint: "查询窗口累计" },
-    { label: "最新更新", value: formatDateTime(summary.updatedAt), hint: "flush 后写入" },
-  ];
-
   return (
-    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
-      {cards.map((card) => (
-        <Card key={card.label} shadow="none" className="rounded-md border border-default-200">
-          <CardBody className="gap-0.5 p-2.5">
-            <span className="text-small text-default-500">{card.label}</span>
-            <span className="text-lg font-semibold">{card.value}</span>
-            <span className="text-tiny text-default-400">{card.hint}</span>
-          </CardBody>
-        </Card>
-      ))}
-    </div>
+    <section className="jd-section" aria-label="流量汇总">
+      <StatGrid>
+        <Stat label={<KpiLabel icon="layers" color={1}>{`活跃${resourceLabel}`}</KpiLabel>} value={summary.resources} meta="当前查询窗口内" />
+        <Stat label={<KpiLabel icon="upload" color={3}>上传</KpiLabel>} value={formatBytes(summary.uploadBytes)} meta="查询窗口累计" />
+        <Stat label={<KpiLabel icon="download" color={2}>下载</KpiLabel>} value={formatBytes(summary.downloadBytes)} meta="查询窗口累计" />
+        <Stat
+          label={<KpiLabel icon="clock" color={6}>最新更新</KpiLabel>}
+          value={summary.updatedAt ? <RelativeTime value={summary.updatedAt} /> : "—"}
+          meta="flush 后写入"
+        />
+      </StatGrid>
+    </section>
   );
 }
 
 function ResourceBars({ items }: { items: ResourceTotal[] }) {
   const max = Math.max(...items.map((item) => item.totalBytes), 0);
   if (items.length === 0) {
-    return (
-      <div className="flex min-h-40 items-center justify-center rounded-small bg-default-50 text-small text-default-400">
-        暂无资源流量
-      </div>
-    );
+    return <Empty icon="bar-chart" title="暂无资源流量" description="资源转发流量后，按总量排在这里。" />;
   }
 
   return (
-    <div className="grid gap-1.5">
+    <ol className="ops-rank" aria-label="资源流量排行">
       {items.map((item) => {
-        const width = `${Math.max(3, Math.round((item.totalBytes / Math.max(max, 1)) * 100))}%`;
+        const width = `${Math.max(2, Math.round((item.totalBytes / Math.max(max, 1)) * 100))}%`;
         return (
-          <div key={item.key} className="grid gap-0.5">
-            <div className="flex items-center justify-between gap-3 text-small">
-              <span className="min-w-0 break-all font-medium" title={item.name}>
-                {item.name}
-              </span>
-              <span className="shrink-0 text-default-500">{formatBytes(item.totalBytes)}</span>
-            </div>
-            <div className="h-1.5 overflow-hidden rounded-small bg-default-100">
-              <div className="h-full rounded-small bg-primary" style={{ width }} />
-            </div>
-            <div className="flex flex-wrap items-center gap-2 text-tiny text-default-400">
-              <Chip size="sm" variant="flat">
+          <li key={item.key} className="ops-rank-row">
+            <span className="ops-rank-label">
+              <span className="jd-strong" title={item.name}>{item.name}</span>
+              <span className="ops-rank-sub">
                 {item.clientName}
-              </Chip>
-              <span>上传 {formatBytes(item.uploadBytes)}</span>
-              <span>下载 {formatBytes(item.downloadBytes)}</span>
-              <span>{formatDateTime(item.updatedAt)}</span>
-            </div>
-          </div>
+                {item.updatedAt ? <> · <RelativeTime value={item.updatedAt} /></> : null}
+              </span>
+            </span>
+            <span className="jd-hbar-track" aria-hidden="true"><i style={{ "--v": width } as CSSProperties} /></span>
+            <span className="ops-rank-value">
+              <b className="bd-num">{formatBytes(item.totalBytes)}</b>
+              <span className="bd-num">上传 {formatBytes(item.uploadBytes)} · 下载 {formatBytes(item.downloadBytes)}</span>
+            </span>
+          </li>
         );
       })}
-    </div>
+    </ol>
   );
 }
 
@@ -3489,7 +2924,8 @@ function httpPath(row: HttpTrafficExchange): string {
   return `${row.relativePath || "/"}${row.rawQuery ? `?${row.rawQuery}` : ""}`;
 }
 
-function httpStatusColor(row: HttpTrafficExchange): "danger" | "warning" | "success" {
+/** The status of one exchange as a Tag tone: errors and 5xx failed, 4xx needs attention. */
+function httpStatusTone(row: HttpTrafficExchange): "danger" | "warning" | "success" {
   if (row.error || row.statusCode >= 500) {
     return "danger";
   }

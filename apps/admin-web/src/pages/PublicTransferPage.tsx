@@ -1,8 +1,7 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { lazy, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type {
   ChangeEvent,
-  ClipboardEvent as ReactClipboardEvent,
-  DragEvent as ReactDragEvent,
+  KeyboardEvent as ReactKeyboardEvent,
   ReactNode,
 } from "react";
 import {
@@ -17,25 +16,24 @@ import {
   Popover,
   PopoverContent,
   PopoverTrigger,
-  Progress,
   Switch,
 } from "@heroui/react";
 import { AppLogo } from "../components/AppLogo";
 import { useAuth } from "../auth/AuthContext";
 import { UserMenuButton } from "../components/UserMenuButton";
 import { PublicToolsMenu } from "../components/PublicToolsMenu";
-import { NearbyDeviceGrid } from "../components/NearbyDeviceGrid";
-import { NearbyDeviceActions } from "../components/NearbyDeviceActions";
-import type { NearbyDeviceAction } from "../components/NearbyDeviceActions";
+import { DeviceAvatar, NearbyDeviceGrid, connectionTag, type NearbyDevice } from "../components/NearbyDeviceGrid";
 import { HeroRuntime } from "../components/HeroRuntime";
 import { ConfirmModal } from "../components/ConfirmModal";
 import { TransferFilePreflight } from "../components/TransferFilePreflight";
-import { ResumableTransfersPanel } from "../components/ResumableTransfersPanel";
+import { ResumableTransfersPanel, hasResumableTransfers } from "../components/ResumableTransfersPanel";
 import { ProductMetricsMemberNotice } from "../components/ProductMetricsDisclosure";
+import { Alert, Icon, Progress, RelativeTime, Tag, type IconName, type Tone } from "../components/ui";
+import { fileKindIcon, fileKindLabel } from "../components/transferFileKind";
 import { useTransferOutcomeMetrics } from "../hooks/useTransferOutcomeMetrics";
 import { useFileLeaveWarning } from "../hooks/useFileLeaveWarning";
 import { useTransferCapabilities } from "../hooks/useTransferCapabilities";
-import { SyncedClipboard } from "../components/SyncedClipboard";
+import { SyncedClipboard, type ClipboardComposerState, type SyncedClipboardHandle } from "../components/SyncedClipboard";
 import { SyncedWhiteboard, isWhiteboardPayload } from "../components/SyncedWhiteboard";
 import type { WhiteboardInboundEvent, WhiteboardPayload } from "../components/SyncedWhiteboard";
 import {
@@ -61,7 +59,7 @@ import type {
   TransferAttachment,
 } from "../api/types";
 import { usePageSeo } from "../lib/seo";
-import { formatDateTime } from "../lib/format";
+import { formatDateTime, formatElapsed } from "../lib/format";
 import { createQrMatrix } from "../lib/qr";
 import {
   buildTransferInviteUrl,
@@ -71,7 +69,7 @@ import {
   selectSafeTransferInviteToken,
 } from "../lib/transferInvite";
 import { sha256Blob } from "../lib/sha256";
-import { effectiveMimeType, mediaKind, previewKindLabel, shortMimeLabel } from "../lib/transferPreview";
+import { effectiveMimeType, mediaKind, shortMimeLabel } from "../lib/transferPreview";
 import {
   MAX_TRANSFER_ROOM_NAME_LENGTH,
   MAX_TRANSFER_ROOM_TOKEN_LENGTH,
@@ -121,7 +119,8 @@ type DiscoveryStatus = "connecting" | "online" | "reconnecting" | "offline" | "n
 type OutgoingTransferStatus = "queued" | "connecting" | "sending" | "completed" | "failed" | "cancelled";
 type TransferInviteRole = Exclude<PublicTransferRoomRole, "OWNER">;
 export type PublicTransferWorkspace = "transfer" | "diagram";
-const TRANSFER_TOOL_MODES: TransferToolMode[] = ["files", "clipboard", "whiteboard"];
+/** In the order the content switch shows them; arrow keys follow the same order. */
+const TRANSFER_TOOL_MODES: TransferToolMode[] = ["clipboard", "files", "whiteboard"];
 
 interface UploadRecord {
   file: File;
@@ -157,6 +156,8 @@ interface IncomingAttachment {
   /** Resumable direct receives kept in this browser's storage until saved or expired. */
   resumeTransferId?: string;
   restored?: boolean;
+  /** When this page added the item, for the inbox's relative time. Display only. */
+  receivedAt?: number;
 }
 
 interface PreviewTarget {
@@ -309,16 +310,16 @@ function memoryReasonText(reason: string): string {
 
 function userFacingTransferError(message: string): string {
   const normalized = message.trim();
-  if (!normalized) return "发送未完成，请检查双方网络后重试";
+  if (!normalized) return "发送未完成：检查双方网络后重试";
   if (/拒绝接收|取消了接收/.test(normalized)) return "对方拒绝接收";
   if (/未确认接收|未确认完成|timeout|timed out|超时/i.test(normalized)) {
-    return "等待对方响应超时，请确认对方页面仍然打开后重试";
+    return "等待对方响应超时：确认对方页面仍然打开后重试";
   }
   if (/TURN|relay|Direct|WebRTC|ICE/i.test(normalized)) {
-    return "设备连接未建立，请检查双方网络后重试";
+    return "设备连接未建立：检查双方网络后重试";
   }
   if (/OSS|presign|object storage/i.test(normalized)) {
-    return "文件临时存储暂时不可用，请稍后重试";
+    return "文件临时存储暂时不可用，稍后重试";
   }
   return normalized;
 }
@@ -401,10 +402,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const [discoverable, setDiscoverable] = useState(() => loadDiscoverable());
   const [discoverableDraft, setDiscoverableDraft] = useState(discoverable);
   const [receiveConfirmationDraft, setReceiveConfirmationDraft] = useState(receiveConfirmationRequired);
-  // 设备列表以设备为主体：点设备先选中它，再从面板里挑要做的事。
-  const [deviceActionPeerId, setDeviceActionPeerId] = useState("");
   const [qrVisible, setQrVisible] = useState(false);
   const [inviteOpen, setInviteOpen] = useState(false);
+  const [inviteInitialMode, setInviteInitialMode] = useState<"invite" | "join">("invite");
   const [inviteError, setInviteError] = useState<string | null>(null);
   const [pairingCode, setPairingCode] = useState<PublicTransferPairingCode | null>(null);
   const [pairingCodeLoading, setPairingCodeLoading] = useState(false);
@@ -412,6 +412,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const [pairingCodeRedeeming, setPairingCodeRedeeming] = useState(false);
   const [sharedAttachmentId] = useState(() => readInitialSharedAttachmentId());
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  // Files the user picked, dropped or pasted, shown in the composer until they press send. Not tied
+  // to a recipient yet: the send button turns them into a draft for the chosen device (preflight).
+  const [stagedFiles, setStagedFiles] = useState<File[]>([]);
   const [fileDraft, setFileDraft] = useState<DraftFileTransfer | null>(null);
   const fileDraftRef = useRef<DraftFileTransfer | null>(null);
   fileDraftRef.current = fileDraft;
@@ -423,8 +426,6 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const [incoming, setIncoming] = useState<IncomingAttachment[]>([]);
   const [state, setState] = useState<UploadState>("idle");
   const [outgoingActivities, setOutgoingActivities] = useState<OutgoingTransferActivity[]>([]);
-  const [activityCenterOpen, setActivityCenterOpen] = useState(false);
-  const [lastViewedFileInboxSignature, setLastViewedFileInboxSignature] = useState("");
   const progressStore = useMemo(() => createTransferProgressStore(), []);
   const setProgress = useCallback((value: number) => progressStore.set(value), [progressStore]);
   const [notice, setNotice] = useState<string | null>(null);
@@ -448,6 +449,8 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const [activeTool, setActiveTool] = useState<TransferToolMode>(() => readInitialTransferTool());
   const [clipboardFocusRequest, setClipboardFocusRequest] = useState(0);
   const [clipboardHasDraft, setClipboardHasDraft] = useState(false);
+  const clipboardRef = useRef<SyncedClipboardHandle | null>(null);
+  const [clipboardComposer, setClipboardComposer] = useState<ClipboardComposerState>({ hasDraft: false, withinLimits: true, sending: false });
   const [whiteboardHasDraft, setWhiteboardHasDraft] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [clipboardEvents, setClipboardEvents] = useState<ClipboardInboundEvent[]>([]);
@@ -858,7 +861,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       }
     },
     onIncoming: (item) => {
-      setIncoming((items) => limitIncomingItems([item, ...items]));
+      setIncoming((items) => limitIncomingItems([{ ...item, receivedAt: Date.now() }, ...items]));
     },
     onPreviewUrl: rememberPreviewUrl,
     onStateChange: (nextState) => {
@@ -955,7 +958,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       return;
     }
     if (!authed) {
-      setError("该文件使用云端存储，请登录后下载");
+      setError("该文件使用云端存储，登录后才能下载");
       return;
     }
     const loadKey = `${sharedAttachmentId}:${roomToken}`;
@@ -976,6 +979,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             objectId: response.objectId,
             downloadUrl: response.downloadUrl,
             downloadExpiresAt: response.expiresAt,
+            receivedAt: Date.now(),
           },
           ...items.filter((item) => item.attachment.attachmentId !== response.attachment.attachmentId),
         ]));
@@ -1080,14 +1084,14 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             reconnectBlocked = true;
             setClientNameStatus("unavailable");
             setDiscoveryStatus("name-conflict");
-            setDiscoveryError("设备名称已被其他在线设备使用，请修改后重试");
+            setDiscoveryError("设备名称已被其他在线设备使用：在设置里换一个名称后重试");
           } else if (message.error === "client name is required"
             || message.error === "client name is too long"
             || message.error === "client name contains invalid characters") {
             reconnectBlocked = true;
             setClientNameStatus("error");
             setDiscoveryStatus("name-conflict");
-            setDiscoveryError("设备名称无效，请修改后重试");
+            setDiscoveryError("设备名称无效：在设置里修改后重试");
           } else {
             const localized = localizeTransferDiscoveryError(message.error);
             const permissionDenied = isDiscoveryPermissionError(localized);
@@ -1140,6 +1144,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                 objectId: attachmentPayload.objectId ?? attachmentPayload.attachment.objectId,
                 downloadUrl: null,
                 downloadExpiresAt: null,
+                receivedAt: Date.now(),
               },
               ...items,
             ]));
@@ -1330,24 +1335,6 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     () => peers.find((peer) => peer.peerId === selectedPeerId) ?? null,
     [peers, selectedPeerId],
   );
-  const selectedFilesSize = useMemo(
-    () => selectedFiles.reduce((total, file) => total + file.size, 0),
-    [selectedFiles],
-  );
-  const selectedFileTitle = selectedFiles.length === 0
-    ? "尚未选择文件"
-    : selectedFiles.length === 1
-      ? selectedFiles[0].name
-      : `${selectedFiles.length} 个文件`;
-  const selectedFileDetail = selectedFiles.length === 0
-    ? fileDeliveryMode === "link"
-      ? "将上传并生成临时文件链接"
-    : selectedPeer
-      ? `将发送给 ${discoveryPeerDisplayName(selectedPeer)}`
-      : "需先选择一台在线设备"
-    : selectedFiles.length === 1
-      ? `${formatBytes(selectedFiles[0].size)} · ${selectedFiles[0].type || "未知类型"}`
-      : `${formatBytes(selectedFilesSize)} · 批量顺序发送`;
   const isTransferBusy = state === "connecting"
     || state === "waiting"
     || state === "direct"
@@ -1368,50 +1355,13 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       ? `发送目标已从 ${discoveryPeerDisplayName(currentPeer)} 切换为 ${discoveryPeerDisplayName(peer)}`
       : `已选择 ${discoveryPeerDisplayName(peer)}`);
   };
-  const fileTargetRequired = fileDeliveryMode === "device";
-  const fileDropzoneTitle = isFileDragActive
-    ? "松开查看发送前确认"
-    : fileTargetRequired && !selectedPeer
-      ? peers.length === 0 ? "先邀请接收设备" : "先选择接收设备"
-      : isTransferBusy
-        ? "继续添加文件"
-        : "选择或拖入文件";
-  const fileDropzoneDetail = selectedFiles.length > 0
-    ? `上次选择：${selectedFileTitle} · ${selectedFileDetail}；再次选择后先确认再发送`
-    : fileDeliveryMode === "link"
-      ? "先选择文件并查看存储说明，确认后才上传并生成链接"
-    : selectedPeer
-      ? `选择后先检查文件和接收方，确认后发送给 ${discoveryPeerDisplayName(selectedPeer)}`
-      : selectedPeerId
-        ? `${selectedPeerName || "原接收设备"} 已离线，请重新选择接收方`
-        : peers.length === 0
-          ? "让对方打开互传页面，或点“添加设备”发送邀请"
-          : "从设备列表选择接收方";
-  const fileActivityCount = outgoingActivities.length + incoming.length + receivingTransfers.length + pendingTransfers.length;
-  const fileInboxSignature = useMemo(() => {
-    const keys = new Set<string>();
-    pendingTransfers.forEach((item) => keys.add(`direct:${receivingTransferKey(item)}`));
-    receivingTransfers.forEach((item) => keys.add(`direct:${receivingTransferKey(item)}`));
-    incoming.forEach((item) => keys.add(`received:${item.sourcePeerId}:${item.attachment.attachmentId}`));
-    return Array.from(keys).sort().join("|");
-  }, [incoming, pendingTransfers, receivingTransfers]);
-  useEffect(() => {
-    if (activeTool === "files") setLastViewedFileInboxSignature(fileInboxSignature);
-  }, [activeTool, fileInboxSignature]);
+  const stagedFilesSize = stagedFiles.reduce((total, file) => total + file.size, 0);
   const activeOutgoingCount = outgoingActivities.filter((activity) => (
     activity.status === "queued" || activity.status === "connecting" || activity.status === "sending"
   )).length;
-  const activeOutgoingActivity = outgoingActivities.find((activity) => (
-    activity.status === "connecting" || activity.status === "sending"
-  )) ?? outgoingActivities.find((activity) => activity.status === "queued") ?? null;
-  const unreadIncomingFileCount = activeTool !== "files"
-    && fileInboxSignature !== lastViewedFileInboxSignature
-    ? incoming.length + receivingTransfers.length + pendingTransfers.length
-    : 0;
-  const unreadFileActivityCount = outgoingActivities.filter((activity) => activity.unread).length
-    + unreadIncomingFileCount;
   const volatileFileWork = hasVolatileFileWork({
-    draftCount: fileDraft?.files.length ?? 0,
+    // Staged files are a draft as well: leaving the page loses the selection.
+    draftCount: (fileDraft?.files.length ?? 0) + stagedFiles.length,
     outgoingCount: activeOutgoingCount + outgoingActivities.filter((activity) => activity.status === "failed").length,
     receivingCount: receivingTransfers.length + incoming.filter((item) => item.downloading).length,
     pendingCount: pendingTransfers.length,
@@ -1712,7 +1662,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     force = false,
   ): Promise<PublicTransferCreatedAccessToken> => {
     if (!sharedRoomActive || roomRole !== "OWNER") {
-      throw new Error(roomRole === null ? "正在确认房间权限，请稍候" : "只有房主可以生成安全邀请");
+      throw new Error(roomRole === null ? "正在确认房间权限，稍候再试" : "只有房主可以生成安全邀请");
     }
     const requestContext = inviteRequestContext;
     const requestKey = `${requestContext}\u0000${role}`;
@@ -1743,7 +1693,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     try {
       const created = await request;
       if (inviteRequestContextRef.current !== requestContext) {
-        throw new Error("房间已切换，请重新生成邀请");
+        throw new Error("房间已切换，重新生成邀请");
       }
       roomAccessSecretsRef.current.set(requestKey, created);
       if (roomInviteRoleRef.current === role) {
@@ -1764,7 +1714,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
 
   const issuePairingCode = async (role: TransferInviteRole, force = false) => {
     if (!sharedRoomActive || roomRole !== "OWNER") {
-      throw new Error(roomRole === null ? "正在确认房间权限，请稍候" : "只有房主可以生成配对码");
+      throw new Error(roomRole === null ? "正在确认房间权限，稍候再试" : "只有房主可以生成配对码");
     }
     const requestContext = inviteRequestContext;
     const requestKey = `${requestContext}\u0000${role}`;
@@ -1793,7 +1743,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     try {
       const created = await request;
       if (inviteRequestContextRef.current !== requestContext) {
-        throw new Error("房间已切换，请重新生成配对码");
+        throw new Error("房间已切换，重新生成配对码");
       }
       if (roomInviteRoleRef.current === role) {
         pairingCodeContextRef.current = requestContext;
@@ -1843,8 +1793,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     }
   };
 
-  const openInvitePanel = () => {
+  const openInvitePanel = (mode: "invite" | "join" = "invite") => {
     setInviteError(null);
+    setInviteInitialMode(mode);
     setInviteOpen(true);
   };
 
@@ -1886,7 +1837,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     setQrVisible(true);
     setNotice(sharedRoomActive
       ? "正在生成一次性扫码邀请"
-      : "二维码已生成，请使用同一网络中的设备扫码");
+      : "二维码已生成，用同一网络中的设备扫码");
     setError(null);
     if (sharedRoomActive) void prepareSecureInvite(roomInviteRole);
   };
@@ -1903,7 +1854,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     setInviteLabelRole(null);
     try {
       await issueRoomAccess(role, label, true);
-      setNotice(`已创建 24 小时${role === "EDITOR" ? "编辑者" : "只读访客"}邀请，请立即复制链接。`);
+      setNotice(`已创建 24 小时${role === "EDITOR" ? "编辑者" : "只读访客"}邀请，链接只在这次显示，现在复制。`);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "创建房间邀请失败");
@@ -1979,7 +1930,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const redeemPairingCode = async (rawCode = pairingCodeDraft) => {
     const normalizedCode = normalizeTransferPairingCode(rawCode);
     if (!normalizedCode) {
-      setInviteError("请输入完整的 8 位配对码");
+      setInviteError("配对码是 8 位数字，输入完整后再连接");
       return;
     }
     setPairingCodeRedeeming(true);
@@ -2063,7 +2014,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           await navigator.share(fileShareData);
           setNotice("已打开系统文件分享");
         } else {
-          setError("此浏览器不支持系统文件分享。请先保存文件，再选择另一台设备发送；不会生成邀请链接。");
+          setError("此浏览器不支持系统文件分享：先保存文件，再选择另一台设备发送；不会生成邀请链接。");
           return;
         }
       } else {
@@ -2097,7 +2048,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         const file = item.blob ? new File([item.blob], item.attachment.fileName, { type: item.blob.type }) : null;
         const data = file ? { title: file.name, files: [file] } : null;
         if (!data || !canShareFiles(data)) {
-          setError("此浏览器不支持系统文件分享。请先保存文件，再选择另一台设备发送；不会生成邀请链接。");
+          setError("此浏览器不支持系统文件分享：先保存文件，再选择另一台设备发送；不会生成邀请链接。");
           return;
         }
         await navigator.share(data);
@@ -2133,18 +2084,18 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const uploadFiles = async (files: File[], task: FileTransferTask) => {
     assertFileTransferTaskCurrent(task);
     if (files.length === 0) {
-      setError("请选择要发送的文件");
+      setError("还没有选择要发送的文件");
       return;
     }
     if (!task.ossFallbackAllowed && !task.targetPeerId) {
       setState("failed");
-      const message = "请先选择一台在线设备";
+      const message = "先选择一台在线设备";
       setError(message);
       failOutgoingActivity(task.activityId, message);
       return;
     }
     if (!task.targetSameLan && !task.roomToken.trim()) {
-      const message = "请先点击“添加设备”，通过邀请连接远程设备";
+      const message = "远程设备需要先通过“添加设备”里的邀请加入";
       setError(message);
       failOutgoingActivity(task.activityId, message);
       return;
@@ -2185,7 +2136,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               : `点对点连接失败：${message}`;
             if (message.includes("未确认接收") || message.includes("未确认完成")) {
               // 等待确认超时不进入 transport 降级循环，避免等待翻倍。
-              peerTransferError = "对方 2 分钟内未确认，请提醒对方查看页面";
+              peerTransferError = "对方 2 分钟内未确认：提醒对方查看页面后重试";
               peerTransferFatal = true;
               break;
             }
@@ -2243,7 +2194,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         if (!task.targetSameLan) {
           if (!task.ossFallbackAllowed) {
             setState("failed");
-            const message = "设备连接未建立；本次未允许云端存储。请检查网络后重试，或重新选择文件生成链接。";
+            const message = "设备连接未建立；本次未允许云端存储。检查网络后重试，或重新选择文件生成链接。";
             setError(message);
             failOutgoingActivity(task.activityId, message);
             continue;
@@ -2254,14 +2205,14 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       if (task.targetSameLan) {
         setNotice(null);
         setState("failed");
-        const message = "直连和 TURN 中继均未完成，请检查双方网络后重试";
+        const message = "直连和 TURN 中继均未完成：检查双方网络后重试";
         setError(message);
         failOutgoingActivity(task.activityId, message);
         continue;
       }
       if (!task.ossFallbackAllowed) {
         setState("failed");
-        const message = "设备连接未建立，请检查双方网络后重试";
+        const message = "设备连接未建立：检查双方网络后重试";
         setError(message);
         failOutgoingActivity(task.activityId, message);
         continue;
@@ -2308,7 +2259,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       return false;
     }
     if (fileDraftRef.current) {
-      setError("请先确认或取消当前待发送文件，再添加新文件");
+      setError("先确认或取消当前待发送文件，再添加新文件");
       return false;
     }
     const targetRequired = deliveryMode === "device";
@@ -2318,7 +2269,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     }
     if (targetRequired && !selectedPeer) {
       setActiveTool("files");
-      setError(peers.length === 0 ? "还没有可接收的设备，请先邀请对方加入" : "请先选择接收设备");
+      setError(peers.length === 0 ? "还没有可接收的设备：先让对方打开本页，或用“添加设备”邀请" : "先选择接收设备");
       return false;
     }
     if (discoveryStatus !== "online" && (targetRequired || selectedPeer)) {
@@ -2405,26 +2356,12 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     setSelectedFiles(files);
     setError(null);
     setNotice(files.length > 1 ? `已加入 ${files.length} 个发送任务` : null);
-    if (files.length > 1) setActivityCenterOpen(true);
     runQueuedTransfersRef.current();
   };
 
   const canOpenFilePicker = () => {
     if (isRoomReadOnly) {
       setError("当前为只读访客，不能向房间发送文件");
-      return false;
-    }
-    const targetRequired = fileDeliveryMode === "device";
-    if (!targetRequired && !ossFallbackEnabled) {
-      setError("登录后才能生成文件链接");
-      return false;
-    }
-    if (targetRequired && !selectedPeer) {
-      setError(peers.length === 0 ? "还没有可接收的设备，请先邀请对方加入" : "请先选择接收设备");
-      return false;
-    }
-    if (discoveryStatus !== "online" && (targetRequired || selectedPeer)) {
-      setDiscoveryError("房间连接尚未恢复，恢复后即可发送");
       return false;
     }
     return true;
@@ -2453,63 +2390,49 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     }
   };
 
+  /**
+   * Picked, dropped and pasted files land in the composer's list. Nothing is read or sent here: the
+   * send button turns the list into a draft for the chosen recipient and opens the preflight.
+   */
+  const stageFiles = (files: File[], source: "pick" | "drop" | "paste") => {
+    if (files.length === 0) {
+      if (source === "drop") setError("没有检测到可发送的文件：拖入的是文件夹或网页内容，换成文件再试");
+      return;
+    }
+    if (isRoomReadOnly) {
+      setError("当前为只读访客，不能向房间发送文件");
+      return;
+    }
+    setStagedFiles((current) => {
+      const seen = new Set(current.map(stagedFileKey));
+      const next = [...current];
+      for (const file of files) {
+        const key = stagedFileKey(file);
+        if (!seen.has(key)) {
+          seen.add(key);
+          next.push(file);
+        }
+      }
+      return next;
+    });
+    if (activeTool !== "files") selectTransferTool("files");
+    setError(null);
+    if (source !== "pick") setNotice(`已添加 ${files.length} 个文件到待发送，尚未发送`);
+  };
+
+  const removeStagedFile = (index: number) => {
+    setStagedFiles((current) => current.filter((_, fileIndex) => fileIndex !== index));
+  };
+
+  const sendStagedFiles = () => {
+    if (stagedFiles.length === 0) return;
+    if (acceptFiles(stagedFiles)) setStagedFiles([]);
+  };
+
   const handleFileInputChange = (event: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.currentTarget.files ?? []);
     event.currentTarget.value = "";
-    acceptFiles(files);
-  };
-
-  const handleFileDragEnter = (event: ReactDragEvent<HTMLButtonElement>) => {
-    event.preventDefault();
-    if (!hasDraggedFiles(event.dataTransfer)) {
-      return;
-    }
-    fileDragDepthRef.current += 1;
-    if (!uploadInFlightRef.current) {
-      setFileDragActive(true);
-    }
-  };
-
-  const handleFileDragOver = (event: ReactDragEvent<HTMLButtonElement>) => {
-    event.preventDefault();
-    if (hasDraggedFiles(event.dataTransfer)) {
-      event.dataTransfer.dropEffect = "copy";
-    }
-  };
-
-  const handleFileDragLeave = (event: ReactDragEvent<HTMLButtonElement>) => {
-    event.preventDefault();
-    fileDragDepthRef.current = Math.max(0, fileDragDepthRef.current - 1);
-    if (fileDragDepthRef.current === 0) {
-      setFileDragActive(false);
-    }
-  };
-
-  const handleFileDrop = (event: ReactDragEvent<HTMLButtonElement>) => {
-    event.preventDefault();
-    fileDragDepthRef.current = 0;
-    setFileDragActive(false);
-    const files = Array.from(event.dataTransfer.files ?? []);
-    if (files.length === 0) {
-      setError("没有检测到可发送的文件");
-      return;
-    }
-    acceptFiles(files);
-  };
-
-  const handlePagePaste = (event: ReactClipboardEvent<HTMLElement>) => {
-    if (isDiagramWorkspace || activeTool !== "files") {
-      return;
-    }
-    if (isEditablePasteTarget(event.target)) {
-      return;
-    }
-    const files = filesFromClipboard(event.clipboardData);
-    if (files.length === 0) {
-      return;
-    }
-    event.preventDefault();
-    acceptFiles(files);
+    stageFiles(files, "pick");
   };
 
   const uploadViaOss = async (file: File, task: FileTransferTask) => {
@@ -2643,7 +2566,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     if (uploadInFlightRef.current?.activityId === activity.id || queuedFileTransfersRef.current.some((item) => item.activityId === activity.id)) return;
     const peerStillAvailable = !activity.targetPeerId || peers.some((peer) => peer.peerId === activity.targetPeerId);
     if (activity.targetPeerId && !peerStillAvailable) {
-      setError("原接收设备已离线。任务目标不会自动更换，请等待对方上线或重新选择文件发送");
+      setError("原接收设备已离线。任务目标不会自动更换：等对方上线后重试，或重新选择文件发送");
       return;
     }
     const preflight = checkFilePreflight(preflightInput({
@@ -2681,7 +2604,6 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       ossFallbackAllowed: cloudFallbackPermitted(activity.ossFallbackAllowed, ossFallbackEnabled, Boolean(activity.targetPeerId && peerLanMap[activity.targetPeerId])),
     });
     setError(null);
-    setActivityCenterOpen(true);
     runQueuedTransfersRef.current();
   };
 
@@ -2944,7 +2866,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     }
     const target = peers.find((peer) => peer.peerId === selectedPeerId);
     if (!target) {
-      throw new Error("请选择一台在线设备后再文字与链接");
+      throw new Error("先选择一台在线设备，再发送文字与链接");
     }
     const sendRoomEpoch = roomEpochRef.current;
     const message = { messageType: "clipboard" as const, payload };
@@ -2975,7 +2897,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     const sentRelay = await sendRelayPeerMessage(target.peerId, message,
       (frame) => sendRelayFrame(target.peerId, frame, sendRoomEpoch));
     if (!sentRelay) {
-      throw new Error("互传通道暂时不可用，请确认对方仍在线");
+      throw new Error("互传通道暂时不可用：确认对方仍在线后重试");
     }
   }, [isRoomReadOnly, peers, selectedPeerId, sendPeerMessage, sendRelayFrame, sendRelayPeerMessage]);
 
@@ -2991,26 +2913,151 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     }
   }, []);
 
-  /**
-   * 设备操作面板的分发：先确保目标是这台设备，再切到对应能力。
-   * 传文件额外直接唤起文件选择器——用户点"传文件"的意图就是要挑文件，
-   * 让他再点一次上传区是多余的一步。
-   */
+  // Page-wide drop and paste. Files dropped or pasted anywhere outside a text field join the
+  // composer's list; pasted text goes into the text draft. Neither sends anything by itself.
+  const activeToolRef = useRef(activeTool);
+  activeToolRef.current = activeTool;
+  const pageDropRef = useRef<(files: File[]) => void>(() => undefined);
+  pageDropRef.current = (files) => stageFiles(files, "drop");
+  const pagePasteRef = useRef<(event: ClipboardEvent) => void>(() => undefined);
+  pagePasteRef.current = (event) => {
+    if (event.defaultPrevented || !event.clipboardData || activeToolRef.current === "whiteboard") return;
+    if (isEditablePasteTarget(event.target)) return;
+    // A paste inside an open dialog (pairing code, settings) belongs to that dialog.
+    if (event.target instanceof Element && event.target.closest("[role='dialog']")) return;
+    const files = filesFromClipboard(event.clipboardData);
+    if (files.length > 0) {
+      event.preventDefault();
+      stageFiles(files, "paste");
+      return;
+    }
+    const text = event.clipboardData.getData("text/plain");
+    if (!text) return;
+    event.preventDefault();
+    selectTransferTool("clipboard");
+    clipboardRef.current?.insertDraft(text, event.clipboardData.getData("text/html"));
+  };
   useEffect(() => {
-    // 目标设备离线时关掉面板：否则用户会对着一台已消失的设备点"传文件"。
-    if (deviceActionPeerId && !peers.some((peer) => peer.peerId === deviceActionPeerId)) {
-      setDeviceActionPeerId("");
-    }
-  }, [deviceActionPeerId, peers]);
+    if (isDiagramWorkspace) return undefined;
+    const carriesFiles = (event: DragEvent) => Boolean(event.dataTransfer && hasDraggedFiles(event.dataTransfer));
+    // The whiteboard takes dropped images on its own canvas; elsewhere a dropped file must not
+    // make the browser leave the page.
+    const stagesFiles = () => activeToolRef.current !== "whiteboard";
+    const reset = () => {
+      fileDragDepthRef.current = 0;
+      setFileDragActive(false);
+    };
+    const onDragEnter = (event: DragEvent) => {
+      if (!carriesFiles(event) || !stagesFiles()) return;
+      event.preventDefault();
+      fileDragDepthRef.current += 1;
+      setFileDragActive(true);
+    };
+    const onDragOver = (event: DragEvent) => {
+      if (!carriesFiles(event) || event.defaultPrevented) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = stagesFiles() ? "copy" : "none";
+    };
+    const onDragLeave = () => {
+      if (fileDragDepthRef.current === 0) return;
+      fileDragDepthRef.current -= 1;
+      if (fileDragDepthRef.current === 0) setFileDragActive(false);
+    };
+    const onDrop = (event: DragEvent) => {
+      if (!carriesFiles(event) || event.defaultPrevented) return;
+      event.preventDefault();
+      reset();
+      if (stagesFiles()) pageDropRef.current(Array.from(event.dataTransfer?.files ?? []));
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && fileDragDepthRef.current > 0) reset();
+    };
+    const onPaste = (event: ClipboardEvent) => pagePasteRef.current(event);
+    window.addEventListener("dragenter", onDragEnter);
+    window.addEventListener("dragover", onDragOver);
+    window.addEventListener("dragleave", onDragLeave);
+    window.addEventListener("drop", onDrop);
+    window.addEventListener("dragend", reset);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("paste", onPaste);
+    return () => {
+      window.removeEventListener("dragenter", onDragEnter);
+      window.removeEventListener("dragover", onDragOver);
+      window.removeEventListener("dragleave", onDragLeave);
+      window.removeEventListener("drop", onDrop);
+      window.removeEventListener("dragend", reset);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("paste", onPaste);
+    };
+  }, [isDiagramWorkspace]);
 
-  const runNearbyDeviceAction = useCallback((action: NearbyDeviceAction) => {
-    setDeviceActionPeerId("");
-    selectTransferTool(action, action === "clipboard");
-    if (action === "files") {
-      // 页签切换后 input 才挂载，下一帧再唤起选择器
-      window.setTimeout(() => openFilePicker(), 0);
+  // When a device first appeared, so its tile can say "连接中" for a moment before "在线".
+  const peerFirstSeenRef = useRef<Map<string, number>>(new Map());
+  const nearbyDevices = useMemo<NearbyDevice[]>(() => peers.map((peer) => {
+    const firstSeen = peerFirstSeenRef.current;
+    if (!firstSeen.has(peer.peerId)) firstSeen.set(peer.peerId, Date.now());
+    return {
+      peerId: peer.peerId,
+      displayName: discoveryPeerDisplayName(peer),
+      sameLan: Boolean(peerLanMap[peer.peerId]),
+      firstSeenAt: firstSeen.get(peer.peerId),
+    };
+  }), [peerLanMap, peers]);
+  const peerLabel = (sourcePeerId: string) => diagramPeerDisplayNames[sourcePeerId]
+    ?? (sourcePeerId === "shared-link" ? "共享链接" : "未命名设备");
+
+  // Short toasts when something arrives or a send finishes; the lists below hold the details.
+  const announcedIncomingRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const seen = announcedIncomingRef.current;
+    const fresh = incoming.filter((item) => !seen.has(incomingItemKey(item)));
+    incoming.forEach((item) => seen.add(incomingItemKey(item)));
+    const announce = fresh.filter((item) => !item.restored && item.sourcePeerId !== "shared-link");
+    if (announce.length === 1) {
+      setNotice(`收到 ${announce[0].attachment.fileName}（来自 ${peerLabel(announce[0].sourcePeerId)}）`);
+    } else if (announce.length > 1) {
+      setNotice(`收到 ${announce.length} 个文件`);
     }
-  }, [openFilePicker, selectTransferTool]);
+  }, [incoming]);
+  const announcedPendingRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const seen = announcedPendingRef.current;
+    const fresh = pendingTransfers.filter((item) => !seen.has(receivingTransferKey(item)));
+    pendingTransfers.forEach((item) => seen.add(receivingTransferKey(item)));
+    if (fresh.length > 0) {
+      setNotice(`${peerLabel(fresh[0].sourcePeerId)} 想发送 ${fresh[0].fileName}，在“收到的内容”里接收或拒绝`);
+    }
+  }, [pendingTransfers]);
+  const announcedClipboardRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const seen = announcedClipboardRef.current;
+    const fresh = clipboardEvents.filter((event) => !seen.has(event.eventId));
+    clipboardEvents.forEach((event) => seen.add(event.eventId));
+    const latest = fresh.at(-1);
+    if (latest) setNotice(`收到 ${latest.sourceDisplayName || "未命名设备"} 发来的文字`);
+  }, [clipboardEvents]);
+  const activityStatusRef = useRef<Map<string, OutgoingTransferStatus>>(new Map());
+  useEffect(() => {
+    const previous = activityStatusRef.current;
+    const finished = outgoingActivities.filter((activity) => activity.status === "completed"
+      && previous.has(activity.id) && previous.get(activity.id) !== "completed");
+    activityStatusRef.current = new Map(outgoingActivities.map((activity) => [activity.id, activity.status]));
+    if (finished.length === 1) {
+      const [activity] = finished;
+      setNotice(activity.transport === "cloud"
+        ? `文件链接已生成：${activity.fileName}`
+        : `${activity.targetPeerLabel} 已接收 ${activity.fileName}`);
+    } else if (finished.length > 1) {
+      setNotice(`${finished.length} 个文件已发送完成`);
+    }
+  }, [outgoingActivities]);
+
+  // An owner alone in a shared room sees the QR code and pairing code right in the device list.
+  const inlineInviteVisible = !isDiagramWorkspace && sharedRoomActive && roomRole === "OWNER"
+    && discoveryStatus === "online" && peers.length === 0;
+  useEffect(() => {
+    if (inlineInviteVisible) void prepareSecureInvite("EDITOR");
+  }, [inlineInviteVisible, roomId, roomToken]);
 
   const clearLocalTransferData = () => {
     void clearResumeData().then(() => {
@@ -3018,32 +3065,13 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     });
   };
 
-  const hasReceivedFiles = incoming.length + receivingTransfers.length + pendingTransfers.length > 0;
-  const incomingFilesPanel = <><IncomingFilesPanel
-    pendingTransfers={pendingTransfers}
-    receivingTransfers={receivingTransfers}
-    peerTransportPaths={peerTransportPaths}
-    peerDisplayNames={diagramPeerDisplayNames}
-    incoming={incoming}
-    cloudTransferEnabled={ossFallbackEnabled}
-    onAcceptDirect={(item) => acceptIncomingTransfer(item.sourcePeerId, item.transferId)}
-    onRejectDirect={(item) => rejectIncomingTransfer(item.sourcePeerId, item.transferId)}
-    onCancelReceiving={(item) => { cancelIncomingTransfer(item.sourcePeerId, item.transferId); setNotice("已取消接收"); }}
-    onShare={shareIncomingFile}
-    onDownload={downloadIncoming}
-    onLogin={openLogin}
-    onPreview={setPreviewTarget}
-  />
-  <ResumableTransfersPanel
-    storedReceives={storedReceives}
-    outgoingResumes={outgoingResumes}
-    peerDisplayNames={diagramPeerDisplayNames}
-    onResumeOutgoing={resumeOutgoing}
-    onAbandonOutgoing={(transferId) => { abandonOutgoing(transferId); setNotice("已放弃该发送"); }}
-    onAbandonReceive={(transferId) => { abandonStoredReceive(transferId); setNotice("已放弃并删除本机保存的部分数据"); }}
-    onClearAll={clearLocalTransferData}
-    onError={(message) => setError(message)}
-  /></>;
+  const inboxEntries = useMemo<InboxEntry[]>(() => [
+    ...incoming.map((item): InboxEntry => ({ kind: "file", key: `file:${incomingItemKey(item)}`, at: item.receivedAt ?? 0, item })),
+    ...clipboardEvents.map((event): InboxEntry => ({ kind: "text", key: `text:${event.eventId}`, at: event.receivedAt, event })),
+  ].sort((left, right) => right.at - left.at), [clipboardEvents, incoming]);
+  const hasTasks = outgoingActivities.length > 0
+    || receivingTransfers.length > 0
+    || hasResumableTransfers(storedReceives, outgoingResumes);
 
   const sharedModals = (
     <>
@@ -3060,21 +3088,18 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         }}
         onRemove={(index) => updateFileDraft({ files: fileDraft.files.filter((_, fileIndex) => fileIndex !== index) })}
         onCancel={cancelFileDraft}
-        onConfirm={confirmFileDraft}
+        onConfirm={() => {
+          confirmFileDraft();
+          // On one-column layouts the task list sits below the composer: bring the send into view.
+          if (!isDiagramWorkspace && window.matchMedia("(max-width: 1023px)").matches) {
+            window.setTimeout(() => document.getElementById("transfer-tasks")?.scrollIntoView({
+              behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+              block: "start",
+            }), 150);
+          }
+        }}
         onLogin={openLogin}
       /> : null}
-      <NearbyDeviceActions
-        isOpen={deviceActionPeerId !== ""}
-        deviceName={(() => {
-          const peer = peers.find((item) => item.peerId === deviceActionPeerId);
-          return peer ? discoveryPeerDisplayName(peer) : "";
-        })()}
-        transportPath={peerTransportPaths[deviceActionPeerId]}
-        sameLan={Boolean(peerLanMap[deviceActionPeerId])}
-        canSend={!isRoomReadOnly}
-        onClose={() => setDeviceActionPeerId("")}
-        onSelect={runNearbyDeviceAction}
-      />
       <ConfirmModal
         isOpen={transferInterruptAction !== null}
         onClose={() => setTransferInterruptAction(null)}
@@ -3339,545 +3364,668 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     );
   }
 
-  return (
-    <main
-      className="app-apple-tool transfer-mode-shell relative min-h-screen overflow-x-hidden text-zinc-950 dark:text-white"
-      onPaste={handlePagePaste}
+  const selectedPeerLabel = selectedPeer ? discoveryPeerDisplayName(selectedPeer) : "";
+  const recipientOffline = Boolean(selectedPeerId && !selectedPeer);
+  const linkMode = activeTool === "files" && fileDeliveryMode === "link";
+  const connectionTone: Tone = discoveryStatus === "online"
+    ? "success"
+    : discoveryStatus === "connecting" || discoveryStatus === "reconnecting" ? "warning" : "danger";
+  const roomLabel = sharedRoomActive ? `共享房间 ${transferRoomDisplayName(roomId)}` : "附近设备";
+  const currentTaskActivityId = uploadInFlightRef.current?.activityId ?? "";
+  const completedTaskCount = outgoingActivities.filter((activity) => activity.status === "completed").length;
+  const retryableTaskCount = outgoingActivities.filter((activity) => activity.status === "failed" || activity.status === "cancelled").length;
+  const runningTaskCount = activeOutgoingCount + receivingTransfers.length;
+  const inboxCount = pendingTransfers.length + inboxEntries.length;
+  const recordActivityId = record
+    ? outgoingActivities.find((activity) => activity.file === record.file && activity.status === "completed")?.id ?? ""
+    : "";
+  const failedRetryAvailable = state === "failed" && selectedFiles.length > 0
+    && outgoingActivities.some((activity) => activity.status === "failed");
+
+  // Why the send button is off, in the order a newcomer has to fix things.
+  const recipientBlocker = isRoomReadOnly
+    ? "当前为只读访客：可以接收和查看，不能发送"
+    : !selectedPeer
+      ? recipientOffline ? `${selectedPeerName || "原接收设备"} 已离线，重新选择接收方` : "先选择接收设备"
+      : discoveryStatus !== "online" ? "房间连接尚未恢复，恢复后即可发送" : "";
+  let send: SendBarModel | null = null;
+  if (activeTool === "files" && linkMode) {
+    const count = stagedFiles.length;
+    send = {
+      label: count ? `上传 ${count} 个文件并生成链接` : "上传并生成链接",
+      icon: "upload",
+      disabled: !count || isRoomReadOnly || !ossFallbackEnabled,
+      reason: isRoomReadOnly ? "当前为只读访客：可以接收和查看，不能发送" : !count ? "先添加要上传的文件" : "",
+      onSend: sendStagedFiles,
+    };
+  } else if (activeTool === "files") {
+    const count = stagedFiles.length;
+    send = {
+      label: count
+        ? selectedPeer ? `发送 ${count} 个文件给 ${selectedPeerLabel}` : `发送 ${count} 个文件`
+        : selectedPeer ? `发送给 ${selectedPeerLabel}` : "发送",
+      icon: "send",
+      disabled: !count || Boolean(recipientBlocker),
+      // The summary already asks for a recipient; the reason line covers what comes after.
+      reason: isRoomReadOnly ? recipientBlocker : !selectedPeer ? "" : recipientBlocker || (!count ? "先添加要发送的文件" : ""),
+      onSend: sendStagedFiles,
+    };
+  } else if (activeTool === "clipboard") {
+    const { hasDraft, withinLimits, sending } = clipboardComposer;
+    send = {
+      label: selectedPeer ? `发送文字给 ${selectedPeerLabel}` : "发送文字",
+      icon: "send",
+      disabled: !hasDraft || !withinLimits || sending || Boolean(recipientBlocker),
+      reason: isRoomReadOnly ? recipientBlocker : !selectedPeer
+        ? ""
+        : recipientBlocker || (!hasDraft ? "输入或粘贴要发送的文字、链接" : !withinLimits ? "内容超过上限，删减后再发送" : sending ? "正在发送…" : ""),
+      onSend: () => clipboardRef.current?.submitComposer(),
+      hint: <span className="tr-kbd-hint"><kbd>Ctrl/⌘</kbd><kbd>Enter</kbd></span>,
+    };
+  }
+
+  const recipientSummary = linkMode ? (
+    <>
+      <span className="tr-sendbar-icon" aria-hidden="true"><Icon name="link" size={18} /></span>
+      <span className="tr-sendbar-text">
+        <span className="tr-sendbar-caption">生成文件链接 · 文件将临时存储</span>
+        <span className="tr-sendbar-name">不需要选择接收方</span>
+      </span>
+    </>
+  ) : selectedPeer ? (
+    <>
+      <DeviceAvatar peerId={selectedPeer.peerId} name={selectedPeerLabel} size="sm" />
+      <span className="tr-sendbar-text">
+        <span className="tr-sendbar-caption">发送给</span>
+        <span className="tr-sendbar-name">
+          <span className="jd-ellipsis">{selectedPeerLabel}</span>
+          {(() => {
+            const tag = connectionTag(peerTransportPaths[selectedPeer.peerId], {
+              firstSeenAt: nearbyDevices.find((device) => device.peerId === selectedPeer.peerId)?.firstSeenAt,
+              now: Date.now(),
+            });
+            return <Tag tone={tag.tone} plain={tag.plain}>{tag.label}</Tag>;
+          })()}
+        </span>
+      </span>
+    </>
+  ) : recipientOffline ? (
+    <>
+      <DeviceAvatar peerId={selectedPeerId} name={selectedPeerName || "?"} size="sm" offline />
+      <span className="tr-sendbar-text">
+        <span className="tr-sendbar-caption tr-text-warning">{selectedPeerName || "原接收设备"} 已离线</span>
+        <span className="tr-sendbar-name">重新选择接收方；不会自动换成别的设备</span>
+      </span>
+    </>
+  ) : (
+    <>
+      <span className="tr-sendbar-icon is-empty" aria-hidden="true"><Icon name="user" size={18} /></span>
+      <span className="tr-sendbar-text">
+        <span className="tr-sendbar-caption">发送给</span>
+        <span className="tr-sendbar-name">先选择接收设备</span>
+      </span>
+    </>
+  );
+
+  const discoveryAlert = discoveryStatus !== "online" || discoveryError ? (
+    <Alert
+      className="tr-stacked-alert"
+      tone={discoveryStatus === "permission-denied" || discoveryStatus === "name-conflict" ? "danger" : "warning"}
+      role={discoveryStatus === "permission-denied" || discoveryStatus === "name-conflict" ? "alert" : "status"}
+      title={discoveryStatusLabel(discoveryStatus)}
+      actions={
+        <>
+          {/* With no devices, the empty list below already offers the retry as its main action. */}
+          {peers.length > 0 || discoveryStatus === "connecting" || discoveryStatus === "reconnecting" || discoveryStatus === "online" ? (
+            <button type="button" className="bd-btn bd-btn--secondary bd-btn--sm" onClick={retryDiscoveryConnection}>重试连接</button>
+          ) : null}
+          <button type="button" className="bd-btn bd-btn--ghost bd-btn--sm" onClick={() => { resetRoomSettingsDraft(); setRoomSettingsOpen(true); }}>检查设置</button>
+          {discoveryErrorDetail ? (
+            <Popover placement="bottom-end">
+              <PopoverTrigger>
+                <button type="button" className="bd-btn bd-btn--ghost bd-btn--sm">查看详情</button>
+              </PopoverTrigger>
+              <PopoverContent className="tr-popover max-w-[min(88vw,420px)]">
+                <div className="tr-popover-title">连接诊断信息</div>
+                <code className="tr-popover-code">{discoveryErrorDetail}</code>
+              </PopoverContent>
+            </Popover>
+          ) : null}
+        </>
+      }
     >
-      <header className="app-apple-tool-header relative z-40 mx-auto flex w-full max-w-[1480px] items-center justify-between gap-3 px-4 py-4 sm:px-8 sm:py-5">
-        <AppLogo className="min-w-0 flex-1" label="specus" subtitle={isDiagramWorkspace ? "专业流程图" : "互传"} />
-        <div className="public-header-actions flex shrink-0 items-center gap-2">
-          <PublicToolsMenu active={workspace} />
-          <UserMenuButton className="public-header-theme-button" />
+      {discoveryError || discoveryStatusDescription(discoveryStatus)}
+    </Alert>
+  ) : null;
+
+  const inlineInvite = inlineInviteVisible ? (
+    <div className="tr-inline-invite">
+      {pairingJoinUrl ? <RoomQrCode value={pairingJoinUrl} /> : <div className="tr-qr-placeholder" role="status">正在生成二维码</div>}
+      <div className="tr-inline-invite-text">
+        <span className="tr-inline-invite-label">扫码，或在对方的“添加设备 → 输入配对码”里输入</span>
+        <span className="tr-pairing-code bd-num">{pairingCode?.role === "EDITOR" ? formatPairingCode(pairingCode.code) : "•••• ••••"}</span>
+        <span className="tr-note">{pairingCode?.role === "EDITOR" ? `${formatInviteExpiry(pairingCode.expiresAt)} · 单次有效` : "正在生成 5 分钟配对码"}</span>
+        <button type="button" className="bd-btn bd-btn--ghost bd-btn--sm" onClick={() => void regeneratePairingCode()}>
+          <Icon name="refresh" /><span>换一个配对码</span>
+        </button>
+      </div>
+    </div>
+  ) : !sharedRoomActive && roomJoinUrl ? (
+    <div className="tr-inline-invite">
+      <RoomQrCode value={roomJoinUrl} />
+      <div className="tr-inline-invite-text">
+        <span className="tr-inline-invite-label">同一网络的手机扫码，直接打开本页</span>
+        <span className="tr-note">不在同一网络时，生成配对码：对方输入 8 位数字即可加入。</span>
+        <button type="button" className="bd-btn bd-btn--secondary bd-btn--sm" onClick={enterSharedRoom}>
+          <Icon name="key" /><span>生成配对码</span>
+        </button>
+      </div>
+    </div>
+  ) : null;
+
+  const recipientsCard = activeTool === "whiteboard" ? (
+    <section className="bd-card tr-card" data-testid="collaboration-audience" aria-labelledby="tr-audience-title">
+      <div className="tr-card-head">
+        <span className="tr-card-icon" aria-hidden="true"><Icon name="users" /></span>
+        <h2 id="tr-audience-title" className="tr-card-title">协作成员</h2>
+        <Tag plain>{sharedRoomActive ? `${collaborationMembers.length + 1} 位` : "本地草稿"}</Tag>
+      </div>
+      <div className="tr-card-body tr-audience">
+        <p className="tr-audience-title">{sharedRoomActive ? "本协作空间的参与者" : "本地白板 · 尚未与任何设备共享"}</p>
+        {sharedRoomActive ? (
+          <ul className="tr-members">
+            <li><DeviceAvatar peerId={peerId} name={displayName} size="sm" /><span className="jd-ellipsis">{displayName}（我）</span></li>
+            {collaborationMembers.map((peer) => (
+              <li key={peer.peerId}>
+                <DeviceAvatar peerId={peer.peerId} name={discoveryPeerDisplayName(peer)} size="sm" />
+                <span className="jd-ellipsis">{discoveryPeerDisplayName(peer)}</span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="tr-muted">附近设备不会自动收到白板。创建协作空间并邀请对方后，才会同步内容。</p>
+        )}
+        <button
+          type="button"
+          className="bd-btn bd-btn--secondary"
+          onClick={sharedRoomActive ? () => openInvitePanel() : enterSharedRoom}
+        >
+          <Icon name={sharedRoomActive ? "plus" : "users"} />
+          <span>{sharedRoomActive ? "邀请参与者 / 输入配对码" : "创建协作空间"}</span>
+        </button>
+      </div>
+    </section>
+  ) : linkMode ? (
+    <section className="bd-card tr-card" aria-labelledby="tr-link-title">
+      <div className="tr-card-head">
+        <span className="tr-card-icon" aria-hidden="true"><Icon name="link" /></span>
+        <h2 id="tr-link-title" className="tr-card-title">生成文件链接</h2>
+      </div>
+      <div className="tr-card-body tr-link-explain">
+        <p>文件上传到服务端配置的临时存储，生成链接后分享；接收方需要登录，并持有链接和访问口令。</p>
+        <p className="tr-note">上传前会显示存储与额度；不需要选择接收方。要直接发给一台设备，在“文件”里改为发送到设备。</p>
+      </div>
+    </section>
+  ) : (
+    <section className="bd-card tr-card" aria-labelledby="tr-step-recipient">
+      <div className="tr-card-head">
+        <StepBadge step={1} done={Boolean(selectedPeer)} />
+        <h2 id="tr-step-recipient" className="tr-card-title">选择接收方</h2>
+        {peers.length > 0 ? <span className="tr-card-meta bd-num">{peers.length} 台在线</span> : null}
+        <button type="button" className="bd-btn bd-btn--secondary bd-btn--sm tr-card-action" onClick={() => openInvitePanel()}>
+          <Icon name="plus" /><span>添加设备</span>
+        </button>
+      </div>
+      <div className="tr-card-body tr-recipients">
+        {discoveryAlert}
+        <NearbyDeviceGrid
+          devices={nearbyDevices}
+          selectedPeerId={selectedPeerId}
+          offlineSelection={recipientOffline ? { peerId: selectedPeerId, displayName: selectedPeerName || "原接收设备" } : null}
+          transportPaths={peerTransportPaths}
+          discoverable={discoverable}
+          discoveryStatus={discoveryStatus}
+          emptyAddon={inlineInvite}
+          onAddDevice={() => openInvitePanel("join")}
+          onRetry={retryDiscoveryConnection}
+          onSelect={(device) => {
+            const peer = peers.find((item) => item.peerId === device.peerId);
+            if (peer) selectTransferPeer(peer);
+          }}
+          onOpenSettings={() => { resetRoomSettingsDraft(); setRoomSettingsOpen(true); }}
+        />
+      </div>
+    </section>
+  );
+
+  return (
+    <main className="bd-root tr-page" data-sendbar={send ? "true" : undefined}>
+      <header className="tr-topbar">
+        <div className="tr-topbar-inner">
+          <AppLogo className="tr-brand" label="specus" subtitle="互传" />
+          <div className={`tr-conn is-${connectionTone}`} role="status">
+            <span className="tr-conn-dot" aria-hidden="true" />
+            <span className="tr-conn-state">{discoveryStatus === "online" ? "已连接" : discoveryStatusLabel(discoveryStatus)}</span>
+            <span className="tr-conn-room">{roomLabel}</span>
+            {discoveryStatus === "online" ? <span className="tr-conn-count bd-num">{peers.length} 台在线</span> : null}
+          </div>
+          <div className="tr-topbar-tools">
+            {hasTasks ? (
+              <button
+                type="button"
+                className={`tr-activity-btn${runningTaskCount > 0 ? " is-running" : ""}`}
+                aria-label="传输任务"
+                title={runningTaskCount > 0 ? `${runningTaskCount} 个进行中，查看传输任务` : "查看传输任务"}
+                onClick={() => {
+                  const section = document.getElementById("transfer-tasks");
+                  section?.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
+                  section?.focus({ preventScroll: true });
+                }}
+              >
+                <Icon name={runningTaskCount > 0 ? "activity" : "list"} />
+                {runningTaskCount > 0 ? <span className="bd-num" aria-hidden="true">{runningTaskCount}</span> : null}
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className="bd-icon-btn tr-tool-btn"
+              aria-label="设置"
+              title="设备设置：名称、被发现、接收前确认"
+              onClick={() => {
+                resetRoomSettingsDraft();
+                setRoomSettingsOpen(true);
+              }}
+            >
+              <Icon name="settings" />
+            </button>
+            <div className="public-header-actions tr-header-menus">
+              <PublicToolsMenu active={workspace} />
+              <UserMenuButton className="public-header-theme-button" />
+            </div>
+          </div>
         </div>
       </header>
 
-      <section
-        className={`app-apple-tool-content relative z-10 mx-auto grid w-full max-w-[1480px] gap-5 px-4 pb-10 sm:px-8 sm:pb-14 ${
-          isDiagramWorkspace || activeTool === "whiteboard" || (activeTool === "files" && fileDeliveryMode === "link") ? "xl:grid-cols-1" : "xl:grid-cols-[minmax(0,1fr)_320px]"
-        }`}
-      >
-        <div className="app-apple-tool-workspace min-w-0 p-1 sm:p-2">
-          <div className="flex items-center justify-between gap-3">
-            <h1 className="text-xl font-semibold text-zinc-950 dark:text-white sm:text-2xl">互传</h1>
-            <div className="flex flex-wrap justify-end gap-1">
-              {outgoingActivities.length + pendingTransfers.length + receivingTransfers.length > 0 ? <Button size="sm" radius="sm" variant="flat" className="transfer-touch-action" onPress={() => {
-                setActivityCenterOpen(true);
-                setOutgoingActivities((activities) => activities.map((activity) => ({ ...activity, unread: false })));
-              }}>传输任务</Button> : null}
-              <Button size="sm" radius="sm" variant="light" className="transfer-touch-action" onPress={() => setHelpOpen(true)}>使用帮助</Button>
-            </div>
+      <div className="tr-shell">
+        <div className="tr-head">
+          <div className="min-w-0">
+            <h1 className="bd-page-title">互传</h1>
+            <p className="bd-page-desc">选择接收方 → 选择内容 → 发送。同一网络里打开本页的设备会自动出现。</p>
           </div>
-
-          <section className="app-apple-tool-surface transfer-room-hub mt-3 p-3">
-            <div className="transfer-room-compact flex flex-wrap items-center gap-3">
-              <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
-                <span className="text-tiny font-medium text-zinc-500 dark:text-zinc-400">这台设备</span>
-                {sharedRoomActive ? <Chip size="sm" radius="sm" variant="flat">{effectiveRoomRole === "OWNER" ? "协作空间管理员" : effectiveRoomRole === "EDITOR" ? "已加入协作" : "只读访客"}</Chip> : null}
+          <div className="tr-head-side">
+            <div className="tr-self">
+              <DeviceAvatar peerId={peerId} name={displayName} size="sm" />
+              <span className="tr-self-text">
+                <span className="tr-self-label">这台设备</span>
                 <button
                   type="button"
-                  className="max-w-48 truncate rounded-sm px-1.5 py-1 font-mono text-tiny text-zinc-500 hover:bg-black/5 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/10 dark:hover:text-white max-sm:min-h-11"
-                  title="点击复制设备名称"
+                  className="tr-self-name"
+                  title="复制设备名称，在另一台设备上核对"
                   onClick={() => void copyText(displayName).then(() => setNotice("设备名称已复制")).catch((err) => setError(err instanceof Error ? err.message : "复制设备名称失败"))}
                 >
                   {displayName}
                 </button>
-                <Chip
-                  size="sm"
-                  radius="sm"
-                  variant="flat"
-                  color={discoveryStatus === "online" ? "success" : discoveryStatus === "reconnecting" ? "warning" : discoveryStatus === "permission-denied" || discoveryStatus === "name-conflict" ? "danger" : "default"}
-                >
-                  {discoveryStatusLabel(discoveryStatus)}
-                </Chip>
-                <Popover placement="bottom-start">
-                  <PopoverTrigger>
-                    <Button
-                      size="sm"
-                      radius="sm"
-                      variant="flat"
-                      color={ossFallbackEnabled ? "success" : "default"}
-                      className="h-6 min-w-0 gap-1 px-2 text-tiny max-sm:min-h-11"
-                      aria-label="传输方式说明"
-                    >
-                      {!authReady ? "账号检测中" : ossFallbackEnabled ? "已登录 · 可申请文件链接" : "未登录 · 设备互传"}
-                    </Button>
-                  </PopoverTrigger>
-                  <PopoverContent className="max-w-64 px-3 py-2">
-                    <div className="text-tiny font-semibold">
-                      {ossFallbackEnabled ? "临时文件链接" : "设备互传"}
-                    </div>
-                    <p className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
-                      {ossFallbackEnabled
-                        ? "生成链接会临时存储文件，需要服务端配置存储且账号额度充足。设备传输只有在发送前单独允许时，才会在失败后改用临时存储。"
-                        : "文件可直接传输或经中继转发，不会创建云端文件副本。"}
-                    </p>
-                  </PopoverContent>
-                </Popover>
-              </div>
-              <div className="transfer-room-controls flex shrink-0 items-center gap-2">
-                <Button size="sm" radius="sm" color="primary" variant="flat" className="min-h-11 sm:min-h-8" onPress={openInvitePanel}>
-                  添加设备
-                </Button>
-                <Button
-                  size="sm"
-                  radius="sm"
-                  variant="light"
-                  className="min-h-11 sm:min-h-8"
-                  onPress={() => {
-                    resetRoomSettingsDraft();
-                    setRoomSettingsOpen(true);
-                  }}
-                >
-                  设置
-                </Button>
-              </div>
+              </span>
+              <Popover placement="bottom-end">
+                <PopoverTrigger>
+                  <button type="button" className={`bd-tag tr-account-tag${ossFallbackEnabled ? " bd-tag--success" : " bd-tag--plain"}`} aria-label="传输方式说明">
+                    {!authReady ? "账号检测中" : ossFallbackEnabled ? "已登录 · 可生成文件链接" : "未登录 · 设备互传"}
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent className="tr-popover max-w-72">
+                  <div className="tr-popover-title">{ossFallbackEnabled ? "临时文件链接" : "设备互传"}</div>
+                  <p className="tr-popover-body">
+                    {ossFallbackEnabled
+                      ? "生成链接会临时存储文件，需要服务端配置存储且账号额度充足。设备传输只有在发送前单独允许时，才会在失败后改用临时存储。"
+                      : "文件可直接传输或经中继转发，不会创建云端文件副本。"}
+                  </p>
+                </PopoverContent>
+              </Popover>
             </div>
+            <button type="button" className="bd-btn bd-btn--ghost bd-btn--sm" onClick={() => setHelpOpen(true)}>
+              <Icon name="info-circle" /><span>使用帮助</span>
+            </button>
+          </div>
+        </div>
+
+        <div className="tr-grid">
+          <div className="tr-col tr-col--side">
+            {recipientsCard}
+
+            {inboxCount > 0 ? (
+              <TransferInbox
+                pending={pendingTransfers}
+                entries={inboxEntries}
+                peerLabel={peerLabel}
+                cloudTransferEnabled={ossFallbackEnabled}
+                onAccept={(item) => acceptIncomingTransfer(item.sourcePeerId, item.transferId)}
+                onReject={(item) => rejectIncomingTransfer(item.sourcePeerId, item.transferId)}
+                onShare={shareIncomingFile}
+                onDownload={downloadIncoming}
+                onLogin={openLogin}
+                onPreview={setPreviewTarget}
+                onCopyText={(text) => void copyText(text).then(() => setNotice("已复制到剪贴板")).catch((err) => setError(err instanceof Error ? err.message : "复制失败：浏览器不允许写入剪贴板，打开预览后手动复制"))}
+              />
+            ) : null}
 
             {transferMetrics.collecting ? (
-              <ProductMetricsMemberNotice className="mt-2">
+              <ProductMetricsMemberNotice className="tr-metrics-note">
                 <button
                   type="button"
-                  className="ml-2 text-primary underline-offset-2 hover:underline max-sm:min-h-11"
+                  className="jd-link tr-inline-link"
                   onClick={() => transferMetrics.setOptedOut(!transferMetrics.optedOut)}
                 >
                   {transferMetrics.optedOut ? "本设备已不参与 · 恢复参与" : "本设备不参与"}
                 </button>
               </ProductMetricsMemberNotice>
             ) : null}
+          </div>
 
-            {discoveryStatus !== "online" || discoveryError ? (
-              <div
-                className={`mt-3 flex flex-col gap-2 rounded-md border px-3 py-2 text-small sm:flex-row sm:items-center sm:justify-between ${
-                  discoveryStatus === "permission-denied" || discoveryStatus === "name-conflict"
-                    ? "border-rose-300 bg-rose-50 text-rose-800 dark:border-rose-400/25 dark:bg-rose-500/10 dark:text-rose-100"
-                    : "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-400/25 dark:bg-amber-500/10 dark:text-amber-100"
-                }`}
-                role={discoveryStatus === "permission-denied" || discoveryStatus === "name-conflict" ? "alert" : "status"}
-              >
-                <span className="min-w-0 [overflow-wrap:anywhere]">
-                  {discoveryError || discoveryStatusDescription(discoveryStatus)}
-                </span>
-                <div className="flex shrink-0 flex-wrap items-center gap-1.5">
-                  <Button size="sm" radius="sm" variant="flat" className="transfer-touch-action" onPress={retryDiscoveryConnection}>重试连接</Button>
-                  <Button size="sm" radius="sm" variant="light" className="transfer-touch-action" onPress={() => setRoomSettingsOpen(true)}>检查设置</Button>
-                  {discoveryErrorDetail ? (
-                    <Popover placement="bottom-end">
-                      <PopoverTrigger>
-                        <Button size="sm" radius="sm" variant="light" className="transfer-touch-action">查看详情</Button>
-                      </PopoverTrigger>
-                      <PopoverContent className="max-w-[min(88vw,420px)] px-3 py-2">
-                        <div>
-                          <div className="text-tiny font-semibold text-zinc-800 dark:text-zinc-100">连接诊断信息</div>
-                          <code className="mt-1 block break-all text-[11px] leading-5 text-zinc-500 dark:text-zinc-400">{discoveryErrorDetail}</code>
-                        </div>
-                      </PopoverContent>
-                    </Popover>
+          <div className="tr-col tr-col--main">
+            <section className={`bd-card tr-card tr-composer${activeTool === "whiteboard" ? " is-board" : ""}`} aria-labelledby="tr-step-content">
+              <div className="tr-card-head tr-composer-head">
+                {activeTool === "whiteboard"
+                  ? <span className="tr-card-icon" aria-hidden="true"><Icon name="edit" /></span>
+                  : <StepBadge step={2} done={activeTool === "files" ? stagedFiles.length > 0 : clipboardComposer.hasDraft} />}
+                <h2 id="tr-step-content" className="tr-card-title">{activeTool === "whiteboard" ? "一起画" : "选择内容"}</h2>
+                <ModeTabs active={activeTool} fileCount={stagedFiles.length} onSelect={selectTransferTool} />
+              </div>
+
+              <div className="tr-card-body tr-composer-body">
+                <div
+                  id="transfer-panel-files"
+                  role="tabpanel"
+                  aria-labelledby="transfer-tab-files"
+                  hidden={activeTool !== "files"}
+                  className="tr-panel"
+                >
+                  <input
+                    ref={fileInputRef}
+                    id="public-transfer-file-input"
+                    type="file"
+                    multiple
+                    hidden
+                    disabled={isRoomReadOnly}
+                    tabIndex={-1}
+                    onChange={handleFileInputChange}
+                  />
+                  <input
+                    ref={systemFileInputRef}
+                    id="public-transfer-system-file-input"
+                    type="file"
+                    accept={MOBILE_SYSTEM_FILE_ACCEPT}
+                    multiple
+                    hidden
+                    disabled={isRoomReadOnly}
+                    tabIndex={-1}
+                    onChange={handleFileInputChange}
+                  />
+                  <input
+                    ref={mediaFileInputRef}
+                    id="public-transfer-media-file-input"
+                    type="file"
+                    accept="image/*,video/*"
+                    multiple
+                    hidden
+                    disabled={isRoomReadOnly}
+                    tabIndex={-1}
+                    onChange={handleFileInputChange}
+                  />
+                  {ossFallbackEnabled ? (
+                    <div className="tr-panel-toolbar">
+                      <span className="tr-delivery">
+                        <Icon name={linkMode ? "link" : "send"} />
+                        {linkMode ? "生成文件链接：上传到临时存储" : "发送到设备：直连或中继，不经过云端"}
+                      </span>
+                      <button
+                        type="button"
+                        className="bd-btn bd-btn--ghost bd-btn--sm"
+                        onClick={() => setFileDeliveryMode((mode) => mode === "device" ? "link" : "device")}
+                      >
+                        {fileDeliveryMode === "device" ? "改为生成文件链接" : "改为发送到设备"}
+                      </button>
+                    </div>
+                  ) : null}
+                  {stagedFiles.length === 0 ? (
+                    <button
+                      type="button"
+                      data-testid="public-transfer-file-dropzone"
+                      aria-label={isFileDragActive ? "松开以添加文件" : coarsePointer ? "选择要发送的文件" : "拖入文件，或选择文件"}
+                      aria-describedby="public-transfer-file-dropzone-detail"
+                      disabled={isRoomReadOnly}
+                      onClick={openFilePicker}
+                      className={`tr-dropzone${isFileDragActive ? " is-active" : ""}`}
+                    >
+                      <span className="tr-dropzone-icon" aria-hidden="true"><Icon name="upload" size={24} /></span>
+                      <span className="tr-dropzone-title">
+                        {isFileDragActive ? "松开以添加文件" : coarsePointer ? "选择要发送的文件" : "拖入文件，或选择文件"}
+                      </span>
+                      <span id="public-transfer-file-dropzone-detail" className="tr-dropzone-desc">
+                        {linkMode
+                          ? "添加后先查看存储与额度，确认后才上传并生成链接。"
+                          : <>也可以拖到页面任意位置，或粘贴<span className="tr-nowrap">（Ctrl/⌘ V）</span>。添加后先检查列表，按发送才会发出。</>}
+                      </span>
+                    </button>
+                  ) : (
+                    <div className="tr-staged">
+                      <div className="tr-staged-head">
+                        <span className="tr-staged-total">
+                          <strong className="bd-num">{stagedFiles.length} 个文件</strong>
+                          <span className="bd-num">合计 {formatBytes(stagedFilesSize)}</span>
+                        </span>
+                        <button type="button" className="bd-btn bd-btn--ghost bd-btn--sm" onClick={() => setStagedFiles([])}>
+                          <Icon name="trash" /><span>清空</span>
+                        </button>
+                      </div>
+                      <ul aria-label="待发送文件" className="tr-file-list">
+                        {stagedFiles.map((file, index) => (
+                          <li key={`${stagedFileKey(file)}:${index}`} className="tr-file-row">
+                            <span className="tr-file-icon" aria-hidden="true"><Icon name={fileKindIcon(file.name, file.type)} size={16} /></span>
+                            <span className="tr-file-text">
+                              <span className="tr-file-name" title={file.name}>{file.name}</span>
+                              <span className="tr-file-meta bd-num">{formatBytes(file.size)} · {fileKindLabel(file.name, file.type)}</span>
+                            </span>
+                            <button
+                              type="button"
+                              className="bd-icon-btn tr-file-remove"
+                              aria-label={`移除 ${file.name}`}
+                              title="从待发送列表移除"
+                              onClick={() => removeStagedFile(index)}
+                            >
+                              <Icon name="x" />
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                      <button
+                        type="button"
+                        data-testid="public-transfer-file-dropzone"
+                        className={`tr-dropzone tr-dropzone--compact${isFileDragActive ? " is-active" : ""}`}
+                        disabled={isRoomReadOnly}
+                        onClick={openFilePicker}
+                      >
+                        <Icon name="plus" />
+                        <span className="tr-dropzone-title">添加更多文件</span>
+                        <span className="tr-dropzone-desc">也可以拖入或粘贴</span>
+                      </button>
+                    </div>
+                  )}
+                  {coarsePointer ? (
+                    <div className="tr-pick-row">
+                      <button type="button" className="bd-btn bd-btn--secondary" disabled={isRoomReadOnly} onClick={openSystemFilePicker}>
+                        <Icon name="folder" /><span>系统文件</span>
+                      </button>
+                      <button type="button" className="bd-btn bd-btn--secondary" disabled={isRoomReadOnly} onClick={openMediaFilePicker}>
+                        <Icon name="image" /><span>照片 / 视频</span>
+                      </button>
+                    </div>
                   ) : null}
                 </div>
+
+                <SyncedClipboard
+                  ref={clipboardRef}
+                  onComposerStateChange={setClipboardComposer}
+                  syncKey={transferRoomScopeKey}
+                  isActive={activeTool === "clipboard"}
+                  focusRequest={clipboardFocusRequest}
+                  canSend={!isRoomReadOnly}
+                  fileTargetRequired={true}
+                  targetPeerId={selectedPeer?.peerId ?? ""}
+                  targetPeerLabel={selectedPeerLabel}
+                  events={clipboardEvents}
+                  onSend={sendClipboardPayload}
+                  onFiles={(files) => acceptFiles(files, "device")}
+                  onDraftStateChange={setClipboardHasDraft}
+                />
+
+                <div
+                  id="transfer-panel-whiteboard"
+                  role="tabpanel"
+                  aria-labelledby="transfer-tab-whiteboard"
+                  hidden={activeTool !== "whiteboard"}
+                  className="tr-panel"
+                >
+                  <SyncedWhiteboard
+                    boardKey={transferRoomScopeKey}
+                    roomRole={effectiveRoomRole}
+                    peerId={peerId}
+                    peerCount={collaborationMembers.length}
+                    isConnected={collaborationMembers.length > 0}
+                    isActive={activeTool === "whiteboard"}
+                    events={whiteboardEvents}
+                    onSend={sendWhiteboardPayload}
+                    onDraftStateChange={setWhiteboardHasDraft}
+                  />
+                </div>
               </div>
-            ) : null}
 
-          <div className="transfer-room-tools mt-3 grid grid-cols-3 gap-1 border-t border-black/10 pt-2.5 dark:border-white/10" role="tablist" aria-label="互传功能切换">
-            <ToolModeButton
-              mode="clipboard"
-              activeMode={activeTool}
-              label="文字与链接"
-              detail="编辑后发送"
-              onSelect={selectTransferTool}
-            />
-            <ToolModeButton
-              mode="files"
-              activeMode={activeTool}
-              label="文件传输"
-              detail={fileActivityCount > 0 ? `${fileActivityCount} 项` : "发送和接收"}
-              unreadCount={unreadFileActivityCount}
-              onSelect={selectTransferTool}
-            />
-            <ToolModeButton
-              mode="whiteboard"
-              activeMode={activeTool}
-              label="多人白板"
-              detail={sharedRoomActive ? `${collaborationMembers.length + 1} 位参与者` : "本地草稿"}
-              onSelect={selectTransferTool}
-            />
-          </div>
-          </section>
-
-          {!isDiagramWorkspace && (activeOutgoingActivity || receivingTransfers.length > 0 || pendingTransfers.length > 0) ? (
-            <button
-              type="button"
-              className="mt-3 flex w-full items-center gap-3 rounded-md border border-primary-300/70 bg-primary-50/75 px-3 py-2 text-left shadow-xs transition hover:bg-primary-100/80 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary-500 dark:border-primary-300/20 dark:bg-primary-300/[0.07] dark:hover:bg-primary-300/[0.11]"
-              onClick={() => {
-                setActivityCenterOpen(true);
-                setOutgoingActivities((activities) => activities.map((activity) => ({ ...activity, unread: false })));
-              }}
-            >
-              <span className="grid h-8 w-8 shrink-0 place-items-center rounded-sm bg-primary-600 text-small font-semibold text-white" aria-hidden>
-                {activeOutgoingCount + receivingTransfers.length + pendingTransfers.length}
-              </span>
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-small font-semibold text-zinc-950 dark:text-white">
-                  {activeOutgoingActivity
-                    ? `${transferActivityStatusLabel(activeOutgoingActivity.status)}：${activeOutgoingActivity.fileName}`
-                    : receivingTransfers.length > 0 ? `正在接收 ${receivingTransfers.length} 个文件` : "有文件等待接收"}
-                </span>
-                <span className="mt-0.5 block truncate text-tiny text-zinc-500 dark:text-zinc-400">
-                  {activeOutgoingActivity
-                    ? `${Math.round(activeOutgoingActivity.progress)}% · ${activeOutgoingCount} 个发送任务`
-                    : "点击查看传输任务"}
-                </span>
-              </span>
-              {activeOutgoingActivity ? (
-                <span className="w-24 shrink-0 sm:w-36">
-                  <Progress size="sm" aria-label={`${activeOutgoingActivity.fileName} 发送进度`} value={activeOutgoingActivity.progress} />
-                </span>
+              {send ? (
+                <SendBar model={send} summary={recipientSummary} />
               ) : null}
-              <span className="shrink-0 text-tiny font-medium text-primary-700 dark:text-primary-300">查看</span>
-            </button>
-          ) : null}
+            </section>
 
-          {!isDiagramWorkspace && activeTool !== "whiteboard" ? (
-            <div className="sticky top-0 z-20 mt-3 rounded-lg border border-default-200 bg-background/95 p-3 backdrop-blur-sm" data-testid="transfer-recipient-bar">
-              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                <strong className="min-w-0 break-words text-small">{activeTool === "files" && fileDeliveryMode === "link" ? "生成文件链接 · 文件将临时存储" : selectedPeer ? `发送给：${discoveryPeerDisplayName(selectedPeer)}` : selectedPeerId ? `${selectedPeerName || "接收设备"} 已离线 · 请重新选择` : "发送给：请先选择接收设备"}</strong>
-                <div className="flex flex-wrap gap-1">
-                  {activeTool !== "files" || fileDeliveryMode === "device" ? <Button size="sm" variant="flat" onPress={openInvitePanel}>添加设备</Button> : null}
-                  {activeTool === "files" && ossFallbackEnabled ? <Button size="sm" variant="flat" onPress={() => setFileDeliveryMode((mode) => mode === "device" ? "link" : "device")}>{fileDeliveryMode === "device" ? "改为生成文件链接" : "改为发送到设备"}</Button> : null}
-                </div>
-              </div>
-              {activeTool !== "files" || fileDeliveryMode === "device" ? <div className="flex gap-1.5 overflow-x-auto pb-1" role="radiogroup" aria-label="发送目标设备">
-                {peers.length === 0 ? (
-                  <button
-                    type="button"
-                    className="app-apple-tool-peer min-h-11 shrink-0 px-3 py-2 text-left text-tiny"
-                    onClick={openInvitePanel}
-                  >
-                    邀请设备加入
-                  </button>
-                ) : peers.map((peer) => {
-                  const selected = selectedPeerId === peer.peerId;
-                  return (
-                    <button
-                      key={peer.peerId}
-                      type="button"
-                      role="radio"
-                      aria-checked={selected}
-                      onClick={() => selectTransferPeer(peer)}
-                      className={`app-apple-tool-peer min-h-11 shrink-0 rounded-md px-3 py-1.5 text-tiny transition-colors ${selected ? "is-selected" : ""}`}
-                    >
-                      {discoveryPeerDisplayName(peer)}
-                    </button>
-                  );
-                })}
-              </div> : null}
-            </div>
-          ) : null}
-
-          {!isDiagramWorkspace && activeTool !== "whiteboard" && hasReceivedFiles ? incomingFilesPanel : null}
-
-          {!isDiagramWorkspace ? <>
-          <div
-            id="transfer-panel-files"
-            role="tabpanel"
-            aria-labelledby="transfer-tab-files"
-            hidden={activeTool !== "files"}
-          >
-            <input
-              ref={fileInputRef}
-              id="public-transfer-file-input"
-              type="file"
-              multiple
-              hidden
-              disabled={isRoomReadOnly}
-              tabIndex={-1}
-              onChange={handleFileInputChange}
-            />
-            <input
-              ref={systemFileInputRef}
-              id="public-transfer-system-file-input"
-              type="file"
-              accept={MOBILE_SYSTEM_FILE_ACCEPT}
-              multiple
-              hidden
-              disabled={isRoomReadOnly}
-              tabIndex={-1}
-              onChange={handleFileInputChange}
-            />
-            <input
-              ref={mediaFileInputRef}
-              id="public-transfer-media-file-input"
-              type="file"
-              accept="image/*,video/*"
-              multiple
-              hidden
-              disabled={isRoomReadOnly}
-              tabIndex={-1}
-              onChange={handleFileInputChange}
-            />
-            <button
-              type="button"
-              data-testid="public-transfer-file-dropzone"
-              aria-label={fileDropzoneTitle}
-              aria-describedby="public-transfer-file-dropzone-detail"
-              aria-busy={isTransferBusy}
-              aria-disabled={isRoomReadOnly}
-              disabled={isRoomReadOnly}
-              onClick={openFilePicker}
-              onDragEnter={handleFileDragEnter}
-              onDragOver={handleFileDragOver}
-              onDragLeave={handleFileDragLeave}
-              onDrop={handleFileDrop}
-              className={`app-apple-tool-dropzone transfer-file-stage group relative mt-4 flex min-h-[180px] w-full flex-col items-center justify-center overflow-hidden px-5 py-6 text-center outline-hidden transition duration-200 motion-reduce:transition-none sm:min-h-[240px] ${
-                isFileDragActive ? "is-active" : isTransferBusy ? "is-busy" : ""
-              }`}
-            >
-              <span className="transfer-file-add" aria-hidden="true">+</span>
-              <span className="app-apple-tool-kicker px-2.5 py-1 text-[10px] font-semibold">
-                {isFileDragActive ? "松开检查" : "点击 · 拖入 · 粘贴"}
-              </span>
-              <span className="mt-4 text-xl font-semibold text-zinc-950 dark:text-white">
-                {fileDropzoneTitle}
-              </span>
-              <span
-                id="public-transfer-file-dropzone-detail"
-                aria-live="polite"
-                className="mt-1.5 w-full min-w-0 max-w-xl [overflow-wrap:anywhere] text-tiny text-zinc-500 dark:text-zinc-400"
-              >
-                {fileDropzoneDetail}
-              </span>
-            </button>
-            {coarsePointer ? (
-              <div className="mt-2 grid grid-cols-2 gap-2">
-                <Button
-                  size="sm"
-                  variant="flat"
-                  isDisabled={isRoomReadOnly}
-                  onPress={openSystemFilePicker}
-                >
-                  系统文件
-                </Button>
-                <Button
-                  size="sm"
-                  variant="flat"
-                  isDisabled={isRoomReadOnly}
-                  onPress={openMediaFilePicker}
-                >
-                  照片 / 视频
-                </Button>
-              </div>
+            {volatileFileWork ? (
+              <p role="status" data-testid="transfer-leave-warning" className="tr-leave-note">
+                <Icon name="alert" />
+                <span>当前有待处理文件。离开或刷新会中断传输：文件草稿和只在内存中接收的文件不会恢复；写入本机存储的接收在 24 小时内可以续传，但发送方需要重新选择同一文件。浏览器可能无法弹出提醒，离开前先完成传输并保存收到的文件。</span>
+              </p>
             ) : null}
-            {volatileFileWork ? <p role="status" data-testid="transfer-leave-warning" className="mt-3 rounded-md border border-warning-200 bg-warning-50/30 p-3 text-tiny">
-              当前有待处理文件。离开或刷新会中断传输：文件草稿和只在内存中接收的文件不会恢复；写入本机存储的接收在 24 小时内可以续传，但发送方需要重新选择同一文件。浏览器可能无法弹出提醒，请先完成传输并保存收到的文件。
-            </p> : null}
-          </div>
 
-          {state !== "idle" && (
-            <div className={activeTool === "whiteboard" ? "hidden" : "mt-4"} aria-hidden={activeTool === "whiteboard"}>
-              <TransferProgress
-                state={state}
-                store={progressStore}
-                transportPath={
-                  uploadInFlightRef.current?.targetPeerId
-                    ? peerTransportPaths[uploadInFlightRef.current.targetPeerId]
-                    : undefined
-                }
-                busy={isTransferBusy}
-                onCancel={cancelTransfer}
-              />
-            </div>
-          )}
-          </> : null}
-
-          {notice && (
-            <div
-              role="status"
-              aria-live="polite"
-              className="mt-4 rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-small text-emerald-800 dark:border-emerald-400/30 dark:bg-emerald-500/10 dark:text-emerald-100"
-            >
-              {notice}
-            </div>
-          )}
-
-          {error && (
-            <div
-              role="alert"
-              className="mt-4 flex items-start justify-between gap-2 rounded-lg border border-rose-300 bg-rose-50 px-3 py-2 text-small text-rose-700 dark:border-rose-400/30 dark:bg-rose-500/10 dark:text-rose-100"
-            >
-              <span className="min-w-0 [overflow-wrap:anywhere]">{error}</span>
-              <span className="flex shrink-0 items-center gap-1">
-                {state === "failed" && selectedFiles.length > 0 ? (
-                  <Button size="sm" radius="sm" color="danger" variant="flat" onPress={retryFailedTransfer}>
-                    重试
-                  </Button>
-                ) : null}
-                <button
-                  type="button"
-                  aria-label="关闭错误提示"
-                  className="grid h-6 w-6 place-items-center rounded-sm text-rose-500 transition hover:bg-rose-500/10 hover:text-rose-700 dark:text-rose-200 dark:hover:text-rose-50"
-                  onClick={() => setError(null)}
-                >
-                  <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
-                    <path d="M6 6l12 12M18 6L6 18" />
-                  </svg>
-                </button>
-              </span>
-            </div>
-          )}
-
-          {!isDiagramWorkspace ? <>
-          <SyncedClipboard
-            syncKey={transferRoomScopeKey}
-            isActive={activeTool === "clipboard"}
-            focusRequest={clipboardFocusRequest}
-            canSend={!isRoomReadOnly}
-            fileTargetRequired={true}
-            targetPeerId={selectedPeer?.peerId ?? ""}
-            targetPeerLabel={selectedPeer ? discoveryPeerDisplayName(selectedPeer) : ""}
-            events={clipboardEvents}
-            onSend={sendClipboardPayload}
-            onFiles={(files) => acceptFiles(files, "device")}
-            onDraftStateChange={setClipboardHasDraft}
-          />
-
-          <div
-            id="transfer-panel-whiteboard"
-            role="tabpanel"
-            aria-labelledby="transfer-tab-whiteboard"
-            hidden={activeTool !== "whiteboard"}
-          >
-            <div className="mt-3 rounded-lg border border-default-200 p-3 text-small" data-testid="collaboration-audience">
-              <div className="font-semibold">{sharedRoomActive ? "本协作空间的参与者" : "本地白板 · 尚未与任何设备共享"}</div>
-              <p className="mt-1 break-words text-default-500">{sharedRoomActive ? [displayName + "（我）", ...collaborationMembers.map(discoveryPeerDisplayName)].join("、") : "附近设备不会自动收到白板。创建协作空间并邀请对方后，才会同步内容。"}</p>
-              <Button className="mt-2" size="sm" variant="flat" onPress={sharedRoomActive ? openInvitePanel : enterSharedRoom}>{sharedRoomActive ? "邀请参与者 / 输入配对码" : "创建协作空间"}</Button>
-            </div>
-            <SyncedWhiteboard
-              boardKey={transferRoomScopeKey}
-              roomRole={effectiveRoomRole}
-              peerId={peerId}
-              peerCount={collaborationMembers.length}
-              isConnected={collaborationMembers.length > 0}
-              isActive={activeTool === "whiteboard"}
-              events={whiteboardEvents}
-              onSend={sendWhiteboardPayload}
-              onDraftStateChange={setWhiteboardHasDraft}
-            />
-          </div>
-
-          <div className={activeTool === "whiteboard" ? "hidden" : ""} aria-hidden={activeTool === "whiteboard"}>
-            {!hasReceivedFiles && !record ? incomingFilesPanel : null}
-
-            {record && (
-              <div className="mt-5 grid gap-4 lg:grid-cols-[minmax(0,1fr)_260px]">
-                <div className="rounded-lg glass glass-border border p-4">
-                  <div className="flex flex-wrap items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <div className="text-base font-semibold text-zinc-950 dark:text-white">
-                        {transferCompletionLabel(!record.direct)}
-                      </div>
-                      <div className="mt-1 truncate text-small font-medium text-zinc-700 dark:text-zinc-200">{record.attachment.fileName}</div>
-                      <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
-                        {formatBytes(record.attachment.sizeBytes)} · {record.direct ? "当前会话可直接保存" : "持有链接与访问口令的登录用户可下载"}
-                      </div>
-                      {!record.direct ? <p className="mt-1 text-tiny text-default-500">文件有效期：{record.attachment.expiresAt ? formatDateTime(record.attachment.expiresAt) : "服务端未提供"}；与房间邀请有效期分别计算。</p> : null}
-                    </div>
-                    <div className="flex max-w-full flex-wrap items-center gap-1.5">
-                      <Button
-                        size="sm"
-                        radius="sm"
-                        color="primary"
-                        variant="flat"
-                        aria-label={record.direct ? "系统分享文件" : "分享文件链接"}
-                        title={record.direct ? "系统分享文件" : "分享文件链接"}
-                        onPress={() => void shareRecordFile()}
-                      >
-                        <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                          <circle cx="18" cy="5" r="3" />
-                          <circle cx="6" cy="12" r="3" />
-                          <circle cx="18" cy="19" r="3" />
-                          <path d="m8.6 13.5 6.8 4M15.4 6.5l-6.8 4" />
-                        </svg>
-                        {record.direct ? "系统分享文件" : "分享文件链接"}
-                      </Button>
-                      <Button
-                        size="sm"
-                        radius="sm"
-                        color="success"
-                        variant="flat"
-                        aria-label="保存到本机"
-                        title="保存到本机"
-                        onPress={() => void downloadRecordFile()}
-                      >
-                        <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                          <path d="M12 4v11m0 0 4-4m-4 4-4-4M4.5 19.5h15" />
-                        </svg>
-                        下载到设备
-                      </Button>
-                    </div>
+            {hasTasks ? (
+              <section className="tr-section" id="transfer-tasks" tabIndex={-1} aria-labelledby="tr-tasks-title">
+                <div className="jd-section-head">
+                  <div className="min-w-0">
+                    <h2 id="tr-tasks-title">传输任务</h2>
+                    <p className="bd-num">
+                      {[
+                        runningTaskCount > 0 ? `${runningTaskCount} 个进行中` : "",
+                        completedTaskCount > 0 ? `${completedTaskCount} 个完成` : "",
+                        retryableTaskCount > 0 ? `${retryableTaskCount} 个可重试` : "",
+                      ].filter(Boolean).join(" · ") || "没有进行中的传输"}
+                    </p>
                   </div>
+                  {completedTaskCount > 0 ? (
+                    <button type="button" className="bd-btn bd-btn--ghost bd-btn--sm" onClick={() => setOutgoingActivities(keepUncompletedTransfers)}>
+                      <Icon name="check-check" /><span>清理已完成</span>
+                    </button>
+                  ) : null}
                 </div>
-                <Preview record={record} onPreview={setPreviewTarget} />
-              </div>
-            )}
+                <div className="tr-task-list">
+                  {receivingTransfers.map((item) => (
+                    <ReceivingTaskRow
+                      key={`receiving:${receivingTransferKey(item)}`}
+                      item={item}
+                      sourceLabel={peerLabel(item.sourcePeerId)}
+                      pathLabel={transportPathLabel(peerTransportPaths[item.sourcePeerId])}
+                      onCancel={() => { cancelIncomingTransfer(item.sourcePeerId, item.transferId); setNotice("已取消接收"); }}
+                    />
+                  ))}
+                  {outgoingActivities.map((activity) => (
+                    <OutgoingTaskRow
+                      key={activity.id}
+                      activity={activity}
+                      detail={activity.id === currentTaskActivityId ? (
+                        <ActiveSendDetail
+                          state={state}
+                          store={progressStore}
+                          transportPath={activity.targetPeerId ? peerTransportPaths[activity.targetPeerId] : undefined}
+                        />
+                      ) : null}
+                      result={activity.id === recordActivityId && record ? (
+                        <RecordResult
+                          record={record}
+                          onShare={() => void shareRecordFile()}
+                          onDownload={() => void downloadRecordFile()}
+                          onPreview={() => setPreviewTarget({
+                            fileName: record.attachment.fileName,
+                            mimeType: record.attachment.mimeType,
+                            url: record.previewUrl,
+                            blob: record.file,
+                            sizeBytes: record.attachment.sizeBytes,
+                          })}
+                        />
+                      ) : null}
+                      onCancel={() => (activity.id === currentTaskActivityId ? cancelTransfer() : cancelOutgoingActivity(activity.id))}
+                      onRetry={() => retryOutgoingActivity(activity)}
+                    />
+                  ))}
+                </div>
+                <ResumableTransfersPanel
+                  storedReceives={storedReceives}
+                  outgoingResumes={outgoingResumes}
+                  peerDisplayNames={diagramPeerDisplayNames}
+                  onResumeOutgoing={resumeOutgoing}
+                  onAbandonOutgoing={(transferId) => { abandonOutgoing(transferId); setNotice("已放弃该发送"); }}
+                  onAbandonReceive={(transferId) => { abandonStoredReceive(transferId); setNotice("已放弃并删除本机保存的部分数据"); }}
+                  onClearAll={clearLocalTransferData}
+                  onError={(message) => setError(message)}
+                />
+              </section>
+            ) : null}
           </div>
-          </> : (
-            <Suspense fallback={<DiagramWorkspaceLoading />}>
-              <LazySyncedDiagram
-                boardKey={transferRoomScopeKey}
-                roomId={roomId}
-                roomToken={sharedRoomActive ? roomToken : ""}
-                roomRole={effectiveRoomRole}
-                peerId={peerId}
-                peerCount={collaborationMembers.length}
-                peerDisplayNames={Object.fromEntries(collaborationMembers.map((peer) => [peer.peerId, discoveryPeerDisplayName(peer)]))}
-                isConnected={collaborationMembers.length > 0}
-                events={diagramEvents}
-                onSend={sendWhiteboardPayload}
-              />
-            </Suspense>
-          )}
         </div>
+      </div>
 
-        {!isDiagramWorkspace && activeTool !== "whiteboard" && (activeTool !== "files" || fileDeliveryMode === "device") ? <aside className="min-w-0 p-4 sm:p-5 xl:sticky xl:top-5 xl:self-start">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <h2 className="text-lg font-semibold">发送给谁</h2>
-              <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
-                {discoverable
-                  ? "自动发现或通过邀请加入的设备。选择前请核对对方页面上的设备名称。"
-                  : "你当前不可被发现；仍可以看到并主动发送给下列设备。"}
-              </div>
-            </div>
-            <Chip size="sm" radius="sm" variant="flat" color={peers.length > 0 ? "primary" : "default"}>
-              {peers.length} 台
-            </Chip>
+      <div className="bd-toast-region tr-toasts">
+        {error ? (
+          <div className="bd-toast bd-toast--error" role="alert">
+            <Icon name="circle-alert" />
+            <span className="tr-toast-text">{error}</span>
+            {failedRetryAvailable ? (
+              <button type="button" className="bd-toast-action" onClick={retryFailedTransfer}>重试</button>
+            ) : null}
+            <button type="button" className="bd-toast-close" aria-label="关闭错误提示" onClick={() => setError(null)}>
+              <Icon name="x" />
+            </button>
           </div>
-          <div className="mt-3">
-            <NearbyDeviceGrid
-              devices={peers.map((peer) => ({
-                peerId: peer.peerId,
-                displayName: discoveryPeerDisplayName(peer),
-                sameLan: Boolean(peerLanMap[peer.peerId]),
-              }))}
-              selectedPeerId={selectedPeerId}
-              transportPaths={peerTransportPaths}
-              discoverable={discoverable}
-              discoveryStatus={discoveryStatus}
-              onAddDevice={openInvitePanel}
-              onRetry={retryDiscoveryConnection}
-              onSelect={(device) => {
-                const peer = peers.find((item) => item.peerId === device.peerId);
-                if (!peer) return;
-                selectTransferPeer(peer);
-                setDeviceActionPeerId(peer.peerId);
-              }}
-              onOpenSettings={() => setRoomSettingsOpen(true)}
-            />
+        ) : null}
+        {notice ? (
+          <div className="bd-toast bd-toast--success" role="status" aria-live="polite">
+            <Icon name="circle-check" />
+            <span className="tr-toast-text">{notice}</span>
           </div>
-        </aside> : null}
-      </section>
+        ) : null}
+      </div>
+
+      {isFileDragActive ? (
+        <div className="tr-drop-overlay" aria-hidden="true">
+          <div className="tr-drop-card">
+            <span className="tr-drop-icon"><Icon name="upload" size={28} /></span>
+            <strong>松开以添加文件</strong>
+            <span>
+              {linkMode
+                ? "添加到待上传列表，确认后才生成链接"
+                : selectedPeer
+                  ? `准备发送给 ${selectedPeerLabel}，按发送前不会发出`
+                  : "先放进待发送列表，再选择接收方"}
+            </span>
+          </div>
+        </div>
+      ) : null}
+
       <TransferInviteModal
         isOpen={inviteOpen}
+        initialMode={inviteInitialMode}
         onClose={() => setInviteOpen(false)}
         sharedRoomActive={sharedRoomActive}
         roomId={roomId}
@@ -3906,39 +4054,38 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         isOpen={roomSettingsOpen}
         size="2xl"
         scrollBehavior="inside"
+        classNames={{ base: "tr-dialog" }}
         onOpenChange={(open) => {
           setRoomSettingsOpen(open);
           if (!open) resetRoomSettingsDraft();
         }}
       >
-        <ModalContent className="transfer-room-settings-modal">
+        <ModalContent>
           {(onClose) => (
             <>
-              <ModalHeader className="flex items-center justify-between gap-3">
-                <span>设备设置</span>
-                <Chip size="sm" radius="sm" variant="flat">{sharedRoomActive ? "共享房间" : "附近设备"}</Chip>
+              <ModalHeader className="tr-dialog-head">
+                <span className="bd-dialog-title">设备设置</span>
+                <Tag plain>{sharedRoomActive ? "共享房间" : "附近设备"}</Tag>
               </ModalHeader>
-              <ModalBody className="gap-5 pb-5">
-                <section className="grid gap-3 sm:grid-cols-2">
-                  <div className="sm:col-span-2">
-                    <h3 className="mb-2 text-small font-semibold text-zinc-900 dark:text-white">设备与房间</h3>
-                    <ClientNameSettings
-                      hideAction
-                      inputId="transfer-client-name-input"
-                      value={displayNameDraft}
-                      onValueChange={setDisplayNameDraft}
-                      status={clientNameStatus}
-                      localError={clientNameLocalError}
-                      isSaving={clientNameSaving}
-                      onApply={() => void saveRoomSettings()}
-                    />
-                  </div>
+              <ModalBody className="tr-settings">
+                <section className="tr-settings-group">
+                  <h3 className="tr-settings-title">设备与房间</h3>
+                  <ClientNameSettings
+                    hideAction
+                    inputId="transfer-client-name-input"
+                    value={displayNameDraft}
+                    onValueChange={setDisplayNameDraft}
+                    status={clientNameStatus}
+                    localError={clientNameLocalError}
+                    isSaving={clientNameSaving}
+                    onApply={() => void saveRoomSettings()}
+                  />
                 </section>
 
-                <section className="flex items-center justify-between gap-4 border-t border-black/[0.07] pt-4 dark:border-white/[0.08]">
-                  <div>
-                    <h3 className="text-small font-semibold text-zinc-900 dark:text-white">允许被发现</h3>
-                    <p className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
+                <section className="tr-settings-row">
+                  <div className="min-w-0">
+                    <h3 className="tr-settings-title">允许被发现</h3>
+                    <p className="tr-note">
                       {discoverableDraft
                         ? "同一公网出口的设备可自动发现你，已加入同一空间的成员也可看到你。"
                         : "其它设备看不到你；你仍可以看到它们并主动发送。"}
@@ -3952,105 +4099,67 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                   />
                 </section>
 
-                {!isDiagramWorkspace ? (
-                  <section className="flex items-center justify-between gap-4 border-t border-black/[0.07] pt-4 dark:border-white/[0.08]">
-                    <div>
-                      <h3 className="text-small font-semibold text-zinc-900 dark:text-white">接收前确认</h3>
-                      <p className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
-                        {receiveConfirmationDraft ? "收到文件后由你确认是否接收。" : "收到文件后立即开始接收。"}
-                      </p>
-                    </div>
-                    <Switch
-                      size="sm"
-                      aria-label="切换接收前确认"
-                      isSelected={receiveConfirmationDraft}
-                      onValueChange={setReceiveConfirmationDraft}
-                    />
-                  </section>
-                ) : null}
-              </ModalBody>
-              <ModalFooter className="justify-between">
-                <div className="flex items-center gap-2">
-                  {sharedRoomActive ? (
-                    <Button color="danger" variant="light" radius="sm" onPress={exitSharedRoom}>退出共享房间</Button>
-                  ) : null}
-                  <Button color="danger" variant="light" radius="sm" onPress={createNewRoom}>创建新房间</Button>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Button variant="light" radius="sm" onPress={onClose}>取消</Button>
-                  <Button
-                    color="primary"
-                    radius="sm"
-                    isLoading={clientNameSaving}
-                    isDisabled={Boolean(clientNameLocalError) || clientNameStatus === "checking" || clientNameStatus === "unavailable"}
-                    onPress={() => void saveRoomSettings()}
-                  >
-                    保存设置
-                  </Button>
-                </div>
-              </ModalFooter>
-            </>
-          )}
-        </ModalContent>
-      </Modal>
+                <section className="tr-settings-row">
+                  <div className="min-w-0">
+                    <h3 className="tr-settings-title">接收前确认</h3>
+                    <p className="tr-note">
+                      {receiveConfirmationDraft ? "收到文件后由你确认是否接收。" : "收到文件后立即开始接收。"}
+                    </p>
+                  </div>
+                  <Switch
+                    size="sm"
+                    aria-label="切换接收前确认"
+                    isSelected={receiveConfirmationDraft}
+                    onValueChange={setReceiveConfirmationDraft}
+                  />
+                </section>
 
-      <Modal
-        isOpen={activityCenterOpen}
-        size="2xl"
-        scrollBehavior="inside"
-        onOpenChange={(open) => {
-          setActivityCenterOpen(open);
-          if (open) {
-            setOutgoingActivities((activities) => activities.map((activity) => ({ ...activity, unread: false })));
-          }
-        }}
-      >
-        <ModalContent>
-          {(onClose) => (
-            <>
-              <ModalHeader className="flex items-center justify-between gap-3">
-                <span>传输任务</span>
-                <Chip size="sm" radius="sm" variant="flat">
-                  {activeOutgoingCount + receivingTransfers.length + pendingTransfers.length} 个进行中
-                </Chip>
-              </ModalHeader>
-              <ModalBody className="gap-5 pb-5">
-                <TransferActivityList
-                  outgoing={outgoingActivities}
-                  pending={pendingTransfers}
-                  receiving={receivingTransfers}
-                  peerDisplayNames={diagramPeerDisplayNames}
-                  onCancel={cancelOutgoingActivity}
-                  onRetry={retryOutgoingActivity}
-                  onAccept={(item) => acceptIncomingTransfer(item.sourcePeerId, item.transferId)}
-                  onReject={(item) => rejectIncomingTransfer(item.sourcePeerId, item.transferId)}
-                  onCancelReceiving={(item) => cancelIncomingTransfer(item.sourcePeerId, item.transferId)}
-                />
+                <section className="tr-settings-row">
+                  <div className="min-w-0">
+                    <h3 className="tr-settings-title">房间</h3>
+                    <p className="tr-note">
+                      {sharedRoomActive
+                        ? `共享房间 ${transferRoomDisplayName(roomId)}：只和加入的成员互传；退出后回到附近设备。`
+                        : "附近设备：同一网络里打开本页的设备会自动出现。创建新房间会断开当前设备。"}
+                    </p>
+                  </div>
+                  <div className="bd-row tr-settings-room-actions">
+                    {sharedRoomActive ? (
+                      <button type="button" className="bd-btn bd-btn--ghost bd-btn--sm tr-danger-text" onClick={exitSharedRoom}>退出共享房间</button>
+                    ) : null}
+                    <button type="button" className="bd-btn bd-btn--ghost bd-btn--sm tr-danger-text" onClick={createNewRoom}>创建新房间</button>
+                  </div>
+                </section>
               </ModalBody>
-              <ModalFooter>
-                <Button
-                  variant="light"
-                  radius="sm"
-                  onPress={() => setOutgoingActivities(keepUncompletedTransfers)}
+              <ModalFooter className="tr-dialog-foot">
+                <span className="tr-dialog-foot-spacer" />
+                <button type="button" className="bd-btn bd-btn--ghost" onClick={onClose}>取消</button>
+                <button
+                  type="button"
+                  className={`bd-btn bd-btn--primary${clientNameSaving ? " is-busy" : ""}`}
+                  disabled={Boolean(clientNameLocalError) || clientNameStatus === "checking" || clientNameStatus === "unavailable" || clientNameSaving}
+                  onClick={() => void saveRoomSettings()}
                 >
-                  清理已完成
-                </Button>
-                <Button color="primary" radius="sm" onPress={onClose}>完成</Button>
+                  保存设置
+                </button>
               </ModalFooter>
             </>
           )}
         </ModalContent>
       </Modal>
 
-      <Modal isOpen={helpOpen} size="2xl" scrollBehavior="inside" onOpenChange={setHelpOpen}>
+      <Modal isOpen={helpOpen} size="2xl" scrollBehavior="inside" classNames={{ base: "tr-dialog" }} onOpenChange={setHelpOpen}>
         <ModalContent>
           {(onClose) => (
             <>
-              <ModalHeader>互传帮助</ModalHeader>
-              <ModalBody className="pb-5">
+              <ModalHeader className="tr-dialog-head"><span className="bd-dialog-title">互传帮助</span></ModalHeader>
+              <ModalBody>
                 <TransferFaq iceConfig={iceConfig} sharedRoom={sharedRoomActive} ossFallbackEnabled={ossFallbackEnabled} onClearResumeData={clearLocalTransferData} />
               </ModalBody>
-              <ModalFooter><Button color="primary" radius="sm" onPress={onClose}>知道了</Button></ModalFooter>
+              <ModalFooter className="tr-dialog-foot">
+                <span className="tr-dialog-foot-spacer" />
+                <button type="button" className="bd-btn bd-btn--primary" onClick={onClose}>知道了</button>
+              </ModalFooter>
             </>
           )}
         </ModalContent>
@@ -4084,7 +4193,7 @@ function ClientNameSettings({
 }) {
   const errorMessage = localError
     || (status === "unavailable" ? "该名称已被其他在线设备使用" : "")
-    || (status === "error" ? "暂时无法校验名称，请稍后重试" : "");
+    || (status === "error" ? "暂时无法校验名称，稍后重试" : "");
   const description = status === "checking"
     ? "正在检查名称是否可用…"
     : status === "available" && !localError
@@ -4282,384 +4391,143 @@ function DiagramWorkspaceLoading({ fullscreen = false }: { fullscreen?: boolean 
   );
 }
 
-function TransferActivityList({
-  outgoing,
-  pending,
-  receiving,
-  peerDisplayNames,
-  onCancel,
-  onRetry,
-  onAccept,
-  onReject,
-  onCancelReceiving,
-}: {
-  outgoing: OutgoingTransferActivity[];
-  pending: DirectPendingTransfer[];
-  receiving: DirectReceivingTransfer[];
-  peerDisplayNames: Record<string, string>;
-  onCancel: (activityId: string) => void;
-  onRetry: (activity: OutgoingTransferActivity) => void;
-  onAccept: (item: DirectPendingTransfer) => void;
-  onReject: (item: DirectPendingTransfer) => void;
-  onCancelReceiving: (item: DirectReceivingTransfer) => void;
-}) {
-  if (outgoing.length === 0 && pending.length === 0 && receiving.length === 0) {
-    return (
-      <div className="rounded-md border border-dashed border-black/10 px-4 py-8 text-center text-small text-zinc-500 dark:border-white/10 dark:text-zinc-400">
-        暂无传输任务
-      </div>
-    );
-  }
-  const completedCount = outgoing.filter((activity) => activity.status === "completed").length;
-  const failedCount = outgoing.filter((activity) => activity.status === "failed").length;
-  const retryableCount = outgoing.filter((activity) => activity.status === "failed" || activity.status === "cancelled").length;
-  const activeCount = outgoing.filter((activity) => (
-    activity.status === "queued" || activity.status === "connecting" || activity.status === "sending"
-  )).length;
-  return (
-    <>
-      {outgoing.length > 0 ? (
-        <div
-          className="grid grid-cols-3 gap-2 rounded-md border border-black/[0.07] bg-black/[0.018] p-2.5 text-center dark:border-white/[0.08] dark:bg-white/[0.025]"
-          role="status"
-          aria-label={`${activeCount} 个进行中，${completedCount} 个成功，${retryableCount} 个可重试`}
-        >
-          <span><strong className="block text-base text-zinc-900 dark:text-white">{activeCount}</strong><span className="text-[11px] text-zinc-500 dark:text-zinc-400">进行中</span></span>
-          <span><strong className="block text-base text-emerald-700 dark:text-emerald-300">{completedCount}</strong><span className="text-[11px] text-zinc-500 dark:text-zinc-400">成功</span></span>
-          <span><strong className={`block text-base ${failedCount > 0 ? "text-rose-700 dark:text-rose-300" : "text-zinc-700 dark:text-zinc-200"}`}>{retryableCount}</strong><span className="text-[11px] text-zinc-500 dark:text-zinc-400">可重试</span></span>
-        </div>
-      ) : null}
-      {outgoing.length > 0 ? (
-        <section className="mt-4">
-          <h3 className="mb-2 text-small font-semibold text-zinc-900 dark:text-white">正在发送与历史</h3>
-          <div className="space-y-2">
-            {outgoing.map((activity) => {
-              const active = activity.status === "queued" || activity.status === "connecting" || activity.status === "sending";
-              return (
-                <div key={activity.id} className="rounded-md border border-black/[0.07] px-3 py-2.5 dark:border-white/[0.08]">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate text-small font-medium text-zinc-900 dark:text-white">{activity.fileName}</div>
-                      <div className="mt-0.5 truncate text-tiny text-zinc-500 dark:text-zinc-400">
-                        发给 {activity.targetPeerLabel} · {formatBytes(activity.sizeBytes)}
-                        {activity.transport ? ` · ${transferTransportLabel(activity.transport)}` : ""}
-                      </div>
-                    </div>
-                    <Chip size="sm" radius="sm" variant="flat" color={transferActivityStatusColor(activity.status)}>
-                      {transferActivityStatusLabel(activity.status, activity.transport)}
-                    </Chip>
-                  </div>
-                  {(active || activity.progress > 0) ? (
-                    <div className="mt-2">
-                      <Progress
-                        size="sm"
-                        aria-label={`${activity.fileName} 传输进度`}
-                        value={activity.progress}
-                        color={activity.status === "failed" || activity.status === "cancelled" ? "danger" : "primary"}
-                      />
-                      <div className="mt-1 flex items-center justify-between gap-2 text-[11px] text-zinc-400">
-                        <span>{formatBytes(activity.transferredBytes)} / {formatBytes(activity.sizeBytes)}</span>
-                        <span>
-                          {activity.speedBytesPerSecond > 0 ? `${formatBytes(activity.speedBytesPerSecond)}/s` : ""}
-                          {activity.etaSeconds !== null && activity.etaSeconds > 0 ? ` · 约 ${formatDuration(activity.etaSeconds)}` : ""}
-                        </span>
-                      </div>
-                    </div>
-                  ) : null}
-                  {activity.error ? <div className="mt-1.5 text-tiny text-rose-600 dark:text-rose-300">{activity.error}</div> : null}
-                  {active || activity.status === "failed" || activity.status === "cancelled" ? (
-                    <div className="mt-2 flex justify-end gap-1.5">
-                      {active ? <Button size="sm" radius="sm" variant="light" color="danger" onPress={() => onCancel(activity.id)}>取消</Button> : null}
-                      {activity.status === "failed" || activity.status === "cancelled" ? (
-                        <Button size="sm" radius="sm" color="primary" variant="flat" onPress={() => onRetry(activity)}>重试</Button>
-                      ) : null}
-                    </div>
-                  ) : null}
-                </div>
-              );
-            })}
-          </div>
-        </section>
-      ) : null}
+type InboxEntry =
+  | { kind: "file"; key: string; at: number; item: IncomingAttachment }
+  | { kind: "text"; key: string; at: number; event: ClipboardInboundEvent };
 
-      {pending.length > 0 || receiving.length > 0 ? (
-        <section>
-          <h3 className="mb-2 text-small font-semibold text-zinc-900 dark:text-white">正在接收</h3>
-          <div className="space-y-2">
-            {pending.map((item) => (
-              <div key={`pending-${item.sourcePeerId}-${item.transferId}`} className="flex items-center justify-between gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2.5 dark:border-amber-400/25 dark:bg-amber-500/10">
-                <div className="min-w-0">
-                  <div className="truncate text-small font-medium">{item.fileName}</div>
-                  <div className="mt-0.5 truncate text-tiny opacity-75">来自 {peerDisplayNames[item.sourcePeerId] || "未命名设备"} · {formatBytes(item.sizeBytes)}</div>
-                </div>
-                <div className="flex shrink-0 gap-1.5">
-                  <Button size="sm" radius="sm" variant="light" color="danger" onPress={() => onReject(item)}>拒绝</Button>
-                  <Button size="sm" radius="sm" color="primary" onPress={() => onAccept(item)}>接收</Button>
-                </div>
-              </div>
-            ))}
-            {receiving.map((item) => {
-              const progress = item.sizeBytes > 0 ? Math.min(100, item.receivedBytes * 100 / item.sizeBytes) : 0;
-              return (
-                <div key={`receiving-${item.sourcePeerId}-${item.transferId}`} className="rounded-md border border-black/[0.07] px-3 py-2.5 dark:border-white/[0.08]">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="min-w-0">
-                      <div className="truncate text-small font-medium">{item.fileName}</div>
-                      <div className="mt-0.5 truncate text-tiny text-zinc-500 dark:text-zinc-400">来自 {peerDisplayNames[item.sourcePeerId] || "未命名设备"}</div>
-                    </div>
-                    <Button size="sm" radius="sm" variant="light" color="danger" onPress={() => onCancelReceiving(item)}>取消</Button>
-                  </div>
-                  <Progress className="mt-2" size="sm" aria-label={`${item.fileName} 接收进度`} value={progress} />
-                  <div className="mt-1 text-[11px] text-zinc-400">{formatBytes(item.receivedBytes)} / {formatBytes(item.sizeBytes)}</div>
-                </div>
-              );
-            })}
-          </div>
-        </section>
-      ) : null}
-    </>
+interface SendBarModel {
+  label: string;
+  icon: IconName;
+  disabled: boolean;
+  /** Why the button is off, or what happens next; empty when the summary already says it. */
+  reason: string;
+  onSend: () => void;
+  hint?: ReactNode;
+}
+
+const TRANSFER_TOOL_META: Record<TransferToolMode, { label: string; icon: IconName }> = {
+  clipboard: { label: "文字与链接", icon: "message" },
+  files: { label: "文件", icon: "folder" },
+  whiteboard: { label: "多人白板", icon: "edit" },
+};
+
+const OUTGOING_STATUS_TONE: Record<OutgoingTransferStatus, { tone: Tone; plain?: boolean }> = {
+  queued: { tone: "neutral", plain: true },
+  connecting: { tone: "info" },
+  sending: { tone: "info" },
+  completed: { tone: "success" },
+  failed: { tone: "danger" },
+  cancelled: { tone: "warning" },
+};
+
+const INBOX_PAGE_SIZE = 6;
+
+/** The current time, refreshed every `intervalMs` while `enabled`; for elapsed-time labels. */
+function useNow(intervalMs: number, enabled = true) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!enabled) return undefined;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), intervalMs);
+    return () => window.clearInterval(timer);
+  }, [enabled, intervalMs]);
+  return now;
+}
+
+function StepBadge({ step, done }: { step: number; done: boolean }) {
+  return (
+    <span className={`tr-step${done ? " is-done" : ""}`} aria-hidden="true">
+      {done ? <Icon name="check" size={13} /> : step}
+    </span>
   );
 }
 
-function ToolModeButton({
-  mode,
-  activeMode,
-  label,
-  detail,
-  unreadCount = 0,
+/** The content switch: the design's segmented control, with tab semantics because it swaps panels. */
+function ModeTabs({
+  active,
+  fileCount,
   onSelect,
 }: {
-  mode: TransferToolMode;
-  activeMode: TransferToolMode;
-  label: string;
-  detail: string;
-  unreadCount?: number;
+  active: TransferToolMode;
+  fileCount: number;
   onSelect: (mode: TransferToolMode, focusContent?: boolean) => void;
 }) {
-  const active = mode === activeMode;
-  const selectAndFocus = (nextMode: TransferToolMode) => {
-    onSelect(nextMode, false);
-    window.requestAnimationFrame(() => document.getElementById(`transfer-tab-${nextMode}`)?.focus());
+  const focusTab = (mode: TransferToolMode) => {
+    window.requestAnimationFrame(() => document.getElementById(`transfer-tab-${mode}`)?.focus());
   };
   return (
-    <button
-      id={`transfer-tab-${mode}`}
-      type="button"
-      role="tab"
-      aria-selected={active}
-      aria-controls={`transfer-panel-${mode}`}
-      tabIndex={active ? 0 : -1}
-      className={`app-apple-tool-tab min-w-0 px-3 py-2 text-left transition-colors ${active ? "is-active" : ""}`}
-      onClick={() => onSelect(mode, true)}
-      onKeyDown={(event) => {
-        const currentIndex = TRANSFER_TOOL_MODES.indexOf(mode);
-        let nextMode: TransferToolMode | null = null;
-        if (event.key === "ArrowRight") {
-          nextMode = TRANSFER_TOOL_MODES[(currentIndex + 1) % TRANSFER_TOOL_MODES.length];
-        } else if (event.key === "ArrowLeft") {
-          nextMode = TRANSFER_TOOL_MODES[(currentIndex - 1 + TRANSFER_TOOL_MODES.length) % TRANSFER_TOOL_MODES.length];
-        } else if (event.key === "Home") {
-          nextMode = TRANSFER_TOOL_MODES[0];
-        } else if (event.key === "End") {
-          nextMode = TRANSFER_TOOL_MODES[TRANSFER_TOOL_MODES.length - 1];
-        }
-        if (nextMode) {
-          event.preventDefault();
-          selectAndFocus(nextMode);
-        }
-      }}
-    >
-      <span className="flex items-center gap-1.5">
-        <span className="min-w-0 truncate text-small font-semibold">{label}</span>
-        {unreadCount > 0 ? (
-          <span className="grid min-h-4 min-w-4 shrink-0 place-items-center rounded-full bg-primary-600 px-1 text-[10px] font-semibold text-white">
-            {unreadCount > 99 ? "99+" : unreadCount}
-          </span>
-        ) : null}
-      </span>
-      <span className="app-apple-tool-tab-detail mt-0.5 block truncate text-[11px]">
-        {detail}
-      </span>
-    </button>
+    <div className="bd-seg bd-seg--md tr-modes" role="tablist" aria-label="选择发送内容">
+      {TRANSFER_TOOL_MODES.map((mode, index) => {
+        const selected = mode === active;
+        const meta = TRANSFER_TOOL_META[mode];
+        return (
+          <button
+            key={mode}
+            id={`transfer-tab-${mode}`}
+            type="button"
+            role="tab"
+            aria-selected={selected}
+            aria-controls={`transfer-panel-${mode}`}
+            tabIndex={selected ? 0 : -1}
+            onClick={() => onSelect(mode, true)}
+            onKeyDown={(event: ReactKeyboardEvent<HTMLButtonElement>) => {
+              const count = TRANSFER_TOOL_MODES.length;
+              const next = event.key === "ArrowRight" ? TRANSFER_TOOL_MODES[(index + 1) % count]
+                : event.key === "ArrowLeft" ? TRANSFER_TOOL_MODES[(index - 1 + count) % count]
+                  : event.key === "Home" ? TRANSFER_TOOL_MODES[0]
+                    : event.key === "End" ? TRANSFER_TOOL_MODES[count - 1]
+                      : null;
+              if (next) {
+                event.preventDefault();
+                onSelect(next, false);
+                focusTab(next);
+              }
+            }}
+          >
+            <Icon name={meta.icon} />
+            <span className="tr-mode-label">{meta.label}</span>
+            {mode === "files" && fileCount > 0 ? <span className="tr-mode-count bd-num">{fileCount}</span> : null}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
-function IncomingFilesPanel({
-  pendingTransfers,
-  receivingTransfers,
-  peerTransportPaths,
-  peerDisplayNames,
-  incoming,
-  cloudTransferEnabled,
-  onAcceptDirect,
-  onRejectDirect,
-  onCancelReceiving,
-  onShare,
-  onDownload,
-  onLogin,
-  onPreview,
-}: {
-  pendingTransfers: DirectPendingTransfer[];
-  receivingTransfers: DirectReceivingTransfer[];
-  peerTransportPaths: Record<string, PeerTransportPath>;
-  peerDisplayNames: Record<string, string>;
-  incoming: IncomingAttachment[];
-  cloudTransferEnabled: boolean;
-  onAcceptDirect: (item: DirectPendingTransfer) => void;
-  onRejectDirect: (item: DirectPendingTransfer) => void;
-  onCancelReceiving: (item: DirectReceivingTransfer) => void;
-  onShare: (item: IncomingAttachment) => Promise<void>;
-  onDownload: (item: IncomingAttachment) => Promise<void>;
-  onLogin: () => void;
-  onPreview: (target: PreviewTarget) => void;
-}) {
-  const hasPending = pendingTransfers.length > 0;
-  const hasReceiving = receivingTransfers.length > 0;
-  const hasIncoming = incoming.length > 0;
-  const sourceLabel = (sourcePeerId: string) => peerDisplayNames[sourcePeerId]
-    ?? (sourcePeerId === "shared-link" ? "共享链接" : sourcePeerId);
-
+/** Step 3: who receives it, and the one primary button that says what will happen. */
+function SendBar({ model, summary }: { model: SendBarModel; summary: ReactNode }) {
+  const reasonId = useId();
   return (
-    <section className="mt-5 rounded-lg glass glass-border border p-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div>
-          <h2 className="text-base font-semibold text-zinc-950 dark:text-white">收到的文件</h2>
-          <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
-            接收进度、预览和保存入口会显示在这里。
-          </div>
-        </div>
-        <Chip size="sm" radius="sm" variant="flat" color={hasIncoming || hasReceiving || hasPending ? "primary" : "default"}>
-          {incoming.length + receivingTransfers.length + pendingTransfers.length} 项
-        </Chip>
+    <div className="tr-sendbar" data-testid="transfer-recipient-bar">
+      <div className="tr-sendbar-target">{summary}</div>
+      {model.reason ? <p id={reasonId} className="tr-sendbar-reason">{model.reason}</p> : null}
+      <div className="tr-sendbar-action">
+        {model.hint}
+        <StepBadge step={3} done={false} />
+        <button
+          type="button"
+          className="bd-btn bd-btn--primary tr-send-btn"
+          disabled={model.disabled}
+          aria-describedby={model.reason ? reasonId : undefined}
+          onClick={model.onSend}
+        >
+          <Icon name={model.icon} />
+          <span>{model.label}</span>
+        </button>
       </div>
-
-      {hasPending && (
-        <div className="mt-3 grid gap-2 md:grid-cols-2">
-          {pendingTransfers.map((item) => (
-            <div key={receivingTransferKey(item)} className="rounded-lg border border-amber-300 bg-amber-50/80 p-3 dark:border-amber-300/25 dark:bg-amber-300/10">
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0">
-                  <div className="truncate text-small font-semibold text-amber-950 dark:text-amber-100">{item.fileName}</div>
-                  <div className="mt-1 text-tiny text-amber-800/75 dark:text-amber-100/70">
-                    来自 <span title={item.sourcePeerId}>{sourceLabel(item.sourcePeerId)}</span> · {formatBytes(item.sizeBytes)}
-                  </div>
-                </div>
-                <Chip size="sm" radius="sm" color="warning" variant="flat">
-                  待确认
-                </Chip>
-              </div>
-              {item.storage === "persistent" ? (
-                <p className="mt-2 text-tiny text-amber-900/80 dark:text-amber-100/75">
-                  接收后已校验的分块会写入本机浏览器存储，中断或刷新后 24 小时内可续传，可随时放弃并删除；浏览器可能自行清除这些数据。同一站点的页面可以读取它们，共用电脑建议拒绝。
-                </p>
-              ) : item.storage === "memory" ? (
-                <p className="mt-2 text-tiny text-amber-900/80 dark:text-amber-100/75">
-                  只在内存中接收{item.memoryReason ? `（${memoryReasonText(item.memoryReason)}）` : ""}：网络短暂中断可以续传，刷新或关闭页面后无法恢复。
-                </p>
-              ) : null}
-              <div className="mt-3 grid grid-cols-2 gap-2">
-                <Button size="sm" radius="sm" color="primary" onPress={() => onAcceptDirect(item)}>
-                  接收
-                </Button>
-                <Button size="sm" radius="sm" variant="flat" onPress={() => onRejectDirect(item)}>
-                  拒绝
-                </Button>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {hasReceiving && (
-        <div className="mt-3 grid gap-2 md:grid-cols-2">
-          {receivingTransfers.map((item) => {
-            const percent = transferProgress(item.receivedBytes, item.sizeBytes);
-            const pathLabel = transportPathLabel(peerTransportPaths[item.sourcePeerId]);
-            return (
-              <div key={receivingTransferKey(item)} className="rounded-lg border border-cyan-400/30 bg-cyan-50/70 p-3 dark:border-cyan-300/20 dark:bg-cyan-400/10">
-                <div className="truncate text-small font-medium text-cyan-950 dark:text-cyan-100">{item.fileName}</div>
-                <div className="mt-1 text-tiny text-cyan-800/75 dark:text-cyan-100/70">
-                  来自 <span title={item.sourcePeerId}>{sourceLabel(item.sourcePeerId)}</span> · {formatBytes(item.receivedBytes)} / {formatBytes(item.sizeBytes)}{pathLabel ? ` · ${pathLabel}` : ""}
-                  {item.storage === "persistent" ? " · 写入本机，可续传" : item.storage === "memory" ? " · 仅内存" : ""}
-                </div>
-                <div className="mt-2 flex items-center gap-2">
-                  <Progress className="flex-1" aria-label={`${item.fileName} 接收进度`} color="primary" size="sm" value={percent} />
-                  <Button size="sm" radius="sm" variant="light" onPress={() => onCancelReceiving(item)}>
-                    取消
-                  </Button>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
-
-      <div className="mt-3 grid gap-3 md:grid-cols-2">
-        {!hasIncoming && !hasPending && !hasReceiving ? (
-          <div className="rounded-lg glass border border-dashed glass-border p-4 text-small text-zinc-500 dark:text-zinc-400 md:col-span-2">
-            尚未收到文件。对方发送后会出现在这里。
-          </div>
-        ) : incoming.map((item) => {
-          const previewUrl = item.previewUrl;
-          const cloudLoginRequired = !item.direct && !cloudTransferEnabled;
-          return (
-            <div key={incomingItemKey(item)} className="rounded-lg glass glass-border border p-3">
-              <div className="truncate text-small font-medium">{item.attachment.fileName}</div>
-              <div className="mt-1 text-tiny text-zinc-500">
-                来自 <span title={item.sourcePeerId}>{sourceLabel(item.sourcePeerId)}</span> · {formatBytes(item.attachment.sizeBytes)}{item.direct ? " · 设备互传" : ""}
-              </div>
-              {(previewUrl || item.direct) && (
-                <FilePreview
-                  fileName={item.attachment.fileName}
-                  mimeType={item.attachment.mimeType}
-                  url={previewUrl}
-                  blob={item.blob}
-                  sizeBytes={item.attachment.sizeBytes}
-                  compact
-                  onPreview={onPreview}
-                />
-              )}
-              <div className="mt-2 flex gap-2">
-                <Button size="sm" radius="sm" variant="flat" isDisabled={cloudLoginRequired} onPress={() => void onShare(item)}>
-                  {item.direct ? "系统分享文件" : "分享文件链接"}
-                </Button>
-                <Button
-                  size="sm"
-                  radius="sm"
-                  color="success"
-                  variant={item.downloadUrl || item.direct ? "solid" : "flat"}
-                  isLoading={item.downloading}
-                  onPress={() => cloudLoginRequired ? onLogin() : void onDownload(item)}
-                >
-                  {item.direct ? "保存到设备" : cloudLoginRequired ? "登录下载" : "下载到设备"}
-                </Button>
-              </div>
-              {item.downloading && (
-                <Progress className="mt-2" aria-label={`${item.attachment.fileName} 下载进度`} color="success" size="sm" value={item.downloadProgress ?? 0} />
-              )}
-              {item.downloadError && (
-                <div className="mt-2 text-tiny text-rose-600 dark:text-rose-200">{item.downloadError}</div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-    </section>
+    </div>
   );
 }
 
-function TransferProgress({
+/** What the send in flight is waiting for: the receiver's consent, the connection, the upload. */
+function ActiveSendDetail({
   state,
   store,
   transportPath,
-  busy,
-  onCancel,
 }: {
   state: UploadState;
   store: TransferProgressStore;
   transportPath?: PeerTransportPath;
-  busy: boolean;
-  onCancel: () => void;
 }) {
   const progress = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
   const [waitingSeconds, setWaitingSeconds] = useState(0);
@@ -4675,57 +4543,393 @@ function TransferProgress({
     return () => window.clearInterval(timer);
   }, [state]);
   const pathLabel = state === "direct" || state === "waiting" ? transportPathLabel(transportPath) : null;
-  const indeterminate = state === "connecting"
-    || state === "waiting"
-    || state === "presigning"
-    || state === "completing";
+  const text = state === "waiting"
+    ? `等待对方确认接收（已等待 ${formatElapsed(waitingSeconds)}）`
+    : state === "direct" || state === "uploading" ? "" : stateLabel(state, progress);
+  if (!text && !pathLabel) return null;
   return (
-    <>
-      <Progress
-        aria-label="上传进度"
-        isIndeterminate={indeterminate}
-        value={indeterminate ? undefined : state === "done" ? 100 : progress}
-        color={state === "failed" ? "danger" : "primary"}
-        size="sm"
-      />
-      <div className="mt-2 flex items-center gap-1.5 text-tiny text-zinc-500 dark:text-zinc-400">
-        <span>{state === "waiting" ? `等待对方确认接收（已等待 ${waitingSeconds} 秒）` : stateLabel(state, progress)}</span>
-        {pathLabel && (
-          <span
-            className={`rounded-sm px-1.5 py-0.5 text-[10px] font-medium ${
-              transportPath === "turn"
-                ? "bg-amber-500/15 text-amber-700 dark:text-amber-200"
-                : "bg-emerald-500/15 text-emerald-700 dark:text-emerald-200"
-            }`}
-          >
-            {pathLabel}
-          </span>
-        )}
-        {busy ? (
-          <Button className="ml-auto" size="sm" radius="sm" color="danger" variant="light" onPress={onCancel}>
-            取消
-          </Button>
-        ) : null}
-      </div>
-    </>
+    <p className="tr-task-msg tr-task-detail">
+      {text ? <span>{text}</span> : null}
+      {pathLabel ? <Tag tone={transportPath === "turn" ? "neutral" : "success"}>{pathLabel}</Tag> : null}
+    </p>
   );
 }
 
-function Preview({ record, onPreview }: { record: UploadRecord; onPreview: (target: PreviewTarget) => void }) {
+/** The finished send's result: the file link and its expiry, or the local copy to share or save. */
+function RecordResult({
+  record,
+  onShare,
+  onDownload,
+  onPreview,
+}: {
+  record: UploadRecord;
+  onShare: () => void;
+  onDownload: () => void;
+  onPreview: () => void;
+}) {
   return (
-    <FilePreview
-      fileName={record.attachment.fileName}
-      mimeType={record.attachment.mimeType}
-      url={record.previewUrl}
-      blob={record.file}
-      sizeBytes={record.attachment.sizeBytes}
-      onPreview={onPreview}
-    />
+    <div className="tr-task-result">
+      <p className="tr-task-msg">
+        {record.direct
+          ? "当前会话可直接保存这个文件。"
+          : <>文件有效期：{record.attachment.expiresAt ? formatDateTime(record.attachment.expiresAt) : "服务端未提供"}；与房间邀请有效期分别计算。持有链接与访问口令的登录用户可下载。</>}
+      </p>
+      <div className="bd-row">
+        <button type="button" className="bd-btn bd-btn--ghost bd-btn--sm" aria-label={`预览 ${record.attachment.fileName}`} onClick={onPreview}>
+          <Icon name="eye" /><span>预览</span>
+        </button>
+        <button type="button" className="bd-btn bd-btn--secondary bd-btn--sm" onClick={onShare}>
+          <Icon name="share" /><span>{record.direct ? "系统分享文件" : "分享文件链接"}</span>
+        </button>
+        <button type="button" className="bd-btn bd-btn--secondary bd-btn--sm" onClick={onDownload}>
+          <Icon name="download" /><span>下载到设备</span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function OutgoingTaskRow({
+  activity,
+  detail,
+  result,
+  onCancel,
+  onRetry,
+}: {
+  activity: OutgoingTransferActivity;
+  detail: ReactNode;
+  result: ReactNode;
+  onCancel: () => void;
+  onRetry: () => void;
+}) {
+  const active = activity.status === "queued" || activity.status === "connecting" || activity.status === "sending";
+  const running = activity.status === "connecting" || activity.status === "sending";
+  const retryable = activity.status === "failed" || activity.status === "cancelled";
+  const now = useNow(1000, active);
+  const elapsedSeconds = Math.max(0, ((activity.completedAt ?? now) - activity.createdAt) / 1000);
+  const status = OUTGOING_STATUS_TONE[activity.status];
+  const linkTask = !activity.targetPeerId;
+  const showError = activity.error && (activity.status === "failed" || activity.error !== "已取消");
+  return (
+    <article className={`tr-task is-${activity.status}${running ? " is-running" : ""}`}>
+      <span className="tr-task-thumb" aria-hidden="true">
+        <Icon name={fileKindIcon(activity.fileName, activity.file.type)} size={18} />
+      </span>
+      <div className="tr-task-main">
+        <div className="tr-task-head">
+          <span className={`tr-task-kind ${linkTask ? "is-link" : "is-send"}`}>{linkTask ? "链接" : "发送"}</span>
+          <span className="tr-task-title" title={activity.fileName}>{activity.fileName}</span>
+        </div>
+        {running || (activity.progress > 0 && activity.status !== "completed") ? (
+          <Progress value={activity.progress} label={`${activity.fileName} 传输进度`} />
+        ) : null}
+        {showError ? <p className="tr-task-msg tr-text-danger">{activity.error}</p> : null}
+        {detail}
+        {result}
+        <div className="tr-task-meta">
+          <Tag tone={status.tone} plain={status.plain}>{transferActivityStatusLabel(activity.status, activity.transport)}</Tag>
+          <span>{linkTask ? "生成文件链接" : `发给 ${activity.targetPeerLabel}`}</span>
+          <span className="bd-num">
+            {active && activity.transferredBytes > 0 ? `${formatBytes(activity.transferredBytes)} / ` : ""}{formatBytes(activity.sizeBytes)}
+          </span>
+          {running && activity.speedBytesPerSecond > 0 ? <span className="bd-num">{formatBytes(activity.speedBytesPerSecond)}/s</span> : null}
+          {running && activity.etaSeconds !== null && activity.etaSeconds > 0 ? <span className="bd-num">剩余约 {formatElapsed(activity.etaSeconds)}</span> : null}
+          {activity.transport ? <span>{transferTransportLabel(activity.transport)}</span> : null}
+          <span className="bd-num">{activity.status === "queued" ? "已等" : active ? "已用" : "用时"} {formatElapsed(elapsedSeconds)}</span>
+          {!active && activity.completedAt ? <span>结束 <RelativeTime value={activity.completedAt} /></span> : null}
+        </div>
+      </div>
+      {active || retryable ? (
+        <div className="tr-task-actions">
+          {active ? <button type="button" className="bd-btn bd-btn--ghost bd-btn--sm" onClick={onCancel}>取消</button> : null}
+          {retryable ? (
+            <button type="button" className="bd-btn bd-btn--secondary bd-btn--sm" onClick={onRetry}>
+              <Icon name="refresh" /><span>重试</span>
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+    </article>
+  );
+}
+
+function ReceivingTaskRow({
+  item,
+  sourceLabel,
+  pathLabel,
+  onCancel,
+}: {
+  item: DirectReceivingTransfer;
+  sourceLabel: string;
+  pathLabel: string | null;
+  onCancel: () => void;
+}) {
+  const [startedAt] = useState(() => Date.now());
+  const sampleRef = useRef({ at: startedAt, bytes: item.receivedBytes });
+  const [speed, setSpeed] = useState(0);
+  const now = useNow(1000);
+  useEffect(() => {
+    const at = Date.now();
+    const previous = sampleRef.current;
+    if (at - previous.at < 500 || item.receivedBytes < previous.bytes) return;
+    const sample = (item.receivedBytes - previous.bytes) * 1000 / (at - previous.at);
+    setSpeed((current) => current > 0 ? current * 0.65 + sample * 0.35 : sample);
+    sampleRef.current = { at, bytes: item.receivedBytes };
+  }, [item.receivedBytes]);
+  const percent = transferProgress(item.receivedBytes, item.sizeBytes);
+  const remaining = speed > 0 ? Math.ceil(Math.max(0, item.sizeBytes - item.receivedBytes) / speed) : null;
+  return (
+    <article className="tr-task is-running">
+      <span className="tr-task-thumb" aria-hidden="true"><Icon name={fileKindIcon(item.fileName, item.mimeType)} size={18} /></span>
+      <div className="tr-task-main">
+        <div className="tr-task-head">
+          <span className="tr-task-kind is-receive">接收</span>
+          <span className="tr-task-title" title={item.fileName}>{item.fileName}</span>
+        </div>
+        <Progress value={percent} label={`${item.fileName} 接收进度`} />
+        <div className="tr-task-meta">
+          <Tag tone="info">正在接收</Tag>
+          <span>来自 {sourceLabel}</span>
+          <span className="bd-num">{formatBytes(item.receivedBytes)} / {formatBytes(item.sizeBytes)}</span>
+          {speed > 0 ? <span className="bd-num">{formatBytes(speed)}/s</span> : null}
+          {remaining ? <span className="bd-num">剩余约 {formatElapsed(remaining)}</span> : null}
+          {pathLabel ? <span>{pathLabel}</span> : null}
+          {item.storage === "persistent" ? <span>写入本机，可续传</span> : item.storage === "memory" ? <span>仅内存</span> : null}
+          <span className="bd-num">已用 {formatElapsed((now - startedAt) / 1000)}</span>
+        </div>
+      </div>
+      <div className="tr-task-actions">
+        <button type="button" className="bd-btn bd-btn--ghost bd-btn--sm" onClick={onCancel}>取消</button>
+      </div>
+    </article>
+  );
+}
+
+/** Everything that arrived: requests to accept first, then files and texts, newest first. */
+function TransferInbox({
+  pending,
+  entries,
+  peerLabel,
+  cloudTransferEnabled,
+  onAccept,
+  onReject,
+  onShare,
+  onDownload,
+  onLogin,
+  onPreview,
+  onCopyText,
+}: {
+  pending: DirectPendingTransfer[];
+  entries: InboxEntry[];
+  peerLabel: (sourcePeerId: string) => string;
+  cloudTransferEnabled: boolean;
+  onAccept: (item: DirectPendingTransfer) => void;
+  onReject: (item: DirectPendingTransfer) => void;
+  onShare: (item: IncomingAttachment) => Promise<void>;
+  onDownload: (item: IncomingAttachment) => Promise<void>;
+  onLogin: () => void;
+  onPreview: (target: PreviewTarget) => void;
+  onCopyText: (text: string) => void;
+}) {
+  const [limit, setLimit] = useState(INBOX_PAGE_SIZE);
+  const visible = entries.slice(0, limit);
+  const hiddenCount = entries.length - visible.length;
+  const total = pending.length + entries.length;
+  return (
+    <section className="bd-card tr-card tr-inbox" aria-labelledby="tr-inbox-title">
+      <div className="tr-card-head">
+        <span className="tr-card-icon" aria-hidden="true"><Icon name="download" /></span>
+        <h2 id="tr-inbox-title" className="tr-card-title">收到的内容</h2>
+        <span className="tr-count-badge bd-num"><span className="jd-sr-only">共 </span>{total}<span className="jd-sr-only"> 项</span></span>
+      </div>
+      <div className="tr-card-body tr-inbox-body">
+        {pending.map((item) => (
+          <article key={`pending:${receivingTransferKey(item)}`} className="tr-inbox-item is-pending">
+            <span className="tr-inbox-thumb" aria-hidden="true"><Icon name={fileKindIcon(item.fileName, item.mimeType)} size={18} /></span>
+            <div className="tr-inbox-main">
+              <div className="tr-inbox-name" title={item.fileName}>{item.fileName}</div>
+              <div className="tr-inbox-meta">
+                <Tag tone="warning">等待你确认</Tag>
+                <span>来自 <span title={item.sourcePeerId}>{peerLabel(item.sourcePeerId)}</span></span>
+                <span className="bd-num">{formatBytes(item.sizeBytes)}</span>
+              </div>
+              {item.storage === "persistent" ? (
+                <p className="tr-note">
+                  接收后已校验的分块会写入本机浏览器存储，中断或刷新后 24 小时内可续传，可随时放弃并删除；浏览器可能自行清除这些数据。同一站点的页面可以读取它们，共用电脑建议拒绝。
+                </p>
+              ) : item.storage === "memory" ? (
+                <p className="tr-note">
+                  只在内存中接收{item.memoryReason ? `（${memoryReasonText(item.memoryReason)}）` : ""}：网络短暂中断可以续传，刷新或关闭页面后无法恢复。
+                </p>
+              ) : null}
+            </div>
+            <div className="tr-inbox-actions">
+              <button type="button" className="bd-btn bd-btn--ghost bd-btn--sm" onClick={() => onReject(item)}>拒绝</button>
+              <button type="button" className="bd-btn bd-btn--primary bd-btn--sm" onClick={() => onAccept(item)}>
+                <Icon name="download" /><span>接收</span>
+              </button>
+            </div>
+          </article>
+        ))}
+        {visible.length > 0 ? (
+          <ul className="tr-inbox-list" aria-label="收到的文件和文字">
+            {visible.map((entry) => entry.kind === "file" ? (
+              <InboxFileRow
+                key={entry.key}
+                item={entry.item}
+                sourceLabel={peerLabel(entry.item.sourcePeerId)}
+                cloudTransferEnabled={cloudTransferEnabled}
+                onShare={onShare}
+                onDownload={onDownload}
+                onLogin={onLogin}
+                onPreview={onPreview}
+              />
+            ) : (
+              <InboxTextRow key={entry.key} event={entry.event} onCopyText={onCopyText} onPreview={onPreview} />
+            ))}
+          </ul>
+        ) : null}
+        {hiddenCount > 0 ? (
+          <button type="button" className="bd-btn bd-btn--ghost bd-btn--sm tr-inbox-more" onClick={() => setLimit((value) => value + INBOX_PAGE_SIZE)}>
+            再显示 {Math.min(hiddenCount, INBOX_PAGE_SIZE)} 条
+          </button>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+function InboxFileRow({
+  item,
+  sourceLabel,
+  cloudTransferEnabled,
+  onShare,
+  onDownload,
+  onLogin,
+  onPreview,
+}: {
+  item: IncomingAttachment;
+  sourceLabel: string;
+  cloudTransferEnabled: boolean;
+  onShare: (item: IncomingAttachment) => Promise<void>;
+  onDownload: (item: IncomingAttachment) => Promise<void>;
+  onLogin: () => void;
+  onPreview: (target: PreviewTarget) => void;
+}) {
+  const { fileName, mimeType, sizeBytes } = item.attachment;
+  const kind = mediaKind(fileName, mimeType);
+  const [thumbFailed, setThumbFailed] = useState(false);
+  const thumbUrl = kind === "image" && item.previewUrl && sizeBytes <= AUTO_PREVIEW_LIMIT_BYTES && !thumbFailed ? item.previewUrl : null;
+  const previewable = Boolean(item.previewUrl || item.blob);
+  const cloudLoginRequired = !item.direct && !cloudTransferEnabled;
+  const saved = item.downloadProgress === 100 && !item.downloading;
+  const shareLabel = item.direct ? "系统分享文件" : "分享文件链接";
+  return (
+    <li className="tr-inbox-item">
+      <span className={`tr-inbox-thumb${thumbUrl ? " has-image" : ""}`} aria-hidden="true">
+        {thumbUrl
+          ? <img src={thumbUrl} alt="" onError={() => setThumbFailed(true)} />
+          : <Icon name={fileKindIcon(fileName, mimeType)} size={18} />}
+      </span>
+      <div className="tr-inbox-main">
+        <div className="tr-inbox-name" title={fileName}>{fileName}</div>
+        <div className="tr-inbox-meta">
+          <span className="bd-num">{formatBytes(sizeBytes)}</span>
+          <span>来自 <span title={item.sourcePeerId}>{sourceLabel}</span></span>
+          {item.receivedAt ? <RelativeTime value={item.receivedAt} /> : null}
+          <span>{item.direct ? "设备互传" : "文件链接"}</span>
+          {saved ? <Tag tone="success">已保存</Tag> : null}
+        </div>
+        {item.downloading ? <Progress value={item.downloadProgress ?? 0} label={`${fileName} 下载进度`} /> : null}
+        {item.downloadError ? <p className="tr-task-msg tr-text-danger">{item.downloadError}</p> : null}
+      </div>
+      <div className="tr-inbox-actions">
+        {previewable ? (
+          <button
+            type="button"
+            className="bd-icon-btn"
+            aria-label={`预览 ${fileName}`}
+            title="预览"
+            onClick={() => onPreview({ fileName, mimeType, url: item.previewUrl, blob: item.blob, sizeBytes })}
+          >
+            <Icon name="eye" />
+          </button>
+        ) : null}
+        <button
+          type="button"
+          className="bd-icon-btn"
+          aria-label={shareLabel}
+          title={cloudLoginRequired ? "登录后才可分享云端文件" : shareLabel}
+          disabled={cloudLoginRequired}
+          onClick={() => void onShare(item)}
+        >
+          <Icon name="share" />
+        </button>
+        <button
+          type="button"
+          className={`bd-btn bd-btn--sm ${saved ? "bd-btn--secondary" : "bd-btn--primary"}${item.downloading ? " is-busy" : ""}`}
+          aria-busy={item.downloading || undefined}
+          onClick={() => (cloudLoginRequired ? onLogin() : void onDownload(item))}
+        >
+          <Icon name="download" />
+          <span>{item.direct ? "保存到设备" : cloudLoginRequired ? "登录下载" : "下载到设备"}</span>
+        </button>
+      </div>
+    </li>
+  );
+}
+
+function InboxTextRow({
+  event,
+  onCopyText,
+  onPreview,
+}: {
+  event: ClipboardInboundEvent;
+  onCopyText: (text: string) => void;
+  onPreview: (target: PreviewTarget) => void;
+}) {
+  const text = event.payload.text;
+  const source = event.sourceDisplayName || "未命名设备";
+  const firstLine = text.trim().split(/\r?\n/, 1)[0] || "空白文字";
+  const isLink = event.payload.kind === "link";
+  return (
+    <li className="tr-inbox-item">
+      <span className="tr-inbox-thumb is-text" aria-hidden="true"><Icon name={isLink ? "link" : "message"} size={18} /></span>
+      <div className="tr-inbox-main">
+        <div className="tr-inbox-name" title={text.slice(0, 400)}>{firstLine}</div>
+        <div className="tr-inbox-meta">
+          <span>{isLink ? "链接" : event.payload.kind === "html" ? "富文本" : "文字"}</span>
+          <span className="bd-num">{Array.from(text).length} 字</span>
+          <span>来自 {source}</span>
+          <RelativeTime value={event.receivedAt} />
+        </div>
+      </div>
+      <div className="tr-inbox-actions">
+        <button
+          type="button"
+          className="bd-icon-btn"
+          aria-label={`预览来自 ${source} 的文字`}
+          title="预览"
+          onClick={() => onPreview({
+            fileName: `来自 ${source} 的文字.txt`,
+            mimeType: "text/plain",
+            blob: new Blob([text], { type: "text/plain" }),
+            sizeBytes: new Blob([text]).size,
+          })}
+        >
+          <Icon name="eye" />
+        </button>
+        <button type="button" className="bd-btn bd-btn--primary bd-btn--sm" onClick={() => onCopyText(text)}>
+          <Icon name="copy" /><span>复制</span>
+        </button>
+      </div>
+    </li>
   );
 }
 
 function TransferInviteModal({
   isOpen,
+  initialMode,
   onClose,
   sharedRoomActive,
   roomId,
@@ -4749,6 +4953,7 @@ function TransferInviteModal({
   onCreateSharedRoom,
 }: {
   isOpen: boolean;
+  initialMode: "invite" | "join";
   onClose: () => void;
   sharedRoomActive: boolean;
   roomId: string;
@@ -4774,155 +4979,145 @@ function TransferInviteModal({
   const canInvite = !sharedRoomActive || currentRole === "OWNER";
   const rolePending = sharedRoomActive && currentRole === null;
   const formattedPairingCode = pairingCode ? formatPairingCode(pairingCode.code) : "";
-  const [mode, setMode] = useState<"invite" | "join">("invite");
+  const [mode, setMode] = useState<"invite" | "join">(initialMode);
   const inviteExpiry = accessExpiresAt ? formatInviteExpiry(accessExpiresAt) : null;
   const pairingExpiry = pairingCode ? formatInviteExpiry(pairingCode.expiresAt) : null;
+  const codeReady = Boolean(normalizeTransferPairingCode(pairingCodeDraft));
+  useEffect(() => {
+    if (isOpen) setMode(initialMode);
+  }, [initialMode, isOpen]);
 
   return (
     <Modal
       isOpen={isOpen}
       onClose={onClose}
-      size="3xl"
+      size="2xl"
       scrollBehavior="inside"
-      backdrop="blur"
-      classNames={{
-        base: "border border-black/10 bg-white/95 shadow-2xl dark:border-white/10 dark:bg-zinc-950/95",
-        closeButton: "top-4 right-4",
-      }}
+      placement="center"
+      classNames={{ base: "tr-dialog", closeButton: "tr-dialog-close" }}
     >
       <ModalContent>
-        <ModalHeader className="flex flex-col gap-1 border-b border-black/[0.07] px-5 py-4 pr-14 dark:border-white/[0.08] sm:px-7">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-lg font-semibold tracking-tight sm:text-xl">添加设备</span>
-            <Chip size="sm" radius="sm" color={sharedRoomActive ? "primary" : "success"} variant="flat">
-              {sharedRoomActive ? "已建立协作空间" : "设备互传"}
-            </Chip>
-          </div>
-          <p className="text-tiny font-normal text-zinc-500 dark:text-zinc-400">
-            {sharedRoomActive ? `协作空间 ${transferRoomDisplayName(roomId)} · 仅主动加入的成员共享白板` : "让对方也打开互传页面；未自动出现时，用邀请或配对码连接。"}
-          </p>
+        <ModalHeader className="tr-dialog-head tr-dialog-head--stack">
+          <span className="tr-dialog-title-row">
+            <span className="bd-dialog-title">添加设备</span>
+            <Tag tone={sharedRoomActive ? "info" : "success"}>{sharedRoomActive ? "已建立协作空间" : "设备互传"}</Tag>
+          </span>
+          <span className="tr-dialog-desc">
+            {sharedRoomActive
+              ? `协作空间 ${transferRoomDisplayName(roomId)} · 仅主动加入的成员共享白板`
+              : "让对方也打开互传页面；同一网络会自动出现。不在同一网络时，用邀请或配对码连接。"}
+          </span>
         </ModalHeader>
-        <ModalBody className="gap-0 overflow-y-auto px-5 pb-6 pt-5 sm:px-7">
-          <div className="mb-4 flex gap-2" role="tablist" aria-label="添加设备方式">
-            <Button role="tab" aria-selected={mode === "invite"} variant={mode === "invite" ? "solid" : "flat"} color="primary" onPress={() => setMode("invite")}>邀请对方</Button>
-            <Button role="tab" aria-selected={mode === "join"} variant={mode === "join" ? "solid" : "flat"} color="primary" onPress={() => setMode("join")}>输入配对码</Button>
+        <ModalBody className="tr-invite">
+          <div className="bd-seg bd-seg--md tr-invite-modes" role="tablist" aria-label="添加设备方式">
+            <button type="button" role="tab" aria-selected={mode === "invite"} onClick={() => setMode("invite")}>
+              <Icon name="share" />邀请对方
+            </button>
+            <button type="button" role="tab" aria-selected={mode === "join"} onClick={() => setMode("join")}>
+              <Icon name="key" />输入配对码
+            </button>
           </div>
-          <div hidden={mode !== "invite"}>
-          {!sharedRoomActive ? <div className="rounded-lg border border-default-200 p-4 text-small">
-            <p>生成一个限时邀请，支持不同网络的设备加入。现有传输或草稿受影响时会先询问你。</p>
-            <Button className="mt-3" color="primary" onPress={onCreateSharedRoom}>生成邀请</Button>
-          </div> : <>
-          {canInvite ? (
-            <div className="grid items-stretch gap-5 md:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)] md:gap-7">
-              <div className="order-2 flex min-h-[292px] flex-col items-center justify-center overflow-hidden rounded-[28px] border border-cyan-500/15 bg-[radial-gradient(circle_at_50%_18%,rgba(34,211,238,0.18),transparent_46%),linear-gradient(145deg,rgba(8,145,178,0.08),rgba(37,99,235,0.04))] px-5 py-6 dark:border-cyan-300/15 dark:bg-[radial-gradient(circle_at_50%_18%,rgba(34,211,238,0.18),transparent_48%),linear-gradient(145deg,rgba(8,145,178,0.10),rgba(37,99,235,0.06))] md:order-1">
-                {qrUrl ? (
-                  <>
-                    <div className="relative">
-                      <span className="absolute -inset-4 -z-0 rounded-[30px] bg-cyan-400/10 blur-xl" aria-hidden="true" />
-                      <RoomQrCode value={qrUrl} large />
-                    </div>
-                    <div className="mt-4 text-center text-small font-semibold text-zinc-900 dark:text-white">
-                      扫码立即配对
-                    </div>
-                    <div className="mt-1 max-w-56 text-center text-tiny text-zinc-500 dark:text-zinc-400">
-                      二维码 5 分钟内单次有效，扫码后自动加入。
-                    </div>
-                  </>
-                ) : (
-                  <div className="flex flex-col items-center text-center">
-                    <div className="relative h-24 w-24" aria-hidden="true">
-                      <span className="absolute inset-0 animate-ping rounded-full border border-cyan-400/40 motion-reduce:animate-none" />
-                      <span className="absolute inset-4 rounded-full border border-cyan-500/30" />
-                      <span className="absolute inset-[38px] rounded-full bg-cyan-500 shadow-[0_0_24px_rgba(6,182,212,0.65)]" />
-                    </div>
-                    <div className="mt-4 text-small font-semibold">{isPreparing ? "正在建立安全邀请" : "等待生成二维码"}</div>
-                    <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">请稍候；生成失败时可点击重试。</div>
-                  </div>
-                )}
-              </div>
 
-              <div className="order-1 flex min-w-0 flex-col md:order-2">
-                <Button
-                  className="mt-4 h-11 w-full bg-cyan-600 font-semibold text-white shadow-[0_10px_30px_rgba(8,145,178,0.22)] md:mt-5"
-                  color="primary"
-                  radius="lg"
-                  isLoading={isPreparing && !inviteUrl}
-                  isDisabled={!inviteUrl}
-                  onPress={onShare}
-                >
-                  {systemShareAvailable ? "发送邀请" : "复制邀请链接"}
-                </Button>
-                <div className="mt-2 grid grid-cols-2 gap-2">
-                  {systemShareAvailable ? <Button radius="lg" variant="flat" isDisabled={!inviteUrl} onPress={onCopy}>复制邀请链接</Button> : null}
-                  <Button radius="lg" variant="light" isLoading={isPreparing} onPress={onRegenerate}>
-                    更新邀请链接
-                  </Button>
+          <div hidden={mode !== "invite"}>
+            {!sharedRoomActive ? (
+              <div className="tr-invite-start">
+                <span className="tr-invite-start-icon" aria-hidden="true"><Icon name="globe" size={22} /></span>
+                <div className="min-w-0">
+                  <p className="tr-invite-start-title">邀请不在同一网络的设备</p>
+                  <p className="tr-note">生成一个限时邀请（二维码、链接和 8 位配对码），不同网络的设备也能加入。现有传输或草稿受影响时会先询问你。</p>
+                </div>
+                <button type="button" className="bd-btn bd-btn--primary" onClick={onCreateSharedRoom}>
+                  <Icon name="key" /><span>生成邀请</span>
+                </button>
+              </div>
+            ) : canInvite ? (
+              <div className="tr-invite-grid">
+                <div className="tr-invite-qr">
+                  {qrUrl ? (
+                    <>
+                      <RoomQrCode value={qrUrl} large />
+                      <span className="tr-invite-qr-title">扫码立即配对</span>
+                      <span className="tr-note">二维码 5 分钟内单次有效，扫码后自动加入。</span>
+                    </>
+                  ) : (
+                    <div className="tr-invite-qr-wait" role="status">
+                      <span className="nearby-radar" aria-hidden="true"><Icon name="key" size={18} /></span>
+                      <span className="tr-invite-qr-title">{isPreparing ? "正在建立安全邀请" : "等待生成二维码"}</span>
+                      <span className="tr-note">生成失败时，用“更新邀请链接”重试。</span>
+                    </div>
+                  )}
                 </div>
 
-                <div className="mt-4 rounded-2xl border border-black/[0.07] bg-black/[0.025] px-4 py-3 dark:border-white/[0.08] dark:bg-white/[0.035]">
-                    <div className="flex items-center justify-between gap-3">
-                      <div>
-                        <div className="text-tiny font-medium text-zinc-500 dark:text-zinc-400">口头告诉对方</div>
-                        <div className="mt-1 font-mono text-2xl font-semibold tracking-[0.18em] text-zinc-950 dark:text-white">
-                          {formattedPairingCode || "•••• ••••"}
-                        </div>
-                      </div>
-                      <Button size="sm" radius="lg" variant="light" isLoading={isPairingCodeLoading} onPress={onRegeneratePairing}>
-                        换一个
-                      </Button>
-                    </div>
-                    <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-zinc-500 dark:text-zinc-400">
-                      <span>{pairingExpiry ? `${pairingExpiry} · 单次有效` : "正在生成 5 分钟配对码"}</span>
-                      {inviteExpiry ? <span>链接 {inviteExpiry}</span> : null}
-                    </div>
+                <div className="tr-invite-side">
+                  <div className="tr-invite-code">
+                    <span className="tr-invite-code-label">口头告诉对方</span>
+                    <span className="tr-pairing-code bd-num">{formattedPairingCode || "•••• ••••"}</span>
+                    <span className="tr-note bd-num">
+                      {pairingExpiry ? `${pairingExpiry} · 单次有效` : "正在生成 5 分钟配对码"}
+                      {inviteExpiry ? ` · 链接${inviteExpiry}` : ""}
+                    </span>
+                    <button
+                      type="button"
+                      className={`bd-btn bd-btn--ghost bd-btn--sm${isPairingCodeLoading ? " is-busy" : ""}`}
+                      onClick={onRegeneratePairing}
+                    >
+                      <Icon name="refresh" /><span>换一个</span>
+                    </button>
                   </div>
+                  <button
+                    type="button"
+                    className={`bd-btn bd-btn--primary tr-invite-primary${isPreparing && !inviteUrl ? " is-busy" : ""}`}
+                    disabled={!inviteUrl}
+                    onClick={onShare}
+                  >
+                    <Icon name={systemShareAvailable ? "share" : "copy"} />
+                    <span>{systemShareAvailable ? "发送邀请" : "复制邀请链接"}</span>
+                  </button>
+                  <div className="bd-row">
+                    {systemShareAvailable ? (
+                      <button type="button" className="bd-btn bd-btn--secondary bd-btn--sm" disabled={!inviteUrl} onClick={onCopy}>复制邀请链接</button>
+                    ) : null}
+                    <button type="button" className={`bd-btn bd-btn--ghost bd-btn--sm${isPreparing ? " is-busy" : ""}`} onClick={onRegenerate}>
+                      <Icon name="refresh" /><span>更新邀请链接</span>
+                    </button>
+                  </div>
+                </div>
               </div>
-            </div>
-          ) : (
-            <div className="rounded-2xl border border-amber-500/20 bg-amber-50/80 px-4 py-3 text-small text-amber-950 dark:border-amber-300/15 dark:bg-amber-300/10 dark:text-amber-100">
-              {rolePending ? "正在确认协作权限，确认后即可生成邀请。" : "只有协作空间管理员可以生成邀请，请让管理员添加设备。"}
-            </div>
-          )}
-          </>}
+            ) : (
+              <Alert tone="warning">
+                {rolePending ? "正在确认协作权限，确认后即可生成邀请。" : "只有协作空间管理员可以生成邀请：让管理员添加设备。"}
+              </Alert>
+            )}
           </div>
 
-          <div hidden={mode !== "join"} className="mt-2">
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
-              <Input
-                className="min-w-0 flex-1"
-                label="对方的配对码"
-                description="输入对方告诉你的 8 位数字，不需要复制长链接。"
-                placeholder="1234 5678"
-                inputMode="numeric"
-                autoComplete="one-time-code"
-                maxLength={12}
-                radius="lg"
-                variant="bordered"
-                value={pairingCodeDraft}
-                onValueChange={(value) => onPairingCodeDraftChange(value.replace(/[^0-9 -]/g, "").slice(0, 12))}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && normalizeTransferPairingCode(pairingCodeDraft)) onRedeem();
-                }}
-              />
-              <Button
-                className="h-11 shrink-0 px-6"
-                color="primary"
-                radius="lg"
-                variant="flat"
-                isLoading={isRedeeming}
-                isDisabled={!normalizeTransferPairingCode(pairingCodeDraft)}
-                onPress={onRedeem}
-              >
-                连接对方
-              </Button>
-            </div>
+          <div hidden={mode !== "join"} className="tr-invite-join">
+            <Input
+              className="min-w-0 flex-1"
+              label="对方的配对码"
+              description="输入对方告诉你的 8 位数字，不需要复制长链接。"
+              placeholder="1234 5678"
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              maxLength={12}
+              radius="md"
+              variant="bordered"
+              value={pairingCodeDraft}
+              onValueChange={(value) => onPairingCodeDraftChange(value.replace(/[^0-9 -]/g, "").slice(0, 12))}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && codeReady) onRedeem();
+              }}
+            />
+            <button
+              type="button"
+              className={`bd-btn bd-btn--primary tr-invite-join-btn${isRedeeming ? " is-busy" : ""}`}
+              disabled={!codeReady}
+              onClick={onRedeem}
+            >
+              <Icon name="arrow-right" /><span>连接对方</span>
+            </button>
           </div>
 
-          {error ? (
-            <div className="mt-4 rounded-xl border border-rose-500/20 bg-rose-50 px-3 py-2 text-tiny text-rose-700 dark:border-rose-300/15 dark:bg-rose-300/10 dark:text-rose-100">
-              {error}
-            </div>
-          ) : null}
+          {error ? <Alert tone="danger" role="alert">{error}</Alert> : null}
         </ModalBody>
       </ModalContent>
     </Modal>
@@ -4930,31 +5125,24 @@ function TransferInviteModal({
 }
 
 function PreviewModal({ target, onClose }: { target: PreviewTarget | null; onClose: () => void }) {
-  const kind = mediaKind(target?.fileName ?? "", target?.mimeType ?? null);
   const mimeType = target ? effectiveMimeType(target.fileName, target.mimeType) : "";
 
   return (
-    <Modal isOpen={Boolean(target)} onClose={onClose} size="5xl" scrollBehavior="inside">
+    <Modal isOpen={Boolean(target)} onClose={onClose} size="5xl" scrollBehavior="inside" classNames={{ base: "tr-dialog" }}>
       <ModalContent className="max-w-[min(96vw,1480px)]">
         {target && (
           <>
-            <ModalHeader className="flex min-w-0 flex-row items-center gap-2 px-4 py-3 pr-12">
-              <span className="min-w-0 flex-1 truncate text-base font-semibold">{target.fileName}</span>
-              <Chip color="primary" size="sm" variant="flat" className="shrink-0">
-                {previewKindLabel(kind)}
-              </Chip>
-              <span className="hidden shrink-0 font-mono text-tiny font-normal text-default-400 sm:inline">
-                {mimeType}
-              </span>
+            <ModalHeader className="tr-dialog-head tr-preview-head">
+              <span className="bd-dialog-title jd-ellipsis">{target.fileName}</span>
+              <Tag plain>{fileKindLabel(target.fileName, target.mimeType)}</Tag>
+              <span className="tr-preview-mime">{mimeType}</span>
             </ModalHeader>
-            <ModalBody className="overflow-y-auto px-3 pb-3 pt-0">
+            <ModalBody className="tr-preview-body">
               <FilePreview
                 fileName={target.fileName}
                 mimeType={target.mimeType}
                 url={target.url}
                 blob={target.blob}
-                sizeBytes={target.sizeBytes}
-                expanded
               />
             </ModalBody>
           </>
@@ -4992,38 +5180,27 @@ function ExpandedImagePreview({ url, fileName, onError }: { url: string; fileNam
   const visualWidth = quarterTurned ? imageHeight : imageWidth;
   const visualHeight = quarterTurned ? imageWidth : imageHeight;
 
-  const toolButton =
-    "grid h-7 min-w-7 place-items-center rounded-md px-1 text-zinc-500 transition hover:bg-black/[0.06] hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/[0.08] dark:hover:text-white";
   return (
-    <div className="relative overflow-hidden rounded-lg border border-black/10 bg-zinc-950/[0.04] dark:border-white/10 dark:bg-white/[0.03]">
-      <div
-        className="absolute right-2 top-2 z-10 flex items-center gap-0.5 rounded-lg border border-black/[0.08] bg-white/90 p-0.5 shadow-xs backdrop-blur-sm dark:border-white/[0.1] dark:bg-zinc-900/90"
-        role="toolbar"
-        aria-label="图片预览工具栏"
-      >
-        <button type="button" className={toolButton} aria-label="缩小" title="缩小" onClick={() => zoomBy(1 / 1.25)}>
-          <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M5 12h14" /></svg>
+    <div className="tr-preview-frame">
+      <div className="tr-preview-toolbar" role="toolbar" aria-label="图片预览工具栏">
+        <button type="button" className="bd-icon-btn" aria-label="缩小" title="缩小" onClick={() => zoomBy(1 / 1.25)}>
+          <Icon name="zoom-out" />
         </button>
-        <span className="w-11 text-center font-mono text-[11px] tabular-nums text-zinc-600 dark:text-zinc-300">
-          {Math.round(scale * 100)}%
-        </span>
-        <button type="button" className={toolButton} aria-label="放大" title="放大" onClick={() => zoomBy(1.25)}>
-          <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
+        <span className="tr-preview-zoom bd-num">{Math.round(scale * 100)}%</span>
+        <button type="button" className="bd-icon-btn" aria-label="放大" title="放大" onClick={() => zoomBy(1.25)}>
+          <Icon name="zoom-in" />
         </button>
-        <button type="button" className={`${toolButton} font-mono text-[10px]`} aria-label="原始大小" title="原始大小" onClick={() => { setScale(1); setRotation(0); }}>
+        <button type="button" className="bd-icon-btn tr-preview-reset bd-num" aria-label="原始大小" title="原始大小" onClick={() => { setScale(1); setRotation(0); }}>
           1:1
         </button>
-        <button type="button" className={toolButton} aria-label="顺时针旋转 90°" title="顺时针旋转 90°" onClick={rotateCW}>
-          <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M20 12a8 8 0 1 1-2.34-5.66" />
-            <path d="M20 3.5v4h-4" />
-          </svg>
+        <button type="button" className="bd-icon-btn" aria-label="顺时针旋转 90°" title="顺时针旋转 90°" onClick={rotateCW}>
+          <Icon name="rotate-cw" />
         </button>
-        <a className={toolButton} href={url} download={fileName} aria-label={`下载 ${fileName}`} title="下载">
-          <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 4v11m0 0 4-4m-4 4-4-4M4.5 19.5h15" /></svg>
+        <a className="bd-icon-btn" href={url} download={fileName} aria-label={`下载 ${fileName}`} title="下载">
+          <Icon name="download" />
         </a>
       </div>
-      <div ref={scrollRef} className="max-h-[78dvh] overflow-auto">
+      <div ref={scrollRef} className="tr-preview-scroll">
         <div
           className="mx-auto flex items-center justify-center"
           style={natural ? { width: visualWidth, height: visualHeight } : undefined}
@@ -5034,7 +5211,7 @@ function ExpandedImagePreview({ url, fileName, onError }: { url: string; fileNam
             onError={onError}
             onLoad={(event) => setNatural({ w: event.currentTarget.naturalWidth, h: event.currentTarget.naturalHeight })}
             style={{ width: containerWidth ? imageWidth : "100%", transform: `rotate(${rotation}deg)` }}
-            className="block max-w-none shrink-0 object-contain transition-transform duration-200 motion-reduce:transition-none"
+            className="tr-preview-image"
           />
         </div>
       </div>
@@ -5042,163 +5219,73 @@ function ExpandedImagePreview({ url, fileName, onError }: { url: string; fileNam
   );
 }
 
+/** The preview dialog's body: image, video, audio, PDF or text, with a plain card for the rest. */
 function FilePreview({
   fileName,
   mimeType,
   url,
   blob,
-  sizeBytes,
-  compact = false,
-  expanded = false,
-  onPreview,
 }: {
   fileName: string;
   mimeType?: string | null;
   url?: string | null;
   blob?: Blob | null;
-  sizeBytes?: number;
-  compact?: boolean;
-  expanded?: boolean;
-  onPreview?: (target: PreviewTarget) => void;
 }) {
   const kind = mediaKind(fileName, mimeType);
-  const previewSizeBytes = sizeBytes ?? blob?.size ?? 0;
   const [previewFailed, setPreviewFailed] = useState(false);
   useEffect(() => {
     setPreviewFailed(false);
   }, [fileName, mimeType, url, blob]);
-  const canOpenPreview = Boolean(onPreview && !expanded && (url || blob));
-  const previewAction = canOpenPreview ? (
-    <button
-      type="button"
-      className="absolute right-2 top-2 z-10 flex h-7 items-center gap-1 rounded-md border border-black/[0.08] bg-white/90 px-2 text-tiny font-medium text-zinc-600 shadow-xs backdrop-blur-sm transition hover:text-zinc-900 dark:border-white/[0.1] dark:bg-zinc-900/90 dark:text-zinc-300 dark:hover:text-white"
-      aria-label={`预览 ${fileName}`}
-      title="预览"
-      onClick={() => onPreview?.({ fileName, mimeType, url, blob, sizeBytes: previewSizeBytes })}
-    >
-      <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" />
-        <circle cx="12" cy="12" r="3" />
-      </svg>
-      预览
-    </button>
-  ) : null;
-  const wrapClass = compact && !expanded ? "relative mt-2" : "relative";
-  const frameClass = compact
-    ? "overflow-hidden rounded-sm border border-black/10 bg-zinc-950/5 dark:border-white/10 dark:bg-white/[0.03]"
-    : "overflow-hidden rounded-lg border border-black/10 bg-zinc-950/5 dark:border-white/10 dark:bg-white/[0.03]";
-  const mediaClass = expanded
-    ? "max-h-[78dvh] w-full object-contain"
-    : compact
-      ? "max-h-44 w-full object-contain"
-      : "h-64 w-full object-contain";
-  const documentClass = expanded
-    ? "h-[78dvh] w-full"
-    : compact
-      ? "h-44 w-full"
-      : "h-80 w-full";
-  const fallbackClass = expanded
-    ? "flex min-h-[45dvh] flex-col items-center justify-center rounded-lg glass glass-border border p-4 text-center"
-    : compact
-      ? "flex min-h-28 flex-col items-center justify-center rounded-sm glass glass-border border p-3 text-center"
-      : "flex h-64 flex-col items-center justify-center rounded-lg glass glass-border border p-4 text-center";
-
-  const deferHeavyPreview = !expanded
-    && Boolean(onPreview)
-    && previewSizeBytes > AUTO_PREVIEW_LIMIT_BYTES
-    && (kind === "image" || kind === "pdf");
-  if (deferHeavyPreview) {
-    return (
-      <div className={wrapClass}>
-        <div className={fallbackClass}>
-          <div className={`${compact ? "text-2xl" : "text-4xl"} font-semibold text-zinc-300 dark:text-white/20`}>{previewKindLabel(kind)}</div>
-          <div className="mt-3 max-w-full truncate text-small font-medium">{fileName}</div>
-          <div className="mt-1 text-tiny text-zinc-500">文件较大，已暂停自动预览以保持页面流畅</div>
-        </div>
-        {previewAction}
-      </div>
-    );
-  }
+  const fallback = (note: string) => (
+    <div className="tr-preview-fallback">
+      <span className="bd-empty-icon" aria-hidden="true"><Icon name={fileKindIcon(fileName, mimeType)} size={24} /></span>
+      <span className="tr-preview-fallback-name">{fileName}</span>
+      <span className="tr-note">{note}</span>
+    </div>
+  );
 
   if (url && kind === "image" && !previewFailed) {
-    if (expanded) {
-      return <ExpandedImagePreview url={url} fileName={fileName} onError={() => setPreviewFailed(true)} />;
-    }
-    return (
-      <div className={wrapClass}>
-        <div className={frameClass}>
-          <img src={url} alt={fileName} className={mediaClass} onError={() => setPreviewFailed(true)} />
-        </div>
-        {previewAction}
-      </div>
-    );
+    return <ExpandedImagePreview url={url} fileName={fileName} onError={() => setPreviewFailed(true)} />;
   }
   if (url && kind === "video" && !previewFailed) {
     return (
-      <div className={wrapClass}>
-        <div className={`${frameClass} bg-zinc-950`}>
-          <video src={url} controls preload="metadata" className={mediaClass} onError={() => setPreviewFailed(true)} />
-        </div>
-        {previewAction}
+      <div className="tr-preview-frame tr-preview-frame--dark">
+        <video src={url} controls preload="metadata" className="tr-preview-media" onError={() => setPreviewFailed(true)} />
       </div>
     );
   }
   if (url && kind === "audio" && !previewFailed) {
     return (
-      <div className={wrapClass}>
-        <div className={fallbackClass}>
-          <div className="text-2xl font-semibold text-zinc-300 dark:text-white/20">AUDIO</div>
-          <div className="mt-2 max-w-full truncate text-small font-medium">{fileName}</div>
-          <audio src={url} controls preload="metadata" className="mt-3 w-full" onError={() => setPreviewFailed(true)} />
-        </div>
-        {previewAction}
+      <div className="tr-preview-fallback">
+        <span className="bd-empty-icon" aria-hidden="true"><Icon name="headphones" size={24} /></span>
+        <span className="tr-preview-fallback-name">{fileName}</span>
+        <audio src={url} controls preload="metadata" className="w-full" onError={() => setPreviewFailed(true)} />
       </div>
     );
   }
   if (url && kind === "pdf" && !previewFailed) {
     return (
-      <div className={wrapClass}>
-        <div className={`${frameClass} bg-white`}>
-          <object data={url} type="application/pdf" className={documentClass} onError={() => setPreviewFailed(true)}>
-            <div className="flex h-full items-center justify-center p-3 text-small text-zinc-500">PDF 预览不可用</div>
-          </object>
-        </div>
-        {previewAction}
+      <div className="tr-preview-frame tr-preview-frame--paper">
+        <object data={url} type="application/pdf" className="tr-preview-document" onError={() => setPreviewFailed(true)}>
+          {fallback("这个浏览器不能内嵌 PDF，保存后用系统应用打开")}
+        </object>
       </div>
     );
   }
   if (kind === "text" && blob) {
-    return (
-      <div className={wrapClass}>
-        <TextFilePreview fileName={fileName} mimeType={mimeType} blob={blob} compact={compact} expanded={expanded} />
-        {previewAction}
-      </div>
-    );
+    return <TextFilePreview fileName={fileName} mimeType={mimeType} blob={blob} />;
   }
-  return (
-    <div className={wrapClass}>
-      <div className={fallbackClass}>
-        <div className={`${compact ? "text-2xl" : "text-4xl"} font-semibold text-zinc-300 dark:text-white/20`}>{previewKindLabel(kind)}</div>
-        <div className="mt-3 max-w-full truncate text-small font-medium">{fileName}</div>
-        <div className="mt-1 text-tiny text-zinc-500">{effectiveMimeType(fileName, mimeType)}</div>
-      </div>
-      {previewAction}
-    </div>
-  );
+  return fallback(previewFailed ? "这个文件不能在浏览器里预览，保存后用系统应用打开" : effectiveMimeType(fileName, mimeType));
 }
 
 function TextFilePreview({
   fileName,
   mimeType,
   blob,
-  compact,
-  expanded,
 }: {
   fileName: string;
   mimeType?: string | null;
   blob: Blob;
-  compact: boolean;
-  expanded: boolean;
 }) {
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -5225,14 +5312,12 @@ function TextFilePreview({
   }, [blob]);
 
   return (
-    <div className="overflow-hidden rounded-sm border border-black/10 bg-zinc-950 text-zinc-100 dark:border-white/10">
-      <div className="flex items-center justify-between gap-2 border-b border-white/10 px-3 py-2">
-        <span className="min-w-0 truncate text-tiny font-medium">{fileName}</span>
-        <span className="shrink-0 text-[10px] uppercase text-zinc-400">{shortMimeLabel(effectiveMimeType(fileName, mimeType))}</span>
+    <div className="tr-text-preview">
+      <div className="tr-text-preview-head">
+        <span className="jd-ellipsis">{fileName}</span>
+        <span className="tr-text-preview-type">{shortMimeLabel(effectiveMimeType(fileName, mimeType))}</span>
       </div>
-      <pre className={`${expanded ? "h-[68dvh]" : compact ? "max-h-44" : "h-80"} overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-[11px] leading-5`}>
-        {error || text || "正在读取预览..."}
-      </pre>
+      <pre>{error || text || "正在读取预览…"}</pre>
     </div>
   );
 }
@@ -5252,30 +5337,34 @@ function TransferFaq({
   const routeLabel = iceConfig?.turnAuthRequired ? "中继授权会在连接时自动申请" : "传输方式以实际连接结果为准";
 
   return (
-    <section className="rounded-lg border border-black/[0.07] p-3 dark:border-white/[0.08]">
-      <h2 className="text-base font-semibold text-zinc-950 dark:text-white">常见问题</h2>
-      <div className="mt-2 divide-y divide-black/10 dark:divide-white/10">
+    <section className="tr-faq" aria-label="常见问题">
+      <ol className="tr-faq-steps">
+        <li><StepBadge step={1} done={false} /><span><b>选择接收方</b>：同一网络里打开本页的设备会自动出现，点它的头像。</span></li>
+        <li><StepBadge step={2} done={false} /><span><b>选择内容</b>：文字与链接、文件，或多人白板。文件可以拖到页面任意位置，也可以粘贴。</span></li>
+        <li><StepBadge step={3} done={false} /><span><b>发送</b>：按下面的发送按钮。粘贴和拖入都只放进草稿，不会自己发出。</span></li>
+      </ol>
+      <div className="tr-faq-list">
         <FaqItem title="怎么把手机加进来？">
           点“添加设备”，选择“邀请对方”生成二维码和链接，或选择“输入配对码”连接对方。手机和电脑可以使用不同网络。
         </FaqItem>
         <FaqItem title="找不到对方怎么办？">
           {sharedRoom
             ? "先发送邀请链接，或让对方输入邀请弹窗里的 8 位配对码。"
-            : "让对方也打开互传页面。自动发现依据公网出口地址，并不保证在同一局域网；没有出现时请使用邀请。"}
+            : "让对方也打开互传页面。自动发现依据公网出口地址，并不保证在同一局域网；没有出现时用邀请或配对码。"}
         </FaqItem>
         <FaqItem title="没有选对方也能发送吗？">
           {ossFallbackEnabled
-            ? "请明确选择“改为生成文件链接”，上传后可分享临时链接；发送到设备时必须先选择接收方。"
+            ? "在“文件”里选“改为生成文件链接”，上传后可分享临时链接；发送到设备时必须先选择接收方。"
             : "不可以。未登录时不会上传云端，需要先选择一台在线设备。"}
         </FaqItem>
         <FaqItem title="文件会怎么传？">
-          {`选择、拖入或粘贴文件后先查看发送前确认。设备文件优先直连，连接不通时尝试 TURN 中继，中继不会生成云端副本。${resumable ? "单文件最多 2 GiB：128 MiB 以内可以直接收进内存；更大的文件需要接收方点击同意，写入其浏览器本地存储。对方页面是旧版本时上限仍为 128 MiB。" : "当前页面不是安全连接（HTTPS），无法分块续传，单文件内存上限为 128 MiB。"}${ossFallbackEnabled ? "只有在发送前明确允许云端回退时，远程设备连接失败才会改用临时存储；接收方需要登录下载。" : "未登录时不会上传云端。"}`}
+          {`添加文件后按发送，先查看发送前确认。设备文件优先直连，连接不通时尝试 TURN 中继，中继不会生成云端副本。${resumable ? "单文件最多 2 GiB：128 MiB 以内可以直接收进内存；更大的文件需要接收方同意，写入其浏览器本地存储。对方页面是旧版本时上限仍为 128 MiB。" : "当前页面不是安全连接（HTTPS），无法分块续传，单文件内存上限为 128 MiB。"}${ossFallbackEnabled ? "只有在发送前明确允许云端回退时，远程设备连接失败才会改用临时存储；接收方需要登录下载。" : "未登录时不会上传云端。"}`}
         </FaqItem>
         <FaqItem title="为什么有时需要手动写入系统剪贴板？">
-          浏览器可能阻止网页改写系统剪贴板。收到的文字仍在页面里，点击“复制到剪贴板”即可重试。本页不会持续读取你在其他应用中复制的内容。
+          浏览器可能阻止网页改写系统剪贴板。收到的文字仍在页面里，用“复制”或“复制到剪贴板”重试。本页不会持续读取你在其他应用中复制的内容。
         </FaqItem>
         <FaqItem title="谁能看到我发的文件？">
-          通过直连或中继转发的文件只到点选设备，不创建云端副本。生成文件链接需要登录并启用临时存储，下载方也需要登录并持有访问口令与文件链接。
+          通过直连或中继转发的文件只到选中的设备，不创建云端副本。生成文件链接需要登录并启用临时存储，下载方也需要登录并持有访问口令与文件链接。
         </FaqItem>
         <FaqItem title="云端额度是多少？">
           存储额度、下载额度、单文件上限和文件保存时长由服务端配置。选择云端方式后，发送前确认会读取当前账号的额度快照；旧服务端不支持或查询失败时会明确提示未核验。查询不预占额度，实际上传仍可能失败；申请上传可能预占存储额度。下载授权首次打开并成功跳转时，按文件完整大小计入下载额度。临时下载地址只能使用一次，重新下载需重新申请；这不代表文件分享链接只能用一次。文件有效期以生成结果为准。
@@ -5284,16 +5373,16 @@ function TransferFaq({
           <p>
             部分可以。设备传输按 1 MiB 分块逐块校验：网络中断或在直连与中继之间切换时，只要两端页面都开着，发送方会自动重连并从缺失的块继续，最多重试 5 次。
           </p>
-          <p className="mt-2">
-            接收方点击同意写入本机存储的文件，刷新或重新打开页面后可以续传，有效期 24 小时，从同意时起算，续传不会延长。发送方刷新后浏览器不允许网页自动重新读取文件，需要在“未完成的发送”里重新选择同一文件；文件内容变了只能作为新传输重新发送，并需要对方重新同意。
+          <p>
+            接收方同意写入本机存储的文件，刷新或重新打开页面后可以续传，有效期 24 小时，从同意时起算，续传不会延长。发送方刷新后浏览器不允许网页自动重新读取文件，需要在“未完成的发送”里重新选择同一文件；文件内容变了只能作为新传输重新发送，并需要对方重新同意。
           </p>
-          <p className="mt-2">
-            自动接收或只在内存中接收的文件不写入本机存储，任一端刷新后都要从头开始；文件草稿也不会保留。已收数据只保存在本机浏览器，浏览器可能自行清除；页面关闭期间不会运行任何清理，过期数据要到下次打开本站页面时才删除。接收完成也不等于已保存到设备，请点击“保存到设备”并检查浏览器下载记录。网页会尝试提醒离开，但浏览器或手机系统可能不显示提醒。
+          <p>
+            自动接收或只在内存中接收的文件不写入本机存储，任一端刷新后都要从头开始；文件草稿也不会保留。已收数据只保存在本机浏览器，浏览器可能自行清除；页面关闭期间不会运行任何清理，过期数据要到下次打开本站页面时才删除。接收完成也不等于已保存到设备：用“保存到设备”，再检查浏览器下载记录。网页会尝试提醒离开，但浏览器或手机系统可能不显示提醒。
           </p>
           {onClearResumeData ? (
-            <Button className="mt-2" size="sm" radius="sm" variant="flat" onPress={onClearResumeData}>
-              清除互传本地数据
-            </Button>
+            <button type="button" className="bd-btn bd-btn--secondary bd-btn--sm" onClick={onClearResumeData}>
+              <Icon name="trash" /><span>清除互传本地数据</span>
+            </button>
           ) : null}
         </FaqItem>
         <FaqItem title="更多说明">
@@ -5308,12 +5397,12 @@ function TransferFaq({
 
 function FaqItem({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <details className="group py-2">
-      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-small font-medium text-zinc-800 dark:text-zinc-100">
+    <details className="tr-faq-item">
+      <summary>
         <span>{title}</span>
-        <span className="shrink-0 text-lg leading-none text-zinc-400 transition-transform group-open:rotate-45">+</span>
+        <Icon name="chevron-down" />
       </summary>
-      <div className="mt-2 text-tiny text-zinc-600 dark:text-zinc-300">
+      <div className="tr-faq-body">
         {children}
       </div>
     </details>
@@ -5331,7 +5420,7 @@ function RoomQrCode({ value, large = false }: { value: string; large?: boolean }
 
   if (!qr.matrix) {
     return (
-      <div className={`mx-auto flex shrink-0 items-center justify-center border border-dashed border-zinc-300 bg-white p-3 text-center text-tiny text-zinc-500 sm:mx-0 ${large ? "h-52 w-52 rounded-2xl" : "h-36 w-36 rounded-md"}`}>
+      <div className={`tr-qr tr-qr--error${large ? " tr-qr--large" : ""}`}>
         {qr.error}
       </div>
     );
@@ -5344,9 +5433,10 @@ function RoomQrCode({ value, large = false }: { value: string; large?: boolean }
     .filter(Boolean)
     .join("");
 
+  // Scanners need dark modules on a light ground in both themes, so the code keeps fixed colors.
   return (
     <svg
-      className={`relative z-10 mx-auto shrink-0 bg-white shadow-xs ring-1 ring-black/10 sm:mx-0 ${large ? "h-52 w-52 rounded-2xl p-3" : "h-36 w-36 rounded-md p-2"}`}
+      className={`tr-qr${large ? " tr-qr--large" : ""}`}
       viewBox={`0 0 ${viewSize} ${viewSize}`}
       role="img"
       aria-label="当前房间二维码"
@@ -5400,7 +5490,7 @@ function putObject(
         finish(() => reject(new Error(`文件发送失败：HTTP ${xhr.status}`)));
       }
     };
-    xhr.onerror = () => finish(() => reject(new Error("文件发送失败，请检查网络后重试")));
+    xhr.onerror = () => finish(() => reject(new Error("文件发送失败：检查网络后重试")));
     xhr.onabort = () => finish(() => reject(new Error("文件发送已取消")));
     signal?.addEventListener("abort", abortUpload, { once: true });
     if (signal?.aborted) {
@@ -5464,9 +5554,9 @@ function discoveryStatusLabel(status: DiscoveryStatus) {
 
 function discoveryStatusDescription(status: DiscoveryStatus) {
   if (status === "reconnecting") return "房间连接暂时中断，正在自动恢复。";
-  if (status === "offline") return "房间连接已中断，请检查网络后重试。";
-  if (status === "name-conflict") return "当前设备名称已被占用，请在设置中更换名称。";
-  if (status === "permission-denied") return "无法加入这个房间，请检查邀请链接和房间口令。";
+  if (status === "offline") return "房间连接已中断：检查网络后重试连接。";
+  if (status === "name-conflict") return "当前设备名称已被占用：在设置中更换名称。";
+  if (status === "permission-denied") return "无法加入这个房间：检查邀请链接和房间口令。";
   return "正在建立房间连接。";
 }
 
@@ -5479,24 +5569,15 @@ function transferActivityStatusLabel(status: OutgoingTransferStatus, transport?:
   return "已取消";
 }
 
-function transferActivityStatusColor(status: OutgoingTransferStatus): "default" | "primary" | "success" | "danger" {
-  if (status === "completed") return "success";
-  if (status === "failed" || status === "cancelled") return "danger";
-  if (status === "connecting" || status === "sending") return "primary";
-  return "default";
-}
-
 function transferTransportLabel(transport: NonNullable<OutgoingTransferActivity["transport"]>) {
   if (transport === "peer") return "设备直连";
   if (transport === "relay") return "中继传输";
   return "文件临时存储";
 }
 
-function formatDuration(seconds: number) {
-  if (!Number.isFinite(seconds) || seconds <= 0) return "不到 1 秒";
-  if (seconds < 60) return `${Math.ceil(seconds)} 秒`;
-  const minutes = Math.ceil(seconds / 60);
-  return minutes < 60 ? `${minutes} 分钟` : `${Math.ceil(minutes / 60)} 小时`;
+/** Same name, size and timestamp: picking a file twice adds it once. */
+function stagedFileKey(file: File) {
+  return `${file.name}\u0000${file.size}\u0000${file.type}\u0000${file.lastModified}`;
 }
 
 function stateLabel(state: UploadState, progress: number) {
@@ -5863,7 +5944,7 @@ async function copyText(value: string) {
   textarea.setSelectionRange(0, value.length);
   const copied = document.execCommand("copy");
   textarea.remove();
-  if (!copied) throw new Error("当前浏览器不允许自动复制，请手动复制");
+  if (!copied) throw new Error("当前浏览器不允许自动复制：选中文字后手动复制");
 }
 
 async function shareOrCopy(data: ShareData, fallbackText: string) {

@@ -129,6 +129,18 @@ async function paste(page, text) {
 async function confirmFiles(page, cloud = false) {
   await page.getByRole("button", { name: cloud ? /^确认上传/ : "确认发送", exact: !cloud }).click();
 }
+// Picked, dropped or pasted files are staged in the composer; the one send button names the action
+// ("发送 1 个文件给 Beta", "上传 1 个文件并生成链接") and opens the preflight. It never sends by itself.
+async function sendStaged(page, label) {
+  await page.getByRole("button", { name: label, exact: true }).click();
+}
+async function dragFiles(page, type, names) {
+  await page.locator("h1").evaluate((el, { type, names }) => {
+    const data = new DataTransfer();
+    for (const name of names) data.items.add(new File([`bytes of ${name}`], name, { type: "text/plain" }));
+    el.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: data }));
+  }, { type, names });
+}
 async function leaveWarningEnabled(page) {
   return page.evaluate(() => {
     const event = new Event("beforeunload", { cancelable: true });
@@ -154,7 +166,8 @@ try {
   console.log("RECON", (await a.page.locator("main").innerText()).slice(0, 1400));
   await a.page.screenshot({ path: `${output}/desktop-initial.png`, fullPage: true });
   await b.page.screenshot({ path: `${output}/mobile-initial.png`, fullPage: true });
-  assert.match(await a.page.getByTestId("transfer-recipient-bar").innerText(), /请先选择接收设备/);
+  assert.match(await a.page.getByTestId("transfer-recipient-bar").innerText(), /先选择接收设备/);
+  assert.equal(await a.page.getByRole("radio", { checked: true }).count(), 0);
   pass("discovery never auto-selects a recipient");
   await a.page.getByRole("radio", { name: b.peer.displayName, exact: true }).first().click();
   await a.page.getByRole("tab", { name: /文字与链接/ }).click();
@@ -166,7 +179,7 @@ try {
   await until(async () => (await a.page.getByTestId("public-transfer-clipboard-text").inputValue()) === "read-draft-only", "read into draft");
   assert.ok(!(await b.page.locator("body").innerText()).includes("read-draft-only"));
   pass("paste and clipboard read remain drafts by default");
-  await a.page.getByRole("button", { name: "发送文字", exact: true }).click();
+  await a.page.getByRole("button", { name: `发送文字给 ${b.peer.displayName}`, exact: true }).click();
   await b.page.getByRole("tab", { name: /文字与链接/ }).click();
   await until(async () => (await b.page.locator("body").innerText()).includes("read-draft-only"), "explicit text received", 25000);
   pass("explicit text send reaches only the selected peer");
@@ -174,9 +187,41 @@ try {
   await paste(a.page, "quick-send-opt-in");
   await until(async () => (await b.page.locator("body").innerText()).includes("quick-send-opt-in"), "quick paste received");
   pass("opt-in quick paste still sends");
-  await a.page.getByRole("tab", { name: /文件传输/ }).click();
-  await b.page.getByRole("tab", { name: /文件传输/ }).click();
+  const composer = a.page.getByTestId("public-transfer-clipboard-text");
+  await composer.fill("keyboard-send-check");
+  assert.match(await a.page.getByTestId("transfer-recipient-bar").innerText(), /Ctrl\/⌘/);
+  await composer.press("Control+Enter");
+  await until(async () => (await b.page.locator("body").innerText()).includes("keyboard-send-check"), "keyboard send received");
+  pass("Ctrl/⌘ Enter sends the text draft to the selected peer, and the send bar shows the shortcut");
+  await a.page.locator("h1").evaluate((el) => {
+    const data = new DataTransfer(); data.setData("text/plain", "page-paste-draft");
+    el.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data }));
+  });
+  await until(async () => (await composer.inputValue()) === "page-paste-draft", "page-wide paste drafted");
+  await delay(300);
+  assert.ok(!(await b.page.locator("body").innerText()).includes("page-paste-draft"), "page-wide paste never sends, even with quick paste on");
+  await composer.fill("");
+  await a.page.getByRole("tab", { name: /^文件/ }).click();
+  await dragFiles(a.page, "dragenter", ["page-drop.txt"]);
+  const overlay = a.page.locator(".tr-drop-overlay");
+  await overlay.waitFor();
+  assert.match(await overlay.innerText(), new RegExp(`准备发送给 ${b.peer.displayName}`));
+  await a.page.keyboard.press("Escape");
+  await overlay.waitFor({ state: "detached" });
+  await dragFiles(a.page, "dragenter", ["page-drop.txt"]);
+  await dragFiles(a.page, "drop", ["page-drop.txt"]);
+  await a.page.getByRole("list", { name: "待发送文件", exact: true }).getByText("page-drop.txt", { exact: true }).waitFor();
+  assert.equal(await overlay.count(), 0);
+  assert.equal(await a.page.getByRole("dialog").count(), 0, "a drop stages files; it does not open the preflight or send");
+  assert.equal(await leaveWarningEnabled(a.page), true);
+  await delay(250);
+  assert.ok(!(await b.page.locator("body").innerText()).includes("page-drop.txt"));
+  await a.page.getByRole("button", { name: "移除 page-drop.txt", exact: true }).click();
+  assert.equal(await leaveWarningEnabled(a.page), false);
+  pass("page-wide drop and paste only stage drafts; the drop overlay names the recipient and Esc closes it");
+  await b.page.getByRole("tab", { name: /^文件/ }).click();
   await a.page.locator("#public-transfer-file-input").setInputFiles({ name: "ux-check.txt", mimeType: "text/plain", buffer: Buffer.from("real WebRTC file regression") });
+  await sendStaged(a.page, `发送 1 个文件给 ${b.peer.displayName}`);
   const preflight = a.page.getByRole("dialog");
   await preflight.waitFor();
   assert.match(await preflight.innerText(), /发送前确认/);
@@ -190,7 +235,7 @@ try {
   await confirmFiles(a.page);
   await until(async () => await b.page.getByRole("button", { name: "保存到设备", exact: true }).count() > 0, "WebRTC file received", 25000);
   assert.match(await a.page.locator("body").innerText(), /对方已接收/);
-  const incomingBox = await b.page.getByRole("heading", { name: "收到的文件" }).boundingBox();
+  const incomingBox = await b.page.getByRole("heading", { name: "收到的内容" }).boundingBox();
   const dropBox = await b.page.getByTestId("public-transfer-file-dropzone").boundingBox();
   assert.ok(incomingBox.y < dropBox.y, "received files precede the mobile send area");
   const downloadWait = b.page.waitForEvent("download");
@@ -216,6 +261,7 @@ try {
     const files = new DataTransfer(); files.items.add(file);
     input.files = files.files; input.dispatchEvent(new Event("change", { bubbles: true }));
   });
+  await sendStaged(a.page, `发送 1 个文件给 ${b.peer.displayName}`);
   await a.page.getByRole("dialog").waitFor();
   assert.equal(await a.page.getByRole("button", { name: "确认发送", exact: true }).isDisabled(), true);
   assert.match(await a.page.getByRole("dialog").innerText(), /超过设备传输的单文件上限/);
@@ -250,15 +296,15 @@ try {
   await b.page.getByRole("button", { name: "拒绝", exact: true }).click();
   await until(async () => (await a.page.locator("body").innerText()).includes("对方拒绝接收"), "rejection remains a failed task");
   pass("pasted files stay staged until an explicit send; receiving confirmation works");
+  // Transfer tasks are a section on the page; the top bar's button jumps to it.
   await a.page.getByRole("button", { name: "传输任务", exact: true }).click();
-  const tasks = a.page.getByRole("dialog");
+  const tasks = a.page.getByRole("region", { name: "传输任务", exact: true });
   await tasks.getByRole("button", { name: "清理已完成", exact: true }).click();
   assert.ok(!(await tasks.innerText()).includes("ux-check.txt"));
   assert.match(await tasks.innerText(), /staged-file.txt/);
   await tasks.getByRole("button", { name: "重试", exact: true }).click();
   await b.page.getByRole("button", { name: "接收", exact: true }).click();
   await until(async () => (await tasks.innerText()).includes("对方已接收"), "failed task retry succeeds");
-  await tasks.getByRole("button", { name: "完成", exact: true }).click();
   pass("completed-task cleanup preserves the failed file and its working retry action");
   await a.page.getByRole("button", { name: "添加设备", exact: true }).first().click();
   const invite = a.page.getByRole("dialog");
@@ -270,15 +316,17 @@ try {
   await invite.waitFor({ state: "hidden" });
   pass("add-device dialog exposes a distinct pairing-code path");
   const c = await setup("Gamma");
-  await a.page.getByRole("tab", { name: /文件传输/ }).click();
+  await a.page.getByRole("tab", { name: /^文件/ }).click();
   await a.page.locator("#public-transfer-file-input").setInputFiles({ name: "offline-draft.txt", mimeType: "text/plain", buffer: Buffer.from("never retarget") });
+  await sendStaged(a.page, `发送 1 个文件给 ${b.peer.displayName}`);
   await a.page.getByRole("dialog").waitFor();
   await b.context.close();
   await until(async () => (await a.page.getByTestId("transfer-recipient-bar").innerText()).includes("已离线"), "offline target retained");
   assert.equal(await a.page.getByRole("button", { name: "确认发送", exact: true }).isDisabled(), true);
   assert.match(await a.page.getByRole("dialog").innerText(), /原接收设备已离线/);
   await a.page.getByRole("button", { name: "取消发送", exact: true }).click();
-  assert.ok(!(await a.page.getByTestId("transfer-recipient-bar").innerText()).includes(`发送给：${c.peer.displayName}`));
+  assert.ok(!(await a.page.getByTestId("transfer-recipient-bar").innerText()).includes(c.peer.displayName));
+  assert.equal(await a.page.getByRole("radio", { name: c.peer.displayName, exact: true }).getAttribute("aria-checked"), "false");
   pass("offline recipient is never replaced by another discovered peer");
   await a.page.getByRole("tab", { name: /多人白板/ }).click();
   assert.match(await a.page.getByTestId("collaboration-audience").innerText(), /尚未与任何设备共享/);
@@ -298,7 +346,8 @@ try {
   pass("shared-space receive filter rejects nearby outsiders and accepts explicit members");
   const relayStart = relays.length;
   await d.page.getByRole("button", { name: "画笔", exact: true }).first().click();
-  assert.equal(await d.page.getByRole("heading", { name: "发送给谁", exact: true }).count(), 0);
+  assert.equal(await d.page.getByRole("heading", { name: "选择接收方", exact: true }).count(), 0);
+  assert.equal(await d.page.getByRole("radiogroup", { name: "发送目标设备", exact: true }).count(), 0);
   const canvas = d.page.getByLabel("多人白板画布", { exact: true });
   const board = await canvas.boundingBox();
   await d.page.mouse.move(board.x + 80, board.y + 80);
@@ -325,8 +374,10 @@ try {
   await logged.page.locator("#public-transfer-file-input").setInputFiles({ name: "cloud-test.txt", mimeType: "text/plain", buffer: Buffer.from("isolated cloud upload") });
   await delay(200);
   assert.equal(apiCalls.filter((call) => call.path.endsWith("attachments/presign-upload")).length, presignsBefore);
+  assert.equal(await logged.page.getByRole("dialog").count(), 0, "staging without a recipient neither sends nor opens a preflight");
+  assert.equal(await logged.page.getByRole("button", { name: "发送 1 个文件", exact: true }).isDisabled(), true);
   await logged.page.getByRole("button", { name: "改为生成文件链接", exact: true }).click();
-  await logged.page.locator("#public-transfer-file-input").setInputFiles({ name: "cloud-test.txt", mimeType: "text/plain", buffer: Buffer.from("isolated cloud upload") });
+  await sendStaged(logged.page, "上传 1 个文件并生成链接");
   await logged.page.getByRole("dialog").waitFor();
   await logged.page.getByText("存储与额度尚未核验", { exact: true }).waitFor();
   assert.equal(apiCalls.filter((call) => call.path.endsWith("attachments/presign-upload")).length, presignsBefore);
@@ -368,6 +419,7 @@ try {
     return route.fulfill({ json: snapshot() });
   });
   await logged.page.locator("#public-transfer-file-input").setInputFiles({ name: "quota-test.txt", mimeType: "text/plain", buffer: Buffer.from("quota test contents") });
+  await sendStaged(logged.page, "上传 1 个文件并生成链接");
   const quotaBox = logged.page.getByTestId("transfer-cloud-quota");
   const uploadConfirm = logged.page.getByRole("button", { name: /^确认上传/ });
   await until(async () => (await quotaBox.innerText()).includes("本批需要 / 剩余存储"), "fresh account snapshot");
@@ -409,11 +461,13 @@ try {
   pass("failed and malformed quota refreshes clear stale data and retain explicit unverified fallback");
   quotaMode = "delayed"; releaseQuota = undefined;
   await logged.page.locator("#public-transfer-file-input").setInputFiles({ name: "old-query.txt", mimeType: "text/plain", buffer: Buffer.from("old query") });
+  await sendStaged(logged.page, "上传 1 个文件并生成链接");
   await until(() => Boolean(releaseQuota), "pending quota query");
   assert.equal(await logged.page.getByRole("button", { name: /^确认上传/ }).isDisabled(), true);
   await logged.page.getByRole("button", { name: "取消发送", exact: true }).click();
   quotaMode = "ready";
   await logged.page.locator("#public-transfer-file-input").setInputFiles({ name: "new-query.txt", mimeType: "text/plain", buffer: Buffer.from("new query") });
+  await sendStaged(logged.page, "上传 1 个文件并生成链接");
   await until(async () => !(await logged.page.getByRole("button", { name: /^确认上传/ }).isDisabled()), "new confirmation has fresh quota");
   releaseQuota(); await delay(200);
   assert.match(await quotaBox.innerText(), /临时存储已配置/);
@@ -422,6 +476,7 @@ try {
   assert.equal(apiCalls.filter((call) => call.path.endsWith("attachments/presign-upload")).length, presignsBefore);
   pass("cancelled quota requests cannot overwrite a new confirmation or authorize an upload");
   await logged.page.locator("#public-transfer-file-input").setInputFiles({ name: "cloud-test.txt", mimeType: "text/plain", buffer: Buffer.from("isolated cloud upload") });
+  await sendStaged(logged.page, "上传 1 个文件并生成链接");
   await confirmFiles(logged.page, true);
   await logged.page.getByText("文件链接已生成", { exact: true }).waitFor();
   assert.match(await logged.page.locator("body").innerText(), /文件有效期：/);
@@ -430,9 +485,11 @@ try {
   pass("signed-in users explicitly choose file links; upload completion is not recipient receipt");
   await logged.page.setViewportSize({ width: 320, height: 720 });
   await delay(350);
-  assert.equal(await logged.page.getByRole("heading", { name: "发送给谁", exact: true }).count(), 0);
+  assert.equal(await logged.page.getByRole("heading", { name: "选择接收方", exact: true }).count(), 0);
   assert.equal(await logged.page.getByRole("radiogroup", { name: "发送目标设备", exact: true }).count(), 0);
-  assert.ok(await logged.page.locator(".transfer-room-tools .app-apple-tool-tab .text-small").evaluateAll((labels) => labels.every((label) => label.scrollWidth <= label.clientWidth + 1)), "narrow-screen tool names remain readable");
+  const toolLabels = logged.page.locator(".tr-modes [role='tab'] .tr-mode-label");
+  assert.equal(await toolLabels.count(), 3);
+  assert.ok(await toolLabels.evaluateAll((labels) => labels.every((label) => label.scrollWidth <= label.clientWidth + 1)), "narrow-screen tool names remain readable");
   assert.ok(await logged.page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), "320px file view has no horizontal overflow");
   await logged.page.screenshot({ path: `${output}/mobile-320-file-link.png`, fullPage: true });
   await logged.context.close();
@@ -442,6 +499,7 @@ try {
   await sender.page.getByRole("radio", { name: recipient.peer.displayName, exact: true }).first().click();
   const beforeFallback = apiCalls.filter((call) => call.path.endsWith("attachments/presign-upload")).length;
   await sender.page.locator("#public-transfer-file-input").setInputFiles({ name: "consent.txt", mimeType: "text/plain", buffer: Buffer.from("explicit cloud consent") });
+  await sendStaged(sender.page, `发送 1 个文件给 ${recipient.peer.displayName}`);
   const consent = sender.page.getByRole("checkbox", { name: /允许将这些文件上传临时存储/ });
   await consent.waitFor();
   assert.equal(await consent.isChecked(), false);
@@ -449,11 +507,12 @@ try {
   await until(async () => (await sender.page.locator("body").innerText()).includes("本次未允许云端存储"), "failed without consent");
   assert.equal(apiCalls.filter((call) => call.path.endsWith("attachments/presign-upload")).length, beforeFallback);
   await sender.page.getByRole("button", { name: "传输任务", exact: true }).click();
-  await sender.page.getByRole("dialog").getByRole("button", { name: "重试", exact: true }).click();
-  await until(async () => (await sender.page.getByRole("dialog").innerText()).includes("本次未允许云端存储"), "retry keeps no-cloud consent");
+  const senderTasks = sender.page.getByRole("region", { name: "传输任务", exact: true });
+  await senderTasks.getByRole("button", { name: "重试", exact: true }).click();
+  await until(async () => (await senderTasks.innerText()).includes("本次未允许云端存储"), "retry keeps no-cloud consent");
   assert.equal(apiCalls.filter((call) => call.path.endsWith("attachments/presign-upload")).length, beforeFallback);
-  await sender.page.getByRole("dialog").getByRole("button", { name: "完成", exact: true }).click();
   await sender.page.locator("#public-transfer-file-input").setInputFiles({ name: "consent.txt", mimeType: "text/plain", buffer: Buffer.from("explicit cloud consent") });
+  await sendStaged(sender.page, `发送 1 个文件给 ${recipient.peer.displayName}`);
   await consent.check();
   await confirmFiles(sender.page);
   await sender.page.getByText("文件链接已生成", { exact: true }).waitFor();

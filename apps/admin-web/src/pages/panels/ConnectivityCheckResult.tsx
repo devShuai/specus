@@ -3,67 +3,89 @@ import {
   type ConnectivityCheckResult,
   type ConnectivityStageResult,
 } from "../../lib/connectivityCheck";
+import type { ReactNode } from "react";
 
-const RESULT_CLASSES: Record<ConnectivityStageResult, string> = {
-  passed: "border-success-200 bg-success-50 text-success-700",
-  failed: "border-danger-200 bg-danger-50 text-danger-700",
-  unverified: "border-warning-200 bg-warning-50 text-warning-700",
-  skipped: "border-default-200 bg-default-50 text-default-400",
+/** Each stage result as a Tag of the design: passed success, failed danger, unverified warning, skipped plain. */
+const RESULT_TAG: Record<ConnectivityStageResult, string> = {
+  passed: "bd-tag--success",
+  failed: "bd-tag--danger",
+  unverified: "bd-tag--warning",
+  skipped: "bd-tag--plain",
 };
 
-const OUTCOME_CLASSES = {
-  success: "text-success-700",
-  danger: "text-danger-700",
-  warning: "text-warning-700",
+// The design's check, x, alert and more-h icons (components/ui/Icon.tsx), drawn inline without an
+// xmlns attribute: the rendered result must not contain any URL.
+const RESULT_ICON: Record<ConnectivityStageResult, ReactNode> = {
+  passed: <polyline points="20 6 9 17 4 12" />,
+  failed: <><path d="M18 6 6 18" /><path d="m6 6 12 12" /></>,
+  unverified: <><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z" /><path d="M12 9v4" /><path d="M12 17h.01" /></>,
+  skipped: <><circle cx="5" cy="12" r="1.6" /><circle cx="12" cy="12" r="1.6" /><circle cx="19" cy="12" r="1.6" /></>,
+};
+
+function StageMark({ result }: { result: ConnectivityStageResult }) {
+  return (
+    <span className="acc-stage-mark" aria-hidden="true">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.75} strokeLinecap="round" strokeLinejoin="round" focusable="false">
+        {RESULT_ICON[result]}
+      </svg>
+    </span>
+  );
+}
+
+const OUTCOME_TAG = {
+  success: "bd-tag--success",
+  danger: "bd-tag--danger",
+  warning: "bd-tag--warning",
 } as const;
 
 /**
- * One connectivity check result: the four stages in their fixed order, each with its result and code,
- * the first stage that did not pass highlighted with the next step. It shows only what the server
- * returned -- never the target address -- and labels the time of the check, because a result is a
- * snapshot, not the route's current state.
+ * One connectivity check result: the four stages in their fixed order (已配置 → 设备在线 → 目标可达 →
+ * 访问成功) as a staged list, each with its result Tag and code, the first stage that did not pass
+ * highlighted with the next step. It shows only what the server returned -- never the target address --
+ * and labels the time of the check, because a result is a snapshot, not the route's current state.
  */
 export function ConnectivityCheckResultView({ result }: { result: ConnectivityCheckResult }) {
   const view = describeConnectivityCheck(result);
   return (
-    <section className="flex flex-col gap-3 text-small" aria-label="连通性检查结果" data-outcome={view.outcome}>
-      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-        <strong className={`text-medium ${OUTCOME_CLASSES[view.tone]}`}>{view.outcomeLabel}</strong>
-        <span className="text-default-600">{view.summary}</span>
+    <section className="acc-cc" aria-label="连通性检查结果" data-outcome={view.outcome}>
+      <div className="acc-cc-head">
+        <span className={`bd-tag acc-cc-outcome ${OUTCOME_TAG[view.tone]}`}>{view.outcomeLabel}</span>
+        <span className="acc-cc-summary">{view.summary}</span>
       </div>
-      <p className="text-tiny text-default-500">
+      <p className="acc-cc-meta bd-num">
         {view.checkedAtText} · 用时 {view.totalMs} ms · {view.requestsText}
         {view.statusClass ? ` · 目标状态类别 ${view.statusClass}` : ""}
       </p>
-      <ol className="flex flex-col gap-2">
+      <ol className="acc-stages">
         {view.stages.map((stage, index) => (
           <li
             key={stage.stage}
-            className={`rounded-medium border p-2 ${RESULT_CLASSES[stage.result]} ${stage.decisive ? "ring-2 ring-offset-1 ring-current" : ""}`}
+            className={`acc-stage is-${stage.result}${stage.decisive ? " is-decisive" : ""}`}
             data-stage={stage.stage}
             data-result={stage.result}
             data-decisive={stage.decisive ? "true" : undefined}
           >
-            <div className="flex flex-wrap items-baseline justify-between gap-2">
-              <span className="font-semibold">
-                {index + 1}. {stage.label}
-              </span>
-              <span>
-                {stage.resultLabel}
-                {stage.atMs !== undefined ? <span className="ml-2 text-tiny opacity-80">{stage.atMs} ms</span> : null}
-              </span>
+            <StageMark result={stage.result} />
+            <div className="acc-stage-body">
+              <div className="acc-stage-head">
+                <span className="acc-stage-label">
+                  <span className="bd-num jd-subtle">{index + 1}.</span> {stage.label}
+                </span>
+                <span className={`bd-tag ${RESULT_TAG[stage.result]}`}>{stage.resultLabel}</span>
+                {stage.atMs !== undefined ? <span className="acc-stage-time bd-num">{stage.atMs} ms</span> : null}
+              </div>
+              {stage.code ? (
+                <p className="acc-stage-code">
+                  {stage.codeLabel} <code className="font-mono">{stage.code}</code>
+                </p>
+              ) : null}
+              {stage.next ? <p className="acc-stage-next">下一步：{stage.next}</p> : null}
             </div>
-            {stage.code ? (
-              <p className="mt-1 [overflow-wrap:anywhere]">
-                {stage.codeLabel} <code className="text-tiny opacity-80">{stage.code}</code>
-              </p>
-            ) : null}
-            {stage.next ? <p className="mt-1 font-medium text-default-700">下一步：{stage.next}</p> : null}
           </li>
         ))}
       </ol>
       {view.notes.map((note) => (
-        <p key={note} className="text-default-600">{note}</p>
+        <p key={note} className="acc-cc-note">{note}</p>
       ))}
     </section>
   );

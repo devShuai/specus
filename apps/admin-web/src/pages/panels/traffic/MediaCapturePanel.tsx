@@ -1,21 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Button,
-  Chip,
   Dropdown,
   DropdownItem,
   DropdownMenu,
   DropdownTrigger,
   Modal,
   ModalContent,
-  Pagination,
   Switch,
-  Table,
-  TableBody,
-  TableCell,
-  TableColumn,
-  TableHeader,
-  TableRow,
   Tooltip,
 } from "@heroui/react";
 import {
@@ -39,8 +31,9 @@ import type {
   HttpMediaPlaybackTicket,
 } from "../../../api/types";
 import { notifyError } from "../../../components/toast";
-import { formatBytes, formatDateTime } from "../../../lib/format";
-import { MobileListCard, MobileListCardList } from "../../../components/MobileListCard";
+import { formatAbsoluteTime, formatBytes, formatDateTime } from "../../../lib/format";
+import { Empty, Icon, RelativeTime, Section, TableWrap, Tag, type Tone } from "../../../components/ui";
+import { Pagination, TableEmptyRow, TableLoadingRow, TypeTag } from "../opsUi";
 import {
   estimateMediaTimeWindows,
   type IndexedMediaTimeWindow,
@@ -139,142 +132,100 @@ export function MediaCapturePanel() {
   );
 
   return (
-    <div className="flex min-w-0 flex-col gap-3">
-      <div className="flex min-h-9 flex-wrap items-center justify-between gap-2">
-        <div className="flex flex-wrap items-center gap-2 text-small text-default-500">
-          <span>当前页 {rows.length} 条</span>
-          <span>可回放 {completeCount} 条</span>
-          <span>已采集 {formatBytes(capturedBytes)}</span>
-        </div>
-        <Button size="sm" variant="flat" isLoading={loading} onPress={() => void load(true)}>
+    <Section
+      title="媒体采集记录"
+      description={`当前页 ${rows.length} 条 · 可回放 ${completeCount} 条 · 已采集 ${formatBytes(capturedBytes)}`}
+      actions={
+        <Button size="sm" variant="flat" isLoading={loading} startContent={loading ? null : <Icon name="refresh" size={14} />} onPress={() => void load(true)}>
           刷新
         </Button>
-      </div>
-
-      <div className="lg:hidden">
-        <MobileListCardList
-          items={rows}
-          isLoading={loading}
-          emptyContent="暂无媒体采集记录"
-          renderCard={(raw) => {
-            const row = raw as HttpMediaCapture;
-            return (
-              <MobileListCard
-                key={row.id}
-                title={<span className="break-all">{row.sourceUrl}</span>}
-                subtitle={`${row.clientName} · ${row.route}`}
-                badges={
-                  <>
-                    <MediaKindChip kind={row.mediaKind} />
-                    <MediaStateChip row={row} />
-                  </>
-                }
-                fields={[
-                  { label: "采集大小", value: formatBytes(row.capturedBytes) },
-                  { label: "源范围", value: mediaRangeLabel(row) },
-                  { label: "采集时间", value: formatDateTime(row.capturedAt) },
-                  { label: "保留至", value: formatDateTime(row.expiresAt) },
-                  ...(row.failureReason ? [{ label: "失败原因", value: row.failureReason }] : []),
-                  ...(row.playbackMessage
-                    ? [{ label: "回放状态", value: row.playbackMessage }]
-                    : []),
-                ]}
-                actions={
-                  <Button
-                    size="sm"
-                    color="primary"
-                    variant="flat"
-                    isDisabled={!canPlay(row)}
-                    title={row.playbackMessage ?? undefined}
-                    isLoading={ticketLoadingId === row.id}
-                    onPress={() => void openPlayer(row)}
-                  >
-                    播放
-                  </Button>
-                }
-              />
-            );
-          }}
-        />
-      </div>
-
-      <div className="hidden min-w-0 overflow-x-auto lg:block">
-        <Table aria-label="HTTP 媒体采集记录" isHeaderSticky removeWrapper>
-          <TableHeader>
-            <TableColumn>来源</TableColumn>
-            <TableColumn>类型</TableColumn>
-            <TableColumn>状态</TableColumn>
-            <TableColumn>范围</TableColumn>
-            <TableColumn>大小</TableColumn>
-            <TableColumn>时间</TableColumn>
-            <TableColumn>操作</TableColumn>
-          </TableHeader>
-          <TableBody items={rows} isLoading={loading} emptyContent="暂无媒体采集记录">
-            {(row) => (
-              <TableRow key={row.id}>
-                <TableCell>
-                  <div className="flex max-w-[34rem] min-w-0 flex-col">
-                    <span className="truncate font-medium" title={row.sourceUrl}>{row.sourceUrl}</span>
-                    <span className="truncate text-tiny text-default-400">
-                      {row.clientName} · {row.route} · #{row.id}
-                    </span>
+      }
+    >
+      <TableWrap className="ops-table-wrap">
+        <table className="bd-table jd-stack" aria-label="HTTP 媒体采集记录">
+          <thead>
+            <tr>
+              <th>来源</th>
+              <th>类型</th>
+              <th>状态</th>
+              <th>范围</th>
+              <th className="bd-col-num">大小</th>
+              <th>时间</th>
+              <th className="jd-col-actions"><span className="jd-sr-only">操作</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading && rows.length === 0 ? <TableLoadingRow colSpan={7} /> : null}
+            {!loading && rows.length === 0 ? (
+              <TableEmptyRow colSpan={7}>
+                <Empty icon="film" title="暂无媒体采集记录" description="HTTP 路由开启媒体采集后，播放过的音视频会缓存到这里。" />
+              </TableEmptyRow>
+            ) : null}
+            {rows.map((row) => (
+              <tr key={row.id}>
+                <td>
+                  <div className="jd-table-title">
+                    <span className="jd-strong" title={row.sourceUrl}>{row.sourceUrl}</span>
+                    <span className="jd-table-sub">{row.clientName} · {row.route} · #{row.id}</span>
                   </div>
-                </TableCell>
-                <TableCell><MediaKindChip kind={row.mediaKind} /></TableCell>
-                <TableCell>
-                  <div className="flex min-w-0 flex-col gap-1">
-                    <MediaStateChip row={row} />
+                </td>
+                <td data-label="类型"><MediaKindChip kind={row.mediaKind} /></td>
+                <td data-label="状态" className="jd-wrap">
+                  <div className="ops-cell-stack gap-1">
+                    <span><MediaStateChip row={row} /></span>
                     {row.failureReason ? (
-                      <span className="max-w-52 truncate text-tiny text-danger" title={row.failureReason}>
+                      <span className="ops-media-note ops-media-note--danger" title={row.failureReason}>
                         {row.failureReason}
                       </span>
                     ) : null}
                     {row.playbackMessage ? (
                       <span
-                        className={`max-w-52 truncate text-tiny ${
-                          row.playable ? "text-warning-600" : "text-danger"
-                        }`}
+                        className={`ops-media-note ${row.playable ? "" : "ops-media-note--danger"}`}
                         title={row.playbackMessage}
                       >
                         {row.playbackMessage}
                       </span>
                     ) : null}
                   </div>
-                </TableCell>
-                <TableCell><span className="whitespace-nowrap font-mono text-tiny">{mediaRangeLabel(row)}</span></TableCell>
-                <TableCell>{formatBytes(row.capturedBytes)}</TableCell>
-                <TableCell>
-                  <div className="flex flex-col whitespace-nowrap">
-                    <span>{formatDateTime(row.capturedAt)}</span>
-                    <span className="text-tiny text-default-400">
-                      保留至 {formatDateTime(row.expiresAt)}
-                    </span>
+                </td>
+                <td data-label="范围"><span className="ops-mono">{mediaRangeLabel(row)}</span></td>
+                <td className="bd-col-num" data-label="大小">{formatBytes(row.capturedBytes)}</td>
+                <td data-label="采集于">
+                  <span className="ops-cell-stack">
+                    <RelativeTime value={row.capturedAt} />
+                    <span className="jd-table-sub">保留至 {formatAbsoluteTime(row.expiresAt)}</span>
+                  </span>
+                </td>
+                <td className="jd-cell-actions">
+                  <div className="jd-row-actions">
+                    <Button
+                      size="sm"
+                      color="primary"
+                      variant="flat"
+                      isDisabled={!canPlay(row)}
+                      title={row.playbackMessage ?? undefined}
+                      isLoading={ticketLoadingId === row.id}
+                      startContent={ticketLoadingId === row.id ? null : <Icon name="play" size={14} />}
+                      onPress={() => void openPlayer(row)}
+                    >
+                      播放
+                    </Button>
                   </div>
-                </TableCell>
-                <TableCell>
-                  <Button
-                    size="sm"
-                    color="primary"
-                    variant="flat"
-                    isDisabled={!canPlay(row)}
-                    title={row.playbackMessage ?? undefined}
-                    isLoading={ticketLoadingId === row.id}
-                    onPress={() => void openPlayer(row)}
-                  >
-                    播放
-                  </Button>
-                </TableCell>
-              </TableRow>
-            )}
-          </TableBody>
-        </Table>
-      </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </TableWrap>
 
       {totalPages > 1 ? (
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-tiny text-default-400">共 {total} 条</span>
-          <Pagination showControls page={page + 1} total={totalPages} onChange={(value) => setPage(value - 1)} />
-        </div>
+        <Pagination
+          page={page}
+          totalPages={totalPages}
+          total={`共 ${total} 条`}
+          onChange={setPage}
+          label="媒体采集记录分页"
+        />
       ) : null}
 
       <MediaPlayerModal
@@ -284,7 +235,7 @@ export function MediaCapturePanel() {
         onBackfillChange={changeBackfillMode}
         onClose={closePlayer}
       />
-    </div>
+    </Section>
   );
 }
 
@@ -1228,21 +1179,21 @@ function MediaKindChip({ kind }: { kind: string }) {
   const label = kind === "HLS_MANIFEST" ? "HLS"
     : kind === "DASH_MANIFEST" ? "DASH"
       : kind === "MEDIA_SEGMENT" ? "分段" : "Range 媒体";
-  return <Chip size="sm" variant="flat">{label}</Chip>;
+  return <TypeTag>{label}</TypeTag>;
 }
 
+// Capture states as the design writes task states: running info, done success, failed danger.
 function MediaStateChip({ row }: { row: HttpMediaCapture }) {
-  const color = row.state === "COMPLETE" && row.offlineReady ? "success"
-    : row.state === "COMPLETE" && row.playable ? "primary"
-      : row.state === "COMPLETE" ? "default"
-        : row.state === "FAILED" || row.state === "INCOMPLETE" ? "danger"
-      : "warning";
+  const tone: Tone = row.state === "COMPLETE" && row.offlineReady ? "success"
+    : row.state === "COMPLETE" ? "neutral"
+      : row.state === "FAILED" || row.state === "INCOMPLETE" ? "danger"
+        : "info";
   const label = row.state === "COMPLETE" && row.offlineReady ? "完整缓存"
     : row.state === "COMPLETE" && row.playable ? "缓存片段"
       : row.state === "COMPLETE" ? "已采集"
         : row.state === "CAPTURING" || row.state === "STARTING" ? "采集中"
           : row.state === "INCOMPLETE" ? "不完整" : "失败";
-  return <Chip color={color} size="sm" variant="flat">{label}</Chip>;
+  return <Tag tone={tone}>{label}</Tag>;
 }
 
 function mediaRangeLabel(row: HttpMediaCapture): string {

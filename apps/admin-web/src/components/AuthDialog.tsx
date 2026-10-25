@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 import { useAuth } from "../auth/AuthContext";
 import type { RegistrationChallengeResponse } from "../api/types";
 import { AppLogo } from "./AppLogo";
+import { Glyph } from "./PublicGlyph";
 
 /** E-7: 焦点陷阱的选择器；补上 iframe，Turnstile 的挑战 iframe 不会再逃出陷阱。 */
 const FOCUSABLE_SELECTOR =
@@ -268,65 +269,64 @@ export function AuthDialog() {
         aria-modal="true"
         aria-labelledby="auth-dialog-title"
         aria-describedby="auth-dialog-description"
-        className="app-apple auth-dialog-panel"
+        className="bd-card jd-login-card auth-dialog-panel"
       >
-        <div className="auth-dialog-brand-row">
+        <div className="auth-dialog-head">
           <AppLogo
             label="specus"
             subtitle={isVerifyingEmail ? "邮箱安全验证" : isRegister ? "创建账号" : "安全账号访问"}
-            markClassName="h-9 w-9"
           />
           <button
             type="button"
             aria-label="关闭"
-            className="auth-dialog-close"
+            className="bd-icon-btn auth-dialog-close"
             onClick={closeLogin}
           >
-            <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-              <path d="M6 6l12 12M6 18L18 6" stroke="currentColor" strokeLinecap="round" strokeWidth="2" />
-            </svg>
+            <Glyph name="x" size={18} />
           </button>
         </div>
 
-        <div className="auth-dialog-intro">
-          <h2 id="auth-dialog-title">{title}</h2>
-          <p id="auth-dialog-description">{description}</p>
-        </div>
-
-        {registrationEnabled && !isVerifyingEmail && (
-          // E-15: 这里不是完整的 APG tab 模式（无 tabpanel/方向键漫游），
-          // 降级为 aria-pressed 切换按钮组，语义更诚实。
-          <div className="auth-dialog-tabs" role="group" aria-label="账号操作">
-            {([["login", "登录"], ["register", "注册"]] as const).map(([key, label]) => (
-              <button
-                key={key}
-                type="button"
-                aria-pressed={tab === key}
-                className={`auth-dialog-tab${tab === key ? " is-active" : ""}`}
-                onClick={() => switchTab(key)}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-        )}
-
         <div className="auth-dialog-body">
+          <div className="auth-dialog-intro">
+            <h2 id="auth-dialog-title" className="jd-login-title">{title}</h2>
+            <p id="auth-dialog-description" className="auth-dialog-sub">{description}</p>
+          </div>
+
+          {registrationEnabled && !isVerifyingEmail && (
+            // E-15: 这里不是完整的 APG tab 模式（无 tabpanel/方向键漫游），
+            // 降级为 aria-pressed 切换按钮组（设计规范的 Segmented），语义更诚实。
+            <div className="bd-seg bd-seg--md auth-dialog-seg" role="group" aria-label="账号操作">
+              {([["login", "登录"], ["register", "注册"]] as const).map(([key, label]) => (
+                <button
+                  key={key}
+                  type="button"
+                  aria-pressed={tab === key}
+                  onClick={() => switchTab(key)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          )}
+
           {passwordEnabled && (
-            <form className="auth-dialog-form" onSubmit={onSubmit}>
+            <form className="jd-login-form" onSubmit={onSubmit}>
               {isVerifyingEmail ? (
                 <>
-                  <div className="auth-dialog-verification-summary">
-                    <p>{username}</p>
-                    <p>
-                      验证码有效期至 {formatExpiry(challenge?.expiresAt ?? "")}
-                    </p>
+                  <div className="auth-dialog-verification">
+                    <Glyph name="send" />
+                    <div className="min-w-0">
+                      <p className="auth-dialog-verification-name">{username}</p>
+                      <p className="auth-dialog-verification-meta">
+                        验证码有效期至 <span className="bd-num">{formatExpiry(challenge?.expiresAt ?? "")}</span>
+                      </p>
+                    </div>
                   </div>
-                  <label className="auth-dialog-field">
-                    <span>邮箱验证码</span>
+                  <label className="bd-field">
+                    <span className="bd-label">邮箱验证码</span>
                     <input
                       ref={codeInputRef}
-                      className="auth-dialog-input auth-dialog-code-input"
+                      className="bd-input jd-input-lg auth-dialog-code-input"
                       value={verificationCode}
                       onChange={(event) => setVerificationCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
                       autoComplete="one-time-code"
@@ -339,10 +339,12 @@ export function AuthDialog() {
               ) : (
                 <>
                   {!isRegister && (
-                    <label className="auth-dialog-field">
-                      <span>租户 ID（非默认租户填写）</span>
+                    <label className="bd-field">
+                      <span className="bd-label">
+                        租户 ID<span className="bd-form-opt">（非默认租户填写）</span>
+                      </span>
                       <input
-                        className="auth-dialog-input"
+                        className="bd-input jd-input-lg"
                         value={tenantId}
                         onChange={(event) => setTenantId(event.target.value)}
                         autoComplete="organization"
@@ -352,11 +354,11 @@ export function AuthDialog() {
                       />
                     </label>
                   )}
-                  <label className="auth-dialog-field">
-                    <span>用户名</span>
+                  <label className="bd-field">
+                    <span className="bd-label">用户名</span>
                     <input
                       ref={usernameInputRef}
-                      className="auth-dialog-input"
+                      className="bd-input jd-input-lg"
                       value={username}
                       onChange={(event) => setUsername(event.target.value)}
                       autoComplete="username"
@@ -369,10 +371,10 @@ export function AuthDialog() {
                     />
                   </label>
                   {isRegister && (
-                    <label className="auth-dialog-field">
-                      <span>邮箱</span>
+                    <label className="bd-field">
+                      <span className="bd-label">邮箱</span>
                       <input
-                        className="auth-dialog-input"
+                        className="bd-input jd-input-lg"
                         type="email"
                         value={email}
                         onChange={(event) => setEmail(event.target.value)}
@@ -384,11 +386,11 @@ export function AuthDialog() {
                       />
                     </label>
                   )}
-                  <label className="auth-dialog-field">
-                    <span>密码</span>
+                  <label className="bd-field">
+                    <span className="bd-label">密码</span>
                     <div className="auth-dialog-password">
                       <input
-                        className="auth-dialog-input"
+                        className="bd-input jd-input-lg"
                         type={showPassword ? "text" : "password"}
                         value={password}
                         onChange={(event) => setPassword(event.target.value)}
@@ -400,21 +402,21 @@ export function AuthDialog() {
                       />
                       <button
                         type="button"
-                        className="auth-dialog-password-toggle"
+                        className="bd-icon-btn auth-dialog-password-toggle"
                         aria-label={showPassword ? "隐藏密码" : "显示密码"}
                         aria-pressed={showPassword}
                         onClick={() => setShowPassword((value) => !value)}
                       >
-                        {showPassword ? <EyeOffIcon /> : <EyeIcon />}
+                        <Glyph name={showPassword ? "eye-off" : "eye"} />
                       </button>
                     </div>
                   </label>
                   {isRegister && (
-                    <label className="auth-dialog-field">
-                      <span>确认密码</span>
+                    <label className="bd-field">
+                      <span className="bd-label">确认密码</span>
                       <div className="auth-dialog-password">
                         <input
-                          className="auth-dialog-input"
+                          className="bd-input jd-input-lg"
                           type={showPassword ? "text" : "password"}
                           value={confirmPassword}
                           onChange={(event) => {
@@ -430,16 +432,16 @@ export function AuthDialog() {
                         />
                         <button
                           type="button"
-                          className="auth-dialog-password-toggle"
+                          className="bd-icon-btn auth-dialog-password-toggle"
                           aria-label={showPassword ? "隐藏密码" : "显示密码"}
                           aria-pressed={showPassword}
                           onClick={() => setShowPassword((value) => !value)}
                         >
-                          {showPassword ? <EyeOffIcon /> : <EyeIcon />}
+                          <Glyph name={showPassword ? "eye-off" : "eye"} />
                         </button>
                       </div>
                       {confirmError && (
-                        <p className="auth-dialog-field-error" id="auth-dialog-confirm-error" role="alert">
+                        <p className="bd-help bd-help--error" id="auth-dialog-confirm-error" role="alert">
                           {confirmError}
                         </p>
                       )}
@@ -453,13 +455,14 @@ export function AuthDialog() {
               )}
 
               {error && (
-                <p className="auth-dialog-error" id="auth-dialog-error" role="alert">
-                  {error}
-                </p>
+                <div className="bd-alert bd-alert--danger auth-dialog-error" id="auth-dialog-error" role="alert">
+                  <Glyph name="circle-alert" />
+                  <div className="bd-alert-title">{error}</div>
+                </div>
               )}
               <button
                 type="submit"
-                className="auth-dialog-primary"
+                className={`bd-btn bd-btn--primary bd-btn--lg jd-login-submit${submitting ? " is-busy" : ""}`}
                 disabled={
                   submitting
                   || (isVerifyingEmail
@@ -477,19 +480,21 @@ export function AuthDialog() {
                 <div className="auth-dialog-inline-actions">
                   <button
                     type="button"
-                    className="auth-dialog-text-button"
+                    className="bd-btn bd-btn--ghost bd-btn--sm"
                     disabled={submitting || resendSeconds > 0}
                     onClick={() => void resendCode()}
                   >
-                    {resendSeconds > 0 ? `${resendSeconds} 秒后可重发` : "重新发送验证码"}
+                    <Glyph name="refresh" />
+                    <span>{resendSeconds > 0 ? `${resendSeconds} 秒后可重发` : "重新发送验证码"}</span>
                   </button>
                   <button
                     type="button"
-                    className="auth-dialog-text-button"
+                    className="bd-btn bd-btn--ghost bd-btn--sm"
                     disabled={submitting}
                     onClick={editRegistration}
                   >
-                    修改注册信息
+                    <Glyph name="edit" />
+                    <span>修改注册信息</span>
                   </button>
                 </div>
               )}
@@ -497,9 +502,10 @@ export function AuthDialog() {
           )}
 
           {!passwordEnabled && error && (
-            <p className="auth-dialog-error" role="alert">
-              {error}
-            </p>
+            <div className="bd-alert bd-alert--danger auth-dialog-error" role="alert">
+              <Glyph name="circle-alert" />
+              <div className="bd-alert-title">{error}</div>
+            </div>
           )}
 
           {passwordEnabled && oidcEnabled && !isRegister && (
@@ -513,31 +519,37 @@ export function AuthDialog() {
           {oidcEnabled && !isRegister && (
             <button
               type="button"
-              className="auth-dialog-secondary"
+              className="bd-btn bd-btn--secondary bd-btn--lg jd-login-submit"
               disabled={submitting}
               aria-busy={submitting}
               onClick={() => void loginWithOidc()}
             >
-              {submitting ? "正在跳转..." : "使用 OIDC 登录"}
+              <Glyph name="key" />
+              <span>{submitting ? "正在跳转..." : "使用 OIDC 登录"}</span>
             </button>
           )}
 
           {certusRegistrationEnabled && !isRegister && (
             <button
               type="button"
-              className="auth-dialog-secondary"
+              className="bd-btn bd-btn--secondary bd-btn--lg jd-login-submit"
               disabled={submitting}
               aria-busy={submitting}
               onClick={() => void registerWithCertus()}
             >
-              {submitting ? "正在跳转..." : "注册 Certus 账号"}
+              <Glyph name="user" />
+              <span>{submitting ? "正在跳转..." : "注册 Certus 账号"}</span>
             </button>
           )}
 
           {!passwordEnabled && !oidcEnabled && (
-            <p className="auth-dialog-error" role="alert">
-              未配置任何登录方式：请设置用户名/密码或 OIDC
-            </p>
+            <div className="bd-alert bd-alert--danger auth-dialog-error" role="alert">
+              <Glyph name="circle-alert" />
+              <div>
+                <div className="bd-alert-title">未配置任何登录方式</div>
+                <div className="bd-alert-body">在服务端设置用户名/密码或 OIDC 后再登录。</div>
+              </div>
+            </div>
           )}
         </div>
       </div>
@@ -549,33 +561,4 @@ function formatExpiry(value: string): string {
   const timestamp = Date.parse(value);
   if (!Number.isFinite(timestamp)) return "稍后";
   return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" }).format(timestamp);
-}
-
-function EyeIcon() {
-  return (
-    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-      <path
-        d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z"
-        stroke="currentColor"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        strokeWidth="1.8"
-      />
-      <circle cx="12" cy="12" r="3" stroke="currentColor" strokeWidth="1.8" />
-    </svg>
-  );
-}
-
-function EyeOffIcon() {
-  return (
-    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-      <path
-        d="M4 4l16 16M9.9 5.9A9.4 9.4 0 0 1 12 5.5c6 0 9.5 6.5 9.5 6.5a17.6 17.6 0 0 1-2.7 3.6M6.1 6.9A16.9 16.9 0 0 0 2.5 12S6 18.5 12 18.5c1.2 0 2.3-.3 3.3-.7M9.9 9.9a3 3 0 0 0 4.2 4.2"
-        stroke="currentColor"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        strokeWidth="1.8"
-      />
-    </svg>
-  );
 }
