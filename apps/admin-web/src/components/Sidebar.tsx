@@ -7,14 +7,14 @@ export interface SidebarProps { groups: NavGroup[]; active: string; onSelect: (k
 
 export function Sidebar({ groups, active, onSelect, variant = "desktop", onClose, footer }: SidebarProps) {
   return <nav aria-label="主导航" className="app-apple-nav flex h-full flex-col">
-    {variant === "desktop" && <div className="app-apple-nav-brand flex h-14 shrink-0 items-center px-3"><AppLogo className="min-w-0" label="specus" markClassName="h-8 w-8" subtitle="管理后台" /></div>}
-    <div className="app-apple-nav-scroll flex-1 overflow-y-auto px-2.5 py-2.5">
-      {groups.map((g) => <div key={g.label} className="app-apple-nav-group mb-2.5">
-        <div className="app-apple-nav-heading mb-1 px-2 text-small font-semibold text-default-400">{g.label}</div>
+    {variant === "desktop" && <div className="app-apple-nav-brand flex h-12 shrink-0 items-center pb-2"><AppLogo className="min-w-0" label="specus" subtitle="管理后台" /></div>}
+    <div className="app-apple-nav-scroll flex-1 overflow-y-auto py-1">
+      {groups.map((g) => <div key={g.label} className="app-apple-nav-group mb-1">
+        <div className="app-apple-nav-heading mb-1 px-2.5">{g.label}</div>
         <ul className="flex flex-col gap-0.5">{g.items.map(item => { const isActive = item.key === active; return <li key={item.key}>
           <button
             aria-current={isActive ? "page" : undefined}
-            className={["app-apple-nav-item flex w-full items-center gap-2 px-2 py-1.5 text-left text-small transition-colors", isActive ? "app-apple-nav-item-active" : ""].join(" ")}
+            className={["app-apple-nav-item flex w-full items-center text-left", isActive ? "app-apple-nav-item-active" : ""].join(" ")}
             title={item.external ? `${item.title}（新页面，离开控制台）` : undefined}
             type="button"
             onClick={() => { onSelect(item.key); onClose?.(); }}
@@ -26,12 +26,12 @@ export function Sidebar({ groups, active, onSelect, variant = "desktop", onClose
         </li>})}</ul>
       </div>)}
     </div>
-    {variant === "desktop" && <div className="app-apple-nav-footer shrink-0 px-2.5 py-2.5">{footer}</div>}
+    {variant === "desktop" && <div className="app-apple-nav-footer shrink-0 pt-2">{footer}</div>}
   </nav>;
 }
 
 const C = "h-4 w-4";
-const A = { fill:"none",stroke:"currentColor",strokeWidth:"1.6",strokeLinecap:"round" as const,strokeLinejoin:"round" as const };
+const A = { fill:"none",stroke:"currentColor",strokeWidth:"1.75",strokeLinecap:"round" as const,strokeLinejoin:"round" as const, "aria-hidden": true };
 function ExternalIcon() {
   return <svg className="h-3.5 w-3.5" {...A} viewBox="0 0 24 24"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M19 13.5V18a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h4.5"/></svg>;
 }

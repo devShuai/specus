@@ -84,6 +84,9 @@ async function setup(hash, options = {}) {
         instances: [{ publisherSessionId: 101, instanceId: "ux-instance", online: true, advertised: true, revision: 1,
           expiresAt: new Date(Date.now() + 600000).toISOString() }] }]);
     if (path === "/api/admin/client-downloads") return json([]);
+    // The member notice in the personal menu reads whether product metrics are collected.
+    if (path === "/api/admin/product-metrics/settings") return json({ schemaVersion: 1, enabled: false, disclosureVersion: 1,
+      retentionDays: 90, onboardingWindowDays: 14, updatedAt: null });
     unexpected.push(`${method} ${path}`);
     return route.fulfill({ status: 404, json: { error: "unconfigured isolated endpoint" } });
   });

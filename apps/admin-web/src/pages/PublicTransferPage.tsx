@@ -3345,7 +3345,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       onPaste={handlePagePaste}
     >
       <header className="app-apple-tool-header relative z-40 mx-auto flex w-full max-w-[1480px] items-center justify-between gap-3 px-4 py-4 sm:px-8 sm:py-5">
-        <AppLogo className="min-w-0 flex-1" label="specus" subtitle={isDiagramWorkspace ? "专业流程图" : "互传"} markClassName="h-8 w-8 sm:h-9 sm:w-9" />
+        <AppLogo className="min-w-0 flex-1" label="specus" subtitle={isDiagramWorkspace ? "专业流程图" : "互传"} />
         <div className="public-header-actions flex shrink-0 items-center gap-2">
           <PublicToolsMenu active={workspace} />
           <UserMenuButton className="public-header-theme-button" />

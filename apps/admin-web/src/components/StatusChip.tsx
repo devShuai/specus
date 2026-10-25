@@ -1,4 +1,3 @@
-import { Chip } from "@heroui/react";
 import type { ReactNode } from "react";
 
 /**
@@ -17,13 +16,18 @@ export interface StatusChipProps {
   className?: string;
 }
 
-/** 统一的状态徽章：固定 size/variant，颜色只能从语义 tone 进入。 */
+const TONE_CLASS: Record<StatusTone, string> = {
+  success: "app-tag--success",
+  warning: "app-tag--warning",
+  danger: "app-tag--danger",
+  primary: "app-tag--info",
+  default: "",
+  secondary: "app-tag--plain",
+};
+
+/** 统一的状态徽章（设计规范的 Tag 组件：胶囊 + 圆点 + 文字），颜色只能从语义 tone 进入。 */
 export function StatusChip({ tone = "default", children, className = "" }: StatusChipProps) {
-  return (
-    <Chip size="sm" variant="flat" color={tone} className={className}>
-      {children}
-    </Chip>
-  );
+  return <span className={["app-tag", TONE_CLASS[tone], className].filter(Boolean).join(" ")}>{children}</span>;
 }
 
 /** 启用/停用的标准 tone：停用不闯红灯。 */

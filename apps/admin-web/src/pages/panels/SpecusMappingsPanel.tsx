@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { PageHeader } from "../../components/PageHeader";
 import {
   Button,
   Input,
@@ -140,7 +141,8 @@ export function SpecusMappingsPanel() {
   const pagedSpecusMappings = specusMappings.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
   return (
-    <div className="mt-4 flex min-w-0 flex-col gap-4">
+    <div className="flex min-w-0 flex-col gap-4">
+      <PageHeader title="端口映射" description="把客户端所在网络里的 TCP 服务映射到服务端的公网端口。" />
       <form className="flex flex-wrap items-end gap-3" onSubmit={onCreate}>
         <Select
           className="w-full sm:w-48"
@@ -156,10 +158,10 @@ export function SpecusMappingsPanel() {
         <Input className="w-full sm:w-32" type="number" label="公网端口" value={listenPort} onValueChange={setListenPort} min={1} max={65535} isRequired />
         <Input className="w-full sm:w-44" label="内网目标地址" placeholder="127.0.0.1" value={targetAddress} onValueChange={setTargetAddress} isRequired />
         <Input className="w-full sm:w-32" type="number" label="内网端口" value={targetPort} onValueChange={setTargetPort} min={1} max={65535} isRequired />
-        <Button className="h-14 w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
+        <Button className="h-10 w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
           新建映射
         </Button>
-        <Button className="h-14 w-full sm:w-auto" variant="flat" isLoading={loading} onPress={() => void load()}>
+        <Button className="h-10 w-full sm:w-auto" variant="flat" isLoading={loading} onPress={() => void load()}>
           刷新
         </Button>
       </form>

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { PageHeader } from "../../components/PageHeader";
 import {
   Button,
   Card,
@@ -119,13 +120,11 @@ export function ProductMetricsPanel() {
   };
 
   return (
-    <div className="mt-4 flex flex-col gap-4">
-      <div>
-        <h2 className="text-lg font-semibold">产品指标</h2>
-        <p className="text-small text-default-500">
-          由管理员显式开启，只保存按天汇总的计数，用来了解新成员的接入进度与互传的成功率。
-        </p>
-      </div>
+    <div className="flex flex-col gap-4">
+      <PageHeader
+        title="产品指标"
+        description="由管理员显式开启，只保存按天汇总的计数，用来了解新成员的接入进度与互传的成功率。"
+      />
 
       <Card shadow="none" className="border border-default-200">
         <CardHeader className="flex flex-wrap items-center gap-3">

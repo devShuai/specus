@@ -9,23 +9,24 @@ export interface EmptyStateProps {
 
 export function EmptyState({ icon = "generic", title, description, actionLabel, onAction, className = "" }: EmptyStateProps) {
   return (
-    <div className={`flex flex-col items-center justify-center py-12 text-center ${className}`}>
-      <div className="mb-4 text-default-300">{Ill(icon)}</div>
-      <h3 className="text-small font-semibold text-default-600">{title}</h3>
-      {description && <p className="mt-1.5 max-w-xs text-tiny text-default-400">{description}</p>}
-      {actionLabel && onAction && <Button className="mt-4" color="primary" size="sm" variant="flat" onPress={onAction}>{actionLabel}</Button>}
+    <div className={`app-empty ${className}`}>
+      <div className="app-empty-icon">{Ill(icon)}</div>
+      <h3 className="app-empty-title">{title}</h3>
+      {description && <p className="app-empty-desc">{description}</p>}
+      {actionLabel && onAction && <Button className="mt-3" color="primary" size="sm" onPress={onAction}>{actionLabel}</Button>}
     </div>
   );
 }
 
-const S = { fill:"none",stroke:"currentColor",strokeWidth:"1.5",strokeLinecap:"round" as const,strokeLinejoin:"round" as const };
+// Line icons of the design (24 canvas, 1.75 stroke) inside the empty state's round badge.
+const S = { fill:"none",stroke:"currentColor",strokeWidth:"1.75",strokeLinecap:"round" as const,strokeLinejoin:"round" as const };
 function Ill(k: EmptyStateIcon) {
-  const c = "h-20 w-20";
+  const c = "h-6 w-6";
   switch(k){
-    case "clients": return <svg aria-hidden="true" className={c} {...S} viewBox="0 0 80 80"><rect height="38" rx="4" width="52" x="14" y="16"/><line x1="40" x2="40" y1="54" y2="62"/><line x1="28" x2="52" y1="62" y2="62"/><circle cx="58" cy="14" fill="currentColor" r="12" stroke="none"/><line stroke="white" x1="58" x2="58" y1="8" y2="20"/><line stroke="white" x1="52" x2="64" y1="14" y2="14"/></svg>;
-    case "traffic": return <svg aria-hidden="true" className={c} {...S} viewBox="0 0 80 80"><line x1="16" x2="16" y1="12" y2="68"/><line x1="16" x2="72" y1="68" y2="68"/><line strokeDasharray="3 3" x1="16" x2="72" y1="52" y2="52"/><line strokeDasharray="3 3" x1="16" x2="72" y1="36" y2="36"/><line strokeDasharray="3 3" x1="16" x2="72" y1="20" y2="20"/><rect height="18" rx="2" width="12" x="22" y="50"/><rect height="34" rx="2" width="12" x="38" y="34"/><rect height="26" rx="2" width="12" x="54" y="42"/></svg>;
-    case "peer": return <svg aria-hidden="true" className={c} {...S} viewBox="0 0 80 80"><circle cx="26" cy="26" r="14"/><circle cx="54" cy="54" r="14"/><line x1="38" x2="44" y1="34" y2="46"/><circle cx="26" cy="26" fill="currentColor" r="3" stroke="none"/><circle cx="54" cy="54" fill="currentColor" r="3" stroke="none"/><text dominantBaseline="central" fill="currentColor" fontSize="14" fontWeight="600" stroke="none" textAnchor="middle" x="54" y="54">?</text></svg>;
-    case "connections": return <svg aria-hidden="true" className={c} {...S} viewBox="0 0 80 80"><rect height="20" rx="4" width="20" x="10" y="30"/><rect height="20" rx="4" width="20" x="50" y="30"/><line x1="30" x2="50" y1="36" y2="36"/><polyline points="44,30 50,36 44,42"/><line strokeDasharray="4 3" x1="30" x2="50" y1="46" y2="46"/><polyline points="36,40 30,46 36,52"/></svg>;
-    default: return <svg aria-hidden="true" className={c} {...S} viewBox="0 0 80 80"><path d="M16 24 L16 66 L64 66 L64 24 Z"/><path d="M16 24 L38 14 L64 24"/><line x1="40" x2="40" y1="38" y2="52"/><line x1="32" x2="48" y1="45" y2="45"/></svg>;
+    case "clients": return <svg aria-hidden="true" className={c} {...S} viewBox="0 0 24 24"><rect height="13" rx="2" width="18" x="3" y="3"/><path d="M12 16v4M8 20h8"/></svg>;
+    case "traffic": return <svg aria-hidden="true" className={c} {...S} viewBox="0 0 24 24"><path d="M4 20V8M10 20V4M16 20v-8M20 20H3"/></svg>;
+    case "peer": return <svg aria-hidden="true" className={c} {...S} viewBox="0 0 24 24"><circle cx="7" cy="7" r="3"/><circle cx="17" cy="17" r="3"/><path d="M9.5 9.5l5 5"/></svg>;
+    case "connections": return <svg aria-hidden="true" className={c} {...S} viewBox="0 0 24 24"><path d="M4 8h13M13 4l4 4-4 4M20 16H7M11 12l-4 4 4 4"/></svg>;
+    default: return <svg aria-hidden="true" className={c} {...S} viewBox="0 0 24 24"><path d="M3 7.5 12 3l9 4.5v9L12 21l-9-4.5z"/><path d="M3 7.5 12 12l9-4.5M12 12v9"/></svg>;
   }
 }

@@ -4,6 +4,10 @@
  */
 @import "tailwindcss" source(none);
 
+/* Liquid Glass Base tokens. In the base layer they override Tailwind's own --radius-* and --font-*
+ * theme values, so the rounded-* and font-* utilities follow the design's scale. */
+@import "./design-tokens.css" layer(base);
+
 /*
  * The hand-written stylesheet. Tailwind 3 emitted it unlayered after the plain utilities and before
  * the variant utilities (which it appends to the end of the stylesheet), so it contested both by
@@ -26,13 +30,15 @@
 @custom-variant dark (&:is(.dark *));
 
 @theme {
-  /* A ring without a color class was blue-500 at half opacity, not currentColor. */
-  --default-ring-color: rgb(59 130 246 / 0.5);
+  /* A ring without a color class is the design's focus ring. */
+  --default-ring-color: rgb(0 113 227 / 0.5);
 
-  /* Inter variable font with CJK system fallbacks (Chinese uses the system font; no bundled CJK font). */
+  /* The design's system font stack (design-tokens.css); no web font is bundled. */
   --font-sans:
-    "Inter Variable", "Inter", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC",
-    "Noto Sans SC", system-ui, sans-serif;
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+    "Noto Sans CJK SC", "Source Han Sans SC", "Segoe UI", sans-serif;
+  --font-mono:
+    "SF Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", "Noto Sans Mono CJK SC", monospace;
 
   /* Display sizes keep natural letter spacing, as in the diagram editor. */
   --text-display-xl: 3rem;
@@ -49,19 +55,19 @@
   --text-display-sm--letter-spacing: 0;
 
   /*
-   * Older pages still use cyan-* utilities; 50–900 map to the editor blue (appleBlueScale in
-   * ../hero.ts) so their state selectors keep working, and 950 keeps Tailwind 3's value.
+   * Older pages still use cyan-* utilities; 50–900 map to the light primary scale (../hero.ts) so
+   * their state selectors keep working, and 950 keeps Tailwind 3's value.
    */
-  --color-cyan-50: #f0f7ff;
-  --color-cyan-100: #e1efff;
-  --color-cyan-200: #bfddff;
-  --color-cyan-300: #8ec4ff;
-  --color-cyan-400: #5aa8ff;
-  --color-cyan-500: #2997ff;
-  --color-cyan-600: #0077ed;
-  --color-cyan-700: #0066cc;
-  --color-cyan-800: #0055aa;
-  --color-cyan-900: #00447f;
+  --color-cyan-50: #eef6ff;
+  --color-cyan-100: #dcecff;
+  --color-cyan-200: #b8d8ff;
+  --color-cyan-300: #85bcff;
+  --color-cyan-400: #4d9cff;
+  --color-cyan-500: #1a82f5;
+  --color-cyan-600: #0071e3;
+  --color-cyan-700: #0062c4;
+  --color-cyan-800: #004f9e;
+  --color-cyan-900: #003c78;
   --color-cyan-950: #083344;
 
   /*
@@ -167,19 +173,19 @@
 
 /* Tailwind 3 preflight defaults that Tailwind 4 changed and the existing screens rely on. */
 @layer base {
-  /* Borders drawn with only a width took gray-200 rather than currentColor. */
+  /* Borders drawn with only a width take the design's hairline rather than currentColor. */
   *,
   ::after,
   ::before,
   ::backdrop,
   ::file-selector-button {
-    border-color: #e5e7eb;
+    border-color: var(--border);
   }
 
-  /* Placeholders were gray-400 rather than half the text color. */
+  /* Placeholders use the subtle text color rather than half the text color. */
   input::placeholder,
   textarea::placeholder {
-    color: #9ca3af;
+    color: var(--text-subtle);
   }
 
   /* Buttons showed a pointer, except when disabled. */

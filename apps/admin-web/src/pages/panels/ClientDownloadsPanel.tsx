@@ -4,6 +4,7 @@ import type { ClientDownloadLink, ClientImplementation } from "../../api/types";
 import { fetchPublicClientDownloads } from "../../api/client";
 import { MacosInstallGuide } from "../../components/MacosInstallGuide";
 import { formatBytes, formatDateTime } from "../../lib/format";
+import { PageHeader } from "../../components/PageHeader";
 
 const IMPLEMENTATION_LABELS: Record<ClientImplementation, string> = {
   java: "Java 客户端",
@@ -52,21 +53,19 @@ export function ClientDownloadsPanel() {
   }));
 
   return (
-    <div className="mt-4 flex flex-col gap-4">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h2 className="text-lg font-semibold">客户端下载</h2>
-          <p className="text-small text-default-500">macOS 推荐 Homebrew；GitHub Releases 提供各平台手动下载包</p>
-        </div>
-        <div className="flex flex-wrap gap-2">
+    <div className="flex flex-col gap-4">
+      <PageHeader
+        title="客户端下载"
+        description="macOS 推荐 Homebrew；GitHub Releases 提供各平台手动下载包"
+        actions={<>
           <Button as="a" href="/download" rel="noopener noreferrer" size="sm" target="_blank" variant="bordered">
             打开公开下载页 ↗
           </Button>
           <Button size="sm" variant="flat" isLoading={loading} onPress={() => void load(true)}>
             刷新
           </Button>
-        </div>
-      </div>
+        </>}
+      />
 
       <MacosInstallGuide />
       <div className="rounded-md border border-primary-200 bg-primary-50/40 p-3 text-small">

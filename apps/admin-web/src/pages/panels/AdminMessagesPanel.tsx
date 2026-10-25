@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type KeyboardEvent } from "react";
+import { PageHeader } from "../../components/PageHeader";
 import { Button, Card, CardBody, Chip, Progress, Textarea, Tooltip } from "@heroui/react";
 import { adminApi, tokenStore } from "../../api/client";
 import type { AttachmentPresignUploadResponse, Client, TransferAttachment } from "../../api/types";
@@ -434,7 +435,9 @@ export function AdminMessagesPanel() {
   };
 
   return (
-    <div className="mt-4 grid min-h-[calc(100vh-120px)] min-w-0 gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
+    <div className="flex min-w-0 flex-col">
+    <PageHeader title="消息" description="和在线的消息客户端互发文字与文件。" />
+    <div className="grid min-h-[calc(100vh-210px)] min-w-0 gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
       <Card shadow="none" className="rounded-md border border-default-200">
         <CardBody className="gap-3 p-3">
           <div className="flex items-center justify-between gap-2">
@@ -600,6 +603,7 @@ export function AdminMessagesPanel() {
           </div>
         </CardBody>
       </Card>
+    </div>
     </div>
   );
 }
