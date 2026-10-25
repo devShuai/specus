@@ -1,27 +1,12 @@
-import { useEffect, useState, type DragEvent } from "react";
+import { useEffect, useId, useState, type DragEvent } from "react";
 import { PageHeader } from "../../components/PageHeader";
 import {
   Button,
-  Card,
-  CardBody,
-  CardHeader,
-  Chip,
-  Input,
   Modal,
   ModalBody,
   ModalContent,
   ModalFooter,
   ModalHeader,
-  Select,
-  SelectItem,
-  Switch,
-  Table,
-  TableBody,
-  TableCell,
-  TableColumn,
-  TableHeader,
-  TableRow,
-  Textarea,
   useDisclosure,
 } from "@heroui/react";
 import { adminApi } from "../../api/client";
@@ -36,13 +21,12 @@ import type {
   ManagementUser,
   ManagementUserMutation,
 } from "../../api/types";
-import { formatBytes, formatDateTime } from "../../lib/format";
+import { formatBytes } from "../../lib/format";
 import { notify, notifyError } from "../../components/toast";
-import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 import { ConfirmModal } from "../../components/ConfirmModal";
-import { EmptyState } from "../../components/EmptyState";
-import { StatusChip, enabledTone } from "../../components/StatusChip";
+import { Alert, Card, CardBody, CardHeader, Empty, Icon, RelativeTime, Section, TableWrap, Tag } from "../../components/ui";
 import { archLabel, platformLabel } from "./ClientDownloadsPanel";
+import { Field, SelectField, TableLoadingRow, TableStateRow, TextField, Toggle } from "./meshSystemParts";
 
 interface ConfirmState {
   title: string;
@@ -113,10 +97,10 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
   const confirmToggleRole = (user: ManagementUser) => {
     const toAdmin = user.role !== "ADMIN";
     setConfirm({
-      title: toAdmin ? "设为管理员" : "设为普通用户",
+      title: toAdmin ? `把 ${user.username} 设为管理员？` : `把 ${user.username} 降为普通用户？`,
       description: toAdmin
-        ? `确定将 ${user.username} 设为管理员吗？管理员可管理全部用户、客户端与系统配置。`
-        : `确定将 ${user.username} 降为普通用户吗？其管理权限将立即失效。`,
+        ? `管理员可管理全部用户、客户端与系统配置。`
+        : `${user.username} 的管理权限会立即失效。`,
       confirmLabel: toAdmin ? "设为管理员" : "设为普通",
       danger: toAdmin,
       action: () => updateUser(user, { role: toAdmin ? "ADMIN" : "USER" }),
@@ -125,10 +109,10 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
 
   const confirmToggleEnabled = (user: ManagementUser) => {
     setConfirm({
-      title: user.enabled ? "停用用户" : "启用用户",
+      title: user.enabled ? `停用 ${user.username}？` : `恢复启用 ${user.username}？`,
       description: user.enabled
-        ? `确定停用 ${user.username} 吗？停用后该用户将无法登录管理后台。`
-        : `确定恢复启用 ${user.username} 吗？`,
+        ? `停用后该用户将无法登录管理后台。`
+        : `启用后该用户可以重新登录管理后台。`,
       confirmLabel: user.enabled ? "停用" : "启用",
       danger: Boolean(user.enabled),
       action: () => updateUser(user, { enabled: !user.enabled }),
@@ -137,8 +121,8 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
 
   const deleteUser = (user: ManagementUser) => {
     setConfirm({
-      title: "删除用户",
-      description: `确定删除用户 ${user.username} 吗？该操作不可恢复。`,
+      title: `删除用户 ${user.username}？`,
+      description: `该操作不可恢复。`,
       confirmLabel: "删除",
       danger: true,
       action: async () => {
@@ -237,8 +221,8 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
 
   const deleteLink = (link: ClientDownloadLink) => {
     setConfirm({
-      title: "删除下载链接",
-      description: `确定删除「${link.displayName}」吗？删除后公开下载和版本检查将不再返回该条目。`,
+      title: `删除「${link.displayName}」？`,
+      description: `删除后公开下载和版本检查将不再返回该条目。`,
       confirmLabel: "删除",
       danger: true,
       action: async () => {
@@ -254,448 +238,263 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
   };
 
   return (
-    <div className="flex flex-col gap-4">
-    <PageHeader title="系统管理" description="用户、数据库与客户端发布。" />
-    <div className="grid gap-4 xl:grid-cols-[minmax(0,1.5fr)_minmax(360px,0.8fr)]">
-      <Card shadow="none" className="rounded-md border border-default-200 bg-content1">
-        <CardHeader className="flex items-center justify-between gap-4 px-5 pb-2 pt-5">
-          <div>
-            <h2 className="text-lg font-semibold text-foreground">用户管理</h2>
-            <p className="mt-1 text-small text-default-500">数据库用户、角色和启用状态</p>
-          </div>
-          <Button radius="sm" variant="flat" isLoading={loadingUsers} onPress={() => void loadUsers()}>
+    <div className="ms-page flex min-w-0 flex-col">
+      <PageHeader title="系统管理" description="用户、数据库与客户端发布。" />
+
+      <Section
+        title="用户管理"
+        description="数据库用户、角色和启用状态；配置文件内置的账号只能在配置文件里改。"
+        actions={(
+          <Button variant="flat" isLoading={loadingUsers} startContent={loadingUsers ? null : <Icon name="refresh" />} onPress={() => void loadUsers()}>
             刷新
           </Button>
-        </CardHeader>
-        <CardBody className="gap-4 px-5 pb-5 pt-2">
-          <div className="grid gap-3 rounded-md border border-default-200 bg-default-50 p-3 lg:grid-cols-[1fr_1fr_150px_auto_auto]">
-            <Input
-              label="用户名"
-              radius="sm"
-              size="sm"
-              value={userForm.username || ""}
-              onValueChange={(username) => setUserForm((prev) => ({ ...prev, username }))}
-            />
-            <Input
-              label="密码"
-              radius="sm"
-              size="sm"
-              type="password"
-              value={userForm.password || ""}
-              onValueChange={(password) => setUserForm((prev) => ({ ...prev, password }))}
-            />
-            <Select
-              label="角色"
-              radius="sm"
-              selectedKeys={[userForm.role || "USER"]}
-              size="sm"
-              onSelectionChange={(keys) => {
-                const role = Array.from(keys)[0]?.toString() as ManagementRole | undefined;
-                setUserForm((prev) => ({ ...prev, role: role || "USER" }));
-              }}
-            >
-              <SelectItem key="USER">普通用户</SelectItem>
-              <SelectItem key="ADMIN">管理员</SelectItem>
-            </Select>
-            <Switch
-              className="self-center"
-              isSelected={userForm.enabled !== false}
-              size="sm"
-              onValueChange={(enabled) => setUserForm((prev) => ({ ...prev, enabled }))}
-            >
-              启用
-            </Switch>
-            <Button
-              className="self-center"
-              color="primary"
-              isLoading={savingUser}
-              radius="sm"
-              onPress={() => void createUser()}
-            >
-              创建用户
+        )}
+      >
+        <Card className="ms-block">
+          <CardHeader title="新建用户" description="创建后对方用这里的用户名和密码登录管理后台。" />
+          <CardBody>
+            <div className="bd-form-grid ms-user-form">
+              <TextField
+                label="用户名"
+                autoComplete="off"
+                value={userForm.username || ""}
+                onChange={(username) => setUserForm((prev) => ({ ...prev, username }))}
+              />
+              <TextField
+                label="密码"
+                type="password"
+                autoComplete="new-password"
+                value={userForm.password || ""}
+                onChange={(password) => setUserForm((prev) => ({ ...prev, password }))}
+              />
+              <SelectField
+                label="角色"
+                value={(userForm.role || "USER") as ManagementRole}
+                onChange={(role) => setUserForm((prev) => ({ ...prev, role: role || "USER" }))}
+                options={[
+                  { value: "USER", label: "普通用户" },
+                  { value: "ADMIN", label: "管理员" },
+                ]}
+              />
+              <div className="ms-form-action ms-user-actions">
+                <Toggle
+                  checked={userForm.enabled !== false}
+                  onChange={(enabled) => setUserForm((prev) => ({ ...prev, enabled }))}
+                >
+                  启用
+                </Toggle>
+                <Button color="primary" isLoading={savingUser} startContent={savingUser ? null : <Icon name="plus" />} onPress={() => void createUser()}>
+                  创建用户
+                </Button>
+              </div>
+            </div>
+          </CardBody>
+        </Card>
+
+        <TableWrap>
+          <table className="bd-table jd-stack ms-table" aria-label="管理用户">
+            <thead>
+              <tr>
+                <th scope="col">用户名</th>
+                <th scope="col">租户</th>
+                <th scope="col">角色</th>
+                <th scope="col">状态</th>
+                <th scope="col">更新时间</th>
+                <th scope="col" className="ms-col-actions">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {loadingUsers && users.length === 0 ? <TableLoadingRow colSpan={6} /> : null}
+              {!loadingUsers && users.length === 0 ? (
+                <TableStateRow colSpan={6}>
+                  <Empty icon="users" title="暂无用户" description="用上面的表单新建第一个用户。" />
+                </TableStateRow>
+              ) : null}
+              {users.map((user) => (
+                <tr key={user.username}>
+                  <td>
+                    <div className="ms-cell-main">
+                      <span className="ms-cell-title">{user.username}</span>
+                      {user.builtIn ? <span className="ms-cell-sub">配置文件内置账号</span> : null}
+                    </div>
+                  </td>
+                  <td data-label="租户">{user.tenantId}</td>
+                  <td>
+                    <Tag tone={user.admin ? "info" : "neutral"}>{roleText(user.role)}</Tag>
+                  </td>
+                  <td>
+                    <Tag tone={user.enabled ? "success" : "neutral"} plain={!user.enabled}>{user.enabled ? "启用" : "停用"}</Tag>
+                  </td>
+                  <td data-label="更新" className={user.updatedAt ? undefined : "is-empty"}>
+                    {user.updatedAt ? <RelativeTime value={user.updatedAt} className="jd-muted" /> : "—"}
+                  </td>
+                  <td className="jd-cell-actions ms-actions-row ms-col-actions">
+                    <div className="ms-row-actions">
+                      <Button isDisabled={user.builtIn} size="sm" variant="flat" onPress={() => confirmToggleRole(user)}>
+                        {user.role === "ADMIN" ? "设为普通" : "设为管理员"}
+                      </Button>
+                      <Button isDisabled={user.builtIn} size="sm" variant="flat" onPress={() => confirmToggleEnabled(user)}>
+                        {user.enabled ? "停用" : "启用"}
+                      </Button>
+                      <Button isDisabled={user.builtIn} size="sm" variant="flat" onPress={() => setResetTarget(user)}>
+                        重置密码
+                      </Button>
+                      <Button color="danger" isDisabled={user.builtIn} size="sm" variant="light" onPress={() => deleteUser(user)}>
+                        删除
+                      </Button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </TableWrap>
+      </Section>
+
+      <Section title="数据库" description="基础数据维护">
+        <Alert
+          tone="warning"
+          title="初始化会按当前配置重建数据库结构"
+          actions={(
+            <Button color="danger" variant="flat" isLoading={initializing} startContent={initializing ? null : <Icon name="database" />} onPress={() => void onInitializeDatabase()}>
+              初始化数据库
             </Button>
-          </div>
+          )}
+        >
+          它会补齐管理端所需的基础数据，可能影响现有数据，执行后无法撤销；点下按钮后还会再确认一次。
+        </Alert>
+      </Section>
 
-          {/* mobile: 用户卡片 */}
-          <div className="lg:hidden">
-            <MobileListCardList
-              items={users}
-              isLoading={loadingUsers}
-              emptyContent={<EmptyState icon="clients" title="暂无用户" />}
-              renderCard={(raw) => {
-                const user = raw as ManagementUser;
-                return (
-                  <MobileListCard
-                    key={user.username}
-                    title={user.username}
-                    subtitle={user.builtIn ? "配置文件内置账号" : undefined}
-                    badges={
-                      <>
-                        <StatusChip tone={user.admin ? "primary" : "default"}>{roleText(user.role)}</StatusChip>
-                        <StatusChip tone={enabledTone(user.enabled)}>{user.enabled ? "启用" : "停用"}</StatusChip>
-                      </>
-                    }
-                    fields={[
-                      { label: "租户", value: user.tenantId },
-                      { label: "更新时间", value: formatDateTime(user.updatedAt) },
-                    ]}
-                    actions={
-                      <>
-                        <Button isDisabled={user.builtIn} radius="sm" size="sm" variant="flat" onPress={() => confirmToggleRole(user)}>
-                          {user.role === "ADMIN" ? "设为普通" : "设为管理员"}
-                        </Button>
-                        <Button isDisabled={user.builtIn} radius="sm" size="sm" variant="flat" onPress={() => confirmToggleEnabled(user)}>
-                          {user.enabled ? "停用" : "启用"}
-                        </Button>
-                        <Button isDisabled={user.builtIn} radius="sm" size="sm" variant="flat" onPress={() => setResetTarget(user)}>
-                          重置密码
-                        </Button>
-                        <Button color="danger" isDisabled={user.builtIn} radius="sm" size="sm" variant="flat" onPress={() => deleteUser(user)}>
-                          删除
-                        </Button>
-                      </>
-                    }
+      <Section
+        title="客户端发布"
+        description="上传受校验的发布包，按实现、平台与架构维护版本轨道；设为最新后客户端才会收到升级提示。"
+        actions={<>
+          <Button variant="flat" isLoading={loadingDownloads} startContent={loadingDownloads ? null : <Icon name="refresh" />} onPress={() => void loadDownloadLinks()}>
+            刷新
+          </Button>
+          <Button variant="bordered" startContent={<Icon name="link" />} onPress={openCreateLink}>
+            新增外链
+          </Button>
+          <Button color="primary" startContent={<Icon name="upload" />} onPress={packageModal.onOpen}>
+            上传发布包
+          </Button>
+        </>}
+      >
+        <TableWrap>
+          <table className="bd-table jd-stack ms-table ms-release-table" aria-label="客户端发布版本">
+            <thead>
+              <tr>
+                <th scope="col">名称</th>
+                <th scope="col">实现 / 平台</th>
+                <th scope="col">版本</th>
+                <th scope="col">校验</th>
+                <th scope="col">启用</th>
+                <th scope="col" className="ms-col-actions">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {loadingDownloads && downloadLinks.length === 0 ? <TableLoadingRow colSpan={6} /> : null}
+              {!loadingDownloads && downloadLinks.length === 0 ? (
+                <TableStateRow colSpan={6}>
+                  <Empty
+                    icon="upload"
+                    title="暂无客户端版本"
+                    description="上传第一个发布包后会出现在公开下载页。"
+                    actions={<Button color="primary" size="sm" startContent={<Icon name="upload" size={14} />} onPress={packageModal.onOpen}>上传发布包</Button>}
                   />
-                );
-              }}
-            />
-          </div>
-
-          {/* desktop: 表格 */}
-          <div className="hidden overflow-x-auto lg:block">
-            <Table
-              aria-label="管理用户"
-              isHeaderSticky
-              removeWrapper
-              classNames={{
-                th: "bg-default-100",
-                td: "align-middle",
-              }}
-            >
-              <TableHeader>
-                <TableColumn>用户名</TableColumn>
-                <TableColumn>租户</TableColumn>
-                <TableColumn>角色</TableColumn>
-                <TableColumn>状态</TableColumn>
-                <TableColumn>更新时间</TableColumn>
-                <TableColumn className="text-right">操作</TableColumn>
-              </TableHeader>
-              <TableBody emptyContent={<EmptyState icon="clients" title="暂无用户" />} isLoading={loadingUsers} items={users}>
-                {(user) => (
-                  <TableRow key={user.username}>
-                    <TableCell>
-                      <div className="font-medium text-foreground">{user.username}</div>
-                      {user.builtIn ? <div className="text-tiny text-default-500">配置文件内置账号</div> : null}
-                    </TableCell>
-                    <TableCell>{user.tenantId}</TableCell>
-                    <TableCell>
-                      <StatusChip tone={user.admin ? "primary" : "default"}>{roleText(user.role)}</StatusChip>
-                    </TableCell>
-                    <TableCell>
-                      <StatusChip tone={enabledTone(user.enabled)}>{user.enabled ? "启用" : "停用"}</StatusChip>
-                    </TableCell>
-                    <TableCell className="whitespace-nowrap text-default-500">{formatDateTime(user.updatedAt)}</TableCell>
-                    <TableCell>
-                      <div className="flex justify-end gap-2">
-                        <Button
-                          isDisabled={user.builtIn}
-                          radius="sm"
-                          size="sm"
-                          variant="flat"
-                          onPress={() => confirmToggleRole(user)}
-                        >
-                          {user.role === "ADMIN" ? "设为普通" : "设为管理员"}
+                </TableStateRow>
+              ) : null}
+              {downloadLinks.map((link) => {
+                const pending = pendingLinkIds.has(link.id);
+                return (
+                  <tr key={link.id}>
+                    <td className="ms-wrap">
+                      <div className="ms-cell-main">
+                        <span className="ms-cell-title">{link.displayName}</span>
+                        {link.description ? <span className="ms-cell-sub">{link.description}</span> : null}
+                        <a className="jd-link ms-mono ms-url" href={link.downloadUrl} rel="noopener noreferrer" target="_blank" title={link.downloadUrl}>
+                          {link.downloadUrl}
+                        </a>
+                      </div>
+                    </td>
+                    <td>
+                      <span className="ms-tags">
+                        <Tag tone="info" plain>{implementationLabel(link.implementation)}</Tag>
+                        <span>{platformLabel(link.platform)} · {archLabel(link.arch)}</span>
+                      </span>
+                    </td>
+                    <td>
+                      <span className="ms-tags">
+                        <Tag tone="neutral" plain className="bd-num">{link.version ? `v${link.version}` : "未标版本"}</Tag>
+                        {link.isLatest ? <Tag tone="success">最新</Tag> : null}
+                        {link.hosted ? <Tag tone="info">托管</Tag> : null}
+                      </span>
+                    </td>
+                    <td data-label="校验">
+                      <div className="ms-cell-main">
+                        <span className="bd-num">{link.fileSize ? formatBytes(link.fileSize) : "外部文件"}</span>
+                        {link.sha256 ? <span className="ms-mono ms-cell-sub ms-sha" title={link.sha256}>{link.sha256}</span> : null}
+                      </div>
+                    </td>
+                    <td>
+                      <Toggle
+                        label={`启用 ${link.displayName}`}
+                        checked={link.enabled}
+                        disabled={pending}
+                        busy={pending}
+                        onChange={() => void toggleLinkEnabled(link)}
+                      />
+                    </td>
+                    <td className="jd-cell-actions ms-col-actions">
+                      <div className="ms-row-actions">
+                        <Button size="sm" variant="flat" onPress={() => openEditLink(link)}>
+                          编辑
                         </Button>
-                        <Button
-                          isDisabled={user.builtIn}
-                          radius="sm"
-                          size="sm"
-                          variant="flat"
-                          onPress={() => confirmToggleEnabled(user)}
-                        >
-                          {user.enabled ? "停用" : "启用"}
-                        </Button>
-                        <Button
-                          isDisabled={user.builtIn}
-                          radius="sm"
-                          size="sm"
-                          variant="flat"
-                          onPress={() => setResetTarget(user)}
-                        >
-                          重置密码
-                        </Button>
-                        <Button
-                          color="danger"
-                          isDisabled={user.builtIn}
-                          radius="sm"
-                          size="sm"
-                          variant="flat"
-                          onPress={() => deleteUser(user)}
-                        >
+                        {!link.isLatest && link.version ? (
+                          <Button size="sm" variant="flat" onPress={() => void markLinkLatest(link)}>
+                            设为最新
+                          </Button>
+                        ) : null}
+                        <Button size="sm" color="danger" variant="light" onPress={() => deleteLink(link)}>
                           删除
                         </Button>
                       </div>
-                    </TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
-            </Table>
-          </div>
-        </CardBody>
-      </Card>
-
-      <Card shadow="none" className="rounded-md border border-default-200 bg-content1">
-        <CardHeader className="flex items-center justify-between gap-4 px-5 pb-2 pt-5">
-          <div>
-            <h2 className="text-lg font-semibold text-foreground">数据库</h2>
-            <p className="mt-1 text-small text-default-500">基础数据维护</p>
-          </div>
-          <Button
-            color="primary"
-            isLoading={initializing}
-            radius="sm"
-            variant="flat"
-            onPress={() => void onInitializeDatabase()}
-          >
-            初始化数据库
-          </Button>
-        </CardHeader>
-        <CardBody className="px-5 pb-5 pt-2">
-          <div className="rounded-md border border-default-200 bg-default-50 p-4 text-small text-default-600">
-            初始化会补齐管理端所需的基础数据，操作前会再次确认。
-          </div>
-        </CardBody>
-      </Card>
-    </div>
-
-    <Card shadow="none" className="rounded-md border border-default-200 bg-content1">
-      <CardHeader className="flex flex-col items-stretch gap-4 px-5 pb-2 pt-5 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h2 className="text-lg font-semibold text-foreground">客户端发布</h2>
-          <p className="mt-1 text-small text-default-500">
-            上传受校验的发布包，按实现、平台与架构维护版本轨道。
-          </p>
-        </div>
-        <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:justify-end">
-          <Button radius="sm" variant="flat" isLoading={loadingDownloads} onPress={() => void loadDownloadLinks()}>
-            刷新
-          </Button>
-          <Button radius="sm" variant="bordered" onPress={openCreateLink}>
-            新增外链
-          </Button>
-          <Button className="col-span-2 sm:col-span-1" radius="sm" color="primary" onPress={packageModal.onOpen}>
-            上传发布包
-          </Button>
-        </div>
-      </CardHeader>
-      <CardBody className="gap-4 px-5 pb-5 pt-2">
-        {/* mobile: 下载链接卡片 */}
-        <div className="lg:hidden">
-          <MobileListCardList
-            items={downloadLinks}
-            isLoading={loadingDownloads}
-            emptyContent={<EmptyState icon="generic" title="暂无客户端版本" description="上传第一个发布包后会出现在公开下载页" />}
-            renderCard={(raw) => {
-              const link = raw as ClientDownloadLink;
-              const pending = pendingLinkIds.has(link.id);
-              return (
-                <MobileListCard
-                  key={link.id}
-                  title={<span className="break-all">{link.displayName}</span>}
-                  subtitle={link.description || undefined}
-                  badges={
-                    <>
-                      <Chip size="sm" variant="flat" color="primary">
-                        {implementationLabel(link.implementation)}
-                      </Chip>
-                      <Chip size="sm" variant="flat">{platformLabel(link.platform)}</Chip>
-                      <Chip size="sm" variant="flat">{archLabel(link.arch)}</Chip>
-                      {link.version ? <Chip size="sm" color={link.isLatest ? "success" : "default"} variant="flat">v{link.version}</Chip> : null}
-                      {link.hosted ? <Chip size="sm" color="secondary" variant="flat">托管</Chip> : null}
-                      <Switch
-                        size="sm"
-                        isSelected={link.enabled}
-                        isDisabled={pending}
-                        onValueChange={() => void toggleLinkEnabled(link)}
-                      >
-                        启用
-                      </Switch>
-                    </>
-                  }
-                  fields={[
-                    {
-                      label: "URL",
-                      value: (
-                        <a
-                          className="break-all font-mono text-tiny text-primary hover:underline"
-                          href={link.downloadUrl}
-                          rel="noopener noreferrer"
-                          target="_blank"
-                        >
-                          {link.downloadUrl}
-                        </a>
-                      ),
-                    },
-                    { label: "排序", value: link.displayOrder },
-                    { label: "文件", value: link.fileSize ? formatBytes(link.fileSize) : "外部链接" },
-                    { label: "SHA-256", value: link.sha256 ? <span className="break-all font-mono text-tiny">{link.sha256}</span> : "-" },
-                  ]}
-                  actions={
-                    <>
-                      <Button size="sm" radius="sm" variant="flat" onPress={() => openEditLink(link)}>
-                        编辑
-                      </Button>
-                      {!link.isLatest && link.version ? (
-                        <Button size="sm" radius="sm" color="success" variant="flat" onPress={() => void markLinkLatest(link)}>
-                          设为最新
-                        </Button>
-                      ) : null}
-                      <Button
-                        size="sm"
-                        radius="sm"
-                        color="danger"
-                        variant="flat"
-                        onPress={() => deleteLink(link)}
-                      >
-                        删除
-                      </Button>
-                    </>
-                  }
-                />
-              );
-            }}
-          />
-        </div>
-
-        {/* desktop: 表格 */}
-        <div className="hidden overflow-x-auto lg:block">
-          <Table
-            aria-label="客户端发布版本"
-            isHeaderSticky
-            removeWrapper
-            classNames={{ th: "bg-default-100", td: "align-middle" }}
-          >
-            <TableHeader>
-              <TableColumn>实现</TableColumn>
-              <TableColumn>平台 / 架构</TableColumn>
-              <TableColumn>名称</TableColumn>
-              <TableColumn>版本</TableColumn>
-              <TableColumn>URL</TableColumn>
-              <TableColumn>校验</TableColumn>
-              <TableColumn>启用</TableColumn>
-              <TableColumn className="text-right">操作</TableColumn>
-            </TableHeader>
-            <TableBody emptyContent={<EmptyState icon="generic" title="暂无客户端版本" description="上传第一个发布包后会出现在公开下载页" />} isLoading={loadingDownloads} items={downloadLinks}>
-              {(link) => {
-                const pending = pendingLinkIds.has(link.id);
-                return (
-                <TableRow key={link.id}>
-                  <TableCell>
-                    <Chip size="sm" variant="flat" color="primary">
-                      {implementationLabel(link.implementation)}
-                    </Chip>
-                  </TableCell>
-                  <TableCell>
-                    <div className="flex flex-wrap gap-1">
-                      <Chip size="sm" variant="flat">{platformLabel(link.platform)}</Chip>
-                      <Chip size="sm" variant="flat">{archLabel(link.arch)}</Chip>
-                    </div>
-                  </TableCell>
-                  <TableCell>
-                    <div className="font-medium">{link.displayName}</div>
-                    {link.description ? (
-                      <div className="text-tiny text-default-500">{link.description}</div>
-                    ) : null}
-                  </TableCell>
-                  <TableCell>
-                    <div className="flex flex-wrap gap-1">
-                      <Chip size="sm" color={link.isLatest ? "success" : "default"} variant="flat">
-                        {link.version ? `v${link.version}` : "未标版本"}
-                      </Chip>
-                      {link.hosted ? <Chip size="sm" color="secondary" variant="flat">托管</Chip> : null}
-                    </div>
-                  </TableCell>
-                  <TableCell>
-                    <a
-                      className="block max-w-64 truncate font-mono text-tiny text-primary hover:underline"
-                      href={link.downloadUrl}
-                      rel="noopener noreferrer"
-                      target="_blank"
-                      title={link.downloadUrl}
-                    >
-                      {link.downloadUrl}
-                    </a>
-                  </TableCell>
-                  <TableCell>
-                    <div className="text-tiny text-default-500">{link.fileSize ? formatBytes(link.fileSize) : "外部文件"}</div>
-                    {link.sha256 ? <div className="max-w-32 truncate font-mono text-tiny" title={link.sha256}>{link.sha256}</div> : null}
-                  </TableCell>
-                  <TableCell>
-                    <Switch
-                      aria-label="启用"
-                      size="sm"
-                      isSelected={link.enabled}
-                      isDisabled={pending}
-                      onValueChange={() => void toggleLinkEnabled(link)}
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <div className="flex justify-end gap-2">
-                      <Button size="sm" radius="sm" variant="flat" onPress={() => openEditLink(link)}>
-                        编辑
-                      </Button>
-                      {!link.isLatest && link.version ? (
-                        <Button size="sm" radius="sm" color="success" variant="flat" onPress={() => void markLinkLatest(link)}>
-                          设为最新
-                        </Button>
-                      ) : null}
-                      <Button
-                        size="sm"
-                        radius="sm"
-                        color="danger"
-                        variant="flat"
-                        onPress={() => deleteLink(link)}
-                      >
-                        删除
-                      </Button>
-                    </div>
-                  </TableCell>
-                </TableRow>
+                    </td>
+                  </tr>
                 );
-              }}
-            </TableBody>
-          </Table>
-        </div>
-      </CardBody>
-    </Card>
+              })}
+            </tbody>
+          </table>
+        </TableWrap>
+      </Section>
 
-    <EditClientDownloadModal
-      disclosure={linkModal}
-      link={editingLink}
-      onSaved={() => void loadDownloadLinks()}
-    />
-    <UploadClientPackageModal
-      disclosure={packageModal}
-      onSaved={() => void loadDownloadLinks()}
-    />
-    <ResetPasswordModal
-      user={resetTarget}
-      onClose={() => setResetTarget(null)}
-      onSubmit={async (password) => {
-        if (resetTarget) {
-          await updateUser(resetTarget, { password });
-        }
-      }}
-    />
-    <ConfirmModal
-      isOpen={confirm != null}
-      onClose={() => setConfirm(null)}
-      onConfirm={() => confirm?.action()}
-      title={confirm?.title ?? ""}
-      description={confirm?.description}
-      confirmLabel={confirm?.confirmLabel}
-      danger={confirm?.danger}
-    />
+      <EditClientDownloadModal
+        disclosure={linkModal}
+        link={editingLink}
+        onSaved={() => void loadDownloadLinks()}
+      />
+      <UploadClientPackageModal
+        disclosure={packageModal}
+        onSaved={() => void loadDownloadLinks()}
+      />
+      <ResetPasswordModal
+        user={resetTarget}
+        onClose={() => setResetTarget(null)}
+        onSubmit={async (password) => {
+          if (resetTarget) {
+            await updateUser(resetTarget, { password });
+          }
+        }}
+      />
+      <ConfirmModal
+        isOpen={confirm != null}
+        onClose={() => setConfirm(null)}
+        onConfirm={() => confirm?.action()}
+        title={confirm?.title ?? ""}
+        description={confirm?.description}
+        confirmLabel={confirm?.confirmLabel}
+        danger={confirm?.danger}
+      />
     </div>
   );
 }
@@ -720,7 +519,7 @@ function ResetPasswordModal({ user, onClose, onSubmit }: ResetPasswordModalProps
   }, [user]);
 
   const passwordError = !password
-    ? "请输入新密码"
+    ? "填写新密码"
     : password.length < 6
       ? "密码至少 6 位"
       : "";
@@ -743,29 +542,28 @@ function ResetPasswordModal({ user, onClose, onSubmit }: ResetPasswordModalProps
   return (
     <Modal isOpen={user != null} onClose={onClose} size="sm" placement="center">
       <ModalContent>
-        <ModalHeader className="text-base">重置密码「{user?.username}」</ModalHeader>
-        <ModalBody className="gap-3">
-          <Input
+        <ModalHeader className="ms-modal-title">重置「{user?.username}」的密码</ModalHeader>
+        <ModalBody className="ms-modal-body">
+          <TextField
             autoComplete="new-password"
             label="新密码"
             type="password"
             value={password}
-            onValueChange={setPassword}
-            isInvalid={Boolean(password && passwordError)}
-            errorMessage={password ? passwordError : ""}
+            onChange={setPassword}
+            help="至少 6 位"
+            error={password ? passwordError : ""}
           />
-          <Input
+          <TextField
             autoComplete="new-password"
             label="确认新密码"
             type="password"
             value={confirmPassword}
-            onValueChange={setConfirmPassword}
-            isInvalid={Boolean(confirmError)}
-            errorMessage={confirmError}
+            onChange={setConfirmPassword}
+            error={confirmError}
           />
         </ModalBody>
         <ModalFooter>
-          <Button variant="flat" onPress={onClose} isDisabled={saving}>
+          <Button variant="light" onPress={onClose} isDisabled={saving}>
             取消
           </Button>
           <Button color="primary" isDisabled={invalid} isLoading={saving} onPress={() => void submit()}>
@@ -790,6 +588,40 @@ function implementationLabel(impl: string): string {
     default:
       return impl;
   }
+}
+
+const IMPLEMENTATION_OPTIONS: Array<{ value: ClientImplementation; label: string }> = [
+  { value: "go", label: "Go" },
+  { value: "csharp", label: ".NET" },
+  { value: "java", label: "Java" },
+  { value: "android", label: "Android" },
+];
+
+function platformOptions(implementation: ClientImplementation): Array<{ value: ClientPlatform; label: string; disabled?: boolean }> {
+  return [
+    { value: "any", label: "跨平台" },
+    { value: "windows", label: "Windows" },
+    { value: "linux", label: "Linux" },
+    { value: "macos", label: "macOS" },
+    { value: "android", label: "Android", disabled: implementation !== "android" },
+  ];
+}
+
+const ARCH_OPTIONS: Array<{ value: ClientArch; label: string }> = [
+  { value: "any", label: "跨架构" },
+  { value: "x64", label: "x86_64" },
+  { value: "arm64", label: "ARM64" },
+];
+
+function TextAreaField({ label, value, onChange, placeholder, optional }: {
+  label: string; value: string; onChange: (value: string) => void; placeholder?: string; optional?: boolean;
+}) {
+  const id = useId();
+  return (
+    <Field label={label} htmlFor={id} optional={optional}>
+      <textarea id={id} className="bd-input" rows={3} value={value} placeholder={placeholder} onChange={(event) => onChange(event.target.value)} />
+    </Field>
+  );
 }
 
 interface UploadClientPackageModalProps {
@@ -848,7 +680,7 @@ function UploadClientPackageModal({ disclosure, onSaved }: UploadClientPackageMo
 
   const upload = async () => {
     if (!file || !version.trim() || !displayName.trim()) {
-      notify("请选择文件并填写版本号与显示名称", "error");
+      notify("还缺发布包、版本号或显示名称：补齐后再上传", "error");
       return;
     }
     const body: ClientPackageUpload = {
@@ -879,17 +711,19 @@ function UploadClientPackageModal({ disclosure, onSaved }: UploadClientPackageMo
 
   return (
     <Modal isOpen={disclosure.isOpen} onOpenChange={disclosure.onOpenChange} size="2xl" scrollBehavior="inside">
-      <ModalContent className="bg-content1">
+      <ModalContent>
         {(onClose) => (
           <>
-            <ModalHeader className="flex flex-col items-start gap-1">
-              <span>上传客户端发布包</span>
-              <span className="text-tiny font-normal text-default-500">服务端计算大小与 SHA-256；设为最新后客户端才会收到升级提示。</span>
+            <ModalHeader className="ms-modal-head">
+              <span className="ms-modal-title">上传客户端发布包</span>
+              <span className="ms-modal-desc">服务端计算大小与 SHA-256；设为最新后客户端才会收到升级提示。</span>
             </ModalHeader>
-            <ModalBody className="gap-4">
+            <ModalBody className="ms-modal-body">
               <label
                 htmlFor="client-package-file"
-                className={`flex min-h-32 cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed px-5 py-6 text-center transition ${dragging ? "border-primary bg-primary-50 dark:bg-primary-500/10" : "border-default-300 bg-default-50 hover:border-primary"}`}
+                className="ms-drop"
+                data-dragging={dragging || undefined}
+                data-filled={file ? true : undefined}
                 onDragEnter={(event) => { event.preventDefault(); setDragging(true); }}
                 onDragOver={(event) => event.preventDefault()}
                 onDragLeave={() => setDragging(false)}
@@ -904,58 +738,52 @@ function UploadClientPackageModal({ disclosure, onSaved }: UploadClientPackageMo
                     if (selected) selectPackageFile(selected);
                   }}
                 />
-                <span className="font-medium text-foreground">{file ? file.name : "拖入发布包，或点击选择文件"}</span>
-                <span className="mt-1 text-tiny text-default-500">{file ? formatBytes(file.size) : "APK、JAR、ZIP、tar.gz 均按二进制原样托管"}</span>
+                <span className="ms-drop-icon" aria-hidden="true"><Icon name={file ? "file" : "upload"} size={22} /></span>
+                <span className="ms-drop-title">{file ? file.name : "拖入发布包，或选择文件"}</span>
+                <span className="ms-drop-desc bd-num">{file ? `${formatBytes(file.size)} · 换一个文件就再拖入或选择` : "APK、JAR、ZIP、tar.gz 均按二进制原样托管"}</span>
               </label>
 
-              <div className="grid gap-3 sm:grid-cols-3">
-                <Select label="实现" selectedKeys={[implementation]} onSelectionChange={(keys) => {
-                  const value = Array.from(keys)[0]?.toString() as ClientImplementation | undefined;
-                  if (value) chooseImplementation(value);
-                }}>
-                  <SelectItem key="go">Go</SelectItem>
-                  <SelectItem key="csharp">.NET</SelectItem>
-                  <SelectItem key="java">Java</SelectItem>
-                  <SelectItem key="android">Android</SelectItem>
-                </Select>
-                <Select isDisabled={implementation === "android"} label="操作系统" selectedKeys={[platform]} onSelectionChange={(keys) => {
-                  const value = Array.from(keys)[0]?.toString() as ClientPlatform | undefined;
-                  if (value) setPlatform(value);
-                }}>
-                  <SelectItem key="any">跨平台</SelectItem>
-                  <SelectItem key="windows">Windows</SelectItem>
-                  <SelectItem key="linux">Linux</SelectItem>
-                  <SelectItem key="macos">macOS</SelectItem>
-                  <SelectItem key="android" isDisabled={implementation !== "android"}>Android</SelectItem>
-                </Select>
-                <Select isDisabled={implementation === "android"} label="架构" selectedKeys={[arch]} onSelectionChange={(keys) => {
-                  const value = Array.from(keys)[0]?.toString() as ClientArch | undefined;
-                  if (value) setArch(value);
-                }}>
-                  <SelectItem key="any">跨架构</SelectItem>
-                  <SelectItem key="x64">x86_64</SelectItem>
-                  <SelectItem key="arm64">ARM64</SelectItem>
-                </Select>
+              <div className="bd-form-grid ms-modal-grid3">
+                <SelectField
+                  label="实现"
+                  value={implementation}
+                  onChange={(value) => { if (value) chooseImplementation(value); }}
+                  options={IMPLEMENTATION_OPTIONS}
+                />
+                <SelectField
+                  label="操作系统"
+                  disabled={implementation === "android"}
+                  value={platform}
+                  onChange={(value) => { if (value) setPlatform(value); }}
+                  options={platformOptions(implementation)}
+                />
+                <SelectField
+                  label="架构"
+                  disabled={implementation === "android"}
+                  value={arch}
+                  onChange={(value) => { if (value) setArch(value); }}
+                  options={ARCH_OPTIONS}
+                />
               </div>
 
-              <div className="grid gap-3 sm:grid-cols-2">
-                <Input isRequired label="版本号" maxLength={32} placeholder="1.4.0" value={version} onValueChange={setVersion} />
-                <Input isRequired label="显示名称" placeholder="Android 客户端 1.4.0" value={displayName} onValueChange={setDisplayName} />
-                <Input label="最低支持版本（可选）" maxLength={32} placeholder="1.2.0" value={minSupportedVersion} onValueChange={setMinSupportedVersion} />
-                <Input label="更新说明 URL（可选）" placeholder="https://…" value={changelogUrl} onValueChange={setChangelogUrl} />
+              <div className="bd-form-grid">
+                <TextField required label="版本号" maxLength={32} placeholder="1.4.0" value={version} onChange={setVersion} />
+                <TextField required label="显示名称" placeholder="Android 客户端 1.4.0" value={displayName} onChange={setDisplayName} />
+                <TextField optional label="最低支持版本" maxLength={32} placeholder="1.2.0" value={minSupportedVersion} onChange={setMinSupportedVersion} />
+                <TextField optional label="更新说明 URL" placeholder="https://…" value={changelogUrl} onChange={setChangelogUrl} />
               </div>
-              <Textarea label="版本说明（可选）" maxRows={3} value={description} onValueChange={setDescription} />
-              <div className="flex flex-wrap gap-5 rounded-md border border-default-200 bg-default-50 p-3">
-                <Switch isDisabled={!enabled} isSelected={isLatest} onValueChange={setIsLatest}>设为此目标的最新版本</Switch>
-                <Switch isSelected={enabled} onValueChange={(value) => {
+              <TextAreaField optional label="版本说明" value={description} onChange={setDescription} />
+              <div className="ms-toggle-row">
+                <Toggle checked={enabled} onChange={(value) => {
                   setEnabled(value);
                   if (!value) setIsLatest(false);
-                }}>公开下载</Switch>
+                }}>公开下载</Toggle>
+                <Toggle disabled={!enabled} checked={isLatest} onChange={setIsLatest}>设为此目标的最新版本</Toggle>
               </div>
             </ModalBody>
             <ModalFooter>
-              <Button variant="flat" onPress={onClose} isDisabled={saving}>取消</Button>
-              <Button color="primary" isLoading={saving} onPress={() => void upload()}>校验并上传</Button>
+              <Button variant="light" onPress={onClose} isDisabled={saving}>取消</Button>
+              <Button color="primary" isLoading={saving} startContent={saving ? null : <Icon name="upload" />} onPress={() => void upload()}>校验并上传</Button>
             </ModalFooter>
           </>
         )}
@@ -1036,7 +864,7 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
 
   const save = async () => {
     if (!displayName.trim() || !downloadUrl.trim() || !version.trim()) {
-      notify("请填写版本号、名称和下载 URL", "error");
+      notify("还缺版本号、名称或下载 URL：补齐后再保存", "error");
       return;
     }
     const normalizedSha256 = sha256.trim().toLowerCase();
@@ -1051,7 +879,7 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
       return;
     }
     if (!link?.hosted && isLatest && (!normalizedSha256 || normalizedFileSize === null)) {
-      notify("发布外部最新版本前，请填写 Release 资产的 SHA-256 和文件字节数", "error");
+      notify("外部链接要设为最新版本，先填 Release 资产的 SHA-256 和文件字节数", "error");
       return;
     }
     setSaving(true);
@@ -1091,133 +919,104 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
   };
 
   return (
-    <Modal isOpen={disclosure.isOpen} onOpenChange={disclosure.onOpenChange} size="lg">
+    <Modal isOpen={disclosure.isOpen} onOpenChange={disclosure.onOpenChange} size="lg" scrollBehavior="inside">
       <ModalContent>
         {(onClose) => (
           <>
-            <ModalHeader>{link ? `编辑下载链接 #${link.id}` : "新增下载链接"}</ModalHeader>
-            <ModalBody className="gap-3">
-              <div className="grid gap-3 sm:grid-cols-3">
-                <Select
+            <ModalHeader className="ms-modal-title">{link ? `编辑下载链接 #${link.id}` : "新增下载链接"}</ModalHeader>
+            <ModalBody className="ms-modal-body">
+              <div className="bd-form-grid ms-modal-grid3">
+                <SelectField
                   label="实现"
-                  selectedKeys={[implementation]}
-                  onSelectionChange={(keys) => {
-                    const value = Array.from(keys)[0]?.toString() as ClientImplementation | undefined;
-                    if (value) chooseImplementation(value);
-                  }}
-                >
-                  <SelectItem key="java">Java</SelectItem>
-                  <SelectItem key="go">Go</SelectItem>
-                  <SelectItem key="csharp">.NET</SelectItem>
-                  <SelectItem key="android">Android</SelectItem>
-                </Select>
-                <Select
-                  isDisabled={implementation === "android"}
+                  value={implementation}
+                  onChange={(value) => { if (value) chooseImplementation(value); }}
+                  options={[
+                    { value: "java", label: "Java" },
+                    { value: "go", label: "Go" },
+                    { value: "csharp", label: ".NET" },
+                    { value: "android", label: "Android" },
+                  ]}
+                />
+                <SelectField
                   label="操作系统"
-                  selectedKeys={[platform]}
-                  onSelectionChange={(keys) => {
-                    const value = Array.from(keys)[0]?.toString() as ClientPlatform | undefined;
-                    if (value) setPlatform(value);
-                  }}
-                >
-                  <SelectItem key="any">跨平台</SelectItem>
-                  <SelectItem key="windows">Windows</SelectItem>
-                  <SelectItem key="linux">Linux</SelectItem>
-                  <SelectItem key="macos">macOS</SelectItem>
-                  <SelectItem key="android" isDisabled={implementation !== "android"}>Android</SelectItem>
-                </Select>
-                <Select
-                  isDisabled={implementation === "android"}
+                  disabled={implementation === "android"}
+                  value={platform}
+                  onChange={(value) => { if (value) setPlatform(value); }}
+                  options={platformOptions(implementation)}
+                />
+                <SelectField
                   label="架构"
-                  selectedKeys={[arch]}
-                  onSelectionChange={(keys) => {
-                    const value = Array.from(keys)[0]?.toString() as ClientArch | undefined;
-                    if (value) setArch(value);
-                  }}
-                >
-                  <SelectItem key="any">跨架构</SelectItem>
-                  <SelectItem key="x64">x86_64</SelectItem>
-                  <SelectItem key="arm64">ARM64</SelectItem>
-                </Select>
+                  disabled={implementation === "android"}
+                  value={arch}
+                  onChange={(value) => { if (value) setArch(value); }}
+                  options={ARCH_OPTIONS}
+                />
               </div>
-              <Input
-                label="版本号"
-                value={version}
-                onValueChange={setVersion}
-                maxLength={32}
-                isRequired
-                placeholder="1.4.0"
-              />
-              <Input
-                label="名称"
-                value={displayName}
-                onValueChange={setDisplayName}
-                maxLength={120}
-                isRequired
-                placeholder="例如：Java 客户端 1.2.0"
-              />
-              <Input
-                isDisabled={link?.hosted === true}
+              <TextField label="版本号" value={version} onChange={setVersion} maxLength={32} required placeholder="1.4.0" />
+              <TextField label="名称" value={displayName} onChange={setDisplayName} maxLength={120} required placeholder="Java 客户端 1.2.0" />
+              <TextField
+                disabled={link?.hosted === true}
                 label="下载 URL"
                 value={downloadUrl}
-                onValueChange={setDownloadUrl}
+                onChange={setDownloadUrl}
                 maxLength={1024}
-                isRequired
+                required
                 placeholder="https://..."
               />
-              <div className="grid gap-3 sm:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
-                <Input
-                  isDisabled={link?.hosted === true}
+              <div className="bd-form-grid ms-sha-grid">
+                <TextField
+                  disabled={link?.hosted === true}
                   label="SHA-256"
                   value={sha256}
-                  onValueChange={setSha256}
+                  onChange={setSha256}
                   maxLength={64}
                   placeholder="Release 资产的 64 位摘要"
                 />
-                <Input
-                  isDisabled={link?.hosted === true}
+                <TextField
+                  disabled={link?.hosted === true}
                   label="文件字节数"
                   type="number"
                   min={1}
                   value={fileSize}
-                  onValueChange={setFileSize}
-                  placeholder="例如 18432000"
+                  onChange={setFileSize}
+                  placeholder="18432000"
                 />
+                <div className="bd-col-full bd-help">
+                  {link?.hosted
+                    ? "托管包的地址、摘要和大小由服务端计算，不能手动修改。"
+                    : "GitHub Release 外链标记为最新版本时，摘要和字节数必填；客户端会在安装前校验。"}
+                </div>
               </div>
-              <p className="text-tiny text-default-500">
-                {link?.hosted
-                  ? "托管包的地址、摘要和大小由服务端计算，不能手动修改。"
-                  : "GitHub Release 外链标记为最新版本时，摘要和字节数必填；客户端会在安装前校验。"}
-              </p>
-              <Textarea
-                label="说明（可选）"
+              <TextAreaField
+                optional
+                label="说明"
                 value={description}
-                onValueChange={setDescription}
-                maxRows={3}
+                onChange={setDescription}
                 placeholder="哈希值、签名说明等"
               />
-              <div className="grid gap-3 sm:grid-cols-2">
-                <Input label="最低支持版本（可选）" maxLength={32} value={minSupportedVersion} onValueChange={setMinSupportedVersion} />
-                <Input label="更新说明 URL（可选）" value={changelogUrl} onValueChange={setChangelogUrl} />
+              <div className="bd-form-grid">
+                <TextField optional label="最低支持版本" maxLength={32} value={minSupportedVersion} onChange={setMinSupportedVersion} />
+                <TextField optional label="更新说明 URL" value={changelogUrl} onChange={setChangelogUrl} />
               </div>
-              <div className="grid gap-3 sm:grid-cols-[120px_1fr] sm:items-center">
-                <Input
+              <div className="ms-order-row">
+                <TextField
                   label="排序"
                   type="number"
                   value={displayOrder}
-                  onValueChange={setDisplayOrder}
+                  onChange={setDisplayOrder}
+                  className="ms-order-field"
                 />
-                <div className="flex flex-wrap gap-4">
-                  <Switch isSelected={enabled} onValueChange={(value) => {
+                <div className="ms-toggle-row">
+                  <Toggle checked={enabled} onChange={(value) => {
                     setEnabled(value);
                     if (!value) setIsLatest(false);
-                  }}>启用</Switch>
-                  <Switch isDisabled={!enabled} isSelected={isLatest} onValueChange={setIsLatest}>最新版本</Switch>
+                  }}>启用</Toggle>
+                  <Toggle disabled={!enabled} checked={isLatest} onChange={setIsLatest}>最新版本</Toggle>
                 </div>
               </div>
             </ModalBody>
             <ModalFooter>
-              <Button variant="flat" onPress={onClose}>
+              <Button variant="light" onPress={onClose}>
                 取消
               </Button>
               <Button color="primary" isLoading={saving} onPress={() => void save()}>

@@ -3,11 +3,11 @@ import { PRODUCT_METRICS_DISCLOSURE, PRODUCT_METRICS_DISCLOSURE_HREF, PRODUCT_ME
 /** The full disclosure of protocol/spec/product-metrics.md section 3.1, item by item. */
 export function ProductMetricsDisclosure({ compact = false }: { compact?: boolean }) {
   return (
-    <dl className={compact ? "space-y-2 text-small" : "space-y-3 text-small"}>
+    <dl className={compact ? "ms-disclosure ms-disclosure--compact" : "ms-disclosure"}>
       {PRODUCT_METRICS_DISCLOSURE.map((item) => (
-        <div key={item.title}>
-          <dt className="font-semibold text-foreground">{item.title}</dt>
-          <dd className="mt-0.5 text-default-600">{item.detail}</dd>
+        <div key={item.title} className="ms-disclosure-item">
+          <dt>{item.title}</dt>
+          <dd>{item.detail}</dd>
         </div>
       ))}
     </dl>
