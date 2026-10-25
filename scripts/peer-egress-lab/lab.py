@@ -2047,7 +2047,29 @@ class Lab:
 
     # -- report -----------------------------------------------------------------------------------
 
+    def held_flow_syns(self):
+        """The egress's "new SYN met an existing flow" lines by the state of the flow it held (#256).
+
+        A count, not a check: an established flow still logs a SYN that does not belong to it. A
+        TIME_WAIT entry is what #256 was, and with tuple reuse a SYN that clears the old window
+        reopens the flow instead of reaching the log. The three clients spell the states
+        differently (TIME_WAIT, TimeWait), so they are compared without case or underscores.
+        """
+        path = self.work / "egress.log"
+        if not path.exists():
+            return None
+        counts = {}
+        for match in re.finditer(r"new SYN met an existing flow consumer=\S+ state=(\S+)",
+                                 path.read_text(encoding="utf-8", errors="replace")):
+            state = match.group(1).replace("_", "").upper()
+            counts[state] = counts.get(state, 0) + 1
+        return counts
+
     def report(self, aborted=None):
+        held = self.held_flow_syns()
+        if held is not None:
+            self.measure("egress: new SYNs that met a held flow, by state (#256)",
+                         ", ".join(f"{state} {count}" for state, count in sorted(held.items())) or "none")
         failed = [r for r in self.results if not r["ok"]]
         kernel = self.sh(["uname", "-r"], check=False).stdout.strip()
         now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")

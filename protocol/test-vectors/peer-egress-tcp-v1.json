@@ -21,6 +21,288 @@
   },
   "cases": [
     {
+      "name": "time-wait-old-traffic-preserves-tombstone",
+      "description": "旧 SYN/RST/FIN/数据不销毁 TIME_WAIT，重传 FIN 得到 ACK；原有十秒期限不被无关包延长",
+      "steps": [
+        {
+          "do": "segment",
+          "seq": 1000,
+          "flags": [
+            "SYN"
+          ],
+          "window": 65535,
+          "mss": 1200,
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "SYN",
+                  "ACK"
+                ],
+                "seq": 5000,
+                "ack": 1001,
+                "window": 65535,
+                "mss": 1240
+              }
+            ],
+            "state": "SYN_RECEIVED"
+          }
+        },
+        {
+          "do": "segment",
+          "seq": 1001,
+          "ack": 5001,
+          "flags": [
+            "ACK"
+          ],
+          "window": 65535,
+          "expect": {
+            "segments": [],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "appClose",
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "FIN",
+                  "ACK"
+                ],
+                "seq": 5001,
+                "ack": 1001,
+                "window": 65535
+              }
+            ],
+            "state": "FIN_WAIT_1"
+          }
+        },
+        {
+          "do": "segment",
+          "seq": 1001,
+          "ack": 5002,
+          "flags": [
+            "ACK",
+            "FIN"
+          ],
+          "window": 65535,
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "ACK"
+                ],
+                "seq": 5002,
+                "ack": 1002,
+                "window": 65535
+              }
+            ],
+            "closeApp": true,
+            "state": "TIME_WAIT"
+          }
+        },
+        {
+          "do": "segment",
+          "seq": 1000,
+          "flags": [
+            "SYN"
+          ],
+          "window": 65535,
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "ACK"
+                ],
+                "seq": 5002,
+                "ack": 1002,
+                "window": 65535
+              }
+            ],
+            "state": "TIME_WAIT"
+          }
+        },
+        {
+          "do": "segment",
+          "seq": 1002,
+          "flags": [
+            "RST"
+          ],
+          "expect": {
+            "segments": [],
+            "state": "TIME_WAIT"
+          }
+        },
+        {
+          "do": "segment",
+          "seq": 1001,
+          "ack": 5002,
+          "flags": [
+            "ACK",
+            "FIN"
+          ],
+          "window": 65535,
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "ACK"
+                ],
+                "seq": 5002,
+                "ack": 1002,
+                "window": 65535
+              }
+            ],
+            "state": "TIME_WAIT"
+          }
+        },
+        {
+          "do": "segment",
+          "seq": 1001,
+          "ack": 5002,
+          "flags": [
+            "ACK",
+            "PSH"
+          ],
+          "window": 65535,
+          "payloadHex": "01",
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "ACK"
+                ],
+                "seq": 5002,
+                "ack": 1002,
+                "window": 65535
+              }
+            ],
+            "state": "TIME_WAIT"
+          }
+        },
+        {
+          "do": "segment",
+          "seq": 1002,
+          "ack": 5002,
+          "flags": [
+            "ACK"
+          ],
+          "window": 65535,
+          "expect": {
+            "segments": [],
+            "state": "TIME_WAIT"
+          }
+        },
+        {
+          "do": "tick",
+          "advanceMs": 9999,
+          "expect": {
+            "segments": [],
+            "state": "TIME_WAIT"
+          }
+        },
+        {
+          "do": "tick",
+          "advanceMs": 1,
+          "expect": {
+            "segments": [],
+            "done": true,
+            "state": "CLOSED"
+          }
+        }
+      ]
+    },
+    {
+      "name": "old-out-of-window-syn-cannot-reset-new-incarnation",
+      "description": "同步态的窗口外旧 SYN 只获当前 ACK，不复位或重建活跃连接",
+      "steps": [
+        {
+          "do": "segment",
+          "seq": 1000,
+          "flags": [
+            "SYN"
+          ],
+          "window": 65535,
+          "mss": 1200,
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "SYN",
+                  "ACK"
+                ],
+                "seq": 5000,
+                "ack": 1001,
+                "window": 65535,
+                "mss": 1240
+              }
+            ],
+            "state": "SYN_RECEIVED"
+          }
+        },
+        {
+          "do": "segment",
+          "seq": 1001,
+          "ack": 5001,
+          "flags": [
+            "ACK"
+          ],
+          "window": 65535,
+          "expect": {
+            "segments": [],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "segment",
+          "seq": 999,
+          "flags": [
+            "SYN"
+          ],
+          "window": 65535,
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "ACK"
+                ],
+                "seq": 5001,
+                "ack": 1001,
+                "window": 65535
+              }
+            ],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "segment",
+          "seq": 1001,
+          "ack": 5001,
+          "flags": [
+            "ACK",
+            "PSH"
+          ],
+          "window": 65535,
+          "payloadHex": "2a",
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "ACK"
+                ],
+                "seq": 5001,
+                "ack": 1002,
+                "window": 65535
+              }
+            ],
+            "deliverHex": "2a",
+            "state": "ESTABLISHED"
+          }
+        }
+      ]
+    },
+    {
       "name": "same-tick-clean-ack-collapses-backoff",
       "description": "同一时钟刻度内的干净 ACK 仍为有效 RTT 样本；恢复丢包退避且不提前重传",
       "steps": [
