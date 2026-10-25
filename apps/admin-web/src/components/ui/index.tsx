@@ -126,7 +126,7 @@ export function Alert({ tone = "info", title, children, actions, className, role
         {title ? <div className="bd-alert-title">{title}</div> : null}
         {children ? <div className="bd-alert-body">{children}</div> : null}
       </div>
-      {actions ? <div className="flex flex-none flex-wrap items-center gap-2 self-center">{actions}</div> : null}
+      {actions ? <div className="app-alert-actions flex flex-none flex-wrap items-center gap-2 self-center">{actions}</div> : null}
     </div>
   );
 }

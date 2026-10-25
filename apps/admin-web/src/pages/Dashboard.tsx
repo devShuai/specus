@@ -213,7 +213,7 @@ function DashboardContent() {
     finally { setInitializing(false); }
   };
 
-  const shellClass = ["app-apple-dashboard jd-shell", collapsed && !phone ? "bd-shell--collapsed" : "", drawerOpen ? "jd-drawer-open" : ""].filter(Boolean).join(" ");
+  const shellClass = ["app-apple-dashboard jd-shell bd-root", collapsed && !phone ? "bd-shell--collapsed" : "", drawerOpen ? "jd-drawer-open" : ""].filter(Boolean).join(" ");
   return (
     <div className={shellClass}>
       <a className="app-skip-link" href="#app-main-content">跳到主内容</a>

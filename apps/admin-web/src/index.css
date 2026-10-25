@@ -2209,6 +2209,13 @@ body {
   border-bottom: 1px solid var(--border);
 }
 
+/* Stacked phone tables (jd-stack) separate rows, not cells. */
+@media (max-width: 767px) {
+  .app-apple-dashboard .jd-stack tbody tr td {
+    border-bottom: 0;
+  }
+}
+
 .app-apple-dashboard tbody tr {
   transition: background-color 0.12s ease;
 }
