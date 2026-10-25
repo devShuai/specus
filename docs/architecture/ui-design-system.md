@@ -15,6 +15,13 @@
 
 管理后台里原有的 `--app-apple-*`、`--diagram-apple-*` 与落地页 `--landing-*` 变量都指向令牌，Tailwind 的 `rounded-*` 与 `font-*` 也读同一套圆角和字体。新样式直接用令牌（`var(--accent)`、`var(--radius-md)` 等），不要再写颜色或圆角的字面值。
 
+管理后台的页面用设计规范自己的组件写：
+
+- `src/styles/liquid-glass.css`：设计规范的 `bd-*` / `jd-*` 组件与外框类（按钮、字段、标签、提示条、卡片、表格、页签、分段、页头、区块标题、筛选条、数字卡、空状态、搜索框、玻璃圆按钮、手机抽屉与叠成条的表格），放在 components 层，同元素上的 Tailwind 工具类仍然优先。
+- `src/components/ui`：图标集（`Icon`，132 个线性图标，不用 emoji 或别的图标库）和这些类的 React 封装（Card、Section、Stat、TableWrap、FilterBar、Tag、Alert、Progress、Empty、Tabs、Segmented、RelativeTime）。
+- `src/styles/` 下每个页面区域一份样式（`area-ops`、`area-access`、`area-mesh-system`、`public-pages`、`transfer`），只写本区域的类。
+- 外框在 `Dashboard.tsx`：可收起的玻璃侧栏、透明顶栏里的搜索框（`/` 或 Ctrl/⌘ K）和圆按钮、同组页面的区域页签；页面自己从页头开始。
+
 ## 主要取值
 
 - 页面底色 `bg`：浅色 `#f5f5f7`，深色 `#0c0c0e`，上面铺三团很淡的彩色辉光。
