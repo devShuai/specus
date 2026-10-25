@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Collections.Frozen;
 using System.Text;
 using System.Text.Json.Nodes;
+using System.Text.Unicode;
 using Specus.Protocol.Packets;
 
 namespace Specus.Protocol.Codec;
@@ -322,7 +323,14 @@ public static class PacketCodec
         {
             throw new InvalidDataException("NAT JSON metadata is empty");
         }
-        var node = JsonNode.Parse(Encoding.UTF8.GetString(json));
+        // RFC 8259 with UTF-8 required (control-protocol.md). Decoding to a string first replaced
+        // invalid UTF-8 with U+FFFD; System.Text.Json already refuses comments, trailing commas
+        // and anything after the value.
+        if (!Utf8.IsValid(json))
+        {
+            throw new InvalidDataException("NAT metadata is not UTF-8");
+        }
+        var node = JsonNode.Parse(json);
         if (node is not JsonObject obj)
         {
             return null;

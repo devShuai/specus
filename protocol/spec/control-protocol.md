@@ -199,6 +199,8 @@ NAT_CONTROL 还可能因为另外两种原因发不出去：写客户端的 cont
 | `metadata` | M | UTF-8 JSON object，只用于 OPEN/FIN/RST 等控制阶段 |
 | `data` | N | 原始字节，不压缩、不加第二层长度或 Base64 |
 
+`metadata` 按 RFC 8259 严格读取：整个字段必须是合法 UTF-8（不接受超长编码与代理项），恰好是一个 JSON object，前后只能有空格、Tab、LF、CR；不接受注释、尾逗号、单引号、`NaN`，也不接受 object 之后的任何内容。读不出的帧按 `malformed_body` 拒绝，连接随之断开。重复的名字、未配对的代理项转义（如 `\ud800`）、字节序标记与嵌套深度由 RFC 留给实现，本规范不规定。共享向量 `protocol/test-vectors/nat-metadata-json-v1.json`（`tools/protocol/generate_nat_metadata_json_vectors.py` 生成）。
+
 | type | ID | `streamId` | 语义 |
 | --- | ---: | --- | --- |
 | `REGISTER` | `1` | `0` | 注册公网 TCP 端口 |

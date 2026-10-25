@@ -264,6 +264,43 @@ int st_json_is_valid_object(const char *json)
     return end != NULL && *skip_ws(end) == '\0';
 }
 
+static size_t utf8_sequence_length(const unsigned char *text);
+
+int st_json_is_valid_object_bytes(const unsigned char *bytes, size_t len)
+{
+    if (bytes == NULL || len == 0U || len == SIZE_MAX) {
+        return 0;
+    }
+    /* The validators read NUL-terminated text, so they get a copy; utf8_sequence_length stops at
+     * the terminator, which is no continuation byte. */
+    char *text = (char *)malloc(len + 1U);
+    if (text == NULL) {
+        return -1;
+    }
+    memcpy(text, bytes, len);
+    text[len] = '\0';
+    int valid = 1;
+    for (size_t i = 0U; valid && i < len;) {
+        unsigned char ch = (unsigned char)text[i];
+        if (ch == 0x00U || ch == 0x0bU || ch == 0x0cU) {
+            /* A NUL would end the copy early; isspace() in skip_ws takes VT and FF for whitespace,
+             * and inside a string they are raw control characters, so neither is ever valid. */
+            valid = 0;
+        } else if (ch < 0x80U) {
+            ++i;
+        } else {
+            size_t sequence = utf8_sequence_length((const unsigned char *)text + i);
+            if (sequence == 0U) {
+                valid = 0;
+            }
+            i += sequence;
+        }
+    }
+    valid = valid && st_json_is_valid_object(text);
+    free(text);
+    return valid;
+}
+
 static int key_equals(const char *start, const char *end, const char *key)
 {
     size_t len = (size_t)(end - start);

@@ -1,6 +1,10 @@
 package com.theshuai.common.protocol;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.json.JsonMapper;
 import com.theshuai.common.command.Command;
 import com.theshuai.common.protocol.request.HeartBeatRequestPacket;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
@@ -14,6 +18,11 @@ import com.theshuai.common.serialize.Serializer;
 import com.theshuai.common.serialize.SerializerAlgorithm;
 import com.theshuai.common.util.JsonUtil;
 import io.netty.buffer.ByteBuf;
+
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
 
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -41,6 +50,13 @@ public final class PacketCodec {
     public static final long MAX_STREAM_VALUE = 0xffff_ffffL;
     private static final TypeReference<Map<String, Object>> METADATA_TYPE = new TypeReference<>() {
     };
+    /**
+     * Reads NAT metadata strictly by RFC 8259 (control-protocol.md): no comments or trailing commas,
+     * which JsonUtil allows for configuration files, and nothing after the object.
+     */
+    private static final ObjectMapper METADATA_READER = JsonMapper.builder()
+            .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+            .build();
 
     private final Map<Byte, Class<? extends Packet>> packetTypeMap = new HashMap<>();
 
@@ -270,7 +286,24 @@ public final class PacketCodec {
         if (encoded.length == 0) {
             return Map.of();
         }
-        Map<String, Object> metadata = JsonUtil.bytesToObjectStrict(encoded, METADATA_TYPE);
+        // Decoded to text first so that only UTF-8 is accepted: Jackson would otherwise detect
+        // UTF-16 and UTF-32 from the bytes. The JDK decoder refuses overlong forms and surrogates.
+        String text;
+        try {
+            text = StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(encoded))
+                    .toString();
+        } catch (CharacterCodingException exception) {
+            throw new ProtocolException(ProtocolException.Reason.MALFORMED_BODY, "NAT metadata is not UTF-8", exception);
+        }
+        Map<String, Object> metadata;
+        try {
+            metadata = METADATA_READER.readValue(text, METADATA_TYPE);
+        } catch (JsonProcessingException exception) {
+            throw new ProtocolException(ProtocolException.Reason.MALFORMED_BODY, "NAT metadata is not a JSON object", exception);
+        }
         if (metadata == null) {
             throw new ProtocolException(ProtocolException.Reason.MALFORMED_BODY, "NAT metadata must be an object");
         }

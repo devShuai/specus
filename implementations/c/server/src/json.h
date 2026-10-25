@@ -6,6 +6,11 @@
 char *st_json_escape(const char *value);
 int st_json_is_valid(const char *json);
 int st_json_is_valid_object(const char *json);
+/*
+ * Whether len bytes are exactly one JSON object by RFC 8259, as NAT metadata must be: valid UTF-8
+ * with no NUL, and only space, tab, LF and CR as whitespace. 1 yes, 0 no, -1 out of memory.
+ */
+int st_json_is_valid_object_bytes(const unsigned char *bytes, size_t len);
 char *st_json_get_string(const char *json, const char *key);
 /* Same lookup as st_json_get_string; reports decoded bytes including embedded NULs.
  * Callers must use the length before applying C-string validation. Zero on failure. */
