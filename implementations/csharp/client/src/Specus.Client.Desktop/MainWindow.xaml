@@ -9,446 +9,500 @@
         WindowStartupLocation="CenterScreen"
         Icon="Assets/favicon.ico"
         Background="{DynamicResource AppBackgroundBrush}"
+        Foreground="{DynamicResource TextPrimaryBrush}"
+        FontFamily="{StaticResource FontSans}"
+        FontSize="{StaticResource FontSizeBody}"
         UseLayoutRounding="True"
         TextOptions.TextFormattingMode="Display"
         TextOptions.TextRenderingMode="ClearType"
         PreviewKeyDown="Window_PreviewKeyDown">
+    <!-- Shell: the page background with soft colour glows, a floating glass sidebar 12px in from
+         the window edges, and the page (header, tabs, content cards, log) to its right.
+         ExpandLogPanel moves LogPanelBorder into this grid across both columns, so it stays a
+         two-column, one-row grid. -->
     <Grid x:Name="RootLayoutGrid" Background="{DynamicResource AppBackgroundBrush}">
         <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="300" />
+            <ColumnDefinition Width="248" />
             <ColumnDefinition Width="*" />
         </Grid.ColumnDefinitions>
 
-        <Border Grid.Column="0"
-                Background="{DynamicResource SidebarBrush}"
-                BorderBrush="{DynamicResource DividerBrush}"
-                BorderThickness="0,0,1,0"
-                Padding="18,16">
-            <Grid>
+        <!-- glow-1..3 on bg. A solid themed fill shaped by a fixed radial mask, so the theme
+             swaps the colour and the shape stays put. They pass behind the glass sidebar. -->
+        <Grid Grid.ColumnSpan="2" IsHitTestVisible="False" ClipToBounds="True">
+            <Rectangle Fill="{DynamicResource Glow1Brush}">
+                <Rectangle.OpacityMask>
+                    <RadialGradientBrush Center="0.04,0.08" GradientOrigin="0.04,0.08" RadiusX="0.46" RadiusY="0.62">
+                        <GradientStop Color="#FF000000" Offset="0" />
+                        <GradientStop Color="#00000000" Offset="0.72" />
+                    </RadialGradientBrush>
+                </Rectangle.OpacityMask>
+            </Rectangle>
+            <Rectangle Fill="{DynamicResource Glow2Brush}">
+                <Rectangle.OpacityMask>
+                    <RadialGradientBrush Center="0.94,0.32" GradientOrigin="0.94,0.32" RadiusX="0.4" RadiusY="0.58">
+                        <GradientStop Color="#FF000000" Offset="0" />
+                        <GradientStop Color="#00000000" Offset="0.72" />
+                    </RadialGradientBrush>
+                </Rectangle.OpacityMask>
+            </Rectangle>
+            <Rectangle Fill="{DynamicResource Glow3Brush}">
+                <Rectangle.OpacityMask>
+                    <RadialGradientBrush Center="0.14,0.86" GradientOrigin="0.14,0.86" RadiusX="0.48" RadiusY="0.62">
+                        <GradientStop Color="#FF000000" Offset="0" />
+                        <GradientStop Color="#00000000" Offset="0.72" />
+                    </RadialGradientBrush>
+                </Rectangle.OpacityMask>
+            </Rectangle>
+            <Rectangle Fill="{DynamicResource Glow1Brush}">
+                <Rectangle.OpacityMask>
+                    <RadialGradientBrush Center="0.88,1.02" GradientOrigin="0.88,1.02" RadiusX="0.42" RadiusY="0.52">
+                        <GradientStop Color="#FF000000" Offset="0" />
+                        <GradientStop Color="#00000000" Offset="0.72" />
+                    </RadialGradientBrush>
+                </Rectangle.OpacityMask>
+            </Rectangle>
+        </Grid>
+
+        <!-- Sidebar (bd-sidebar): glass, radius-2xl, sidebar-width 236. -->
+        <Grid Grid.Column="0" Margin="12,12,0,12">
+            <Border Style="{StaticResource GlassPanelStyle}" Background="{DynamicResource SidebarBrush}" />
+            <Border Style="{StaticResource GlassHighlightStyle}" />
+            <Grid Margin="12,14,12,12">
                 <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
 
-                <ScrollViewer Grid.Row="0"
-                              VerticalScrollBarVisibility="Auto"
-                              HorizontalScrollBarVisibility="Disabled"
-                              Padding="0,0,6,0">
-                    <StackPanel>
-                        <Grid Margin="0,0,0,16">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="40" />
-                                <ColumnDefinition Width="*" />
-                            </Grid.ColumnDefinitions>
-                            <Border Width="40"
-                                    Height="40"
-                                    CornerRadius="10"
-                                    Background="#14161F"
-                                    HorizontalAlignment="Left"
-                                    VerticalAlignment="Center">
-                                <Canvas Width="40" Height="40">
-                                    <Path Data="M4.375,8.75 H35.625"
-                                          Stroke="#F2F3F7"
-                                          StrokeThickness="2.8125"
-                                          StrokeStartLineCap="Round"
-                                          StrokeEndLineCap="Round" />
-                                    <Path Data="M5,32.5 V22.5 A3.75,3.75 0 0 1 12.5,22.5 V32.5"
-                                          Stroke="#F2F3F7"
-                                          StrokeThickness="2.8125"
-                                          StrokeStartLineCap="Round"
-                                          StrokeEndLineCap="Round"
-                                          StrokeLineJoin="Round"
-                                          Opacity="0.5" />
-                                    <Path Data="M12.5,32.5 V22.5 A7.5,7.5 0 0 1 27.5,22.5 V32.5"
-                                          Stroke="#F2F3F7"
-                                          StrokeThickness="2.8125"
-                                          StrokeStartLineCap="Round"
-                                          StrokeEndLineCap="Round"
-                                          StrokeLineJoin="Round" />
-                                    <Path Data="M27.5,32.5 V22.5 A3.75,3.75 0 0 1 35,22.5 V32.5"
-                                          Stroke="#F2F3F7"
-                                          StrokeThickness="2.8125"
-                                          StrokeStartLineCap="Round"
-                                          StrokeEndLineCap="Round"
-                                          StrokeLineJoin="Round"
-                                          Opacity="0.5" />
-                                    <Ellipse Canvas.Left="17.5"
-                                             Canvas.Top="23.75"
-                                             Width="5"
-                                             Height="5"
-                                             Fill="#9B82FF" />
-                                </Canvas>
-                            </Border>
-                            <StackPanel Grid.Column="1"
-                                        Margin="12,0,0,0"
-                                        VerticalAlignment="Center">
-                                <TextBlock Text="specus"
-                                           FontSize="18"
-                                           FontWeight="Bold" />
-                                <TextBlock Text="桌面客户端"
-                                           Margin="0,1,0,0"
-                                           Style="{StaticResource CaptionTextStyle}" />
-                            </StackPanel>
-                        </Grid>
+                <!-- Brand: the product mark in a 28px square (text fill, bg strokes, so it turns
+                     over with the theme), then the name. -->
+                <StackPanel Grid.Row="0"
+                            Orientation="Horizontal"
+                            Margin="4,0,0,14">
+                    <Border Width="28"
+                            Height="28"
+                            CornerRadius="9"
+                            Background="{DynamicResource TextPrimaryBrush}"
+                            VerticalAlignment="Center">
+                        <Viewbox Width="28" Height="28">
+                            <Canvas Width="40" Height="40">
+                                <Path Data="M4.375,8.75 H35.625"
+                                      Stroke="{DynamicResource AppBackgroundBrush}"
+                                      StrokeThickness="2.8125"
+                                      StrokeStartLineCap="Round"
+                                      StrokeEndLineCap="Round" />
+                                <Path Data="M5,32.5 V22.5 A3.75,3.75 0 0 1 12.5,22.5 V32.5"
+                                      Stroke="{DynamicResource AppBackgroundBrush}"
+                                      StrokeThickness="2.8125"
+                                      StrokeStartLineCap="Round"
+                                      StrokeEndLineCap="Round"
+                                      StrokeLineJoin="Round"
+                                      Opacity="0.5" />
+                                <Path Data="M12.5,32.5 V22.5 A7.5,7.5 0 0 1 27.5,22.5 V32.5"
+                                      Stroke="{DynamicResource AppBackgroundBrush}"
+                                      StrokeThickness="2.8125"
+                                      StrokeStartLineCap="Round"
+                                      StrokeEndLineCap="Round"
+                                      StrokeLineJoin="Round" />
+                                <Path Data="M27.5,32.5 V22.5 A3.75,3.75 0 0 1 35,22.5 V32.5"
+                                      Stroke="{DynamicResource AppBackgroundBrush}"
+                                      StrokeThickness="2.8125"
+                                      StrokeStartLineCap="Round"
+                                      StrokeEndLineCap="Round"
+                                      StrokeLineJoin="Round"
+                                      Opacity="0.5" />
+                                <Ellipse Canvas.Left="17.5"
+                                         Canvas.Top="23.75"
+                                         Width="5"
+                                         Height="5"
+                                         Fill="{DynamicResource PrimaryBrush}" />
+                            </Canvas>
+                        </Viewbox>
+                    </Border>
+                    <TextBlock Margin="10,0,0,0"
+                               VerticalAlignment="Center"
+                               LineHeight="24">
+                        <Run Text="specus" FontSize="16" FontWeight="Bold" />
+                        <Run Text=" 桌面客户端" FontSize="12" Foreground="{DynamicResource TextMutedBrush}" />
+                    </TextBlock>
+                </StackPanel>
 
-                        <Border Style="{StaticResource SurfacePanelStyle}" Padding="14,12">
-                            <Expander x:Name="ConnectionSettingsExpander" Header="连接设置" IsExpanded="True" Foreground="{DynamicResource TextPrimaryBrush}">
+                <ScrollViewer Grid.Row="1"
+                              VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled">
+                    <!-- The 3px margin keeps the inputs' focus ring inside the scroll area. -->
+                    <StackPanel Margin="3,0,3,3">
+                        <Expander x:Name="ConnectionSettingsExpander"
+                                  Header="连接设置"
+                                  IsExpanded="True"
+                                  Style="{StaticResource SectionExpanderStyle}"
+                                  Foreground="{DynamicResource TextPrimaryBrush}">
                             <StackPanel>
                                 <TextBlock Text="服务端地址" Style="{StaticResource FieldLabelTextStyle}" />
                                 <TextBox x:Name="ServerBaseUrlBox"
-                                         Margin="0,4,0,10"
+                                         Margin="0,6,0,14"
                                          ToolTip="例如 https://specus.devshuai.com 或 http://127.0.0.1:8088" />
 
                                 <TextBlock Text="API Key" Style="{StaticResource FieldLabelTextStyle}" />
                                 <TextBox x:Name="ApiKeyBox"
-                                         Margin="0,4,0,10" />
+                                         Margin="0,6,0,14" />
 
                                 <TextBlock Text="Secret" Style="{StaticResource FieldLabelTextStyle}" />
                                 <PasswordBox x:Name="SecretBox"
-                                             Margin="0,4,0,10" />
+                                             Margin="0,6,0,10" />
 
                                 <TextBlock Text="凭据来自管理后台的「接入凭证」。先保存，再连接。"
-                                           TextWrapping="Wrap" Style="{StaticResource CaptionTextStyle}" Margin="0,0,0,10" />
+                                           TextWrapping="Wrap"
+                                           Style="{StaticResource CaptionTextStyle}"
+                                           Margin="0,0,0,12" />
                                 <Expander Header="高级设置" IsExpanded="False">
-                                <StackPanel Margin="0,8,0,0">
-                                <TextBlock Text="auto / windows-wintun 需要管理员权限；noop 不创建网卡，仍可使用转发与互传。"
-                                           TextWrapping="Wrap" Style="{StaticResource CaptionTextStyle}" Margin="0,0,0,8" />
-                                <TextBlock Text="虚拟网卡模式" Style="{StaticResource FieldLabelTextStyle}" />
-                                <ComboBox x:Name="PeerMeshDeviceBox"
-                                          IsEditable="True"
-                                          Margin="0,4,0,10">
-                                    <ComboBoxItem Content="auto" />
-                                    <ComboBoxItem Content="windows-wintun" />
-                                    <ComboBoxItem Content="noop" />
-                                </ComboBox>
+                                    <StackPanel Margin="0,2,0,0">
+                                        <TextBlock Text="auto / windows-wintun 需要管理员权限；noop 不创建网卡，仍可使用转发与互传。"
+                                                   TextWrapping="Wrap"
+                                                   Style="{StaticResource CaptionTextStyle}"
+                                                   Margin="0,0,0,12" />
+                                        <TextBlock Text="虚拟网卡模式" Style="{StaticResource FieldLabelTextStyle}" />
+                                        <ComboBox x:Name="PeerMeshDeviceBox"
+                                                  IsEditable="True"
+                                                  Margin="0,6,0,14">
+                                            <ComboBoxItem Content="auto" />
+                                            <ComboBoxItem Content="windows-wintun" />
+                                            <ComboBoxItem Content="noop" />
+                                        </ComboBox>
 
-                                <Grid>
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="*" />
-                                        <ColumnDefinition Width="78" />
-                                    </Grid.ColumnDefinitions>
-                                    <StackPanel Grid.Column="0" Margin="0,0,8,0">
-                                        <TextBlock Text="网卡名称" Style="{StaticResource FieldLabelTextStyle}" />
-                                        <TextBox x:Name="TunNameBox" Margin="0,4,0,0" />
-                                    </StackPanel>
-                                    <StackPanel Grid.Column="1">
-                                        <TextBlock Text="MTU" Style="{StaticResource FieldLabelTextStyle}" />
-                                        <TextBox x:Name="MtuBox" Margin="0,4,0,0" />
-                                    </StackPanel>
-                                </Grid>
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="78" />
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Grid.Column="0" Margin="0,0,8,0">
+                                                <TextBlock Text="网卡名称" Style="{StaticResource FieldLabelTextStyle}" />
+                                                <TextBox x:Name="TunNameBox" Margin="0,6,0,0" />
+                                            </StackPanel>
+                                            <StackPanel Grid.Column="1">
+                                                <TextBlock Text="MTU" Style="{StaticResource FieldLabelTextStyle}" />
+                                                <TextBox x:Name="MtuBox"
+                                                         Margin="0,6,0,0"
+                                                         Typography.NumeralAlignment="Tabular" />
+                                            </StackPanel>
+                                        </Grid>
 
-                                <CheckBox x:Name="UpdateCheckEnabledCheckBox"
-                                          Content="自动检查客户端更新"
-                                          Margin="0,12,0,0" />
-                                <Grid Margin="0,8,0,0">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="*" />
-                                        <ColumnDefinition Width="78" />
-                                    </Grid.ColumnDefinitions>
-                                    <TextBlock Grid.Column="0"
-                                               Text="检查间隔（小时）"
-                                               Style="{StaticResource FieldLabelTextStyle}"
-                                               VerticalAlignment="Center" />
-                                    <TextBox x:Name="UpdateCheckIntervalHoursBox"
-                                             Grid.Column="1"
-                                             Text="24"
-                                             ToolTip="1–168 小时" />
-                                </Grid>
-                                <CheckBox x:Name="AutoUpdateCheckBox"
-                                          Content="自动安装已验证更新"
-                                          Margin="0,8,0,0"
-                                          ToolTip="仅安装由服务端提供、且通过 SHA-256 校验的 HTTPS 更新包" />
-                                </StackPanel>
+                                        <CheckBox x:Name="UpdateCheckEnabledCheckBox"
+                                                  Content="自动检查客户端更新"
+                                                  Margin="0,16,0,0" />
+                                        <Grid Margin="0,10,0,0">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="78" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0"
+                                                       Text="检查间隔（小时）"
+                                                       Style="{StaticResource FieldLabelTextStyle}"
+                                                       VerticalAlignment="Center" />
+                                            <TextBox x:Name="UpdateCheckIntervalHoursBox"
+                                                     Grid.Column="1"
+                                                     Text="24"
+                                                     Typography.NumeralAlignment="Tabular"
+                                                     ToolTip="1–168 小时" />
+                                        </Grid>
+                                        <CheckBox x:Name="AutoUpdateCheckBox"
+                                                  Content="自动安装已验证更新"
+                                                  Margin="0,12,0,0"
+                                                  ToolTip="仅安装由服务端提供、且通过 SHA-256 校验的 HTTPS 更新包" />
+                                    </StackPanel>
                                 </Expander>
                             </StackPanel>
-                            </Expander>
-                        </Border>
-
+                        </Expander>
                     </StackPanel>
                 </ScrollViewer>
-                <StackPanel Grid.Row="1">
-                        <Button x:Name="ConnectButton"
-                                Content="连接"
-                                Height="38"
-                                Margin="0,12,0,0"
-                                Style="{StaticResource PrimaryButtonStyle}"
-                                FontSize="14"
-                                FontWeight="Bold"
-                                Click="ConnectButton_Click" />
+
+                <!-- Actions: one primary, the rest secondary, all control-md. -->
+                <StackPanel Grid.Row="2" Margin="0,12,0,0">
+                    <Button x:Name="ConnectButton"
+                            Content="连接"
+                            Style="{StaticResource PrimaryButtonStyle}"
+                            Click="ConnectButton_Click" />
+                    <Grid Margin="0,8,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="8" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
                         <Button x:Name="SaveButton"
+                                Grid.Column="0"
                                 Content="保存配置"
-                                Height="32"
-                                Margin="0,8,0,2"
                                 Style="{StaticResource SecondaryButtonStyle}"
                                 Click="SaveButton_Click" />
-                        <Button Content="立即重试" Margin="0,8,0,0" Click="RetryButton_Click" />
+                        <Button Grid.Column="2"
+                                Content="立即重试"
+                                Style="{StaticResource SecondaryButtonStyle}"
+                                Click="RetryButton_Click" />
+                    </Grid>
                 </StackPanel>
 
-                <Border Grid.Row="2"
+                <!-- Connection status: a status dot always paired with the phase in words. -->
+                <Border Grid.Row="3"
                         Margin="0,12,0,0"
-                        Style="{StaticResource SurfacePanelStyle}">
+                        Style="{StaticResource InsetCardStyle}">
                     <StackPanel>
-                        <TextBlock Text="当前状态"
-                                   FontSize="12"
-                                   FontWeight="Bold"
-                                   Foreground="{DynamicResource MutedBrush}" />
-                        <Grid Margin="0,7,0,4">
+                        <TextBlock Text="当前状态" Style="{StaticResource OverlineTextStyle}" />
+                        <Grid Margin="0,2,0,2">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="Auto" />
                                 <ColumnDefinition Width="*" />
                             </Grid.ColumnDefinitions>
                             <Border x:Name="SidebarStatusDot"
-                                    Width="9"
-                                    Height="9"
-                                    CornerRadius="4.5"
+                                    Width="8"
+                                    Height="8"
+                                    CornerRadius="4"
                                     Background="{DynamicResource TextMutedBrush}"
                                     VerticalAlignment="Center"
                                     Margin="0,0,8,0" />
                             <TextBlock x:Name="StatusPhaseText"
                                        Grid.Column="1"
                                        Text="未连接"
-                                       FontSize="15"
-                                       FontWeight="Bold"
+                                       Style="{StaticResource SectionLabelTextStyle}"
+                                       TextTrimming="CharacterEllipsis"
                                        VerticalAlignment="Center" />
                         </Grid>
                         <TextBlock x:Name="StatusDetailText"
                                    Text="填写连接信息后启动客户端"
                                    TextWrapping="Wrap"
-                                   FontSize="12"
-                                   Foreground="{DynamicResource MutedBrush}" />
+                                   Style="{StaticResource CaptionTextStyle}" />
                     </StackPanel>
                 </Border>
             </Grid>
-        </Border>
+        </Grid>
 
-        <Grid x:Name="MainContentGrid" Grid.Column="1" Margin="20,16,20,16">
+        <Grid x:Name="MainContentGrid" Grid.Column="1" Margin="20,12,20,12">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="*" />
                 <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
 
-            <Border Style="{StaticResource SurfacePanelStyle}" Padding="16,12">
-                <Grid>
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                    </Grid.RowDefinitions>
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                            <ColumnDefinition Width="Auto" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-                        <StackPanel VerticalAlignment="Center">
-                            <TextBlock Text="设备与服务"
-                                       FontSize="17"
-                                       FontWeight="Bold" />
-                            <TextBlock x:Name="RuntimeSummaryText"
-                                       Text="连接后显示客户端、控制端和 Peer Mesh 信息"
-                                       Margin="0,2,0,0"
-                                       Style="{StaticResource CaptionTextStyle}"
-                                       TextTrimming="CharacterEllipsis" />
-                        </StackPanel>
-                        <Border x:Name="PeerMeshStatusStrip"
-                                Grid.Column="1"
-                                Style="{StaticResource InfoStripStyle}"
-                                MaxWidth="460"
-                                Margin="12,0,10,0"
-                                VerticalAlignment="Center">
-                            <Grid>
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="Auto" />
-                                    <ColumnDefinition Width="*" />
-                                </Grid.ColumnDefinitions>
-                                <Border x:Name="PeerMeshStatusDot"
-                                        Width="8"
-                                        Height="8"
-                                        CornerRadius="4"
-                                        Background="{DynamicResource TextMutedBrush}"
-                                        VerticalAlignment="Center"
-                                        Margin="0,0,8,0" />
-                                <TextBlock x:Name="PeerMeshSummaryText"
-                                           Grid.Column="1"
-                                           Text="Peer Mesh 未启动"
-                                           FontSize="12"
-                                           FontWeight="Bold"
-                                           TextTrimming="CharacterEllipsis"
-                                           Foreground="{DynamicResource PrimaryHoverBrush}" />
-                            </Grid>
-                        </Border>
-                        <Button x:Name="CheckUpdateButton"
-                                Grid.Column="2"
-                                Content="检查更新"
-                                Height="32"
-                                Margin="0,0,8,0"
-                                Padding="12,0"
-                                VerticalAlignment="Center"
-                                Style="{StaticResource SecondaryButtonStyle}"
-                                Click="CheckUpdateButton_Click" />
-                        <Button x:Name="ThemeModeButton"
-                                Grid.Column="3"
-                                Width="32"
-                                Height="32"
-                                MinHeight="32"
-                                Padding="7"
-                                BorderThickness="0"
-                                VerticalAlignment="Center"
-                                Click="ThemeModeButton_Click">
-                            <Viewbox Width="16"
-                                     Height="16"
-                                     Stretch="Uniform">
+            <!-- Page header (bd-page-header): the 30px title and its page actions on one line,
+                 the description and the page's counts under it. -->
+            <Grid Grid.Row="0" Margin="0,2,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <TextBlock Grid.Row="0"
+                           Grid.Column="0"
+                           Text="设备与服务"
+                           Style="{StaticResource PageTitleTextStyle}"
+                           TextTrimming="CharacterEllipsis"
+                           VerticalAlignment="Center" />
+
+                <StackPanel Grid.Row="0"
+                            Grid.Column="1"
+                            Margin="16,0,0,0"
+                            Orientation="Horizontal"
+                            VerticalAlignment="Center">
+                    <Border x:Name="PeerMeshStatusStrip"
+                            Style="{StaticResource StatusPillStyle}"
+                            MaxWidth="190"
+                            Margin="0,0,8,0"
+                            VerticalAlignment="Center"
+                            ToolTip="{Binding Text, ElementName=PeerMeshSummaryText}">
+                        <Grid VerticalAlignment="Center">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Border x:Name="PeerMeshStatusDot"
+                                    Width="6"
+                                    Height="6"
+                                    CornerRadius="3"
+                                    Background="{DynamicResource TextMutedBrush}"
+                                    VerticalAlignment="Center"
+                                    Margin="0,0,6,0" />
+                            <TextBlock x:Name="PeerMeshSummaryText"
+                                       Grid.Column="1"
+                                       Text="Peer Mesh 未启动"
+                                       FontSize="12"
+                                       LineHeight="18"
+                                       VerticalAlignment="Center"
+                                       TextTrimming="CharacterEllipsis"
+                                       Foreground="{DynamicResource TextSecondaryBrush}" />
+                        </Grid>
+                    </Border>
+                    <Button x:Name="CheckUpdateButton"
+                            Content="检查更新"
+                            Margin="0,0,4,0"
+                            VerticalAlignment="Center"
+                            Style="{StaticResource SecondaryButtonStyle}"
+                            Click="CheckUpdateButton_Click" />
+                    <Button x:Name="ThemeModeButton"
+                            VerticalAlignment="Center"
+                            Style="{StaticResource IconButtonStyle}"
+                            AutomationProperties.Name="主题"
+                            Click="ThemeModeButton_Click">
+                        <Viewbox Width="18"
+                                 Height="18"
+                                 Stretch="Uniform">
+                            <Canvas Width="24" Height="24">
                                 <Path x:Name="ThemeModeIcon"
-                                      Data="M4,5 H20 V15 H4 Z M8,19 H16 M12,15 V19"
-                                      Stroke="{DynamicResource TextSecondaryBrush}"
-                                      StrokeThickness="2"
+                                      Data="M4,3 H20 A2,2 0 0 1 22,5 V15 A2,2 0 0 1 20,17 H4 A2,2 0 0 1 2,15 V5 A2,2 0 0 1 4,3 Z M8,21 H16 M12,17 V21"
+                                      Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"
+                                      StrokeThickness="1.75"
                                       StrokeStartLineCap="Round"
                                       StrokeEndLineCap="Round"
                                       StrokeLineJoin="Round" />
-                            </Viewbox>
-                        </Button>
-                    </Grid>
-                    <UniformGrid Grid.Row="1"
-                                 Rows="1"
-                                 Columns="3"
-                                 Margin="0,12,0,0">
-                        <StackPanel Margin="0,0,8,0">
-                            <TextBlock Text="TCP 路由" FontSize="12" Foreground="{DynamicResource MutedBrush}" />
-                            <TextBlock x:Name="TcpCountText" Text="0" FontSize="20" FontWeight="Bold" Margin="0,1,0,0" Foreground="{DynamicResource PrimaryHoverBrush}" />
-                        </StackPanel>
-                        <StackPanel Margin="0,0,8,0">
-                            <TextBlock Text="HTTP 路由" FontSize="12" Foreground="{DynamicResource MutedBrush}" />
-                            <TextBlock x:Name="HttpCountText" Text="0" FontSize="20" FontWeight="Bold" Margin="0,1,0,0" Foreground="{DynamicResource PrimaryHoverBrush}" />
-                        </StackPanel>
-                        <StackPanel>
-                            <TextBlock Text="Peer 对端" FontSize="12" Foreground="{DynamicResource MutedBrush}" />
-                            <TextBlock x:Name="PeerCountText" Text="0" FontSize="20" FontWeight="Bold" Margin="0,1,0,0" Foreground="{DynamicResource PrimaryHoverBrush}" />
-                        </StackPanel>
-                    </UniformGrid>
-                </Grid>
-            </Border>
+                            </Canvas>
+                        </Viewbox>
+                    </Button>
+                </StackPanel>
 
+                <TextBlock x:Name="RuntimeSummaryText"
+                           Grid.Row="1"
+                           Grid.Column="0"
+                           Text="连接后显示客户端、控制端和 Peer Mesh 信息"
+                           Margin="0,2,0,0"
+                           Style="{StaticResource PageDescTextStyle}"
+                           TextTrimming="CharacterEllipsis"
+                           ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+
+                <!-- The page's counts: label in text-subtle, the number in tabular figures. -->
+                <StackPanel Grid.Row="1"
+                            Grid.Column="1"
+                            Margin="16,2,0,0"
+                            Orientation="Horizontal"
+                            HorizontalAlignment="Right">
+                    <TextBlock Text="TCP 路由" Style="{StaticResource StatLabelTextStyle}" />
+                    <TextBlock x:Name="TcpCountText" Text="0" Margin="6,0,16,0" Style="{StaticResource StatValueTextStyle}" />
+                    <TextBlock Text="HTTP 路由" Style="{StaticResource StatLabelTextStyle}" />
+                    <TextBlock x:Name="HttpCountText" Text="0" Margin="6,0,16,0" Style="{StaticResource StatValueTextStyle}" />
+                    <TextBlock Text="Peer 对端" Style="{StaticResource StatLabelTextStyle}" />
+                    <TextBlock x:Name="PeerCountText" Text="0" Margin="6,0,0,0" Style="{StaticResource StatValueTextStyle}" />
+                </StackPanel>
+            </Grid>
+
+            <!-- Views of the page as pill tabs; each view's content sits in cards and tables. -->
             <TabControl Grid.Row="1" SelectedIndex="1"
-                        Margin="0,12,0,12"
+                        Margin="0,14,0,12"
                         Style="{StaticResource ModernTabControlStyle}"
                         ItemContainerStyle="{StaticResource ModernTabItemStyle}">
                 <TabItem Header="连接诊断">
                     <Grid>
-                            <Grid.RowDefinitions>
-                                <!-- 两张表按比例分配并设最小高度：窗口再矮也不会把
-                                     任何一张表挤没，表格外框始终完整可见，行数多时表内滚动 -->
-                                <RowDefinition Height="3*" MinHeight="120" />
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="2*" MinHeight="110" />
-                            </Grid.RowDefinitions>
-                            <Border Grid.Row="0"
-                                    Style="{StaticResource TableShellStyle}">
-                                <DataGrid x:Name="PeerGrid"
-                                          AlternationCount="2"
-                                          ItemsSource="{Binding PeerRoutes}">
-                                    <DataGrid.Columns>
-                                        <DataGridTemplateColumn Header="客户端" SortMemberPath="ClientName" ClipboardContentBinding="{Binding ClientName}" Width="2*">
-                                            <DataGridTemplateColumn.CellTemplate>
-                                                <DataTemplate>
-                                                    <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
-                                                             Text="{Binding ClientName}"
-                                                             ToolTip="{Binding ClientName}" />
-                                                </DataTemplate>
-                                            </DataGridTemplateColumn.CellTemplate>
-                                        </DataGridTemplateColumn>
-                                        <DataGridTemplateColumn Header="虚拟 IP" SortMemberPath="VirtualIp" ClipboardContentBinding="{Binding VirtualIp}" Width="150">
-                                            <DataGridTemplateColumn.CellTemplate>
-                                                <DataTemplate>
-                                                    <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
-                                                             Text="{Binding VirtualIp}"
-                                                             ToolTip="{Binding VirtualIp}" />
-                                                </DataTemplate>
-                                            </DataGridTemplateColumn.CellTemplate>
-                                        </DataGridTemplateColumn>
-                                        <DataGridCheckBoxColumn Header="在线" Binding="{Binding Online}" Width="80" />
-                                        <DataGridTemplateColumn Header="候选地址" SortMemberPath="CandidateCount" ClipboardContentBinding="{Binding CandidateCount}" Width="90">
-                                            <DataGridTemplateColumn.CellTemplate>
-                                                <DataTemplate>
-                                                    <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
-                                                             Text="{Binding CandidateCount}"
-                                                             ToolTip="{Binding CandidateCount}" />
-                                                </DataTemplate>
-                                            </DataGridTemplateColumn.CellTemplate>
-                                        </DataGridTemplateColumn>
-                                        <DataGridTemplateColumn Header="Client ID" SortMemberPath="ClientId" ClipboardContentBinding="{Binding ClientId}" Width="170">
-                                            <DataGridTemplateColumn.CellTemplate>
-                                                <DataTemplate>
-                                                    <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
-                                                             Text="{Binding ClientId}"
-                                                             ToolTip="{Binding ClientId}" />
-                                                </DataTemplate>
-                                            </DataGridTemplateColumn.CellTemplate>
-                                        </DataGridTemplateColumn>
-                                    </DataGrid.Columns>
-                                </DataGrid>
-                            </Border>
-                            <TextBlock Grid.Row="1"
-                                       Text="活跃会话"
-                                       FontSize="12"
-                                       FontWeight="Bold"
-                                       Foreground="{DynamicResource TextSecondaryBrush}"
-                                       Margin="0,8,0,6" />
-                            <Border Grid.Row="2"
-                                    Style="{StaticResource TableShellStyle}">
-                                <DataGrid x:Name="PeerSessionGrid"
-                                          AlternationCount="2"
-                                          ItemsSource="{Binding PeerSessions}">
-                                    <DataGrid.Columns>
-                                        <DataGridTemplateColumn Header="对端" SortMemberPath="PeerName" ClipboardContentBinding="{Binding PeerName}" Width="2*">
-                                            <DataGridTemplateColumn.CellTemplate>
-                                                <DataTemplate>
-                                                    <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
-                                                             Text="{Binding PeerName}"
-                                                             ToolTip="{Binding PeerName}" />
-                                                </DataTemplate>
-                                            </DataGridTemplateColumn.CellTemplate>
-                                        </DataGridTemplateColumn>
-                                        <DataGridTemplateColumn Header="虚拟 IP" SortMemberPath="PeerVirtualIp" ClipboardContentBinding="{Binding PeerVirtualIp}" Width="150">
-                                            <DataGridTemplateColumn.CellTemplate>
-                                                <DataTemplate>
-                                                    <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
-                                                             Text="{Binding PeerVirtualIp}"
-                                                             ToolTip="{Binding PeerVirtualIp}" />
-                                                </DataTemplate>
-                                            </DataGridTemplateColumn.CellTemplate>
-                                        </DataGridTemplateColumn>
-                                        <DataGridTemplateColumn Header="路径" SortMemberPath="PathType" ClipboardContentBinding="{Binding PathType}" Width="90">
-                                            <DataGridTemplateColumn.CellTemplate>
-                                                <DataTemplate>
-                                                    <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
-                                                             Text="{Binding PathType}"
-                                                             ToolTip="{Binding PathType}" />
-                                                </DataTemplate>
-                                            </DataGridTemplateColumn.CellTemplate>
-                                        </DataGridTemplateColumn>
-                                        <DataGridTemplateColumn Header="Endpoint" SortMemberPath="RemoteEndpoint" ClipboardContentBinding="{Binding RemoteEndpoint}" Width="2*">
-                                            <DataGridTemplateColumn.CellTemplate>
-                                                <DataTemplate>
-                                                    <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
-                                                             Text="{Binding RemoteEndpoint}"
-                                                             ToolTip="{Binding RemoteEndpoint}" />
-                                                </DataTemplate>
-                                            </DataGridTemplateColumn.CellTemplate>
-                                        </DataGridTemplateColumn>
-                                        <DataGridTemplateColumn Header="RTT(ms)" SortMemberPath="RttMillis" ClipboardContentBinding="{Binding RttMillis}" Width="90">
-                                            <DataGridTemplateColumn.CellTemplate>
-                                                <DataTemplate>
-                                                    <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
-                                                             Text="{Binding RttMillis}"
-                                                             ToolTip="{Binding RttMillis}" />
-                                                </DataTemplate>
-                                            </DataGridTemplateColumn.CellTemplate>
-                                        </DataGridTemplateColumn>
-                                    </DataGrid.Columns>
-                                </DataGrid>
-                            </Border>
+                        <Grid.RowDefinitions>
+                            <!-- 两张表按比例分配并设最小高度：窗口再矮也不会把
+                                 任何一张表挤没，表格外框始终完整可见，行数多时表内滚动 -->
+                            <RowDefinition Height="3*" MinHeight="120" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="2*" MinHeight="110" />
+                        </Grid.RowDefinitions>
+                        <Border Grid.Row="0"
+                                Style="{StaticResource TableShellStyle}">
+                            <DataGrid x:Name="PeerGrid"
+                                      AlternationCount="2"
+                                      ItemsSource="{Binding PeerRoutes}">
+                                <DataGrid.Columns>
+                                    <DataGridTemplateColumn Header="客户端" SortMemberPath="ClientName" ClipboardContentBinding="{Binding ClientName}" Width="2*">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding ClientName}"
+                                                         ToolTip="{Binding ClientName}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTemplateColumn Header="虚拟 IP" SortMemberPath="VirtualIp" ClipboardContentBinding="{Binding VirtualIp}" Width="150">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding VirtualIp}"
+                                                         ToolTip="{Binding VirtualIp}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridCheckBoxColumn Header="在线" Binding="{Binding Online}" Width="80" ElementStyle="{StaticResource GridCheckBoxStyle}" />
+                                    <DataGridTemplateColumn Header="候选地址" SortMemberPath="CandidateCount" ClipboardContentBinding="{Binding CandidateCount}" Width="90" HeaderStyle="{StaticResource NumericColumnHeaderStyle}">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellNumberTextBoxStyle}"
+                                                         Text="{Binding CandidateCount}"
+                                                         ToolTip="{Binding CandidateCount}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTemplateColumn Header="Client ID" SortMemberPath="ClientId" ClipboardContentBinding="{Binding ClientId}" Width="170">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding ClientId}"
+                                                         ToolTip="{Binding ClientId}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                </DataGrid.Columns>
+                            </DataGrid>
+                        </Border>
+                        <TextBlock Grid.Row="1"
+                                   Text="活跃会话"
+                                   Style="{StaticResource SectionLabelTextStyle}"
+                                   Margin="0,10,0,6" />
+                        <Border Grid.Row="2"
+                                Style="{StaticResource TableShellStyle}">
+                            <DataGrid x:Name="PeerSessionGrid"
+                                      AlternationCount="2"
+                                      ItemsSource="{Binding PeerSessions}">
+                                <DataGrid.Columns>
+                                    <DataGridTemplateColumn Header="对端" SortMemberPath="PeerName" ClipboardContentBinding="{Binding PeerName}" Width="2*">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding PeerName}"
+                                                         ToolTip="{Binding PeerName}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTemplateColumn Header="虚拟 IP" SortMemberPath="PeerVirtualIp" ClipboardContentBinding="{Binding PeerVirtualIp}" Width="150">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding PeerVirtualIp}"
+                                                         ToolTip="{Binding PeerVirtualIp}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTemplateColumn Header="路径" SortMemberPath="PathType" ClipboardContentBinding="{Binding PathType}" Width="90">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding PathType}"
+                                                         ToolTip="{Binding PathType}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTemplateColumn Header="Endpoint" SortMemberPath="RemoteEndpoint" ClipboardContentBinding="{Binding RemoteEndpoint}" Width="2*">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding RemoteEndpoint}"
+                                                         ToolTip="{Binding RemoteEndpoint}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTemplateColumn Header="RTT(ms)" SortMemberPath="RttMillis" ClipboardContentBinding="{Binding RttMillis}" Width="90" HeaderStyle="{StaticResource NumericColumnHeaderStyle}">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellNumberTextBoxStyle}"
+                                                         Text="{Binding RttMillis}"
+                                                         ToolTip="{Binding RttMillis}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                </DataGrid.Columns>
+                            </DataGrid>
+                        </Border>
                     </Grid>
                 </TabItem>
                 <TabItem Header="共享服务">
@@ -502,16 +556,16 @@
                                     <DataGridTemplateColumn Header="操作" Width="150">
                                         <DataGridTemplateColumn.CellTemplate>
                                             <DataTemplate>
-                                                <StackPanel Orientation="Horizontal">
+                                                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                                                     <Button Content="打开"
                                                             Margin="0,0,6,0"
-                                                            Padding="8,2"
+                                                            Style="{StaticResource SmallButtonStyle}"
                                                             IsEnabled="{Binding Openable}"
                                                             AutomationProperties.HelpText="{Binding UnavailableReason}"
                                                             Click="OpenPeerService_Click"
                                                             Tag="{Binding}" />
                                                     <Button Content="复制"
-                                                            Padding="8,2"
+                                                            Style="{StaticResource SmallButtonStyle}"
                                                             IsEnabled="{Binding Copyable}"
                                                             AutomationProperties.HelpText="{Binding UnavailableReason}"
                                                             Click="CopyPeerService_Click"
@@ -525,10 +579,9 @@
                         </Border>
                         <TextBlock Grid.Row="1"
                                    Text="本机发布（本实例开关，不改服务端配置）"
-                                   FontSize="12"
-                                   FontWeight="Bold"
-                                   Foreground="{DynamicResource TextSecondaryBrush}"
-                                   Margin="0,8,0,6" />
+                                   Style="{StaticResource SectionLabelTextStyle}"
+                                   TextTrimming="CharacterEllipsis"
+                                   Margin="0,10,0,6" />
                         <Border Grid.Row="2" Style="{StaticResource TableShellStyle}">
                             <DataGrid x:Name="PeerLocalServiceGrid"
                                       AlternationCount="2"
@@ -558,13 +611,14 @@
                                             </DataTemplate>
                                         </DataGridTemplateColumn.CellTemplate>
                                     </DataGridTemplateColumn>
-                                    <DataGridTextColumn Header="发布端口" Binding="{Binding PublishedPort}" Width="90" />
-                                    <DataGridCheckBoxColumn Header="配置启用" Binding="{Binding ConfigEnabled}" Width="80" IsReadOnly="True" />
+                                    <DataGridTextColumn Header="发布端口" Binding="{Binding PublishedPort}" Width="90" HeaderStyle="{StaticResource NumericColumnHeaderStyle}" ElementStyle="{StaticResource GridNumberTextBlockStyle}" />
+                                    <DataGridCheckBoxColumn Header="配置启用" Binding="{Binding ConfigEnabled}" Width="80" IsReadOnly="True" ElementStyle="{StaticResource GridCheckBoxStyle}" />
                                     <DataGridTemplateColumn Header="状态" Width="2*">
                                         <DataGridTemplateColumn.CellTemplate>
                                             <DataTemplate>
                                                 <TextBlock Text="{Binding PublicationStatus}"
                                                            TextWrapping="Wrap"
+                                                           VerticalAlignment="Center"
                                                            AutomationProperties.Name="{Binding PublicationStatus}" />
                                             </DataTemplate>
                                         </DataGridTemplateColumn.CellTemplate>
@@ -572,8 +626,11 @@
                                     <DataGridTemplateColumn Header="本实例发布" Width="90">
                                         <DataGridTemplateColumn.CellTemplate>
                                             <DataTemplate>
+                                                <!-- Takes effect at once, so it is a switch. -->
                                                 <CheckBox IsChecked="{Binding LocallyPublished, Mode=OneWay}"
                                                           IsEnabled="{Binding CanToggle}"
+                                                          Style="{StaticResource SwitchCheckBoxStyle}"
+                                                          VerticalAlignment="Center"
                                                           AutomationProperties.Name="{Binding Name, StringFormat=发布服务 {0}}"
                                                           Click="LocalPeerServiceToggle_Click"
                                                           Tag="{Binding}"
@@ -589,19 +646,19 @@
                 <TabItem x:Name="EgressTab" Header="出口分流">
                     <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                         <StackPanel>
-                            <Border Style="{StaticResource SurfacePanelStyle}" Padding="12,10" Margin="0,0,0,8">
+                            <Border Style="{StaticResource SurfacePanelStyle}" Margin="0,0,0,12">
                                 <Grid>
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="*" />
                                         <ColumnDefinition Width="Auto" />
                                     </Grid.ColumnDefinitions>
-                                    <StackPanel>
+                                    <StackPanel VerticalAlignment="Center">
                                         <StackPanel Orientation="Horizontal">
                                             <TextBlock Text="系统接管" Style="{StaticResource SectionLabelTextStyle}" />
                                             <TextBlock x:Name="EgressTakeoverStateText"
                                                        Text="已关闭"
-                                                       Margin="8,0,0,0"
-                                                       FontWeight="Bold" />
+                                                       Margin="10,0,0,0"
+                                                       Style="{StaticResource InlineStatusTextStyle}" />
                                         </StackPanel>
                                         <TextBlock x:Name="EgressTakeoverDetailText"
                                                    Margin="0,4,0,0"
@@ -611,30 +668,29 @@
                                     <Button x:Name="EgressTakeoverButton"
                                             Grid.Column="1"
                                             Content="开启接管"
-                                            Margin="12,0,0,0"
-                                            Padding="14,4"
+                                            Margin="16,0,0,0"
                                             VerticalAlignment="Center"
                                             Style="{StaticResource SecondaryButtonStyle}"
                                             Click="EgressTakeoverButton_Click" />
                                 </Grid>
                             </Border>
 
-                            <Border Style="{StaticResource SurfacePanelStyle}" Padding="12,10" Margin="0,0,0,8">
+                            <Border Style="{StaticResource SurfacePanelStyle}" Margin="0,0,0,12">
                                 <StackPanel>
                                     <TextBlock Text="添加规则" Style="{StaticResource SectionLabelTextStyle}" />
-                                    <Grid Margin="0,6,0,0">
+                                    <Grid Margin="0,10,0,0">
                                         <Grid.RowDefinitions>
                                             <RowDefinition Height="Auto" />
                                             <RowDefinition Height="Auto" />
                                         </Grid.RowDefinitions>
                                         <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="116" />
+                                            <ColumnDefinition Width="128" />
                                             <ColumnDefinition Width="*" />
                                             <ColumnDefinition Width="Auto" />
                                         </Grid.ColumnDefinitions>
                                         <TextBox x:Name="EgressMatchBox"
                                                  Grid.ColumnSpan="3"
-                                                 Margin="0,0,0,6"
+                                                 Margin="0,0,0,8"
                                                  ToolTip="IPv4 地址或网段，例如 203.0.113.0/24"
                                                  AutomationProperties.Name="规则目标" />
                                         <ComboBox x:Name="EgressActionBox"
@@ -660,32 +716,32 @@
                                                 Grid.Row="1"
                                                 Grid.Column="2"
                                                 Content="添加"
-                                                Padding="16,4"
+                                                Padding="18,0"
                                                 Style="{StaticResource PrimaryButtonStyle}"
                                                 Click="EgressAddButton_Click" />
                                     </Grid>
-                                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
-                                        <CheckBox x:Name="EgressAddFirstBox" Content="放在最前（优先匹配）" Margin="0,0,16,0" />
-                                        <CheckBox x:Name="EgressAddDisabledBox" Content="先停用" />
-                                    </StackPanel>
-                                    <TextBlock Margin="0,6,0,0"
+                                    <WrapPanel Orientation="Horizontal" Margin="0,12,0,0">
+                                        <CheckBox x:Name="EgressAddFirstBox" Content="放在最前（优先匹配）" Margin="0,0,20,4" />
+                                        <CheckBox x:Name="EgressAddDisabledBox" Content="先停用" Margin="0,0,0,4" />
+                                    </WrapPanel>
+                                    <TextBlock Margin="0,8,0,0"
                                                TextWrapping="Wrap"
                                                Style="{StaticResource CaptionTextStyle}"
                                                Text="规则只匹配 IPv4 地址和网段，按列表顺序取第一条命中的；域名规则需二期的 DNS 接管，目前不会生效。应用自带 DoH/DoT、使用系统缓存或直接写死 IP 时，域名规则不会命中。" />
                                     <TextBlock x:Name="EgressNoticeText"
-                                               Margin="0,6,0,0"
+                                               Margin="0,8,0,0"
                                                TextWrapping="Wrap"
                                                Visibility="Collapsed" />
                                 </StackPanel>
                             </Border>
 
-                            <Border Style="{StaticResource TableShellStyle}" Margin="0,0,0,8" MaxHeight="260">
+                            <Border Style="{StaticResource TableShellStyle}" Margin="0,0,0,12" MaxHeight="260">
                                 <DataGrid x:Name="EgressRuleGrid"
                                           AlternationCount="2"
                                           MinHeight="84"
                                           ItemsSource="{Binding EgressRules}">
                                     <DataGrid.Columns>
-                                        <DataGridTextColumn Header="#" Binding="{Binding Index}" Width="44" />
+                                        <DataGridTextColumn Header="#" Binding="{Binding Index}" Width="44" HeaderStyle="{StaticResource NumericColumnHeaderStyle}" ElementStyle="{StaticResource GridNumberTextBlockStyle}" />
                                         <DataGridTemplateColumn Header="目标" SortMemberPath="Match" Width="2*">
                                             <DataGridTemplateColumn.CellTemplate>
                                                 <DataTemplate>
@@ -705,19 +761,23 @@
                                                 </DataTemplate>
                                             </DataGridTemplateColumn.CellTemplate>
                                         </DataGridTemplateColumn>
-                                        <DataGridTemplateColumn Header="操作" Width="228">
+                                        <DataGridTemplateColumn Header="操作" Width="240">
                                             <DataGridTemplateColumn.CellTemplate>
                                                 <DataTemplate>
-                                                    <StackPanel Orientation="Horizontal">
-                                                        <Button Content="{Binding ToggleLabel}" Padding="8,2" Margin="0,0,4,0"
+                                                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                                        <Button Content="{Binding ToggleLabel}" Margin="0,0,4,0"
+                                                                Style="{StaticResource SmallButtonStyle}"
                                                                 Tag="{Binding}" Click="EgressToggleRule_Click" />
-                                                        <Button Content="上移" Padding="8,2" Margin="0,0,4,0"
+                                                        <Button Content="上移" Margin="0,0,4,0"
+                                                                Style="{StaticResource SmallButtonStyle}"
                                                                 IsEnabled="{Binding CanMoveUp}"
                                                                 Tag="{Binding}" Click="EgressMoveUp_Click" />
-                                                        <Button Content="下移" Padding="8,2" Margin="0,0,4,0"
+                                                        <Button Content="下移" Margin="0,0,4,0"
+                                                                Style="{StaticResource SmallButtonStyle}"
                                                                 IsEnabled="{Binding CanMoveDown}"
                                                                 Tag="{Binding}" Click="EgressMoveDown_Click" />
-                                                        <Button Content="删除" Padding="8,2"
+                                                        <Button Content="删除"
+                                                                Style="{StaticResource SmallDangerButtonStyle}"
                                                                 Tag="{Binding}" Click="EgressRemoveRule_Click" />
                                                     </StackPanel>
                                                 </DataTemplate>
@@ -727,10 +787,10 @@
                                 </DataGrid>
                             </Border>
 
-                            <Border Style="{StaticResource SurfacePanelStyle}" Padding="12,10" Margin="0,0,0,8">
+                            <Border Style="{StaticResource SurfacePanelStyle}" Margin="0,0,0,12">
                                 <StackPanel>
                                     <TextBlock Text="规则测试" Style="{StaticResource SectionLabelTextStyle}" />
-                                    <Grid Margin="0,6,0,0">
+                                    <Grid Margin="0,10,0,0">
                                         <Grid.RowDefinitions>
                                             <RowDefinition Height="Auto" />
                                             <RowDefinition Height="Auto" />
@@ -740,14 +800,13 @@
                                             <ColumnDefinition Width="Auto" />
                                         </Grid.ColumnDefinitions>
                                         <TextBox x:Name="EgressTestAddressBox"
-                                                 Margin="0,0,8,6"
+                                                 Margin="0,0,8,8"
                                                  ToolTip="要测试的 IPv4 地址或域名；连通测试只接受 IPv4 地址"
                                                  AutomationProperties.Name="测试地址" />
                                         <Button x:Name="EgressPreviewButton"
                                                 Grid.Column="1"
                                                 Content="按配置预演"
-                                                Padding="12,4"
-                                                Margin="0,0,0,6"
+                                                Margin="0,0,0,8"
                                                 Style="{StaticResource SecondaryButtonStyle}"
                                                 Click="EgressPreviewButton_Click" />
                                         <StackPanel Grid.Row="1" Orientation="Horizontal">
@@ -756,8 +815,9 @@
                                                        Margin="0,0,8,0"
                                                        Style="{StaticResource FieldLabelTextStyle}" />
                                             <TextBox x:Name="EgressTestPortBox"
-                                                     Width="72"
+                                                     Width="80"
                                                      Text="443"
+                                                     Typography.NumeralAlignment="Tabular"
                                                      ToolTip="连通测试的 TCP 端口"
                                                      AutomationProperties.Name="测试端口" />
                                         </StackPanel>
@@ -765,45 +825,53 @@
                                                 Grid.Row="1"
                                                 Grid.Column="1"
                                                 Content="连通测试"
-                                                Padding="12,4"
                                                 Style="{StaticResource SecondaryButtonStyle}"
                                                 Click="EgressConnectButton_Click" />
                                     </Grid>
                                     <TextBlock x:Name="EgressTestResultText"
-                                               Margin="0,6,0,0"
+                                               Margin="0,10,0,0"
                                                TextWrapping="Wrap"
+                                               LineHeight="22"
                                                Text="预演只按已保存的规则判断去向，不建立连接；连通测试真实连接一次，只说明能否连上，不说明走了哪条路径。" />
                                 </StackPanel>
                             </Border>
 
-                            <Border Style="{StaticResource SurfacePanelStyle}" Padding="12,10">
+                            <Border Style="{StaticResource SurfacePanelStyle}">
                                 <StackPanel>
                                     <StackPanel Orientation="Horizontal">
                                         <TextBlock Text="运行状态" Style="{StaticResource SectionLabelTextStyle}" />
-                                        <TextBlock x:Name="EgressProblemsText" Margin="8,0,0,0" FontWeight="Bold" Text="—" />
+                                        <TextBlock x:Name="EgressProblemsText"
+                                                   Margin="10,0,0,0"
+                                                   Style="{StaticResource InlineStatusTextStyle}"
+                                                   Text="—" />
                                     </StackPanel>
                                     <TextBlock x:Name="EgressSummaryText"
                                                Margin="0,4,0,0"
                                                TextWrapping="Wrap"
+                                               LineHeight="22"
+                                               Foreground="{DynamicResource TextSecondaryBrush}"
                                                Text="连接后显示本机分流规则是否生效；未连接时不读取路由表。" />
                                     <ItemsControl x:Name="EgressIssueList" ItemsSource="{Binding EgressIssues}" Margin="0,4,0,0">
                                         <ItemsControl.ItemTemplate>
                                             <DataTemplate>
-                                                <Border Style="{StaticResource InfoStripStyle}" Margin="0,4,0,0">
+                                                <Border Style="{StaticResource InfoStripStyle}" Margin="0,8,0,0">
                                                     <StackPanel>
-                                                        <TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextWrapping="Wrap" />
-                                                        <TextBlock Text="{Binding Detail}" TextWrapping="Wrap" Style="{StaticResource CaptionTextStyle}" />
+                                                        <TextBlock Text="{Binding Title}" FontWeight="Bold" LineHeight="20" TextWrapping="Wrap" />
+                                                        <TextBlock Text="{Binding Detail}" Margin="0,2,0,0" TextWrapping="Wrap" Style="{StaticResource CaptionTextStyle}" />
                                                         <TextBox Text="{Binding Code, Mode=OneWay}"
+                                                                 Margin="0,4,0,0"
                                                                  Visibility="{Binding CodeVisibility}"
                                                                  Style="{StaticResource GridCellSelectableTextBoxStyle}"
-                                                                 FontFamily="Consolas" />
+                                                                 FontFamily="{StaticResource FontMono}"
+                                                                 FontSize="12"
+                                                                 Foreground="{DynamicResource TextSecondaryBrush}" />
                                                     </StackPanel>
                                                 </Border>
                                             </DataTemplate>
                                         </ItemsControl.ItemTemplate>
                                     </ItemsControl>
                                     <TextBlock x:Name="EgressRoleText"
-                                               Margin="0,6,0,0"
+                                               Margin="0,10,0,0"
                                                TextWrapping="Wrap"
                                                Style="{StaticResource CaptionTextStyle}" />
                                 </StackPanel>
@@ -818,24 +886,25 @@
                             <RowDefinition Height="*" />
                         </Grid.RowDefinitions>
                         <Border Style="{StaticResource SurfacePanelStyle}"
-                                Padding="10"
-                                Margin="0,0,0,8">
+                                Padding="12"
+                                Margin="0,0,0,12">
                             <Grid>
                                 <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="210" />
+                                    <ColumnDefinition Width="180" />
                                     <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="64" />
-                                    <ColumnDefinition Width="84" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
                                 </Grid.ColumnDefinitions>
                                 <ComboBox x:Name="MessageTargetBox"
                                           IsEditable="True"
                                           ItemsSource="{Binding MessagePeerRoutes}"
                                           DisplayMemberPath="ClientName"
                                           SelectedValuePath="ClientName"
+                                          VerticalAlignment="Top"
                                           Margin="0,0,8,0" />
                                 <TextBox x:Name="MessageBodyBox"
                                          Grid.Column="1"
-                                         MinHeight="32"
+                                         MinHeight="36"
                                          MaxHeight="88"
                                          AcceptsReturn="True"
                                          TextWrapping="Wrap"
@@ -843,8 +912,9 @@
                                          Margin="0,0,8,0" />
                                 <Button x:Name="SendFileButton"
                                         Grid.Column="2"
-                                        Content="文件"
+                                        Content="发送文件"
                                         Margin="0,0,8,0"
+                                        VerticalAlignment="Top"
                                         Style="{StaticResource SecondaryButtonStyle}"
                                         ToolTip="发送文件（对方需为支持 STXFER 的客户端，如 Android/桌面端）"
                                         IsEnabled="False"
@@ -852,6 +922,8 @@
                                 <Button x:Name="SendMessageButton"
                                         Grid.Column="3"
                                         Content="发送"
+                                        MinWidth="72"
+                                        VerticalAlignment="Top"
                                         Style="{StaticResource PrimaryButtonStyle}"
                                         IsEnabled="False"
                                         Click="SendMessageButton_Click" />
@@ -867,6 +939,7 @@
                                         <DataGridTemplateColumn.CellTemplate>
                                             <DataTemplate>
                                                 <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Typography.NumeralAlignment="Tabular"
                                                          Text="{Binding CreatedAtText}"
                                                          ToolTip="{Binding CreatedAtText}" />
                                             </DataTemplate>
@@ -925,130 +998,122 @@
                 <TabItem Header="本机 TCP 路由">
                     <Border Style="{StaticResource TableShellStyle}">
                         <DataGrid x:Name="TcpRouteGrid"
-                                      AlternationCount="2"
-                                      ItemsSource="{Binding TcpRoutes}">
-                                <DataGrid.Columns>
-                                    <DataGridTemplateColumn Header="公网端口" SortMemberPath="PublicPort" ClipboardContentBinding="{Binding PublicPort}" Width="120">
-                                        <DataGridTemplateColumn.CellTemplate>
-                                            <DataTemplate>
-                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
-                                                         Text="{Binding PublicPort}"
-                                                         ToolTip="{Binding PublicPort}" />
-                                            </DataTemplate>
-                                        </DataGridTemplateColumn.CellTemplate>
-                                    </DataGridTemplateColumn>
-                                    <DataGridTemplateColumn Header="本机目标" SortMemberPath="Target" ClipboardContentBinding="{Binding Target, Mode=OneWay}" Width="2*">
-                                        <DataGridTemplateColumn.CellTemplate>
-                                            <DataTemplate>
-                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
-                                                         Text="{Binding Target, Mode=OneWay}"
-                                                         ToolTip="{Binding Target}" />
-                                            </DataTemplate>
-                                        </DataGridTemplateColumn.CellTemplate>
-                                    </DataGridTemplateColumn>
-                                    <DataGridTemplateColumn Header="目标地址" SortMemberPath="TargetAddress" ClipboardContentBinding="{Binding TargetAddress}" Width="2*">
-                                        <DataGridTemplateColumn.CellTemplate>
-                                            <DataTemplate>
-                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
-                                                         Text="{Binding TargetAddress}"
-                                                         ToolTip="{Binding TargetAddress}" />
-                                            </DataTemplate>
-                                        </DataGridTemplateColumn.CellTemplate>
-                                    </DataGridTemplateColumn>
-                                    <DataGridTemplateColumn Header="目标端口" SortMemberPath="TargetPort" ClipboardContentBinding="{Binding TargetPort}" Width="120">
-                                        <DataGridTemplateColumn.CellTemplate>
-                                            <DataTemplate>
-                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
-                                                         Text="{Binding TargetPort}"
-                                                         ToolTip="{Binding TargetPort}" />
-                                            </DataTemplate>
-                                        </DataGridTemplateColumn.CellTemplate>
-                                    </DataGridTemplateColumn>
-                                </DataGrid.Columns>
+                                  AlternationCount="2"
+                                  ItemsSource="{Binding TcpRoutes}">
+                            <DataGrid.Columns>
+                                <DataGridTemplateColumn Header="公网端口" SortMemberPath="PublicPort" ClipboardContentBinding="{Binding PublicPort}" Width="120" HeaderStyle="{StaticResource NumericColumnHeaderStyle}">
+                                    <DataGridTemplateColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <TextBox Style="{StaticResource GridCellNumberTextBoxStyle}"
+                                                     Text="{Binding PublicPort}"
+                                                     ToolTip="{Binding PublicPort}" />
+                                        </DataTemplate>
+                                    </DataGridTemplateColumn.CellTemplate>
+                                </DataGridTemplateColumn>
+                                <DataGridTemplateColumn Header="本机目标" SortMemberPath="Target" ClipboardContentBinding="{Binding Target, Mode=OneWay}" Width="2*">
+                                    <DataGridTemplateColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                     Text="{Binding Target, Mode=OneWay}"
+                                                     ToolTip="{Binding Target}" />
+                                        </DataTemplate>
+                                    </DataGridTemplateColumn.CellTemplate>
+                                </DataGridTemplateColumn>
+                                <DataGridTemplateColumn Header="目标地址" SortMemberPath="TargetAddress" ClipboardContentBinding="{Binding TargetAddress}" Width="2*">
+                                    <DataGridTemplateColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                     Text="{Binding TargetAddress}"
+                                                     ToolTip="{Binding TargetAddress}" />
+                                        </DataTemplate>
+                                    </DataGridTemplateColumn.CellTemplate>
+                                </DataGridTemplateColumn>
+                                <DataGridTemplateColumn Header="目标端口" SortMemberPath="TargetPort" ClipboardContentBinding="{Binding TargetPort}" Width="120" HeaderStyle="{StaticResource NumericColumnHeaderStyle}">
+                                    <DataGridTemplateColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <TextBox Style="{StaticResource GridCellNumberTextBoxStyle}"
+                                                     Text="{Binding TargetPort}"
+                                                     ToolTip="{Binding TargetPort}" />
+                                        </DataTemplate>
+                                    </DataGridTemplateColumn.CellTemplate>
+                                </DataGridTemplateColumn>
+                            </DataGrid.Columns>
                         </DataGrid>
                     </Border>
                 </TabItem>
                 <TabItem Header="本机 HTTP 路由">
                     <Border Style="{StaticResource TableShellStyle}">
                         <DataGrid x:Name="HttpRouteGrid"
-                                      AlternationCount="2"
-                                      ItemsSource="{Binding HttpRoutes}">
-                                <DataGrid.Columns>
-                                    <DataGridTemplateColumn Header="Route" SortMemberPath="Route" ClipboardContentBinding="{Binding Route}" Width="*">
-                                        <DataGridTemplateColumn.CellTemplate>
-                                            <DataTemplate>
-                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
-                                                         Text="{Binding Route}"
-                                                         ToolTip="{Binding Route}" />
-                                            </DataTemplate>
-                                        </DataGridTemplateColumn.CellTemplate>
-                                    </DataGridTemplateColumn>
-                                    <DataGridTemplateColumn Header="Target Base URL" SortMemberPath="TargetBaseUrl" ClipboardContentBinding="{Binding TargetBaseUrl}" Width="4*">
-                                        <DataGridTemplateColumn.CellTemplate>
-                                            <DataTemplate>
-                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
-                                                         Text="{Binding TargetBaseUrl}"
-                                                         ToolTip="{Binding TargetBaseUrl}" />
-                                            </DataTemplate>
-                                        </DataGridTemplateColumn.CellTemplate>
-                                    </DataGridTemplateColumn>
-                                </DataGrid.Columns>
+                                  AlternationCount="2"
+                                  ItemsSource="{Binding HttpRoutes}">
+                            <DataGrid.Columns>
+                                <DataGridTemplateColumn Header="Route" SortMemberPath="Route" ClipboardContentBinding="{Binding Route}" Width="*">
+                                    <DataGridTemplateColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                     Text="{Binding Route}"
+                                                     ToolTip="{Binding Route}" />
+                                        </DataTemplate>
+                                    </DataGridTemplateColumn.CellTemplate>
+                                </DataGridTemplateColumn>
+                                <DataGridTemplateColumn Header="Target Base URL" SortMemberPath="TargetBaseUrl" ClipboardContentBinding="{Binding TargetBaseUrl}" Width="4*">
+                                    <DataGridTemplateColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                     Text="{Binding TargetBaseUrl}"
+                                                     ToolTip="{Binding TargetBaseUrl}" />
+                                        </DataTemplate>
+                                    </DataGridTemplateColumn.CellTemplate>
+                                </DataGridTemplateColumn>
+                            </DataGrid.Columns>
                         </DataGrid>
                     </Border>
                 </TabItem>
             </TabControl>
 
+            <!-- Run log: a solid card at the foot of the page; enlarged, it covers the window. -->
             <Border x:Name="LogPanelBorder"
                     Grid.Row="2"
-                    Background="{DynamicResource LogBackgroundBrush}"
-                    BorderBrush="{DynamicResource PanelStrokeBrush}"
-                    BorderThickness="1"
-                    CornerRadius="10"
-                    Padding="10">
+                    Style="{StaticResource LogPanelStyle}">
                 <Expander Header="运行日志（诊断）" IsExpanded="False">
-                <Grid x:Name="LogContentGrid" Height="180">
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="*" />
-                    </Grid.RowDefinitions>
-                    <Grid Margin="0,0,0,6">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                            <Border Width="6"
-                                    Height="6"
-                                    CornerRadius="3"
-                                    Background="{DynamicResource PrimaryBrush}"
-                                    VerticalAlignment="Center"
-                                    Margin="0,0,7,0" />
-                            <TextBlock Text="运行日志"
-                                       FontSize="12"
-                                       Foreground="{DynamicResource TextSecondaryBrush}"
-                                       FontWeight="Bold"
-                                       VerticalAlignment="Center" />
-                        </StackPanel>
-                        <Button x:Name="LogExpandButton"
-                                Grid.Column="1"
-                                Content="放大"
-                                MinHeight="0"
-                                Height="24"
-                                Padding="10,1"
-                                FontSize="12"
-                                ToolTip="放大到整个窗口（Esc 还原）"
-                                Click="LogExpandButton_Click" />
+                    <Grid x:Name="LogContentGrid" Height="180">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                        </Grid.RowDefinitions>
+                        <Grid Margin="0,0,0,8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                <Border Width="6"
+                                        Height="6"
+                                        CornerRadius="3"
+                                        Background="{DynamicResource PrimaryBrush}"
+                                        VerticalAlignment="Center"
+                                        Margin="0,0,8,0" />
+                                <TextBlock Text="运行日志"
+                                           Style="{StaticResource OverlineTextStyle}"
+                                           VerticalAlignment="Center" />
+                            </StackPanel>
+                            <Button x:Name="LogExpandButton"
+                                    Grid.Column="1"
+                                    Content="放大"
+                                    Style="{StaticResource SmallButtonStyle}"
+                                    ToolTip="放大到整个窗口（Esc 还原）"
+                                    Click="LogExpandButton_Click" />
+                        </Grid>
+                        <ScrollViewer x:Name="LogScrollViewer"
+                                      Grid.Row="1"
+                                      Style="{StaticResource LogScrollViewerStyle}"
+                                      HorizontalScrollBarVisibility="Auto"
+                                      VerticalScrollBarVisibility="Auto">
+                            <TextBox x:Name="LogTextBox"
+                                     MinWidth="{Binding ViewportWidth, ElementName=LogScrollViewer}"
+                                     Style="{StaticResource LogTextBoxStyle}" />
+                        </ScrollViewer>
                     </Grid>
-                    <ScrollViewer x:Name="LogScrollViewer"
-                                  Grid.Row="1"
-                                  Style="{StaticResource LogScrollViewerStyle}"
-                                  HorizontalScrollBarVisibility="Auto"
-                                  VerticalScrollBarVisibility="Auto">
-                        <TextBox x:Name="LogTextBox"
-                                 MinWidth="{Binding ViewportWidth, ElementName=LogScrollViewer}"
-                                 Style="{StaticResource LogTextBoxStyle}" />
-                    </ScrollViewer>
-                </Grid>
                 </Expander>
             </Border>
         </Grid>
