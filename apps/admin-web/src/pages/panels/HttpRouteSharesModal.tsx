@@ -1,23 +1,21 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   Button,
-  Checkbox,
-  Chip,
   Input,
   Modal,
   ModalBody,
   ModalContent,
   ModalFooter,
   ModalHeader,
-  Radio,
-  RadioGroup,
   Select,
   SelectItem,
 } from "@heroui/react";
 import { adminApi } from "../../api/client";
 import type { HttpRoute } from "../../api/types";
 import { copyTextWithFeedback } from "../../lib/clipboard";
-import { formatDateTime } from "../../lib/format";
+import { formatAbsoluteTime } from "../../lib/format";
+import { Alert, Icon, RelativeTime, TableWrap, Tag } from "../../components/ui";
+import { DesignCheck, DesignRadioRow, RadioCards } from "./accessUi";
 import {
   buildCreateShareBody,
   describeAuditEntry,
@@ -142,23 +140,19 @@ export function HttpRouteSharesModal({ route, clientEnabled, isOpen, onClose }: 
         <ModalContent>
           <ModalHeader className="flex flex-col gap-1">
             <span>临时分享</span>
-            <span className="text-small font-normal text-default-500">
-              路由 <code>{route?.route}</code>（{route?.clientName}）
+            <span className="acc-dialog-sub">
+              路由 <code className="font-mono">{route?.route}</code>（{route?.clientName}）
             </span>
           </ModalHeader>
-          <ModalBody className="gap-4">
-            <div className="rounded-medium border border-default-200 bg-default-50/70 p-3 text-tiny text-default-600">
-              <p>分享不会改变路由的访问认证：路由自己的访问链接仍需用户名和密码，访客也拿不到这组密码。</p>
-              <p className="mt-1">路由被停用、改为公开或删除，客户端被停用，或创建者失去管理权时，分享立即失效且不会恢复。</p>
-            </div>
+          <ModalBody className="acc-dialog-body">
+            <Alert tone="info" title="分享不会改变路由的访问认证">
+              <p>路由自己的访问链接仍需用户名和密码，访客也拿不到这组密码。</p>
+              <p>路由被停用、改为公开或删除，客户端被停用，或创建者失去管理权时，分享立即失效且不会恢复。</p>
+            </Alert>
             {!availability.available ? (
-              <p className="rounded-medium border border-warning-200 bg-warning-50 p-3 text-small text-warning-700" role="alert">
-                {availability.reason}
-              </p>
+              <Alert tone="warning" role="alert">{availability.reason}</Alert>
             ) : blocker ? (
-              <p className="rounded-medium border border-default-200 p-3 text-small text-default-600" role="status">
-                {blocker}
-              </p>
+              <Alert tone="info" role="status">{blocker}</Alert>
             ) : (
               <ShareCreateForm
                 draft={draft}
@@ -168,69 +162,90 @@ export function HttpRouteSharesModal({ route, clientEnabled, isOpen, onClose }: 
               />
             )}
             {createdLink ? (
-              <div className="flex min-w-0 flex-col gap-2 rounded-medium border border-success-200 bg-success-50 p-3 text-small" role="status">
-                <span className="font-semibold text-success">分享链接（只显示这一次，关闭后无法再次查看）</span>
-                <code className="break-all font-mono">{createdLink}</code>
-                <div className="flex gap-2">
-                  <Button size="sm" variant="flat" onPress={() => void copyTextWithFeedback(createdLink, "分享链接已复制")}>
-                    复制链接
-                  </Button>
+              <div className="bd-alert bd-alert--success acc-share-created" role="status">
+                <Icon name="circle-check" />
+                <div className="min-w-0 flex-1">
+                  <div className="bd-alert-title">分享链接（只显示这一次，关闭后无法再次查看）</div>
+                  <code className="acc-code-line font-mono">{createdLink}</code>
                 </div>
+                <Button size="sm" variant="flat" startContent={<Icon name="copy" size={14} />} onPress={() => void copyTextWithFeedback(createdLink, "分享链接已复制")}>
+                  复制链接
+                </Button>
               </div>
             ) : null}
-            <section aria-label="分享列表">
-              <div className="mb-2 flex items-center justify-between">
-                <h3 className="text-small font-semibold">分享列表</h3>
-                <Button size="sm" variant="light" isLoading={loading} onPress={() => void load()}>
+            <section aria-label="分享列表" className="acc-dialog-section">
+              <div className="acc-dialog-section-head">
+                <h3>分享列表</h3>
+                <span className="acc-head-count bd-num">{shares.length ? `${shares.length} 个` : ""}</span>
+                <Button size="sm" variant="light" isLoading={loading} startContent={loading ? null : <Icon name="refresh" size={14} />} onPress={() => void load()}>
                   刷新
                 </Button>
               </div>
               {shares.length === 0 ? (
-                <p className="text-small text-default-500">{loading ? "加载中…" : "还没有分享"}</p>
+                <p className="acc-dialog-empty">{loading ? "正在读取分享…" : "还没有分享；在上面选好有效期后创建。"}</p>
               ) : (
-                <ul className="flex flex-col gap-2">
-                  {shares.map((share) => (
-                    <li key={share.shareId} className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-medium border border-default-200 p-2 text-small">
-                      <span className="font-medium">{share.label || "（无备注）"}</span>
-                      <Chip size="sm" variant="flat" color={share.access === "full" ? "warning" : "default"}>
-                        {share.access === "full" ? "完整访问" : "只读"}
-                      </Chip>
-                      <code className="break-all">{share.pathPrefix}</code>
-                      <span className="text-default-500">创建者 {share.createdBy}</span>
-                      <span className="text-default-500" title={share.expiresAt}>
-                        到期 {formatDateTime(share.expiresAt)}
-                        {share.status === "active" ? ` · ${shareRemaining(share.expiresAt, now)}` : ""}
-                      </span>
-                      <Chip size="sm" variant="dot" color={share.status === "active" ? "success" : "default"}>
-                        {shareStatusLabel(share)}
-                      </Chip>
-                      {share.status === "active" ? (
-                        <Button className="ml-auto" size="sm" color="danger" variant="flat" onPress={() => setRevoking(share)}>
-                          撤销
-                        </Button>
-                      ) : null}
-                    </li>
-                  ))}
-                </ul>
+                <TableWrap>
+                  <table className="bd-table bd-table--compact jd-stack acc-share-table">
+                    <thead>
+                      <tr>
+                        <th>备注</th>
+                        <th>访问</th>
+                        <th>路径</th>
+                        <th>到期</th>
+                        <th>状态</th>
+                        <th className="jd-col-actions"><span className="jd-sr-only">操作</span></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {shares.map((share) => (
+                        <tr key={share.shareId}>
+                          <td>
+                            <div className="jd-table-title">
+                              <span className={share.label ? "font-medium" : "jd-subtle"}>{share.label || "（无备注）"}</span>
+                              <span className="jd-table-sub">创建者 {share.createdBy}</span>
+                            </div>
+                          </td>
+                          <td><Tag tone={share.access === "full" ? "warning" : "neutral"} plain>{share.access === "full" ? "完整访问" : "只读"}</Tag></td>
+                          <td data-label="路径"><code className="font-mono">{share.pathPrefix}</code></td>
+                          <td data-label="到期">
+                            <span className="bd-num" title={share.expiresAt}>
+                              {formatAbsoluteTime(share.expiresAt)}
+                              {share.status === "active" ? <span className="jd-subtle"> · {shareRemaining(share.expiresAt, now)}</span> : null}
+                            </span>
+                          </td>
+                          <td><Tag tone={share.status === "active" ? "success" : "neutral"}>{shareStatusLabel(share)}</Tag></td>
+                          <td className="jd-cell-actions">
+                            {share.status === "active" ? (
+                              <Button size="sm" color="danger" variant="flat" onPress={() => setRevoking(share)}>
+                                撤销
+                              </Button>
+                            ) : null}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </TableWrap>
               )}
             </section>
-            <section aria-label="访问审计">
-              <div className="mb-2 flex items-center justify-between">
-                <h3 className="text-small font-semibold">访问审计</h3>
-                <Button size="sm" variant="light" onPress={() => void loadAudit()}>
+            <section aria-label="访问审计" className="acc-dialog-section">
+              <div className="acc-dialog-section-head">
+                <h3>访问审计</h3>
+                <span className="acc-head-count bd-num">{audit?.length ? `最近 ${audit.length} 条` : ""}</span>
+                <Button size="sm" variant="light" startContent={<Icon name="history" size={14} />} onPress={() => void loadAudit()}>
                   {audit ? "刷新审计" : "查看审计"}
                 </Button>
               </div>
               {audit ? (
                 audit.length === 0 ? (
-                  <p className="text-small text-default-500">暂无记录</p>
+                  <p className="acc-dialog-empty">还没有访问记录。</p>
                 ) : (
-                  <ul className="flex flex-col gap-1 text-tiny">
+                  <ul className="acc-audit">
                     {audit.map((entry) => (
-                      <li key={entry.auditId} className="flex flex-wrap gap-x-2">
-                        <span className="text-default-500">{formatDateTime(entry.at)}</span>
-                        <span>{entry.actor ?? "系统"}</span>
-                        <span>{describeAuditEntry(entry)}</span>
+                      <li key={entry.auditId}>
+                        <RelativeTime className="acc-audit-time" value={entry.at} />
+                        <span className="acc-audit-actor">{entry.actor ?? "系统"}</span>
+                        <span className="acc-audit-text">{describeAuditEntry(entry)}</span>
                       </li>
                     ))}
                   </ul>
@@ -243,7 +258,7 @@ export function HttpRouteSharesModal({ route, clientEnabled, isOpen, onClose }: 
               关闭
             </Button>
             {availability.available && !blocker ? (
-              <Button color="primary" isDisabled={!canCreate} isLoading={creating} onPress={() => void create()}>
+              <Button color="primary" isDisabled={!canCreate} isLoading={creating} startContent={creating ? null : <Icon name="share" />} onPress={() => void create()}>
                 创建分享
               </Button>
             ) : null}
@@ -275,31 +290,24 @@ function ShareCreateForm({
   detailCaptureEnabled: boolean;
 }) {
   return (
-    <section aria-label="创建分享" className="flex flex-col gap-3">
-      <RadioGroup
-        label="有效期（必选）"
-        orientation="horizontal"
+    <section aria-label="创建分享" className="bd-card acc-share-form">
+      <DesignRadioRow
+        legend="有效期（必选）"
         value={draft.expiry}
-        onValueChange={(expiry) => update({ expiry })}
-      >
-        {SHARE_EXPIRY_PRESETS.map((preset) => (
-          <Radio key={preset.key} value={preset.key}>
-            {preset.label}
-          </Radio>
-        ))}
-        <Radio value="custom">自定义</Radio>
-      </RadioGroup>
+        options={[...SHARE_EXPIRY_PRESETS.map((preset) => ({ key: preset.key, label: preset.label })), { key: "custom", label: "自定义" }]}
+        onChange={(expiry) => update({ expiry })}
+      />
       {draft.expiry === "custom" ? (
-        <div className="flex flex-wrap gap-2">
+        <div className="acc-share-custom">
           <Input
-            className="w-36"
+            className="acc-share-amount"
             inputMode="numeric"
             label="时长"
             value={draft.customAmount}
             onValueChange={(customAmount) => update({ customAmount })}
           />
           <Select
-            className="w-32"
+            className="acc-share-unit"
             label="单位"
             selectedKeys={[draft.customUnit]}
             onChange={(event) => update({ customUnit: (event.target.value || "hours") as ShareExpiryUnit })}
@@ -308,26 +316,27 @@ function ShareCreateForm({
             <SelectItem key="hours">小时</SelectItem>
             <SelectItem key="days">天</SelectItem>
           </Select>
-          <p className="w-full text-tiny text-default-500">5 分钟到 7 天之间；不提供永久分享，长期访问请使用路由自己的访问密码。</p>
+          <p className="bd-help acc-share-custom-help">5 分钟到 7 天之间；不提供永久分享，长期访问请使用路由自己的访问密码。</p>
         </div>
       ) : null}
-      <RadioGroup
-        label="访问方式"
-        orientation="horizontal"
-        value={draft.access}
-        onValueChange={(access) => update({ access: access === "full" ? "full" : "read", fullAccessConfirmed: false })}
-      >
-        <Radio value="read">只读（GET / HEAD）</Radio>
-        <Radio value="full">完整</Radio>
-      </RadioGroup>
-      {draft.access === "read" ? (
-        <p className="text-tiny text-default-500">只读按请求方法过滤，不能保证目标应用的 GET 请求没有副作用。</p>
-      ) : (
-        <Checkbox isSelected={draft.fullAccessConfirmed} onValueChange={(fullAccessConfirmed) => update({ fullAccessConfirmed })}>
-          我了解完整访问允许访客提交表单、修改数据和建立 WebSocket 连接
-        </Checkbox>
-      )}
-      <div className="grid gap-3 sm:grid-cols-2">
+      <RadioCards
+        legend="访问方式"
+        value={draft.access === "full" ? "full" : "read"}
+        onChange={(access) => update({ access: access === "full" ? "full" : "read", fullAccessConfirmed: false })}
+        options={[
+          { key: "read", title: "只读（GET / HEAD）", description: "按请求方法过滤，不能保证目标应用的 GET 请求没有副作用。" },
+          { key: "full", title: "完整", description: "访客可以提交表单、修改数据和建立 WebSocket 连接。" },
+        ]}
+      />
+      {draft.access === "full" ? (
+        <div className="bd-alert bd-alert--warning acc-confirm-box">
+          <Icon name="alert" />
+          <DesignCheck checked={draft.fullAccessConfirmed} onChange={(fullAccessConfirmed) => update({ fullAccessConfirmed })}>
+            我了解完整访问允许访客提交表单、修改数据和建立 WebSocket 连接
+          </DesignCheck>
+        </div>
+      ) : null}
+      <div className="acc-field-pair">
         <Input
           description="留空表示整条路由，例如 /docs/"
           label="路径前缀（可选）"
@@ -344,9 +353,9 @@ function ShareCreateForm({
         />
       </div>
       {detailCaptureEnabled ? (
-        <p className="text-tiny text-warning">该路由开启了明细采集：访客的请求内容会被记录。</p>
+        <p className="acc-publish-warn"><Icon name="alert" size={14} />该路由开启了明细采集：访客的请求内容会被记录。</p>
       ) : null}
-      {validation && draft.expiry ? <p className="text-tiny text-danger">{validation}</p> : null}
+      {validation && draft.expiry ? <p className="bd-help bd-help--error">{validation}</p> : null}
     </section>
   );
 }

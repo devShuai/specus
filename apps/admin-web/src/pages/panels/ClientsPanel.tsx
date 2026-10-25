@@ -2,7 +2,6 @@ import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { PageHeader } from "../../components/PageHeader";
 import {
   Button,
-  Chip,
   Input,
   Modal,
   ModalBody,
@@ -10,37 +9,54 @@ import {
   ModalFooter,
   ModalHeader,
   Pagination,
-  Switch,
   Textarea,
-  Table,
-  TableBody,
-  TableCell,
-  TableColumn,
-  TableHeader,
-  TableRow,
-  Tooltip,
   useDisclosure,
 } from "@heroui/react";
 import { adminApi } from "../../api/client";
 import type { Client, ClientCredential } from "../../api/types";
-import { formatBytes, formatDateTime, formatSince } from "../../lib/format";
+import { formatAbsoluteTime, formatBytes, formatElapsed } from "../../lib/format";
 import { copyTextWithFeedback } from "../../lib/clipboard";
 import { notify, notifyError } from "../../components/toast";
 import { useNowTick } from "../../hooks/useNowTick";
-import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 import { ClientDetailDrawer } from "../../components/ClientDetailDrawer";
 import { ConfirmModal } from "../../components/ConfirmModal";
-import { EmptyState } from "../../components/EmptyState";
-import { StatusChip, enabledTone, onlineTone } from "../../components/StatusChip";
 import { ClientOnboardingGuide } from "../../components/ClientOnboardingGuide";
+import { Alert, Empty, Icon, Section, TableWrap, Tag } from "../../components/ui";
 import { buildClientStartupConfig } from "../../lib/clientOnboarding";
+import { DesignSwitch, EmptyCell, ListLoading, TimeText } from "./accessUi";
 
 const PAGE_SIZE = 10;
 
 /** 在线时长自 tick 的小组件，避免整表每秒重挂载。 */
 function SinceText({ sinceMs }: { sinceMs: number }) {
   const now = useNowTick(1000);
-  return <>{formatSince(sinceMs, now)}</>;
+  return <>{formatElapsed(Math.max(0, (now - sinceMs) / 1000))}</>;
+}
+
+/** Online state of an instance: a Tag (disabled before online), and how long it has been online. */
+function ClientStatus({ client }: { client: Client }) {
+  const title = client.online && client.connectedSinceMs ? `登录于 ${formatAbsoluteTime(client.connectedSinceMs)}` : undefined;
+  return (
+    <div className="acc-status-cell">
+      <Tag tone={client.enabled && client.online ? "success" : "neutral"} plain={!client.enabled} title={title}>
+        {!client.enabled ? "停用" : client.online ? "在线" : "离线"}
+      </Tag>
+      {client.enabled && client.online && client.connectedSinceMs ? (
+        <span className="jd-table-sub bd-num" title={title}>已在线 <SinceText sinceMs={client.connectedSinceMs} /></span>
+      ) : null}
+    </div>
+  );
+}
+
+function MessageCapability({ client }: { client: Client }) {
+  const title = client.messageReceiveCapable
+    ? `附件 ${client.messageAttachmentsCapable ? "支持" : "不支持"} · 预览 ${client.messageMediaPreviewCapable ? "支持" : "不支持"}`
+    : "该客户端未上报消息能力";
+  return (
+    <Tag tone={client.messageReceiveCapable ? "info" : "neutral"} plain title={title}>
+      {client.messageReceiveCapable ? "可聊天" : "不可聊天"}
+    </Tag>
+  );
 }
 
 interface ConfirmState {
@@ -57,8 +73,9 @@ function useLocalPagination<T>(items: T[], pageSize = PAGE_SIZE) {
   const safePage = Math.min(page, totalPages);
   const paged = items.slice((safePage - 1) * pageSize, safePage * pageSize);
   const pager = totalPages > 1 ? (
-    <div className="flex justify-end">
-      <Pagination showControls page={safePage} total={totalPages} onChange={setPage} />
+    <div className="acc-pager">
+      <span className="bd-num">共 {items.length} 条</span>
+      <Pagination showControls size="sm" page={safePage} total={totalPages} onChange={setPage} />
     </div>
   ) : null;
   return { paged, pager };
@@ -239,63 +256,30 @@ export function ClientsPanel() {
     });
   };
 
-  const statusChip = (client: Client) => {
-    const tooltip = client.online && client.connectedSinceMs
-      ? `登录于 ${formatDateTime(new Date(client.connectedSinceMs).toISOString())}`
-      : undefined;
-    const chip = (
-      <StatusChip tone={onlineTone(client.online, !client.enabled)}>
-        {!client.enabled ? "停用" : client.online ? "在线" : "离线"}
-        {client.online && client.connectedSinceMs ? (
-          <>
-            {" · "}
-            <SinceText sinceMs={client.connectedSinceMs} />
-          </>
-        ) : null}
-      </StatusChip>
-    );
-    return tooltip ? <Tooltip content={tooltip}>{chip}</Tooltip> : chip;
-  };
-
-  const messageCapabilityChip = (client: Client) => (
-    <Tooltip
-      content={
-        client.messageReceiveCapable
-          ? `附件 ${client.messageAttachmentsCapable ? "支持" : "不支持"} · 预览 ${client.messageMediaPreviewCapable ? "支持" : "不支持"}`
-          : "该客户端未上报消息能力"
-      }
-    >
-      <Chip size="sm" color={client.messageReceiveCapable ? "success" : "default"} variant="flat">
-        {client.messageReceiveCapable ? "可聊天" : "不可聊天"}
-      </Chip>
-    </Tooltip>
-  );
-
   const credentialPagination = useLocalPagination(credentials);
   const clientPagination = useLocalPagination(clients);
+  const onlineCount = clients.filter((client) => client.enabled && client.online).length;
 
   return (
-    <div className="flex min-w-0 flex-col gap-5">
-      <PageHeader title="客户端" description="创建接入凭证、管理客户端实例，确认设备上线后再发布服务。" />
+    <div className="acc-page">
+      <PageHeader
+        title="客户端"
+        description="创建接入凭证、管理客户端实例，确认设备上线后再发布服务。"
+        actions={<Button variant="flat" isLoading={loadingClients || loadingCredentials} startContent={loadingClients || loadingCredentials ? null : <Icon name="refresh" />} onPress={() => void load()}>刷新</Button>}
+      />
       <ClientOnboardingGuide loading={loadingClients || loadingCredentials} error={clientsLoadError || credentialsLoadError}
-        online={clients.filter((client) => client.enabled && client.online).length} registered={clients.length} credentials={credentials.length}
+        online={onlineCount} registered={clients.length} credentials={credentials.length}
         onRefresh={() => void load()} />
-      <section className="flex min-w-0 flex-col gap-3">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h2 className="text-lg font-semibold text-foreground">接入凭证</h2>
-            <p className="text-small text-default-500">客户端启动只需要 serverBaseUrl、apiKey 和 secret；名称首次连接时自动生成，之后可在实例列表中修改。</p>
-          </div>
-          <Button className="w-full sm:w-auto" variant="flat" isLoading={loadingClients || loadingCredentials} onPress={() => void load()}>
-            刷新
-          </Button>
-        </div>
 
-        <form className="flex flex-wrap items-end gap-3" onSubmit={createCredential}>
-          <Input className="w-full sm:w-64" label="apiKey" placeholder="留空自动生成" value={apiKey} onValueChange={setApiKey} />
-          <Input className="w-full sm:w-56" label="secret" type="password" autoComplete="new-password" placeholder="留空自动生成" value={secret} onValueChange={setSecret} />
+      <Section
+        title="接入凭证"
+        description="客户端启动只需要 serverBaseUrl、apiKey 和 secret；名称首次连接时自动生成，之后可在实例列表中修改。"
+        actions={credentialsLoadError ? <Tag tone="danger">读取失败</Tag> : !loadingCredentials ? <span className="acc-head-count bd-num">{credentials.length} 个</span> : null}
+      >
+        <form className="bd-card acc-inline-form" onSubmit={createCredential} aria-label="新建接入凭证">
+          <Input label="apiKey" placeholder="team-laptop" description="留空自动生成" value={apiKey} onValueChange={setApiKey} />
+          <Input label="secret" type="password" autoComplete="new-password" description="留空自动生成；只在创建后显示一次" value={secret} onValueChange={setSecret} />
           <Input
-            className="w-full sm:w-44"
             type="number"
             label="在线实例上限"
             min={1}
@@ -304,195 +288,130 @@ export function ClientsPanel() {
             onValueChange={setMaxOnline}
             isInvalid={Boolean(maxOnlineError)}
             errorMessage={maxOnlineError}
+            description="同一凭证同时在线的实例数，1–10000"
           />
-          <Button className="h-10 w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
-            新建接入凭证
-          </Button>
+          <div className="acc-inline-form-submit">
+            <Button type="submit" color="primary" isLoading={creating} startContent={creating ? null : <Icon name="plus" />}>
+              新建接入凭证
+            </Button>
+          </div>
         </form>
 
-        {/* mobile: 卡片 */}
-        <div className="lg:hidden">
-          <MobileListCardList
-            items={credentialPagination.paged}
-            isLoading={loadingCredentials}
-            emptyContent={<EmptyState icon="clients" title="暂无接入凭证" description="创建凭证后客户端即可接入" />}
-            renderCard={(raw) => {
-              const credential = raw as ClientCredential;
-              return (
-                <MobileListCard
-                  key={credential.id}
-                  title={<span className="break-all font-mono">{credential.apiKey}</span>}
-                  subtitle={`${credential.ownerUsername || "-"} · #${credential.id}`}
-                  badges={
-                    <StatusChip tone={enabledTone(credential.enabled)}>
-                      {credential.enabled ? "启用" : "停用"}
-                    </StatusChip>
-                  }
-                  fields={[
-                    { label: "实例上限", value: credential.maxOnlineInstances },
-                    { label: "创建时间", value: formatDateTime(credential.createdAt) },
-                  ]}
-                  actions={
-                    <>
-                      <Button size="sm" variant="flat" onPress={() => openCredentialEdit(credential)}>
-                        编辑
-                      </Button>
-                      <Button size="sm" color="danger" variant="flat" onPress={() => void removeCredential(credential)}>
-                        删除
-                      </Button>
-                    </>
-                  }
-                />
-              );
-            }}
-          />
-        </div>
-
-        {/* desktop: 表格 */}
-        <div className="hidden min-w-0 overflow-x-auto lg:block">
-        <Table aria-label="接入凭证列表" isHeaderSticky removeWrapper>
-          <TableHeader>
-            <TableColumn>ID</TableColumn>
-            <TableColumn>apiKey</TableColumn>
-            <TableColumn>归属</TableColumn>
-            <TableColumn>状态</TableColumn>
-            <TableColumn>在线实例上限</TableColumn>
-            <TableColumn>创建时间</TableColumn>
-            <TableColumn>操作</TableColumn>
-          </TableHeader>
-          <TableBody items={credentialPagination.paged} isLoading={loadingCredentials} emptyContent={<EmptyState icon="clients" title="暂无接入凭证" description="创建凭证后客户端即可接入" />}>
-            {(credential) => (
-              <TableRow key={credential.id}>
-                <TableCell>{credential.id}</TableCell>
-                <TableCell className="font-mono">{credential.apiKey}</TableCell>
-                <TableCell>{credential.ownerUsername || "-"}</TableCell>
-                <TableCell>
-                  <StatusChip tone={enabledTone(credential.enabled)}>
-                    {credential.enabled ? "启用" : "停用"}
-                  </StatusChip>
-                </TableCell>
-                <TableCell>{credential.maxOnlineInstances}</TableCell>
-                <TableCell>{formatDateTime(credential.createdAt)}</TableCell>
-                <TableCell>
-                  <div className="flex gap-2">
-                    <Button size="sm" variant="flat" onPress={() => openCredentialEdit(credential)}>
-                      编辑
-                    </Button>
-                    <Button size="sm" color="danger" variant="flat" onPress={() => removeCredential(credential)}>
-                      删除
-                    </Button>
-                  </div>
-                </TableCell>
-              </TableRow>
-            )}
-          </TableBody>
-        </Table>
-        </div>
+        {loadingCredentials && credentials.length === 0 ? <ListLoading label="正在读取接入凭证…" /> : credentials.length === 0 ? (
+          <div className="bd-card"><Empty icon="key" title="还没有接入凭证" description="在上面新建一个接入凭证，保存配置后客户端就能接入。" /></div>
+        ) : (
+          <TableWrap className={loadingCredentials ? "bd-refetching" : undefined}>
+            <table className="bd-table jd-stack" aria-label="接入凭证列表">
+              <thead>
+                <tr>
+                  <th>apiKey</th>
+                  <th>归属</th>
+                  <th>状态</th>
+                  <th className="bd-col-num">在线实例上限</th>
+                  <th>创建时间</th>
+                  <th className="jd-col-actions"><span className="jd-sr-only">操作</span></th>
+                </tr>
+              </thead>
+              <tbody>
+                {credentialPagination.paged.map((credential) => (
+                  <tr key={credential.id}>
+                    <td>
+                      <div className="jd-table-title">
+                        <span className="font-mono">{credential.apiKey}</span>
+                        <span className="jd-table-sub bd-num">#{credential.id}</span>
+                      </div>
+                    </td>
+                    <td data-label="归属" className={credential.ownerUsername ? undefined : "is-empty"}>{credential.ownerUsername || <EmptyCell />}</td>
+                    <td><Tag tone={credential.enabled ? "success" : "neutral"} plain={!credential.enabled}>{credential.enabled ? "启用" : "停用"}</Tag></td>
+                    <td className="bd-col-num" data-label="实例上限">{credential.maxOnlineInstances}</td>
+                    <td data-label="创建"><TimeText value={credential.createdAt} /></td>
+                    <td className="jd-cell-actions">
+                      <div className="jd-row-actions">
+                        <Button size="sm" variant="flat" startContent={<Icon name="edit" size={14} />} onPress={() => openCredentialEdit(credential)}>
+                          编辑
+                        </Button>
+                        <Button size="sm" color="danger" variant="flat" startContent={<Icon name="trash" size={14} />} onPress={() => removeCredential(credential)}>
+                          删除
+                        </Button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </TableWrap>
+        )}
         {credentialPagination.pager}
-      </section>
+      </Section>
 
-      <section className="flex min-w-0 flex-col gap-3">
-        <div>
-          <h2 className="text-lg font-semibold text-foreground">客户端实例</h2>
-          <p className="text-small text-default-500">实例首次登录后自动注册并生成名称；可在编辑窗口中自定义，名称在全局范围内不可重复。</p>
-        </div>
-
-        {/* mobile: 卡片 */}
-        <div className="lg:hidden">
-          <MobileListCardList
-            items={clientPagination.paged}
-            isLoading={loadingClients}
-            emptyContent={<EmptyState icon="clients" title="暂无客户端实例" description="客户端首次登录后自动注册" />}
-            renderCard={(raw) => {
-              const client = raw as Client;
-              return (
-                <MobileListCard
-                  key={client.id}
-                  title={<span className="break-all">{client.clientName}</span>}
-                  subtitle={`${client.ownerUsername || "-"} · #${client.id}`}
-                  badges={statusChip(client)}
-                  fields={[
-                    { label: "版本", value: client.clientVersion || "未上报" },
-                    { label: "每分钟上限", value: client.connectionRateLimitPerMinute || "不限" },
-                    { label: "消息", value: messageCapabilityChip(client) },
-                    { label: "上传", value: formatBytes(client.uploadBytes) },
-                    { label: "下载", value: formatBytes(client.downloadBytes) },
-                    { label: "创建时间", value: formatDateTime(client.createdAt) },
-                  ]}
-                  actions={
-                    <>
-                      <Button size="sm" variant="flat" onPress={() => setDetailClient(client)}>
-                        详情
-                      </Button>
-                      <Button size="sm" variant="flat" onPress={() => openClientEdit(client)}>
-                        编辑
-                      </Button>
-                      <Button size="sm" variant="flat" onPress={() => void pushNat(client)}>
-                        下发映射
-                      </Button>
-                      <Button size="sm" color="danger" variant="flat" onPress={() => removeClient(client)}>
-                        删除
-                      </Button>
-                    </>
-                  }
-                />
-              );
-            }}
-          />
-        </div>
-
-        {/* desktop: 表格 */}
-        <div className="hidden min-w-0 overflow-x-auto lg:block">
-        <Table aria-label="客户端实例列表" isHeaderSticky removeWrapper>
-          <TableHeader>
-            <TableColumn>ID</TableColumn>
-            <TableColumn>客户端</TableColumn>
-            <TableColumn>归属</TableColumn>
-            <TableColumn>状态</TableColumn>
-            <TableColumn>版本</TableColumn>
-            <TableColumn>消息</TableColumn>
-            <TableColumn>每分钟上限</TableColumn>
-            <TableColumn>上传</TableColumn>
-            <TableColumn>下载</TableColumn>
-            <TableColumn>创建时间</TableColumn>
-            <TableColumn>操作</TableColumn>
-          </TableHeader>
-          <TableBody items={clientPagination.paged} isLoading={loadingClients} emptyContent={<EmptyState icon="clients" title="暂无客户端实例" description="客户端首次登录后自动注册" />}>
-            {(client) => (
-              <TableRow key={client.id}>
-                <TableCell>{client.id}</TableCell>
-                <TableCell>{client.clientName}</TableCell>
-                <TableCell>{client.ownerUsername || "-"}</TableCell>
-                <TableCell>{statusChip(client)}</TableCell>
-                <TableCell><span className="whitespace-nowrap font-mono text-tiny">{client.clientVersion || "未上报"}</span></TableCell>
-                <TableCell>{messageCapabilityChip(client)}</TableCell>
-                <TableCell>{client.connectionRateLimitPerMinute || "不限"}</TableCell>
-                <TableCell>{formatBytes(client.uploadBytes)}</TableCell>
-                <TableCell>{formatBytes(client.downloadBytes)}</TableCell>
-                <TableCell>{formatDateTime(client.createdAt)}</TableCell>
-                <TableCell>
-                  <div className="flex gap-2">
-                    <Button size="sm" variant="flat" onPress={() => setDetailClient(client)}>
-                      详情
-                    </Button>
-                    <Button size="sm" variant="flat" onPress={() => openClientEdit(client)}>
-                      编辑
-                    </Button>
-                    <Button size="sm" variant="flat" onPress={() => void pushNat(client)}>
-                      下发映射
-                    </Button>
-                    <Button size="sm" color="danger" variant="flat" onPress={() => removeClient(client)}>
-                      删除
-                    </Button>
-                  </div>
-                </TableCell>
-              </TableRow>
-            )}
-          </TableBody>
-        </Table>
-        </div>
+      <Section
+        title="客户端实例"
+        description="实例首次登录后自动注册并生成名称；可在编辑窗口中自定义，名称在全局范围内不可重复。"
+        actions={clientsLoadError ? <Tag tone="danger">读取失败</Tag> : !loadingClients ? (
+          <>
+            {onlineCount > 0 ? <Tag tone="success">{onlineCount} 台在线</Tag> : null}
+            <span className="acc-head-count bd-num">共 {clients.length} 台</span>
+          </>
+        ) : null}
+      >
+        {loadingClients && clients.length === 0 ? <ListLoading label="正在读取客户端实例…" /> : clients.length === 0 ? (
+          <div className="bd-card"><Empty icon="monitor" title="还没有客户端实例" description="客户端用接入凭证首次登录后自动注册，会出现在这里。" /></div>
+        ) : (
+          <TableWrap className={loadingClients ? "bd-refetching" : undefined}>
+            <table className="bd-table jd-stack acc-instances" aria-label="客户端实例列表">
+              <thead>
+                <tr>
+                  <th>客户端</th>
+                  <th>归属</th>
+                  <th>状态</th>
+                  <th>消息</th>
+                  <th className="bd-col-num">每分钟上限</th>
+                  <th className="bd-col-num">上传</th>
+                  <th className="bd-col-num">下载</th>
+                  <th>创建时间</th>
+                  <th className="jd-col-actions"><span className="jd-sr-only">操作</span></th>
+                </tr>
+              </thead>
+              <tbody>
+                {clientPagination.paged.map((client) => (
+                  <tr key={client.id}>
+                    <td>
+                      <div className="jd-table-title">
+                        <span className="font-medium">{client.clientName}</span>
+                        <span className="jd-table-sub bd-num">#{client.id}{client.clientVersion ? ` · v${client.clientVersion.replace(/^v/, "")}` : ""}</span>
+                      </div>
+                    </td>
+                    <td data-label="归属" className={client.ownerUsername ? undefined : "is-empty"}>{client.ownerUsername || <EmptyCell />}</td>
+                    <td><ClientStatus client={client} /></td>
+                    <td><MessageCapability client={client} /></td>
+                    <td className="bd-col-num" data-label="每分钟上限">{client.connectionRateLimitPerMinute || "不限"}</td>
+                    <td className="bd-col-num" data-label="上传">{formatBytes(client.uploadBytes)}</td>
+                    <td className="bd-col-num" data-label="下载">{formatBytes(client.downloadBytes)}</td>
+                    <td data-label="创建"><TimeText value={client.createdAt} /></td>
+                    <td className="jd-cell-actions">
+                      <div className="jd-row-actions">
+                        <Button size="sm" variant="flat" onPress={() => setDetailClient(client)}>
+                          详情
+                        </Button>
+                        <Button size="sm" variant="flat" onPress={() => openClientEdit(client)}>
+                          编辑
+                        </Button>
+                        <Button size="sm" variant="flat" onPress={() => void pushNat(client)}>
+                          下发映射
+                        </Button>
+                        <Button size="sm" color="danger" variant="flat" onPress={() => removeClient(client)}>
+                          删除
+                        </Button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </TableWrap>
+        )}
         {clientPagination.pager}
-      </section>
+      </Section>
 
       <EditCredentialModal disclosure={credentialModal} credential={editingCredential} onSaved={(value, currentApiKey) => {
         showSecret(value, currentApiKey);
@@ -506,22 +425,25 @@ export function ClientsPanel() {
           {() => (
             <>
               <ModalHeader>保存接入配置（凭证仅显示一次）</ModalHeader>
-              <ModalBody className="gap-3">
-                <p className="text-small text-warning">配置包含接入凭证，请只交给要接入的设备。关闭后本页不再保留；不要上传到仓库或发送给他人。</p>
-                <Input label="服务端地址" description="需能从客户端设备访问；前端与服务端分开部署时，请改为实际服务端地址。" value={serverBaseUrl} onValueChange={setServerBaseUrl} isInvalid={Boolean(startupConfigError)} errorMessage={startupConfigError} />
-                <Input label="apiKey" value={revealedApiKey} isReadOnly />
+              <ModalBody className="acc-dialog-body">
+                <Alert tone="warning" title="配置包含接入凭证">
+                  只交给要接入的设备。关闭后本页不再保留；不要上传到仓库或发送给他人。
+                </Alert>
+                <Input label="服务端地址" description="需能从客户端设备访问；前端与服务端分开部署时，改为实际服务端地址。" value={serverBaseUrl} onValueChange={setServerBaseUrl} isInvalid={Boolean(startupConfigError)} errorMessage={startupConfigError} />
+                <Input label="apiKey" value={revealedApiKey} isReadOnly classNames={{ input: "font-mono" }} />
                 <Textarea label="client.jsonc（含敏感凭证）" value={startupConfig} isReadOnly minRows={5} classNames={{ input: "font-mono text-tiny" }} />
-                <p className="text-small text-default-500">保存为 client.jsonc 后，按所选客户端的启动说明运行。实例首次登录后才会出现在列表中。</p>
+                <p className="bd-help">保存为 client.jsonc 后，按所选客户端的启动说明运行。实例首次登录后才会出现在列表中。</p>
               </ModalBody>
               <ModalFooter className="flex-wrap">
                 <Button
                   variant="flat"
                   isDisabled={!startupConfig}
+                  startContent={<Icon name="copy" />}
                   onPress={() => void copyTextWithFeedback(startupConfig, "接入配置已复制，请妥善保存")}
                 >
                   复制配置
                 </Button>
-                <Button variant="flat" isDisabled={!startupConfig} onPress={downloadStartupConfig}>下载配置</Button>
+                <Button variant="flat" isDisabled={!startupConfig} startContent={<Icon name="download" />} onPress={downloadStartupConfig}>下载配置</Button>
                 <Button color="primary" onPress={closeSecret}>
                   关闭配置
                 </Button>
@@ -602,7 +524,7 @@ function EditCredentialModal({ disclosure, credential, onSaved }: EditCredential
         {(onClose) => (
           <>
             <ModalHeader>编辑接入凭证「{credential?.apiKey}」</ModalHeader>
-            <ModalBody className="gap-3">
+            <ModalBody className="acc-dialog-body">
               <Input label="apiKey" value={apiKey} onValueChange={setApiKey} isRequired />
               <Input label="secret" type="password" autoComplete="new-password" placeholder="留空保留原 secret" value={secret} onValueChange={setSecret} />
               <Input
@@ -615,9 +537,7 @@ function EditCredentialModal({ disclosure, credential, onSaved }: EditCredential
                 isInvalid={Boolean(maxOnlineError)}
                 errorMessage={maxOnlineError}
               />
-              <Switch isSelected={enabled} onValueChange={setEnabled}>
-                启用
-              </Switch>
+              <DesignSwitch checked={enabled} onChange={setEnabled} label="启用" />
             </ModalBody>
             <ModalFooter>
               <Button variant="flat" onPress={onClose}>
@@ -737,7 +657,7 @@ function EditClientModal({ disclosure, client, onSaved }: EditClientModalProps) 
         {(onClose) => (
           <>
             <ModalHeader>编辑客户端实例「{client?.clientName}」</ModalHeader>
-            <ModalBody className="gap-3">
+            <ModalBody className="acc-dialog-body">
               <Input
                 label="客户端名称"
                 value={clientName}
@@ -762,9 +682,7 @@ function EditClientModal({ disclosure, client, onSaved }: EditClientModalProps) 
                 isInvalid={Boolean(rateError)}
                 errorMessage={rateError}
               />
-              <Switch isSelected={enabled} onValueChange={setEnabled}>
-                启用
-              </Switch>
+              <DesignSwitch checked={enabled} onChange={setEnabled} label="启用" />
             </ModalBody>
             <ModalFooter>
               <Button variant="flat" onPress={onClose}>

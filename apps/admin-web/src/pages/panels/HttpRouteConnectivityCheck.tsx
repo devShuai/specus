@@ -11,6 +11,9 @@ import {
   type ConnectivityCheckResult,
 } from "../../lib/connectivityCheck";
 import { ConnectivityCheckResultView } from "./ConnectivityCheckResult";
+import { Alert, Icon } from "../../components/ui";
+
+const OUTCOME_TAG = { succeeded: "bd-tag--success", failed: "bd-tag--danger", unverified: "bd-tag--warning" } as const;
 
 /** The latest check of one route, kept in page state only (never localStorage). */
 export interface RouteCheckState {
@@ -112,16 +115,21 @@ export function RouteCheckButtons({ route, checks, compact = false }: { route: H
         className={compact ? "min-w-0 px-2" : undefined}
         size="sm"
         variant="flat"
-        color="primary"
         isDisabled={Boolean(state?.running) || wait > 0}
         isLoading={Boolean(state?.running)}
+        startContent={state?.running || wait > 0 ? null : <Icon name="activity" size={14} />}
         onPress={() => checks.start(route, state?.path)}
       >
         {label}
       </Button>
       {state && !state.running && (state.result || state.refusal || state.error) ? (
-        <Button className={compact ? "min-w-0 px-2" : undefined} size="sm" variant="light" onPress={() => checks.open(route)}>
-          {state.result ? `${OUTCOME_LABELS[state.result.outcome]} · ${formatCheckTime(state.result.checkedAt)}` : "查看结果"}
+        <Button className={compact ? "min-w-0 px-2 acc-cc-result" : "acc-cc-result"} size="sm" variant="light" onPress={() => checks.open(route)}>
+          {state.result ? (
+            <>
+              <span className={`bd-tag ${OUTCOME_TAG[state.result.outcome] ?? ""}`}>{OUTCOME_LABELS[state.result.outcome]}</span>
+              <span className="bd-num jd-subtle"><span className="jd-sr-only">·</span>{formatCheckTime(state.result.checkedAt)}</span>
+            </>
+          ) : "查看结果"}
         </Button>
       ) : null}
     </>
@@ -147,25 +155,25 @@ export function ConnectivityCheckModal({ checks }: { checks: RouteConnectivityCh
             <ModalHeader className="flex flex-col gap-1">
               <span>连通性检查</span>
               {route ? (
-                <span className="text-small font-normal text-default-500 [overflow-wrap:anywhere]">
-                  {route.clientName} · <code>{route.route}</code>
+                <span className="acc-dialog-sub">
+                  {route.clientName} · <code className="font-mono">{route.route}</code>
                 </span>
               ) : null}
             </ModalHeader>
-            <ModalBody className="gap-3">
-              <p className="text-tiny text-default-500">
+            <ModalBody className="acc-dialog-body">
+              <p className="bd-help acc-tight">
                 从服务端经设备向目标发一次 HEAD（目标不支持时改发一次 GET），不读取响应内容、不携带凭据，最长 10 秒。
               </p>
-              {state?.running ? <p role="status">正在检查…</p> : null}
+              {state?.running ? <p role="status" className="acc-cc-running"><Icon name="loader" size={16} />正在检查…</p> : null}
               {refusal ? (
-                <p role="alert" className={refusal.unsupported ? "text-default-600" : "text-warning-700"}>
+                <Alert role="alert" tone={refusal.unsupported ? "info" : "warning"}>
                   {refusal.message}
                   {wait > 0 ? `（${wait} 秒）` : ""}
-                </p>
+                </Alert>
               ) : null}
-              {state?.error ? <p role="alert" className="text-danger-600">{state.error}</p> : null}
+              {state?.error ? <Alert role="alert" tone="danger" title="检查请求没有完成">{state.error}</Alert> : null}
               {state?.result ? <ConnectivityCheckResultView result={state.result} /> : null}
-              {!state ? <p className="text-default-500">尚未检查。点击下方按钮开始。</p> : null}
+              {!state ? <p className="jd-muted">尚未检查。用下方的“开始检查”发起一次。</p> : null}
               <Input
                 label="检查路径"
                 description="默认为 /；可以填写健康检查地址，例如 /healthz。只能在该路由的目标地址之下。"
@@ -173,11 +181,11 @@ export function ConnectivityCheckModal({ checks }: { checks: RouteConnectivityCh
                 onValueChange={setPath}
                 isInvalid={!pathValid}
                 errorMessage={pathValid ? undefined : "须以 / 开头，不含 ?、#、空白，也不能有 . 或 .. 路径段"}
-                size="sm"
+                classNames={{ input: "font-mono" }}
               />
             </ModalBody>
             <ModalFooter>
-              <Button variant="light" onPress={checks.close}>
+              <Button variant="flat" onPress={checks.close}>
                 关闭
               </Button>
               <Button

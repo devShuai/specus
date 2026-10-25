@@ -958,47 +958,6 @@ section[role="dialog"][data-slot="base"],
   background: var(--landing-action-soft, var(--app-apple-blue-soft, color-mix(in srgb, var(--accent) 10%, transparent))) !important;
 }
 
-.macos-command-row {
-  grid-template-columns: auto minmax(0, 1fr) auto;
-}
-
-.macos-command-label {
-  width: 2rem;
-}
-
-.macos-command-copy {
-  min-height: 32px;
-}
-
-@media (max-width: 420px) {
-  .macos-command-row {
-    grid-template-columns: 1fr auto;
-  }
-
-  .macos-command-label {
-    grid-column: 1;
-    grid-row: 1;
-    width: auto;
-    text-align: left;
-  }
-
-  .macos-command-code {
-    grid-column: 1 / -1;
-    grid-row: 2;
-    min-height: 32px;
-    padding: 7px 6px;
-    border-radius: 7px;
-    background: color-mix(in srgb, var(--landing-ink, currentColor) 4%, transparent);
-  }
-
-  .macos-command-copy {
-    grid-column: 2;
-    grid-row: 1;
-    min-height: 44px;
-    min-width: 44px;
-  }
-}
-
 /* Apple-style public tools: NAT detection and device transfer share one quiet workspace shell. */
 .app-apple-tool {
   min-height: 100vh;
