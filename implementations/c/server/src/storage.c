@@ -6919,6 +6919,31 @@ int st_storage_record_connection_detail_with_tenant_and_id(const char *path,
     return rc == 0 ? 0 : -1;
 }
 
+int st_storage_count_recent_connections(const char *path, const char *tenant_id, long long client_id,
+                                        const char *cutoff, long long *count)
+{
+    char normalized[ST_INSTANT_CAPACITY];
+    if (count == NULL || client_id <= 0 || st_instant_normalize(cutoff, normalized) != 0) return -1;
+    *count = 0;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    if (sqlite3_prepare_v2(db,
+            "SELECT COUNT(*) FROM connection_record WHERE tenant_id=? AND client_id=? "
+            "AND specus_instant(connected_at)>=?", -1, &stmt, NULL) == SQLITE_OK
+        && sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT) == SQLITE_OK
+        && sqlite3_bind_int64(stmt, 2, client_id) == SQLITE_OK
+        && sqlite3_bind_text(stmt, 3, normalized, -1, SQLITE_TRANSIENT) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW) {
+        *count = sqlite3_column_int64(stmt, 0);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc;
+}
+
 int st_storage_mark_connection_disconnected(const char *path,
                                             long long id,
                                             const char *disconnect_reason,

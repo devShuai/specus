@@ -8,6 +8,20 @@
 
 旧记录曾列出基线后新增的 22 类；该清单已不完整。当前提交的完整范围盘点与未完成项见下一节，下文历史表的计数仍只含原基线 79 类。
 
+## 2026-10-25 控制连接的频率限制（#301 的剩余部分）
+
+C 原先只保存客户端的 `connection_limit_per_minute`，控制登录不执行它。现按 Java `ClientAuthService.hasExceededRateLimit` 执行：在账号与凭据的启用检查之后、关闭陈旧会话与在线数检查之前，统计该账号（租户加 client id）`connected_at` 不早于 60 秒前的全部连接记录，成功与失败都算，截止点含相等值；达到正数限制即以「连接频率超过限制」拒绝，0 及以下不限，读不出计数时以「客户端连接频率状态不可用」拒绝。data 连接不受限制，并与 Java `ManagedLoginRequestHandler` 一样不再为 data 登录写成功或失败记录。拒绝记录归在已认证账号的租户与当前名称下，请求里写的名字不影响计数。
+
+C 比 Java 多做一步：控制登录在释放进程内的准入锁之前写入本次的成功或拒绝记录（管理事件仍在锁外广播），两个同时到达的控制登录不会都在计数为 0 时通过。Java 在 `authenticateNetty` 返回之后才写记录，同时到达的登录可以一起越过限制。跨实例两边都没有原子额度。连接与断开时间改为带小数的 Instant，与 Java 相同，此前截成整秒。
+
+| 内容 | 测试 |
+| --- | --- |
+| 计数 | `connection_time_reference_tests`：四种整秒/小数、规范/旧格式组合下截止点含相等值，按租户与 client id 隔离，非法截止点与缺表报错 |
+| 登录路径 | 新 ctest `connection_rate_tests`（CMake 与 Makefile 均登记），真实 HTTP 登录与 control/data socket 上六个场景：过期与他租户、他客户端的记录不计入，失败记录计入；被拒的控制登录不替换已在线的控制连接；data 连接照常登录且不写记录；限制为 0 时不限；计数表不可读时拒绝且不激活；他租户同名请求的拒绝记在实际账号下；第一条控制登录停在发布后、响应前时计数已为 1，第二条被拒 |
+| 负对照 | 同一测试对 main 的服务端运行，除「限制为 0」外五个场景都失败 |
+
+`SortableTimestampOrderingTests.connectionRateLimitFilterAndStartupClose` 因此由部分改为覆盖，该类七个方法都有对应；下方复核表、旧表外类目表与汇总随之更新。
+
 ## 2026-10-23 Redis 协调的 TLS 与 Sentinel（Issue #35）
 
 Java `PublicTransferCoordinationService` 用 `RedisURI.create(redisUri.trim())` 后 `setTimeout(命令超时)`，再以 `RedisClient.create(uri)` 建命令、发布、订阅三条连接，没有另配 `ClientOptions`/`SslOptions`，所以支持的就是 Lettuce 7.5.2 `RedisURI` 本身的全部写法。C 原先只接受 `redis://host[:port][/0..15]`，`rediss://`、Sentinel、Unix socket 与任何查询参数都拒绝启动；现在按同一套语义解析与连接，剩余差异见 API 盘点第 8 节。
@@ -71,12 +85,12 @@ Peer 信令断言接受公开格式的 0/3/6/9 位小数，并用正反例继续
 | `peerSessionExpirySweep` | `peer_session_expiry_tests`：到期瞬间关闭、已关闭记录不重复处理，七个生产入口及精确集合；查询实现不同，不声称返回 Java Repository 的分页对象。 |
 | `pairingCodeRedeem` | `pairing_expiry_tests`：恰好到期拒绝、未来三个码可消费，实际 HTTP 与数据库状态；含读后跨越到期边界。 |
 | `registrationChallengePurge` | `auth_expiry_reference_tests`：严格清理及剩余键集合；`registration_expiry_tests` 另经实际验证与账号写入检查到期拒绝。 |
-| `connectionRateLimitFilterAndStartupClose` | **部分**：`connection_time_reference_tests` 验证上下界、日期输入、公开视图、启动严格截止与退出收尾；该 Java 方法的 `countByTenantIdAndClientIdAndConnectedAtGreaterThanEqual` 及其实际连接限流路径仍欠 C 证据。不能用列表总数替代连接限流计数。 |
+| `connectionRateLimitFilterAndStartupClose` | `connection_time_reference_tests` 验证上下界、日期输入、公开视图、启动严格截止与退出收尾，以及 `countByTenantIdAndClientIdAndConnectedAtGreaterThanEqual` 对应的含相等值计数与租户/client 隔离；`connection_rate_tests` 验证实际控制登录的限流路径（2026-10-25，见本文开头一节）。 |
 | `mediaCaptureRetentionSweepAndReuse` | `media_expiry_tests`：严格早于当前时刻清理、严格未来才复用、七个公开时间的倒序视图，实际采集/S3/HTTP 路径。 |
 | `TransferExpiryOrderingTests.storageUsageAroundAWholeSecondNow` / `storageUsageAroundAFractionalNow` | `transfer_expiry_tests`：PENDING 用上传有效期、UPLOADED 用保留期，七点加权用量和跨租户/账号隔离，经实际能力快照；补齐规范/旧格式两组。 |
 | `expiryScanAndDownloadGrantsAroundAFractionalNow` | 同上：按时间顺序清理且核对对象删除、严格未来 grant 消费、单次记账与过期清理后的剩余授权集合。 |
 
-因此迁移器一类与附件到期三方法列为候选覆盖；排序类仍为部分，不能把整类七方法计为完成。旧 79 类当前断言、其他新增类、背压/HA 和真实跨 NAT 条件仍待继续完成。
+因此迁移器一类与附件到期三方法列为候选覆盖；排序类当时仍为部分，2026-10-25 补上连接限流后七方法都有对应。旧 79 类当前断言、其他新增类、背压/HA 和真实跨 NAT 条件仍待继续完成。
 
 ## 2026-10-19 附件与下载授权到期增量
 
@@ -123,7 +137,7 @@ Peer 信令断言接受公开格式的 0/3/6/9 位小数，并用正反例继续
 
 以 JDK 21 的 `JavacTask.parse` 解析上述提交的全部 `src/test/java` 源文件（不解析依赖、不执行测试）：main 有 136 个 Java 源文件，其中 128 个类包含 591 个测试注解方法（565 个 `@Test`、14 个 `@ParameterizedTest`、12 个 `@TestFactory`）。另外 8 个源文件是无上述测试注解的辅助源码。注册分支同样为 128 类，仅 `RegistrationServiceTests` 由 2 个增加到 8 个，总注解方法为 597 个。这里是静态方法声明数，**不是运行次数、参数化/动态用例数、通过数或 C 覆盖数**。
 
-旧表的79类已于2026-10-20按当前 main 的 Java 源码逐方法复核（见下方“79 个 Java 测试类”一段），不再沿用2026-10-08的历史计数。当前main另有下列50类不在旧表中（49类加2026-10-20新增的 `ClientDownloadLinkValidationVectorTests`）：前批说明4类框架/平台差异；连通性4类20方法、控制写入/会话/离线通知/指标4类8方法、HTTP流重置1类2方法、路由生命周期/失败关闭/NAT推送3类5方法、显式空快照/NAT大小与管理变更3类5方法先后补证；本节新增SQLite二进制列/真实约束2类8方法的候选对照，并逐方法说明Spring/JDBC异常转换1类4方法的平台差异，见相应新节。2026-10-20 余下24类逐方法核验完毕（#317 临时分享3类、#318 服务工作台5类、#319 产品指标/媒体采集/管理账号/注册8类、#320 数据库8类，另 #316 新增1类），核验中补测并修正了若干 C 行为（工作台身份索引、注册 `expiresAt` 精度、映射端口与 Peer 设备 IP 的唯一键）。当前50=9类平台差异+38类候选覆盖（132个注解方法）+2类按方法拆分（`PostgresSchemaMigrationTests` 5方法覆盖、5方法平台差异；`SqliteSchemaUpdateRestartTests` 1方法覆盖、1方法平台差异；均无未对应方法）+1类部分（`SortableTimestampOrderingTests` 7个注解方法，不能计为全部通过）+0类待核验；这仍不包括部分排序类的连接限流缺口及旧79类的当前断言复核。候选类内仍有明确列出的框架API差异，132不是132个独立C运行场景。表中增量是待合并C分支的候选对照状态，不是main完成率；最终提交CI须另行核验。待核验不等于C没有相应能力，同名功能也不等于覆盖已成立。
+旧表的79类已于2026-10-20按当前 main 的 Java 源码逐方法复核（见下方“79 个 Java 测试类”一段），不再沿用2026-10-08的历史计数。当前main另有下列50类不在旧表中（49类加2026-10-20新增的 `ClientDownloadLinkValidationVectorTests`）：前批说明4类框架/平台差异；连通性4类20方法、控制写入/会话/离线通知/指标4类8方法、HTTP流重置1类2方法、路由生命周期/失败关闭/NAT推送3类5方法、显式空快照/NAT大小与管理变更3类5方法先后补证；本节新增SQLite二进制列/真实约束2类8方法的候选对照，并逐方法说明Spring/JDBC异常转换1类4方法的平台差异，见相应新节。2026-10-20 余下24类逐方法核验完毕（#317 临时分享3类、#318 服务工作台5类、#319 产品指标/媒体采集/管理账号/注册8类、#320 数据库8类，另 #316 新增1类），核验中补测并修正了若干 C 行为（工作台身份索引、注册 `expiresAt` 精度、映射端口与 Peer 设备 IP 的唯一键）。当前50=9类平台差异+39类候选覆盖（139个注解方法；2026-10-25 `SortableTimestampOrderingTests` 补上连接限流后由部分转入）+2类按方法拆分（`PostgresSchemaMigrationTests` 5方法覆盖、5方法平台差异；`SqliteSchemaUpdateRestartTests` 1方法覆盖、1方法平台差异；均无未对应方法）+0类部分+0类待核验。候选类内仍有明确列出的框架API差异，139不是139个独立C运行场景。表中增量是待合并C分支的候选对照状态，不是main完成率；最终提交CI须另行核验。待核验不等于C没有相应能力，同名功能也不等于覆盖已成立。
 
 新增“无（平台差异）”只限定到说明的框架断言。不得将其扩展为存储完整性、唯一约束、并发/回滚或 HTTP 契约的豁免；尤其不能把所有 SQLite/MySQL/MariaDB 测试一律排除。关闭 #35 前仍须为当前全部参考断言补齐 C 证据或逐项的书面差异说明，并完成该 issue 的其他运行时及真实环境验收。
 
@@ -173,7 +187,7 @@ Peer 信令断言接受公开格式的 0/3/6/9 位小数，并用正反例继续
 | `management/service/NatControlSizeLimitHttpTests` | 1 | 覆盖（共享14步；候选） | `nat_sizing_reference_tests.c:sizing_management_steps` 在真实服务端逐步回放原14个HTTP操作，命中精确1MiB边界，6次400解析error并比较两配置表全部行/类型/字段/时间戳；接受的ID与字段另读回，每步实际生成的启用配置均符合预留上限。设置及填充差异见下。 |
 | `management/service/NatControlSizingVectorTests` | 2 | 覆盖（参考2方法；候选；名称仅限编码层） | 同一新程序以生产JSON构造和管理入口共用计算核验5个精确J/body/fits值及varint边界；6类参考名称经真实JSON/compact编码并解码回原值、实际body不超过预留。未据此验收C公共改名、存储或登录对长名称的接受范围。 |
 | `management/service/RegistrationServiceTests` | 8 | 覆盖（参考8方法及限定反射/Mock差异；候选；含生产修复） | `sharedJava21RootCaseVectorsMatchTheReferenceRuntime`→`unicode_java21_tests.c:main` 校验version 1、55例并逐字节比较 `st_unicode_java21_lower_root`；`registrationMvcResponsesPreserveUnicodeMaskBoundaries`→`management_crud_tests.c:test_registration_mailbox_vectors`：掩码向量全部24例（含Java选取的8例）经真实 `POST /auth/register` 为202、响应为合法UTF-8且emailMasked相等，发信回调收到规范化邮箱与请求username（本次补username）；NUL向量以原始JSON转义发送，拒绝例400“邮箱格式无效”、不发信、不留challenge，并钉住拒绝数12（本次补）；`sharedEmailNulPolicyRejectsRawInputBeforeTrim`→同一NUL回放：version 1、14例，接受例202且发信与落库邮箱等于normalized，拒绝例400“邮箱格式无效”；`sharedEmailMasksCountCodePointsAndSerializeWithoutBrokenSurrogates`→掩码回放：version 1、24例，掩码相等且掩码与整个响应为合法UTF-8/JSON；`emailLengthLimitCountsUtf16UnitsInsteadOfUtf8Bytes`→`test_registration_email_storage`：四个地址（UTF-8 254/744/500/740字节）202且完整落库，多一个单位则400“邮箱格式无效”且不发信，另验证注册完成和重复邮箱拒绝；`sharedMailboxAddressFormsMatchTheCurrentReference`→邮箱形式回放：version 1、36例，接受例normalized与masked相等，拒绝例400“邮箱格式无效”；`domainPunctuationIsNotConfusedWithValidLocalPartPunctuation`→`test_registration` 中8个域名标点地址均400“邮箱格式无效”，两个有效地址202且发信邮箱等于原文（本次补）；`challengeExpiryIsStoredSortableAndAnsweredAsAnInstant`→`test_registration_challenge_expiry`（本次新增）经HTTP注册，库中expires_at为28字符且等于响应expiresAt的规范化，响应等于其Instant.toString往返，值落在请求前后时钟+600秒之间（含亚秒），created_at/resend_available_at同源；冷却内重复请求429“请在 60/59 秒后”；以等于expires的截止purge保留、晚1秒删除。生产修复：Java用未截断的 `Instant.now()`，响应 `expiresAt.toString()` 带亚秒（存储为 `SortableInstant` 7位），C原以整秒strftime生成，现 `registration.c:st_registration_request` 改用 `st_instant_now/add_seconds/public`。Java经反射调用私有normalizeEmail/maskEmail、Mock仓储计调用次数，C经HTTP与真实SQLite观察同一结果，为限定差异。 |
-| `management/service/SortableTimestampOrderingTests` | 7 | 部分 | 六个域的到期方法及连接过滤/收尾已有逐方法证据，实际连接限流计数仍欠缺，见上方复核表。 |
+| `management/service/SortableTimestampOrderingTests` | 7 | 覆盖（参考7方法；候选） | 六个域的到期方法及连接过滤/收尾的逐方法证据见上方复核表；连接限流计数与实际控制登录路径由 `connection_time_reference_tests`、`connection_rate_tests` 补上（2026-10-25）。 |
 | `management/service/TransferExpiryOrderingTests` | 3 | 候选覆盖 | `transfer_expiry_tests` 实际额度、清理、授权消费路径的四组时间/存储边界及状态集合；最终整合 CI 另记。 |
 | `management/service/WorkbenchItemWriterTests` | 3 | 无（平台差异） | 三项检查按 JDBC 元数据选择的 upsert SQL 文本：MySQL（`ON DUPLICATE KEY UPDATE`/`GREATEST`）、PostgreSQL（`ON CONFLICT … GREATEST`）及取不到产品名时回退的 SQLite 形式；C 只用 SQLite，没有方言选择层。SQLite upsert 的实际行为（收藏保留首次时间、最近取较晚时间）由共享向量与 `test_workbench_rows_written_meanwhile` 核验。不证明 MySQL/PostgreSQL 支持。 |
 | `productmetrics/ProductMetricsModelTests` | 2 | 覆盖（参考2方法及限定单元/HTTP层差异；候选） | `product_metrics_tests.c:closed_schema_checks`：`ingestRefusesWhatTheClosedSchemaDoesNotAllow` 的全部原输入（重复schemaVersion、事件内重复mode、`1.0`、`1e0`、`]} {}`、空体、`[EVENT` 截断、`{"a":"\xff"}`）经真实处理入口均400 `PRODUCT_METRICS_INVALID` 且计数不变，前后带空白的 ` \n{"events":[…],"schemaVersion":1}\n` 为200 accepted 1并实计1条（后三者本次补）；`settingsBodyIsClosed` 的11个原body逐一PUT均400 INVALID且开关不变，`{"disclosureVersion":2,"enabled":true}` 被解析后由披露校验答400 `DISCLOSURE_REQUIRED`，`{"enabled":false}` 200且实际关闭（本次补）。Java直接断言 `parseIngest/parseSettingsUpdate` 的返回值（如 `SettingsUpdate(true,"2")`）；C无独立解析API，只能经HTTP观察解析后的下一步检查结果。 |

@@ -251,6 +251,7 @@ struct specus_session {
     int control_fd;
     st_tls_connection *tls_connection;
     int is_data_connection;
+    st_storage_client login_account;
     /*
      * Settled by the login before the connection is published, and fixed from then on but for the
      * route set a runtime NAT_CONTROL push replaces (apply_runtime_route_config): mappings,
@@ -1456,25 +1457,34 @@ static void fill_connection_event(st_storage_connection *connection,
     connection->success = success;
 }
 
-static void record_login_failure_event(const server_config *config,
-                                       const char *client_name,
-                                       const char *remote_address,
-                                       const char *reason)
+static int current_connection_timestamp(char out[64])
 {
+    char stored[ST_INSTANT_CAPACITY];
+    return st_instant_now(stored) == 0 ? st_instant_public(stored, out, 64U) : -1;
+}
+
+static int record_login_failure(const specus_session *session,
+                                const char *client_name,
+                                const char *remote_address,
+                                const char *reason,
+                                st_storage_connection *connection)
+{
+    const server_config *config = &session->config;
+    const st_storage_client *account = &session->login_account;
+    const char *tenant = account->id > 0 ? account->tenant_id : config->tenant_id;
     if (config->database_path[0] == '\0') {
-        return;
+        return 0;
     }
     char timestamp[64];
-    if (current_utc_timestamp(timestamp) != 0) {
-        return;
+    if (current_connection_timestamp(timestamp) != 0) {
+        return 0;
     }
-    const char *effective_name = client_name != NULL && *client_name != '\0'
-        ? client_name
-        : config->client_name;
-    long long client_id = strcmp(effective_name, config->client_name) == 0 ? config->client_id : 0;
+    const char *effective_name = account->id > 0 ? account->client_name
+        : (client_name != NULL && *client_name != '\0' ? client_name : config->client_name);
+    long long client_id = account->id > 0 ? account->id : 0;
     long long record_id = 0;
     if (st_storage_record_connection_detail_with_tenant_and_id(config->database_path,
-                                                               config->tenant_id,
+                                                               tenant,
                                                                client_id,
                                                                effective_name,
                                                                NULL,
@@ -1485,10 +1495,9 @@ static void record_login_failure_event(const server_config *config,
                                                                timestamp,
                                                                timestamp,
                                                                &record_id) != 0) {
-        return;
+        return 0;
     }
-    st_storage_connection connection;
-    fill_connection_event(&connection,
+    fill_connection_event(connection,
                           config,
                           record_id,
                           effective_name,
@@ -1498,8 +1507,9 @@ static void record_login_failure_event(const server_config *config,
                           "LOGIN_FAILURE",
                           timestamp,
                           timestamp);
-    connection.client_id = client_id;
-    st_admin_broadcast_connection_event(config->tenant_id, "created", &connection);
+    connection->client_id = client_id;
+    snprintf(connection->tenant_id, sizeof(connection->tenant_id), "%s", tenant);
+    return 1;
 }
 
 /*
@@ -1519,12 +1529,12 @@ static void record_client_online_milestone(const specus_session *session)
     }
 }
 
-static void record_login_success_event(specus_session *session)
+static void record_login_success(specus_session *session)
 {
     if (session->config.database_path[0] == '\0') {
         return;
     }
-    if (current_utc_timestamp(session->connected_at) != 0) {
+    if (current_connection_timestamp(session->connected_at) != 0) {
         return;
     }
     long long record_id = 0;
@@ -1544,10 +1554,15 @@ static void record_login_success_event(specus_session *session)
         return;
     }
     session->connection_record_id = record_id;
+}
+
+static void broadcast_login_success_event(const specus_session *session)
+{
+    if (session->connection_record_id <= 0 || session->connected_at[0] == '\0') return;
     st_storage_connection connection;
     fill_connection_event(&connection,
                           &session->config,
-                          record_id,
+                          session->connection_record_id,
                           session->config.client_name,
                           session->remote,
                           1,
@@ -1566,7 +1581,7 @@ static void record_session_disconnected_event(specus_session *session, const cha
         return;
     }
     char disconnected_at[64];
-    if (current_utc_timestamp(disconnected_at) != 0) {
+    if (current_connection_timestamp(disconnected_at) != 0) {
         return;
     }
     const char *disconnect_reason = nonempty_text(reason);
@@ -4043,9 +4058,29 @@ static int verify_database_login(specus_session *session, const st_login_request
         *reason = "客户端不存在";
         return 0;
     }
+    /* Policy refusals belong to this authenticated account, regardless of the requested name. */
+    session->login_account = client;
     if (!client.enabled || !credential.enabled) {
         *reason = "客户端已停用";
         return 0;
+    }
+
+    if (!session->is_data_connection && client.connection_rate_limit_per_minute > 0) {
+        char current[ST_INSTANT_CAPACITY], cutoff[ST_INSTANT_CAPACITY];
+        long long recent = 0;
+        if (st_instant_now(current) != 0 || st_instant_add_seconds(current, -60, cutoff) != 0) {
+            *reason = "服务器时间不可用";
+            return 0;
+        }
+        if (st_storage_count_recent_connections(config->database_path, client.tenant_id, client.id,
+                                                cutoff, &recent) != 0) {
+            *reason = "客户端连接频率状态不可用";
+            return 0;
+        }
+        if (recent >= client.connection_rate_limit_per_minute) {
+            *reason = "连接频率超过限制";
+            return 0;
+        }
     }
 
     int online_count = 0;
@@ -6074,6 +6109,8 @@ static void *client_thread(void *arg)
             const char *reason = NULL;
             displaced_sessions displaced = {.count = 0U};
             int control_login = !session->is_data_connection;
+            st_storage_connection failure_event;
+            int failure_recorded = 0;
             st_buffer nat_control = {0};
             size_t nat_control_tcp_routes = 0U;
             size_t nat_control_http_routes = 0U;
@@ -6102,6 +6139,11 @@ static void *client_thread(void *arg)
                 }
             }
             if (control_login) {
+                /* The next control admission must see this attempt even while its response is
+                 * blocked. Publish its management event later, outside the admission lock. */
+                if (logged_in) record_login_success(session);
+                else failure_recorded = record_login_failure(session, request.client_name, session->remote,
+                                                             reason == NULL ? "登录失败" : reason, &failure_event);
                 pthread_mutex_unlock(&control_admission_lock);
             }
             if (logged_in) {
@@ -6122,6 +6164,10 @@ static void *client_thread(void *arg)
                 st_buffer_free(&nat_control);
             }
             pthread_mutex_unlock(&session->send_lock);
+            if (logged_in && control_login) broadcast_login_success_event(session);
+            else if (failure_recorded) {
+                st_admin_broadcast_connection_event(failure_event.tenant_id, "created", &failure_event);
+            }
             release_displaced_sessions(&displaced);
             if (response_rc != 0) {
                 st_login_request_free(&request);
@@ -6132,10 +6178,6 @@ static void *client_thread(void *arg)
                        request.client_name == NULL ? "" : request.client_name,
                        session->remote,
                        reason == NULL ? "" : reason);
-                record_login_failure_event(&session->config,
-                                           request.client_name,
-                                           session->remote,
-                                           reason == NULL ? "登录失败" : reason);
                 st_login_request_free(&request);
                 break;
             }
@@ -6143,7 +6185,6 @@ static void *client_thread(void *arg)
                    session->is_data_connection ? "data" : "control",
                    session->config.client_name, session->remote);
             if (!session->is_data_connection) {
-                record_login_success_event(session);
                 record_client_online_milestone(session);
                 if (nat_control_rc != 0) {
                     /*

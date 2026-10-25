@@ -81,8 +81,24 @@ static int run(int fractional, int legacy)
     CHECK(sqlite3_step(stmt) == SQLITE_DONE); sqlite3_finalize(stmt); sqlite3_close(db);
     CHECK(st_storage_close_open_connections_before(path, cutoffs[fractional], "SERVER_RESTARTED", cutoffs[fractional], &closed) == 0 && closed == 0);
     CHECK(st_storage_close_open_connections(path, "SERVER_SHUTDOWN", cutoffs[fractional], &closed) == 0 && closed == 4);
+    long long recent = -1;
+    CHECK(st_storage_count_recent_connections(path, "t1", client.id, cutoffs[fractional], &recent) == 0 && recent == 4);
+    CHECK(st_storage_record_connection_detail_with_tenant_and_id(path, "t1", client.id, client.client_name,
+        NULL, "127.0.0.1", 0, "policy refusal", "LOGIN_FAILURE", cutoffs[fractional], cutoffs[fractional], NULL) == 0);
+    CHECK(st_storage_record_connection_detail_with_tenant_and_id(path, "t2", client.id, client.client_name,
+        NULL, "127.0.0.1", 1, NULL, NULL, cutoffs[fractional], NULL, NULL) == 0);
+    CHECK(st_storage_record_connection_detail_with_tenant_and_id(path, "t1", client.id + 1, "other-client",
+        NULL, "127.0.0.1", 1, NULL, NULL, cutoffs[fractional], NULL, NULL) == 0);
+    CHECK(st_storage_count_recent_connections(path, "t1", client.id, cutoffs[fractional], &recent) == 0 && recent == 5);
+    CHECK(st_storage_count_recent_connections(path, "t2", client.id, cutoffs[fractional], &recent) == 0 && recent == 1);
+    CHECK(st_storage_count_recent_connections(path, "t1", client.id + 1, cutoffs[fractional], &recent) == 0 && recent == 1);
+    CHECK(st_storage_count_recent_connections(path, "t2", client.id + 1, cutoffs[fractional], &recent) == 0 && recent == 0);
+    CHECK(st_storage_count_recent_connections(path, "t1", client.id, "invalid", &recent) != 0);
+    CHECK(sqlite3_open(path, &db) == SQLITE_OK && sqlite3_exec(db, "DROP TABLE connection_record", NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(db);
+    CHECK(st_storage_count_recent_connections(path, "t1", client.id, cutoffs[fractional], &recent) != 0);
     unlink(path);
-    printf("connection time: fractional=%d legacy=%d actual writers/startup migration/lower upper visible views/strict restart/all shutdown passed\n", fractional, legacy);
+    printf("connection time: fractional=%d legacy=%d actual writers/startup migration/lower upper visible views/strict restart/all shutdown/inclusive scoped rate counts passed\n", fractional, legacy);
     return 0;
 }
 
