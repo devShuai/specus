@@ -663,6 +663,9 @@ func TestWSSpecusSendCredit(t *testing.T) {
 	}
 }
 
+// TestWSSpecusBrowserCloseStopsWaitingWhenClientWithholdsCredit 客户端不回 credit：浏览器的 CLOSE
+// 转发不出去，超时后以 RST 31（WebSocket close credit timeout）结束流，不发 CLOSE 与 FIN，
+// 同 C、.NET 与 Java。
 func TestWSSpecusBrowserCloseStopsWaitingWhenClientWithholdsCredit(t *testing.T) {
 	h := newWSHarness(t)
 	if !h.specus.takeSendCredit(context.Background(), wsInitialWindowBytes) {
@@ -678,13 +681,38 @@ func TestWSSpecusBrowserCloseStopsWaitingWhenClientWithholdsCredit(t *testing.T)
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("browser close waited too long for withheld credit: %s", elapsed)
 	}
-	if h.finishes.Load() != 1 {
-		t.Fatalf("FIN count = %d, want 1", h.finishes.Load())
-	}
+	h.awaitClosed(t)
 	select {
-	case <-h.closed:
-	case <-time.After(time.Second):
-		t.Fatal("specus did not close after credit timeout")
+	case reset := <-h.resets:
+		if reset.code != 31 || reset.reason != "WebSocket close credit timeout" {
+			t.Fatalf("RST = %d %q, want 31 %q", reset.code, reset.reason, "WebSocket close credit timeout")
+		}
+	default:
+		t.Fatalf("stream was not reset; FIN count %d, %d SWS2 frames", h.finishes.Load(), len(h.frames))
+	}
+	if h.finishes.Load() != 0 || len(h.frames) != 0 {
+		t.Fatalf("reset stream also got FIN count %d and %d SWS2 frames", h.finishes.Load(), len(h.frames))
+	}
+}
+
+// TestWSSpecusBrowserProtocolErrorClosesWith1002 浏览器发了 RSV1 置位的帧：gorilla 判为协议错误，
+// 以 1002 关闭浏览器，客户端收到 SWS2 CLOSE 1002（invalid WebSocket frame）+ FIN，同 C/Java/.NET
+// （此前为 1011）。
+func TestWSSpecusBrowserProtocolErrorClosesWith1002(t *testing.T) {
+	h, browser := newGorillaBrowserWSHarness(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go h.specus.ReadLoop(ctx)
+
+	// FIN + RSV1 + 文本帧，带掩码、空负载：没有协商扩展时 RSV1 必须为 0。
+	if _, err := browser.NetConn().Write([]byte{0xC1, 0x80, 1, 2, 3, 4}); err != nil {
+		t.Fatalf("write frame with RSV1: %v", err)
+	}
+
+	h.expectCloseAndFin(t, gorillaws.CloseProtocolError, "invalid WebSocket frame")
+	_ = browser.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, _, err := browser.ReadMessage(); !gorillaws.IsCloseError(err, gorillaws.CloseProtocolError) {
+		t.Fatalf("browser read = %v, want CLOSE 1002", err)
 	}
 }
 

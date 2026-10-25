@@ -103,7 +103,7 @@ class WebSocketSpecusHandlerTests {
 
             NatMessagePacket reset = fixture.control.readOutbound();
             assertThat(reset.getNatMessageType()).isEqualTo(NatMessageType.RST);
-            assertThat(reset.getValue()).isEqualTo(8);
+            assertThat(reset.getValue()).isEqualTo(WebSocketSpecusHandler.RST_BROWSER_GONE);
             assertThat(reset.getMetaData()).containsEntry(
                     "reason", "websocket close credit timeout");
             assertThat((Object) fixture.control.readOutbound()).isNull();

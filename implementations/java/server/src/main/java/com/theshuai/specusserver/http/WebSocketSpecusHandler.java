@@ -484,11 +484,14 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
             if (error == null) {
                 return;
             }
-            Throwable cause = unwrap(error);
-            String resetReason = cause instanceof TimeoutException
-                    ? "websocket close credit timeout"
-                    : "websocket close send failed";
-            flow.reset(streamId, 8, resetReason);
+            // A device that gives no credit for the CLOSE within the timeout gets the stream reset
+            // with RST_BROWSER_GONE, as the C, .NET and Go servers do: the browser has gone and
+            // its close handshake never reached the device.
+            if (unwrap(error) instanceof TimeoutException) {
+                flow.reset(streamId, RST_BROWSER_GONE, "websocket close credit timeout");
+            } else {
+                flow.reset(streamId, 8, "websocket close send failed");
+            }
         });
     }
 
