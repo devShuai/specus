@@ -519,17 +519,42 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
         Assert.Equal("upstream gone", received.Result.CloseStatusDescription);
         await socket.CloseOutputAsync(WebSocketCloseStatus.EndpointUnavailable, "upstream gone",
             cancellation.Token);
-        await AssertWindowCreditAsync(session.Writer, opened.StreamId, encodedClose.Length,
-            cancellation.Token);
 
-        var returnedClose = await session.Writer.ReadAsync(
-            packet => IsCloseData(packet, opened.StreamId), cancellation.Token);
+        // The credit for the client's CLOSE goes out after that CLOSE reaches the browser, and
+        // the browser's answering CLOSE and the FIN after it can overtake it, so the three are
+        // taken in whatever order they come.
+        NatMessagePacket? update = null;
+        NatMessagePacket? returnedClose = null;
+        NatMessagePacket? fin = null;
+        while (update is null || returnedClose is null || fin is null)
+        {
+            var packet = await session.Writer.ReadAsync(candidate =>
+                    candidate.StreamId == opened.StreamId
+                    && (candidate.NatMessageType is NatMessageType.WindowUpdate or NatMessageType.Fin
+                        || IsCloseData(candidate, opened.StreamId)),
+                cancellation.Token);
+            switch (packet.NatMessageType)
+            {
+                case NatMessageType.WindowUpdate:
+                    update = packet;
+                    break;
+                case NatMessageType.Fin:
+                    fin = packet;
+                    break;
+                default:
+                    returnedClose = packet;
+                    break;
+            }
+        }
+        Assert.Equal((uint)encodedClose.Length, update.Value);
         var returnedFrame = WebSocketSpecusFrame.Decode(returnedClose.Data!);
         Assert.Equal((ushort)WebSocketCloseStatus.EndpointUnavailable, returnedFrame.CloseCode);
         Assert.Equal("upstream gone", Encoding.UTF8.GetString(returnedFrame.Payload));
-        await session.Writer.ReadAsync(packet => packet.NatMessageType == NatMessageType.Fin
-                                                 && packet.StreamId == opened.StreamId,
-            cancellation.Token);
+        var written = session.Writer.Snapshot().ToList();
+        Assert.True(written.FindIndex(packet => IsCloseData(packet, opened.StreamId))
+                    < written.FindIndex(packet => packet.NatMessageType == NatMessageType.Fin
+                                                  && packet.StreamId == opened.StreamId),
+            "the returned CLOSE goes out before the FIN");
 
         await Task.Delay(100, cancellation.Token);
         Assert.Single(session.Writer.Snapshot(), packet => IsCloseData(packet, opened.StreamId));
