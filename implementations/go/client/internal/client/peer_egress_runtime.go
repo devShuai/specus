@@ -372,10 +372,12 @@ func (r *egressRuntime) handleSegment(consumer int64, segment tcpSegment, now ti
 		return
 	}
 	if segment.has(tcpFlagSYN) && !segment.has(tcpFlagACK) && handle.conn.state != tcpStateSynReceived {
-		// A new connection's SYN on a four-tuple this egress still holds. The state machine answers
-		// it with a reset carrying no ACK, which a socket in SYN-SENT ignores, so the application
-		// waits out its SYN timer (#256). Logged with what the held flow was, without the tuple,
-		// so the next occurrence shows where it came from.
+		// A new connection's SYN on a four-tuple this egress still holds, and canReopen did not take
+		// it: the flow is not in TIME_WAIT, or the SYN does not clear the old window. The state
+		// machine answers it with an ACK outside the window and a reset inside it; a socket in
+		// SYN-SENT ignores both and waits out its SYN timer, which was #256 before TIME_WAIT reuse.
+		// Logged with what the held flow was, without the tuple, so the next occurrence shows where
+		// it came from.
 		r.logger.Printf("[peer-egress] new SYN met an existing flow consumer=%d state=%s lingering=%t age=%s idle=%s toRemote=%d fromRemote=%d",
 			consumer, handle.conn.state, flow.Lingering, now.Sub(flow.OpenedAt).Round(time.Millisecond),
 			now.Sub(flow.LastSeen).Round(time.Millisecond), flow.BytesToRemote, flow.BytesFromRemote)

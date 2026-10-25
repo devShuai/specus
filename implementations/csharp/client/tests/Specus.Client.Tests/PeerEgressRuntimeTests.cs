@@ -635,10 +635,10 @@ public partial class PeerEgressRuntimeTests
     }
 
     /// <summary>
-    /// The #256 signature: a new connection's SYN on a four-tuple the egress still holds is answered
-    /// with a reset without ACK, which the consumer's socket ignores. The egress logs what it was
-    /// holding, so the next occurrence in the lab says where the flow came from, and leaves the tuple
-    /// out of the log.
+    /// The #256 signature: a new connection's SYN on a four-tuple the egress still holds. An
+    /// established flow is not reopened (only TIME_WAIT is), so a SYN outside its window is answered
+    /// with an ACK, which the consumer's socket ignores. The egress logs what it was holding, so the
+    /// next occurrence in the lab says where the flow came from, and leaves the tuple out of the log.
     /// </summary>
     [Fact]
     public void LogsANewSynMeetingAHeldFlow()
@@ -656,7 +656,7 @@ public partial class PeerEgressRuntimeTests
 
         var answers = harness.Segments().Skip(before).ToList();
         Assert.Single(answers);
-        Assert.Equal(PeerEgressSegment.FlagRst, answers[0].Flags);
+        Assert.Equal(PeerEgressSegment.FlagAck, answers[0].Flags);
         Assert.Equal(1, harness.DialCount);
         var line = logger.Lines.FirstOrDefault(l => l.Contains("new SYN met an existing flow")) ?? "";
         Assert.Contains("consumer=7 state=Established lingering=False age=2000ms", line);

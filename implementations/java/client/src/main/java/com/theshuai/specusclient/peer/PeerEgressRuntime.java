@@ -487,10 +487,12 @@ final class PeerEgressRuntime {
             }
             if (segment.has(PeerEgressSegment.FLAG_SYN) && !segment.has(PeerEgressSegment.FLAG_ACK)
                     && handle.connection().state() != PeerEgressTcpConnection.State.SYN_RECEIVED) {
-                // A new connection's SYN on a four-tuple this egress still holds. The state machine
-                // answers it with a reset carrying no ACK, which a socket in SYN-SENT ignores, so the
-                // application waits out its SYN timer (#256). Logged with what the held flow was,
-                // without the tuple, so the next occurrence shows where it came from.
+                // A new connection's SYN on a four-tuple this egress still holds, and canReopen did
+                // not take it: the flow is not in TIME_WAIT, or the SYN does not clear the old window.
+                // The state machine answers it with an ACK outside the window and a reset inside it; a
+                // socket in SYN-SENT ignores both and waits out its SYN timer, which was #256 before
+                // TIME_WAIT reuse. Logged with what the held flow was, without the tuple, so the next
+                // occurrence shows where it came from.
                 log.info("[peer-egress] new SYN met an existing flow consumer={} state={} lingering={} age={}ms idle={}ms toRemote={} fromRemote={}",
                         consumer, handle.connection().state(), flow.lingering, nowMs - flow.openedAtMs,
                         nowMs - flow.lastSeenMs, flow.bytesToRemote, flow.bytesFromRemote);

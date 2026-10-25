@@ -305,9 +305,11 @@ func TestEgressRuntimeOpensAndForwardsATCPFlow(t *testing.T) {
 	}
 }
 
-// The #256 signature: a new connection's SYN on a four-tuple the egress still holds is answered with
-// a reset without ACK, which the consumer's socket ignores. The egress logs what it was holding, so
-// the next occurrence in the lab says where the flow came from, and leaves the tuple out of the log.
+// The #256 signature: a new connection's SYN on a four-tuple the egress still holds. An established
+// flow is not reopened (only TIME_WAIT is, see peer_egress_timewait_reuse_test.go), so a SYN outside
+// its window is answered with an ACK, which the consumer's socket ignores. The egress logs what it
+// was holding, so the next occurrence in the lab says where the flow came from, and leaves the tuple
+// out of the log.
 func TestEgressRuntimeLogsANewSynMeetingAHeldFlow(t *testing.T) {
 	harness := newEgressHarness(t)
 	var logged strings.Builder
@@ -333,7 +335,7 @@ func TestEgressRuntimeLogsANewSynMeetingAHeldFlow(t *testing.T) {
 	harness.runtime.handleFrame(7, egressFrameFor(buildTCPSegment(again)), flowEpoch.Add(2*time.Second))
 
 	answers := harness.segments()[before:]
-	if len(answers) != 1 || answers[0].Flags != tcpFlagRST || harness.dialCount() != 1 {
+	if len(answers) != 1 || answers[0].Flags != tcpFlagACK || harness.dialCount() != 1 {
 		t.Fatalf("a SYN on a held four-tuple: answers %+v, dialed %d times", answers, harness.dialCount())
 	}
 	logMu.Lock()

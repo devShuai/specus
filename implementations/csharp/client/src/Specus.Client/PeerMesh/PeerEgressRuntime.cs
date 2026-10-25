@@ -491,10 +491,12 @@ internal sealed class PeerEgressRuntime
             if (segment.Has(PeerEgressSegment.FlagSyn) && !segment.Has(PeerEgressSegment.FlagAck)
                 && handle.Connection.CurrentState != PeerEgressTcpConnection.State.SynReceived)
             {
-                // A new connection's SYN on a four-tuple this egress still holds. The state machine
-                // answers it with a reset carrying no ACK, which a socket in SYN-SENT ignores, so the
-                // application waits out its SYN timer (#256). Logged with what the held flow was,
-                // without the tuple, so the next occurrence shows where it came from.
+                // A new connection's SYN on a four-tuple this egress still holds, and CanReopen did
+                // not take it: the flow is not in TIME_WAIT, or the SYN does not clear the old window.
+                // The state machine answers it with an ACK outside the window and a reset inside it; a
+                // socket in SYN-SENT ignores both and waits out its SYN timer, which was #256 before
+                // TIME_WAIT reuse. Logged with what the held flow was, without the tuple, so the next
+                // occurrence shows where it came from.
                 _logger?.LogInformation(
                     "[peer-egress] new SYN met an existing flow consumer={Consumer} state={State} lingering={Lingering} age={Age}ms idle={Idle}ms toRemote={ToRemote} fromRemote={FromRemote}",
                     consumer, handle.Connection.CurrentState, flow.Lingering, nowMs - flow.OpenedAtMs,

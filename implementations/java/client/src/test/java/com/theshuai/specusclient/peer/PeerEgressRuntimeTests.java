@@ -641,10 +641,10 @@ class PeerEgressRuntimeTests {
     }
 
     /**
-     * The #256 signature: a new connection's SYN on a four-tuple the egress still holds is answered
-     * with a reset without ACK, which the consumer's socket ignores. The egress logs what it was
-     * holding, so the next occurrence in the lab says where the flow came from, and leaves the tuple
-     * out of the log.
+     * The #256 signature: a new connection's SYN on a four-tuple the egress still holds. An
+     * established flow is not reopened (only TIME_WAIT is), so a SYN outside its window is answered
+     * with an ACK, which the consumer's socket ignores. The egress logs what it was holding, so the
+     * next occurrence in the lab says where the flow came from, and leaves the tuple out of the log.
      */
     @Test
     void logsANewSynMeetingAHeldFlow() {
@@ -668,7 +668,7 @@ class PeerEgressRuntimeTests {
 
             List<PeerEgressSegment.Segment> answers = harness.segments().subList(before, harness.segments().size());
             assertEquals(1, answers.size(), "one answer to the SYN");
-            assertEquals(PeerEgressSegment.FLAG_RST, answers.get(0).flags(), "a reset without ACK");
+            assertEquals(PeerEgressSegment.FLAG_ACK, answers.get(0).flags(), "an ACK for a SYN outside the window");
             assertEquals(1, harness.dialCount(), "the held flow is not dialled again");
             String text = appender.list.stream().map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage)
                     .filter(message -> message.contains("new SYN met an existing flow"))
