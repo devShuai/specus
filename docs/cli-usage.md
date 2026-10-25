@@ -24,7 +24,7 @@ dotnet specus-client.dll ui --config ./client.jsonc --no-open
 - 管理页本身不会登录、探测内网或启动更新器。关闭浏览器不停止隧道；终端 Ctrl+C 退出管理并断开其拥有的连接。每个配置只允许一个 `ui` 管理进程；崩溃留下的 `.specus-cli/*ui.lock` 包含 PID，先确认进程已退出再手工移除，不能对运行中的进程强行清锁。
 - HTTP / 控制认证 / 数据通道就绪分开呈现；设备与服务来自目录，不代表已探测目标。管理服务不可达时清除页面的在线标记，避免旧状态冒充当前状态。
 - 「连接与服务」页的**出口分流**面板显示与 `egress` 命令相同的内容：逐条列出没生效的规则、没装上的路由、离线的出口设备和路由下发错误，其余只计数；本机是否正作为出口及其拒绝计数。管理服务不可达时面板清空并注明已过期。系统接管未开启而规则已保存时，面板直接说明"均未生效"而不逐条列为问题。未连接时不读取路由表。
-- 「出口规则」页编辑规则与系统接管开关：添加（会被拒绝的规则不写入）、启用/停用、上移/下移、删除，开启接管前先确认其影响；另可预演一个 IPv4 地址的去向（不建连）。与 `egress rule`/`egress enable|disable` 命令做同样的修改，只写配置文件，运行中的连接需重新连接后应用。
+- 「出口规则」页编辑规则与系统接管开关：添加（会被拒绝的规则不写入）、启用/停用、上移/下移、删除，开启接管前先确认其影响；另可预演一个 IPv4 或 IPv6 地址、或域名的去向（不建连），并可对地址做一次连通测试。与 `egress rule`/`egress enable|disable` 命令做同样的修改，只写配置文件，运行中的连接需重新连接后应用。
 
 本地端点需要随机会话凭证，严格校验 Host/Origin；写操作还要求 JSON 与自定义请求头。静态资源嵌入二进制，无 CDN/Node 运行依赖。仅供同一用户的本机管理，不提供公网访问参数、任意文件读写、命令执行、远程接管或自启动安装。首批不提供日志浏览、主动诊断按钮和互传页面；完整安全边界及剩余范围见 [本地页面契约](architecture/cli-local-ui.md)。
 
@@ -61,7 +61,7 @@ Go / .NET 使用 `specus-client` 可执行文件；Java 使用 `java -jar specus
 | 出口分流 | `egress --config PATH` | 本机出口分流状态：哪些规则在生效、哪些路由装上了、哪些被拒及原因、出口设备是否在线、本机是否正作为出口。只读，不连接服务端 |
 | 编辑出口规则 | `egress rules\|rule add\|rule remove\|rule move\|rule enable\|rule disable --config PATH` | 列出、增删、排序、停用或恢复 `peerEgressRules`；只改配置文件，运行中的客户端重启后应用。见 [出口分流使用说明](peer-mesh/peer-egress-usage.md#用命令编辑规则) |
 | 出口接管开关 | `egress enable --yes\|disable --config PATH` | 设置 `peerEgressEnabled`；开启前先说明影响，缺 `--yes` 时不修改 |
-| 出口预演 | `egress test ADDRESS --config PATH [--connect PORT]` | 按配置预演某个 IPv4 地址或域名的去向，不建连、不查询 DNS；域名给出命中的域名规则与 DNS 处理方式；`--connect` 只接受 IPv4 地址，做一次 TCP 可达性测试 |
+| 出口预演 | `egress test ADDRESS --config PATH [--connect PORT]` | 按配置预演某个 IPv4 或 IPv6 地址、或域名的去向，不建连、不查询 DNS；域名给出命中的域名规则与 DNS 处理方式；`--connect` 只接受 IP 地址（IPv4 或 IPv6），不接受域名，做一次 TCP 可达性测试 |
 | DNS 接管开关 | `egress dns enable --yes\|disable --config PATH` | 设置 `peerEgressDnsTakeover`（二期域名规则）；每次开启先说明它会改系统 DNS，缺 `--yes` 时不修改。见 [出口分流使用说明](peer-mesh/peer-egress-usage.md#五二期域名规则与系统-dns-接管) |
 | DNS 接管状态 | `egress dns status --config PATH` | 二期是否运行、系统 DNS 是否已接管及原因、转发的上游、事务日志、映射数与池使用率；客户端没在运行也能用 |
 | 恢复系统 DNS | `egress dns restore [--force]` | 按事务日志把系统 DNS 改回，客户端被强杀后用；记录的客户端仍在运行（仍在发布状态，只看进程号不算）时拒绝，`--force` 跳过这一检查 |

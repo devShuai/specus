@@ -32,7 +32,11 @@ This version implements the v2 core server path:
 
 It intentionally does not build the SPA or provide a C client/virtual network device; it serves an existing SPA
 from `SPECUS_STATIC_ROOT`. Server-side Peer Mesh signalling and STUN/TURN relay are implemented, while virtual IP
-traffic is terminated by Java/Go/.NET/Android clients; no client has been run against the C Peer Mesh or TURN paths end to end.
+traffic is terminated by Java/Go/.NET/Android clients. CI's `C server (Linux)` job runs `scripts/peer_mesh_e2e.sh`
+once each for the Java, Go, .NET and Android (client core on the JVM) clients, every time with two clients of that kind
+against the C Peer Mesh signalling and TURN relay: a DIRECT path over loopback, then a RELAY path through C TURN allocations between isolated network
+namespaces. The clients use `peerMeshDevice: "noop"`, so only the session-token-bound connectivity checks cross the
+relay; no virtual-IP traffic (TUN, SPM2 data frames) has been run through the C server end to end.
 Control/data TLS is implemented. `/oidc/token` follows Java: it validates the ID token against the JWKS and the
 browser's nonce, binds the identity to a local management user and returns the same local HS256 token as password
 login (see below). With `SPECUS_DATABASE_PATH` configured,
@@ -737,8 +741,8 @@ file, one combined PEM keystore and an encrypted key, and runs handshakes where 
 verifies the CA-signed chain and the host name, and refuses another CA or another name.
 `tls_deployment_e2e.sh` (CTest and `make test`) starts the real binary with each refused
 combination and checks the exit status and message, starts it with PEM file TLS, and verifies that
-listener with `openssl s_client`. `tls_client_e2e.sh` (below) runs the Java, Go and .NET clients
-against it. Not tested: PKCS#12 or self-signed listeners with a real client, production certificates
+listener with `openssl s_client`. `tls_client_e2e.sh` (below) runs the Java, Go, .NET and Android (client core on the JVM)
+clients against it. Not tested: PKCS#12 or self-signed listeners with a real client, production certificates
 from a public CA, and TLS terminated by an actual L4 proxy.
 
 ## End-to-End Smoke Tests
