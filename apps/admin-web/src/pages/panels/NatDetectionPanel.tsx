@@ -1,18 +1,9 @@
-import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
-import {
-  Button,
-  Card,
-  CardBody,
-  Chip,
-  Input,
-  Textarea,
-  Tooltip,
-} from "@heroui/react";
-import { AppLogo } from "../../components/AppLogo";
-import { UserMenuButton } from "../../components/UserMenuButton";
+import { useEffect, useId, useMemo, useRef, useState, type CSSProperties } from "react";
+import { Tooltip } from "@heroui/react";
 import { HeroRuntime } from "../../components/HeroRuntime";
-import { PublicToolsMenu } from "../../components/PublicToolsMenu";
+import { PublicPage } from "../../components/PublicTopBar";
 import { notify } from "../../components/toast";
+import { Alert, Card, CardHeader, Icon, Tag, type IconName, type Tone } from "../../components/ui";
 import { fetchPublicNatProbeConfig, fetchPublicPeerStunConfig } from "../../api/client";
 import type { PublicNatProbeConfig, PublicNatProbeEndpoint } from "../../api/types";
 import { NAT_TRAVERSAL_REFERENCE, natTypeProfile } from "../../lib/nat";
@@ -100,7 +91,7 @@ function timeoutMsInputValid(value: string): boolean {
 
 function formatElapsedMs(ms: number): string {
   const value = Math.max(0, Math.round(ms));
-  return value >= 1000 ? `${(value / 1000).toFixed(1)} s` : `${value} ms`;
+  return value >= 1000 ? `${(value / 1000).toFixed(1)} 秒` : `${value} 毫秒`;
 }
 
 type BrowserNatKind =
@@ -200,9 +191,6 @@ interface BrowserNatOutcome {
   description: string;
   reachability: string;
   tone: "default" | "primary" | "success" | "warning" | "danger";
-  frameClass: string;
-  markerClass: string;
-  textClass: string;
   game: BrowserNatExperience;
   p2p: BrowserNatExperience;
 }
@@ -214,9 +202,6 @@ const BROWSER_NAT_CLASSIFICATIONS: Record<BrowserNatLevel, BrowserNatOutcome> = 
     description: "探测到本机地址与公网端点一致，本轮未观察到 NAT 地址或端口转换。本机或上游防火墙仍可能限制入站连接。",
     reachability: "直连条件最佳",
     tone: "success",
-    frameClass: "border-emerald-500/35 bg-emerald-500/[0.07] dark:border-emerald-400/30 dark:bg-emerald-400/[0.09]",
-    markerClass: "bg-emerald-600 text-white dark:bg-emerald-400 dark:text-zinc-950",
-    textClass: "text-emerald-800 dark:text-emerald-200",
     game: {
       verdict: "联机条件优秀",
       description: "玩家间直连和作为房主的网络条件较好，通常更容易获得低延迟；实际仍受游戏服务器、对端网络和防火墙影响。",
@@ -232,9 +217,6 @@ const BROWSER_NAT_CLASSIFICATIONS: Record<BrowserNatLevel, BrowserNatOutcome> = 
     description: "公网映射保持稳定，并保留了本机源端口。这通常有利于 UDP 打洞，但不能据此判断入站过滤是否宽松。",
     reachability: "直连友好",
     tone: "primary",
-    frameClass: "border-blue-500/35 bg-blue-500/[0.07] dark:border-blue-400/30 dark:bg-blue-400/[0.09]",
-    markerClass: "bg-blue-600 text-white dark:bg-blue-400 dark:text-zinc-950",
-    textClass: "text-blue-800 dark:text-blue-200",
     game: {
       verdict: "多数联机场景友好",
       description: "P2P 组队、语音和玩家间直连的成功机会较高；遇到严格防火墙或对称型 NAT 对端时，仍可能转为中继。",
@@ -250,9 +232,6 @@ const BROWSER_NAT_CLASSIFICATIONS: Record<BrowserNatLevel, BrowserNatOutcome> = 
     description: "A1/A2、P1/P2 四端点共享探测未观察到公网映射随目标变化，但公网端口已被改写。它更接近现代术语 EIM；过滤行为仍需原生 RFC 5780 探测。",
     reachability: "条件直连",
     tone: "warning",
-    frameClass: "border-amber-500/40 bg-amber-500/[0.08] dark:border-amber-400/35 dark:bg-amber-400/[0.1]",
-    markerClass: "bg-amber-500 text-zinc-950 dark:bg-amber-400",
-    textClass: "text-amber-900 dark:text-amber-100",
     game: {
       verdict: "联机可用但受对端影响",
       description: "多数场景可以尝试 UDP 直连，但作为房主或遇到严格对端时，成功率会受双方网络策略影响。",
@@ -268,9 +247,6 @@ const BROWSER_NAT_CLASSIFICATIONS: Record<BrowserNatLevel, BrowserNatOutcome> = 
     description: "同一个本机 UDP 基址访问不同地址或端口时得到不同公网映射，属于 ADM / APDM，传统工具通常称为 Symmetric NAT。",
     reachability: "建议 Relay",
     tone: "danger",
-    frameClass: "border-rose-500/40 bg-rose-500/[0.07] dark:border-rose-400/35 dark:bg-rose-400/[0.1]",
-    markerClass: "bg-rose-600 text-white dark:bg-rose-400 dark:text-zinc-950",
-    textClass: "text-rose-800 dark:text-rose-200",
     game: {
       verdict: "直连联机更易受限",
       description: "连接普通中心服务器通常仍可工作，但玩家间直连、作为房主或局域网式联机更容易失败或转中继，可能增加延迟。",
@@ -628,16 +604,8 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
 
   if (publicPage) {
     return (
-      <main className="app-apple-tool nat-tool-plain relative min-h-screen overflow-x-hidden text-zinc-950 dark:text-white">
-        <header className="app-apple-tool-header relative z-40 mx-auto flex w-full max-w-[1080px] items-center justify-between gap-3 px-5 py-5 sm:px-8 xl:max-w-[1280px]">
-          <AppLogo className="min-w-0 flex-1" label="specus" subtitle="浏览器 NAT 检测" />
-          <div className="public-header-actions flex shrink-0 items-center gap-2">
-            <PublicToolsMenu active="nat-detect" />
-            <UserMenuButton className="public-header-theme-button" />
-          </div>
-        </header>
-
-        <section className="app-apple-tool-content relative z-10 mx-auto w-full max-w-[1080px] px-5 pb-16 sm:px-8 xl:max-w-[1280px]">
+      <PublicPage active="nat-detect">
+        <div className="pub-container pub-nat">
           <NatDetectStage {...stageProps} />
 
           {result && (
@@ -649,14 +617,14 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
 
           <NatTypeGuide probeConfig={natProbeConfig} currentLevel={currentLevel} />
           <NatFooterNote probeConfig={natProbeConfig} />
-        </section>
-      </main>
+        </div>
+      </PublicPage>
     );
   }
 
-  // 控制台内嵌版（保持简洁，与原有面板风格一致）
+  // 控制台内嵌版：同一套卡片，检测球缩小，不带页头和页脚说明。
   return (
-    <div className="mt-4 flex min-w-0 flex-col gap-4">
+    <div className="pub-nat pub-nat--embedded">
       <NatDetectStage embedded {...stageProps} />
       {result && (
         <>
@@ -692,7 +660,7 @@ interface NatDetectStageProps {
  * 检测舞台：页面唯一的动作中心。
  *
  * 信息架构是「大按钮 → 一句话结论 → 细节折叠」，所以这里只保留
- * 状态徽章、标题、检测按钮和高级设置，结果渲染全部交给 NatVerdictSection。
+ * 状态标签、标题、检测球和可折叠的高级设置卡片，结果渲染全部交给 NatVerdictSection。
  */
 function NatDetectStage({
   embedded = false,
@@ -711,8 +679,10 @@ function NatDetectStage({
   onResetServers,
 }: NatDetectStageProps) {
   const profile = browserNatProfile(checking ? "checking" : result?.kind ?? "idle");
-  const accent = ACCENTS[profile.color];
   const outcome = result ? browserNatOutcome(result) : null;
+  const fieldId = useId();
+  const timeoutValid = timeoutMsInputValid(timeoutMs);
+  const serverCount = serversText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).length;
   const liveAnnouncement = checking
     ? `${progress.label}${progress.responded > 0
       ? `，${progress.responded}/${progress.total} 个 STUN 已返回映射`
@@ -728,101 +698,93 @@ function NatDetectStage({
     : result
       ? "结论与影响见下方报告；修改 STUN 服务或超时后建议重新检测。"
       : profile.description;
+  const TitleTag = embedded ? "h2" : "h1";
 
   return (
-    <section
-      className={embedded
-        ? `app-apple-nat-hero relative overflow-hidden rounded-xl border ${accent.border} ${accent.bg} p-5`
-        : "relative py-6 sm:py-10"}
-    >
-      <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+    <section className={`pub-nat-stage${embedded ? " pub-nat-stage--embedded" : ""}`} aria-labelledby={`${fieldId}-title`}>
+      <span className="jd-sr-only" role="status" aria-live="polite" aria-atomic="true">
         {liveAnnouncement}
       </span>
-      <div className="relative flex flex-col items-center gap-6 text-center">
-        <div className="flex flex-wrap items-center justify-center gap-2">
-          <Chip
-            radius="sm"
-            variant="flat"
-            startContent={<StatusGlyph color={profile.color} className="ml-1" />}
-            className={`${accent.chipBg} ${accent.chipText} border ${accent.chipBorder}`}
-          >
+      <div className="pub-nat-stage-head">
+        <div className="bd-row pub-nat-stage-tags">
+          <Tag tone={checking ? "info" : result ? "success" : "neutral"}>
             {checking ? "检测进行中" : result ? "检测完成" : "准备就绪"}
-          </Chip>
-          <span className="rounded-md border glass-chip glass-border px-2 py-0.5 text-tiny font-medium text-zinc-600 dark:text-zinc-300">
-            {probeActive ? "RFC 5780 四端点" : "WebRTC 多 STUN"}
-          </span>
-          {resultStale && (
-            <span className="rounded-md border border-warning-300 bg-warning-50 px-2 py-0.5 text-tiny font-medium text-warning-700 dark:border-warning-400/40 dark:bg-warning-500/10 dark:text-warning-300">
-              参数已变更，结果可能过期
-            </span>
-          )}
+          </Tag>
+          <Tag plain>{probeActive ? "RFC 5780 四端点" : "WebRTC 多 STUN"}</Tag>
+          {resultStale && <Tag tone="warning">参数已变更，结果可能过期</Tag>}
         </div>
+        <TitleTag id={`${fieldId}-title`} className="bd-page-title pub-nat-title">{heroTitle}</TitleTag>
+        <p className="bd-page-desc pub-nat-desc">{heroDescription}</p>
+      </div>
 
-        <div className="flex max-w-2xl flex-col gap-3">
-          <h1 className={embedded ? "text-2xl font-semibold tracking-tight" : "text-3xl font-semibold tracking-tight sm:text-4xl"}>
-            {heroTitle}
-          </h1>
-          <p className="text-small text-zinc-700 dark:text-zinc-300 sm:text-medium">
-            {heroDescription}
-          </p>
-        </div>
+      <div className="pub-nat-orb-row">
+        <NatStageChannel
+          state={checking ? "checking" : result ? "complete" : "idle"}
+          tone={outcome?.tone ?? null}
+          embedded={embedded}
+        />
+        <NatDetectionOrb
+          embedded={embedded}
+          checking={checking}
+          result={result}
+          progress={progress}
+          onRun={onRun}
+          onCancel={onCancel}
+        />
+      </div>
 
-        <div className="relative w-full">
-          <NatStageChannel
-            state={checking ? "checking" : result ? "complete" : "idle"}
-            tone={outcome?.tone ?? null}
-            embedded={embedded}
-          />
-          <NatDetectionOrb
-            embedded={embedded}
-            checking={checking}
-            result={result}
-            progress={progress}
-            onRun={onRun}
-            onCancel={onCancel}
-          />
-        </div>
-
-        <details className="group w-full rounded-lg border glass glass-border px-3 py-2 text-left text-small">
-          <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-zinc-700 transition-colors hover:text-zinc-950 dark:text-zinc-300 dark:hover:text-white">
-            <span className="flex items-center gap-2">
-              <ChevronIcon className="h-4 w-4 transition-transform group-open:rotate-90" />
-              高级设置（STUN 服务、超时时间）
-            </span>
-            <span className="text-tiny text-zinc-500 dark:text-zinc-400">点击展开</span>
-          </summary>
-          <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_160px]">
-            <Textarea
-              label="STUN 服务（每行一个，默认主备节点）"
-              size="sm"
-              variant="bordered"
-              radius="sm"
-              minRows={2}
-              value={serversText}
-              onValueChange={onServersTextChange}
-              description={probeActive
-                ? "默认使用自建 A1/A2、P1/P2 四端点。页面先逐一验证可达性，再用同一 ICE socket 对比映射；不会使用 TURN relay。"
-                : `默认使用 specus 主备 STUN${selfHostedStunServer ? `，首选 ${selfHostedStunServer}` : ""}。浏览器仅使用标准 STUN Binding，不使用 TURN relay。`}
-            />
-            <Input
-              label="单服务超时"
-              size="sm"
-              variant="bordered"
-              radius="sm"
-              value={timeoutMs}
-              onValueChange={onTimeoutChange}
-              isInvalid={!timeoutMsInputValid(timeoutMs)}
-              errorMessage="请输入 3000–15000 之间的数字"
-              endContent={<span className="text-tiny text-default-400">ms</span>}
-            />
-            <div className="flex justify-end sm:col-span-2">
-              <Button size="sm" variant="light" onPress={onResetServers}>
-                恢复默认
-              </Button>
+      <details className="bd-card pub-collapse pub-nat-settings">
+        <summary>
+          <Icon name="chevron-right" className="pub-collapse-chevron" />
+          <span>高级设置（STUN 服务、超时时间）</span>
+          <span className="pub-collapse-meta bd-num">{serverCount} 个服务 · 单服务 {timeoutMs.trim() || "—"} ms</span>
+        </summary>
+        <div className="pub-collapse-body">
+          <div className="bd-form-grid pub-nat-settings-grid">
+            <div className="bd-field">
+              <label className="bd-label" htmlFor={`${fieldId}-servers`}>STUN 服务（每行一个，默认主备节点）</label>
+              <textarea
+                id={`${fieldId}-servers`}
+                className="bd-input pub-mono-input"
+                rows={3}
+                spellCheck={false}
+                value={serversText}
+                onChange={(event) => onServersTextChange(event.target.value)}
+                aria-describedby={`${fieldId}-servers-help`}
+              />
+              <p id={`${fieldId}-servers-help`} className="bd-help">
+                {probeActive
+                  ? "默认使用自建 A1/A2、P1/P2 四端点。页面先逐一验证可达性，再用同一 ICE socket 对比映射；不会使用 TURN relay。"
+                  : `默认使用 specus 主备 STUN${selfHostedStunServer ? `，首选 ${selfHostedStunServer}` : ""}。浏览器仅使用标准 STUN Binding，不使用 TURN relay。`}
+              </p>
+            </div>
+            <div className="bd-field">
+              <label className="bd-label" htmlFor={`${fieldId}-timeout`}>单服务超时</label>
+              <div className="bd-input-group">
+                <input
+                  id={`${fieldId}-timeout`}
+                  className="bd-input bd-num"
+                  inputMode="numeric"
+                  value={timeoutMs}
+                  onChange={(event) => onTimeoutChange(event.target.value)}
+                  aria-invalid={timeoutValid ? undefined : true}
+                  aria-describedby={`${fieldId}-timeout-help`}
+                />
+                <span className="bd-addon">ms</span>
+              </div>
+              <p id={`${fieldId}-timeout-help`} className={`bd-help${timeoutValid ? "" : " bd-help--error"}`}>
+                {timeoutValid ? "3000–15000 毫秒，超时后这个服务记为未返回映射" : "超时要填 3000–15000 之间的毫秒数"}
+              </p>
             </div>
           </div>
-        </details>
-      </div>
+          <div className="pub-nat-settings-actions">
+            <button type="button" className="bd-btn bd-btn--ghost bd-btn--sm" onClick={onResetServers}>
+              <Icon name="rotate-ccw" />
+              <span>恢复默认</span>
+            </button>
+          </div>
+        </div>
+      </details>
     </section>
   );
 }
@@ -880,25 +842,17 @@ const NAT_PHASE_ORDER: Record<NatCheckProgressPhase, number> = {
   complete: NAT_CHECK_STEPS.length,
 };
 
+/** The running check as a staged row: done steps get a check, the current one is accent. */
 function NatCheckSteps({ phase }: { phase: NatCheckProgressPhase }) {
   const current = NAT_PHASE_ORDER[phase];
   return (
-    <ol className="nat-steps" aria-hidden="true">
+    <ol className="pub-stages pub-stages--row" aria-hidden="true">
       {NAT_CHECK_STEPS.map((step, index) => {
         const state = index < current ? "done" : index === current ? "active" : "pending";
         return (
-          <li key={step.phase} className={`nat-step nat-step-${state}`}>
-            <span className="nat-step-dot">
-              {state === "done" ? (
-                <svg viewBox="0 0 12 12" fill="none" className="h-2.5 w-2.5">
-                  <path d="m2.5 6 2.5 2.5 4.5-5" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" />
-                </svg>
-              ) : (
-                index + 1
-              )}
-            </span>
-            <span className="nat-step-label">{step.label}</span>
-            {index < NAT_CHECK_STEPS.length - 1 && <span className="nat-step-line" />}
+          <li key={step.phase} className="pub-stage" data-state={state}>
+            <span className="pub-stage-dot bd-num">{state === "done" ? <Icon name="check" size={12} /> : index + 1}</span>
+            <span className="pub-stage-body"><b>{step.label}</b></span>
           </li>
         );
       })}
@@ -1060,7 +1014,7 @@ function NatDetectionOrb({
         : "检测中"
     : result
       ? "再测一次"
-      : "点我检测";
+      : "开始检测";
 
   return (
     <div className="relative flex min-w-0 flex-col items-center justify-center gap-3">
@@ -1083,7 +1037,7 @@ function NatDetectionOrb({
         <button
           type="button"
           aria-busy={checking}
-          aria-label={checking ? "取消 NAT 检测" : result ? "重新检测 NAT 类型" : "点我检测 NAT 类型"}
+          aria-label={checking ? "取消 NAT 检测" : result ? "重新检测 NAT 类型" : "检测 NAT 类型"}
           data-state={state}
           onClick={checking ? onCancel : onRun}
           style={accentStyle}
@@ -1147,20 +1101,20 @@ function NatDetectionOrb({
                 <path d="M5.5 28.5 H26.5" stroke="var(--specus-water)" strokeWidth="1.6" strokeLinecap="round" strokeDasharray="3.5 3" opacity="0.85" />
               </svg>
             )}
-            <span className={`${checking ? "text-xl tabular-nums" : embedded ? "text-sm" : "text-base"} font-semibold text-zinc-950 dark:text-white`}>
+            <span className={`pub-orb-value${checking ? " is-number" : embedded ? " is-small" : ""}`}>
               {checking && determinate ? `${Math.round(ringPercent)}%` : centerText}
             </span>
-            <span className="text-[10px] font-medium tracking-wide text-zinc-500 dark:text-zinc-400">
-              {checking ? "STUN 探测 · 点击取消" : result ? "更新检测结果" : "浏览器直测"}
+            <span className="pub-orb-hint">
+              {checking ? "STUN 探测 · 按下取消" : result ? "更新检测结果" : "浏览器直测"}
             </span>
           </span>
         </button>
       </div>
-      <div className="min-h-9 text-center text-tiny text-zinc-500 dark:text-zinc-400">
+      <div className="pub-orb-status">
         {checking && (
           <>
-            <span className="block font-medium text-zinc-700 dark:text-zinc-200">{progress.label}</span>
-            <span>
+            <span className="pub-orb-status-label">{progress.label}</span>
+            <span className="bd-num">
               {progress.responded > 0
                 ? `${progress.responded}/${progress.total} 个 STUN 已返回映射`
                 : progress.unattributedMapping
@@ -1170,12 +1124,29 @@ function NatDetectionOrb({
           </>
         )}
       </div>
-      <div className="flex h-7 items-center">
+      <div className="pub-orb-steps">
         {checking && <NatCheckSteps phase={progress.phase} />}
       </div>
     </div>
   );
 }
+
+type NatTone = BrowserNatOutcome["tone"];
+
+/** The outcome tones in the design's status vocabulary: primary is informational, default neutral. */
+function tagTone(tone: NatTone | "default" | "primary" | "success" | "warning" | "danger"): Tone {
+  if (tone === "primary") return "info";
+  if (tone === "default") return "neutral";
+  return tone;
+}
+
+const TONE_ICON: Record<NatTone, IconName> = {
+  default: "circle-alert",
+  primary: "info-circle",
+  success: "circle-check",
+  warning: "alert",
+  danger: "circle-x",
+};
 
 function NatOutcomeCard({
   outcome,
@@ -1189,108 +1160,77 @@ function NatOutcomeCard({
   result: BrowserNatResult;
 }) {
   return (
-    <article className={`nat-result-reveal relative overflow-hidden rounded-2xl border p-5 shadow-xs sm:p-6 ${outcome.frameClass}`}>
-      <span
-        className={`nat-outcome-bar absolute inset-x-0 top-0 h-1 overflow-hidden ${natToneBg(outcome.tone)}${outcome.tone === "success" || outcome.tone === "primary" ? " nat-outcome-bar-flow" : ""}`}
-        aria-hidden="true"
-      />
-      <div className="flex flex-wrap items-start gap-4 pt-1">
-        <div
-          className={`nat-outcome-marker flex h-14 w-14 shrink-0 items-center justify-center shadow-xs ${outcome.markerClass}`}
-          aria-hidden="true"
-        >
-          <StatusGlyph color={outcome.tone} className="h-6 w-6" />
-        </div>
+    <article className="bd-card pub-outcome nat-result-reveal" data-tone={outcome.tone}>
+      <div className="pub-outcome-head">
+        <span className="pub-outcome-mark" aria-hidden="true">
+          <Icon name={TONE_ICON[outcome.tone]} size={22} />
+        </span>
         <div className="min-w-0 flex-1">
-          <p className="text-tiny font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">检测结果</p>
-          <div className="mt-1 flex flex-wrap items-center gap-2.5">
-            <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white sm:text-3xl">{outcome.title}</h2>
-            <Chip size="sm" radius="sm" variant="flat" className={`${outcome.textClass} bg-white/45 dark:bg-black/15`}>
-              {outcome.reachability}
-            </Chip>
+          <p className="pub-outcome-kicker">检测结果</p>
+          <div className="pub-outcome-title-row">
+            <h2 className="pub-outcome-title">{outcome.title}</h2>
+            <Tag tone={tagTone(outcome.tone)}>{outcome.reachability}</Tag>
           </div>
         </div>
         {outcome.level ? <NatDifficultyMeter level={outcome.level} tone={outcome.tone} /> : null}
       </div>
-      <p className="mt-4 max-w-3xl text-small text-zinc-700 dark:text-zinc-300 sm:text-medium">
-        {outcome.description}
-      </p>
 
-      <div className="mt-4 grid gap-px overflow-hidden rounded-lg border border-black/[0.07] bg-black/[0.07] dark:border-white/10 dark:bg-white/10 sm:grid-cols-3">
-        <NatEvidenceFact label="映射行为" value={mappingBehaviorText(result.mappingBehavior)} />
-        <NatEvidenceFact
-          label="过滤行为"
-          value={result.filteringBehavior === "BROWSER_NOT_OBSERVABLE" ? "需原生 RFC 5780 验证" : "本轮未知"}
-        />
-        <NatEvidenceFact label="验证方法" value={verificationMethodLabel(result.verificationMethod)} />
+      <div className="pub-outcome-body">
+        <p className="pub-outcome-desc">{outcome.description}</p>
+
+        <dl className="bd-desc pub-outcome-facts">
+          <div>
+            <dt>映射行为</dt>
+            <dd>{mappingBehaviorText(result.mappingBehavior)}</dd>
+          </div>
+          <div>
+            <dt>过滤行为</dt>
+            <dd>{result.filteringBehavior === "BROWSER_NOT_OBSERVABLE" ? "需原生 RFC 5780 验证" : "本轮未知"}</dd>
+          </div>
+          <div>
+            <dt>验证方法</dt>
+            <dd>{verificationMethodLabel(result.verificationMethod)}</dd>
+          </div>
+        </dl>
+
+        <div className="pub-impact-grid">
+          <NatImpactCard title="游戏联机" icon="users" experience={outcome.game} />
+          <NatImpactCard title="P2P / 语音视频" icon="video" experience={outcome.p2p} />
+        </div>
+
+        <Alert tone="info" title="建议">{result.recommendation}</Alert>
       </div>
 
-      <div className="mt-5 grid gap-3 sm:grid-cols-2">
-        <NatImpactCard title="游戏联机" icon={<GamepadIcon />} experience={outcome.game} />
-        <NatImpactCard title="P2P / 语音视频" icon={<PeerLinksIcon />} experience={outcome.p2p} />
-      </div>
-
-      <div className="mt-4 rounded-xl border border-black/[0.07] bg-white/45 p-3 dark:border-white/10 dark:bg-black/15">
-        <p className="text-tiny font-semibold text-zinc-500 dark:text-zinc-400">建议</p>
-        <p className="mt-1 text-small text-zinc-700 dark:text-zinc-300">{result.recommendation}</p>
-      </div>
-
-      <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-tiny text-zinc-600 dark:text-zinc-400">
+      <div className="pub-outcome-meta">
         <Tooltip
           placement="bottom"
           content={<div className="max-w-64 py-0.5 text-tiny">{technicalSummary}</div>}
         >
-          <a
-            href="#/help/peer-mesh#nat-types"
-            className="inline-flex items-center gap-1.5 font-medium text-zinc-700 underline decoration-black/20 underline-offset-4 transition-colors hover:text-zinc-950 dark:text-zinc-300 dark:decoration-white/25 dark:hover:text-white"
-          >
-            <span className={`inline-block h-2 w-2 rounded-full ${natToneBg(outcome.tone)}`} />
+          <a href="#/help/peer-mesh#nat-types" className="jd-link pub-outcome-tech">
             技术判断：{technicalLabel}
           </a>
         </Tooltip>
-        <span aria-hidden="true">·</span>
-        <span className="inline-flex items-center gap-1.5">
-          <ConfidenceBars confidence={result.confidence} />
-          置信度 {confidenceLabel(result.confidence)}
-        </span>
-        <span aria-hidden="true">·</span>
-        <span>耗时 {formatElapsedMs(result.finishedAt - result.startedAt)}</span>
-        <span aria-hidden="true">·</span>
+        <span>置信度 {confidenceLabel(result.confidence)}</span>
+        <span className="bd-num">耗时 {formatElapsedMs(result.finishedAt - result.startedAt)}</span>
         <span>{result.evidence}</span>
       </div>
     </article>
   );
 }
 
-// 直连难度量表：四段刻度随结果揭晓依次点亮，颜色跟随结论 tone。
-function NatDifficultyMeter({ level, tone }: { level: BrowserNatLevel; tone: BrowserNatOutcome["tone"] }) {
+// 直连难度量表：四段刻度，点亮的段数即难度，颜色跟随结论 tone。
+function NatDifficultyMeter({ level, tone }: { level: BrowserNatLevel; tone: NatTone }) {
   return (
-    <div className="nat-level-meter shrink-0" role="img" aria-label={`直连难度 ${level}/4`}>
-      <div className="flex items-baseline justify-between gap-3">
-        <span className="text-tiny font-medium text-zinc-500 dark:text-zinc-400">直连难度</span>
-        <span className="font-mono text-base font-bold text-zinc-900 dark:text-zinc-100">
-          {level}
-          <span className="text-tiny font-medium text-zinc-400 dark:text-zinc-500">/4</span>
-        </span>
+    <div className="pub-meter" data-tone={tone} role="img" aria-label={`直连难度 ${level}/4`}>
+      <div className="pub-meter-head">
+        <span>直连难度</span>
+        <b className="bd-num">{level}<span>/4</span></b>
       </div>
-      <div className="mt-1.5 flex w-28 gap-1" aria-hidden="true">
+      <div className="pub-meter-track" aria-hidden="true">
         {[1, 2, 3, 4].map((segment) => (
-          <span
-            key={segment}
-            className={`nat-level-segment ${segment <= level ? `is-on ${natToneBg(tone)}` : ""}`}
-            style={{ animationDelay: `${260 + segment * 110}ms` }}
-          />
+          <span key={segment} className={segment <= level ? "is-on" : undefined} />
         ))}
       </div>
-    </div>
-  );
-}
-
-function NatEvidenceFact({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="bg-white/55 px-3 py-2.5 dark:bg-zinc-950/55">
-      <p className="text-tiny text-zinc-500 dark:text-zinc-400">{label}</p>
-      <p className="mt-0.5 text-small font-semibold text-zinc-900 dark:text-zinc-100">{value}</p>
     </div>
   );
 }
@@ -1299,36 +1239,16 @@ function verificationMethodLabel(method: BrowserNatVerificationMethod): string {
   return method === "RFC5780_WEBRTC_MAPPING" ? "四端点 + 共享 ICE" : "多 STUN 共享 ICE";
 }
 
-function NatImpactCard({ title, icon, experience }: { title: string; icon: ReactNode; experience: BrowserNatExperience }) {
+function NatImpactCard({ title, icon, experience }: { title: string; icon: IconName; experience: BrowserNatExperience }) {
   return (
-    <section className="rounded-xl border border-black/[0.07] bg-white/55 p-4 dark:border-white/10 dark:bg-black/15">
-      <div className="flex items-center gap-2">
-        <span className="nat-impact-icon" aria-hidden="true">{icon}</span>
-        <p className="text-tiny font-semibold text-zinc-500 dark:text-zinc-400">{title}</p>
+    <section className="pub-impact">
+      <div className="pub-impact-head">
+        <span className="pub-impact-icon" aria-hidden="true"><Icon name={icon} size={14} /></span>
+        <span>{title}</span>
       </div>
-      <p className="mt-2 text-base font-semibold text-zinc-950 dark:text-white">{experience.verdict}</p>
-      <p className="mt-2 text-small text-zinc-700 dark:text-zinc-300">{experience.description}</p>
+      <p className="pub-impact-verdict">{experience.verdict}</p>
+      <p className="pub-impact-desc">{experience.description}</p>
     </section>
-  );
-}
-
-function GamepadIcon() {
-  return (
-    <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M6.5 7.5h11a4.5 4.5 0 0 1 4.4 5.4l-.9 4a3 3 0 0 1-5.2 1.4L14 16h-4l-1.8 2.3A3 3 0 0 1 3 16.9l-.9-4A4.5 4.5 0 0 1 6.5 7.5Z" />
-      <path d="M8 11v3M6.5 12.5h3M15.5 11.5h.01M17.5 13.5h.01" />
-    </svg>
-  );
-}
-
-function PeerLinksIcon() {
-  return (
-    <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="6" cy="6" r="2.5" />
-      <circle cx="18" cy="6" r="2.5" />
-      <circle cx="12" cy="18" r="2.5" />
-      <path d="M8.2 7.3 10.5 16M15.8 7.3 13.5 16M8.5 6h7" />
-    </svg>
   );
 }
 
@@ -1361,9 +1281,6 @@ export function browserNatOutcome(result: BrowserNatResult): BrowserNatOutcome {
       description: "本轮没有获得 STUN 公网映射。可能是网络限制 UDP/STUN，也可能是浏览器隐私策略、VPN、代理或探测服务不可达，不能直接断言 UDP 已被封锁。",
       reachability: "直连可能受阻",
       tone: "danger",
-      frameClass: "border-rose-500/45 bg-rose-500/[0.08] dark:border-rose-400/40 dark:bg-rose-400/[0.1]",
-      markerClass: "bg-rose-600 text-white dark:bg-rose-400 dark:text-zinc-950",
-      textClass: "text-rose-800 dark:text-rose-200",
       game: {
         verdict: "依赖 UDP 的联机可能受影响",
         description: "如果网络确实限制 UDP，玩家直连、语音或部分实时游戏可能无法直连，或改走 TCP / 中继；连接中心服务器是否受影响取决于游戏协议。",
@@ -1378,7 +1295,7 @@ export function browserNatOutcome(result: BrowserNatResult): BrowserNatOutcome {
     return unavailableNatOutcome("当前浏览器无法检测", "浏览器没有提供所需的 WebRTC 能力，这不是 NAT 类型结论。", "换用支持 WebRTC 的现代浏览器后再检测。");
   }
   if (result.kind === "failed") {
-    return unavailableNatOutcome("本次检测未完成", "检测流程发生异常，这不是 NAT 类型结论。", "请重试，或检查 WebRTC 权限并更换 STUN 服务。");
+    return unavailableNatOutcome("本次检测未完成", "检测流程发生异常，这不是 NAT 类型结论。", "重新检测；仍不成功时检查 WebRTC 权限，或在高级设置里更换 STUN 服务。");
   }
   return {
     ...unavailableNatOutcome(
@@ -1404,9 +1321,6 @@ function unavailableNatOutcome(title: string, description: string, action: strin
     description,
     reachability: "暂时无法判断",
     tone: "warning",
-    frameClass: "border-amber-500/40 bg-amber-500/[0.07] dark:border-amber-400/35 dark:bg-amber-400/[0.09]",
-    markerClass: "bg-amber-500 text-zinc-950 dark:bg-amber-400",
-    textClass: "text-amber-900 dark:text-amber-100",
     game: {
       verdict: "暂时无法判断",
       description: action,
@@ -1418,86 +1332,52 @@ function unavailableNatOutcome(title: string, description: string, action: strin
   };
 }
 
-function useCountUp(target: number, duration = 720): number {
-  const [value, setValue] = useState(0);
-
-  useEffect(() => {
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      setValue(target);
-      return;
-    }
-    let raf = 0;
-    const start = performance.now();
-    const tick = (now: number) => {
-      const t = Math.min(1, (now - start) / duration);
-      setValue(Math.round(target * (1 - (1 - t) ** 3)));
-      if (t < 1) {
-        raf = requestAnimationFrame(tick);
-      }
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [target, duration]);
-
-  return value;
-}
-
-function MetricStrip({ result }: { result: BrowserNatResult | null }) {
-  const knownProbes = result?.probes.filter((probe) => probe.sourceKnown) ?? [];
+/** The four numbers of a finished check, with what each means on hover. */
+function NatMetrics({ result }: { result: BrowserNatResult }) {
+  const knownProbes = result.probes.filter((probe) => probe.sourceKnown);
   const respondedCount = knownProbes.filter((probe) =>
     probe.candidates.some((candidate) => candidate.type === "srflx"),
   ).length;
-  const endpointTotal = result?.endpointChecks.length ?? 0;
-  const reachableCount = result?.endpointChecks.filter((check) => check.reachable).length ?? 0;
-  const mappedCount = result?.mappedEndpoints.length ?? 0;
-  const elapsedMs = result ? Math.max(0, result.finishedAt - result.startedAt) : 0;
-  const animatedFirst = useCountUp(endpointTotal > 0 ? reachableCount : respondedCount);
-  const animatedMapped = useCountUp(mappedCount);
-  const animatedElapsed = useCountUp(elapsedMs);
+  const endpointTotal = result.endpointChecks.length;
+  const reachableCount = result.endpointChecks.filter((check) => check.reachable).length;
   const items = [
     {
-      label: result?.endpointChecks.length ? "四端点预检" : "STUN 服务",
-      value: result
-        ? endpointTotal > 0
-          ? `${animatedFirst}/${endpointTotal}`
-          : `${animatedFirst}/${knownProbes.length}`
-        : "—",
-      hint: result?.endpointChecks.length
+      label: endpointTotal ? "四端点预检" : "STUN 服务",
+      value: endpointTotal > 0 ? `${reachableCount}/${endpointTotal}` : `${respondedCount}/${knownProbes.length}`,
+      hint: endpointTotal
         ? "先分别验证 A1:P1、A1:P2、A2:P1、A2:P2 可达，防止把服务端点不可达误判成 NAT 行为。"
         : "返回公网映射的 STUN 服务数 / 参与探测的总数。返回数越多，映射结论越可靠。",
     },
     {
       label: "映射行为",
-      value: result ? mappingBehaviorShortLabel(result.mappingBehavior) : "—",
+      value: mappingBehaviorShortLabel(result.mappingBehavior),
       hint: "EIM 表示映射不随目标变化；ADM/APDM 表示映射依赖目标地址或端口。映射和过滤是两个独立维度。",
     },
     {
       label: "公网映射端点",
-      value: result ? String(animatedMapped) : "—",
+      value: `${result.mappedEndpoints.length} 个`,
       hint: "NAT 分配给本机的公网 IP:Port。同一 UDP 基址因目标变化出现多个端点，表示目标相关映射。",
     },
     {
       label: "总耗时",
-      value: result ? `${animatedElapsed} ms` : "—",
+      value: formatElapsedMs(Math.max(0, result.finishedAt - result.startedAt)),
       hint: "从发起检测到 ICE 收集结束的总时间，受「单服务超时」设置影响。",
     },
   ];
   return (
-    <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+    <div className="bd-dash pub-nat-metrics nat-result-reveal" style={{ animationDelay: "90ms" }}>
       {items.map((item) => (
         <Tooltip
           key={item.label}
           placement="bottom"
           content={<div className="max-w-60 py-0.5 text-tiny">{item.hint}</div>}
         >
-          <div className="cursor-help rounded-lg border glass glass-border px-3 py-2 transition duration-200 hover:-translate-y-0.5 hover:border-primary-500/30 dark:hover:border-primary-500/30 hover:shadow-xs motion-reduce:transform-none motion-reduce:transition-none">
-            <div className="flex items-center gap-1 text-tiny text-zinc-500 dark:text-zinc-400">
+          <div className="bd-card bd-stat bd-span-3 pub-nat-stat" tabIndex={0} aria-label={`${item.label}：${item.value}。${item.hint}`}>
+            <div className="bd-stat-label">
               <span>{item.label}</span>
-              <InfoIcon className="h-3 w-3 shrink-0 opacity-60" />
+              <Icon name="info" size={12} />
             </div>
-            <div className="mt-0.5 font-mono text-lg font-semibold text-zinc-950 dark:text-white">
-              {item.value}
-            </div>
+            <div className="bd-stat-value">{item.value}</div>
           </div>
         </Tooltip>
       ))}
@@ -1530,54 +1410,39 @@ function NatVerdictSection({ result }: { result: BrowserNatResult }) {
   const profile = browserNatProfile(result.kind);
   const natTypeProfileEntry = result.natType ? natTypeProfile(result.natType) : null;
   return (
-    <div className="mt-8 flex flex-col gap-4">
-      <div className="nat-result-reveal">
-        <NatOutcomeCard
-          result={result}
-          outcome={outcome}
-          technicalLabel={natTypeProfileEntry?.label ?? profile.title}
-          technicalSummary={natTypeProfileEntry?.summary ?? result.summary}
-        />
-      </div>
-      <div className="nat-result-reveal" style={{ animationDelay: "90ms" }}>
-        <MetricStrip result={result} />
-      </div>
-      <div className="nat-result-reveal" style={{ animationDelay: "160ms" }}>
-        <MappedEndpointsCard result={result} />
-      </div>
-    </div>
+    <section className="pub-nat-verdict" aria-label="检测报告">
+      <NatOutcomeCard
+        result={result}
+        outcome={outcome}
+        technicalLabel={natTypeProfileEntry?.label ?? profile.title}
+        technicalSummary={natTypeProfileEntry?.summary ?? result.summary}
+      />
+      <NatMetrics result={result} />
+      <MappedEndpointsCard result={result} />
+    </section>
   );
 }
 
 /**
- * 技术细节折叠区：RFC 5780 预检、STUN 探测归属、ICE Candidate 明细。
+ * 技术细节折叠卡片：RFC 5780 预检、STUN 探测归属、ICE Candidate 明细。
  * 面向的用户只需要结论，这些证据默认收起，排查时一次展开。
  */
 function NatTechnicalDetails({ result }: { result: BrowserNatResult }) {
   const candidateCount = result.probes.reduce((count, probe) => count + probe.candidates.length, 0);
   return (
-    <details
-      className="nat-result-reveal group mt-4 rounded-xl border glass glass-border transition-colors open:border-black/15 dark:open:border-white/15"
-      style={{ animationDelay: "220ms" }}
-    >
-      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 p-5 text-base font-semibold">
-        <span className="flex items-center gap-2">
-          <ChevronIcon className="h-4 w-4 transition-transform group-open:rotate-90" />
-          技术细节
-          <span className="text-small font-normal text-zinc-500 dark:text-zinc-400">
-            {[
-              result.endpointChecks.length > 0 ? "RFC 5780 预检" : null,
-              `${result.probes.length} 个 STUN 探测`,
-              `${candidateCount} 个 ICE Candidate`,
-            ].filter(Boolean).join(" · ")}
-          </span>
-        </span>
-        <span className="text-tiny font-normal text-zinc-500 dark:text-zinc-400">
-          <span className="group-open:hidden">点击展开</span>
-          <span className="hidden group-open:inline">点击收起</span>
+    <details className="bd-card pub-collapse pub-nat-details nat-result-reveal" style={{ animationDelay: "220ms" }}>
+      <summary>
+        <Icon name="chevron-right" className="pub-collapse-chevron" />
+        <span>技术细节</span>
+        <span className="pub-collapse-meta bd-num">
+          {[
+            result.endpointChecks.length > 0 ? "RFC 5780 预检" : null,
+            `${result.probes.length} 个 STUN 探测`,
+            `${candidateCount} 个 ICE Candidate`,
+          ].filter(Boolean).join(" · ")}
         </span>
       </summary>
-      <div className="flex flex-col gap-4 border-t border-black/5 p-4 dark:border-white/5">
+      <div className="pub-collapse-body pub-nat-details-body">
         {result.endpointChecks.length > 0 && <Rfc5780EndpointCard checks={result.endpointChecks} />}
         <StunProbesCard result={result} />
         <CandidateTableCard result={result} />
@@ -1593,44 +1458,40 @@ function MappedEndpointsCard({ result }: { result: BrowserNatResult }) {
   ].filter((group) => group.endpoints.length > 0);
 
   return (
-    <Card shadow="none" className="rounded-xl border glass glass-border">
-      <CardBody className="gap-4 p-5">
-        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-          <span className="flex items-center gap-2">
-            <DotIcon className={result.mappedEndpoints.length ? "text-emerald-500" : "text-zinc-400"} />
-            <h2 className="text-base font-semibold">公网映射端点</h2>
-          </span>
-          <span className="text-tiny text-zinc-500 dark:text-zinc-400">
-            NAT 分配给本机的公网出口，点击可复制
-          </span>
-        </div>
+    <Card className="pub-nat-endpoints nat-result-reveal" style={{ animationDelay: "160ms" }}>
+      <CardHeader
+        title="公网映射端点"
+        description="NAT 分配给本机的公网出口；按端点即可复制"
+        actions={<Tag tone={groups.length ? "success" : "warning"} className="bd-num">{result.mappedEndpoints.length} 个</Tag>}
+      />
+      <div className="bd-card-body">
         {groups.length === 0 ? (
-          <p className="rounded-lg border border-dashed border-black/15 dark:border-white/15 glass-chip p-3 text-small text-zinc-600 dark:text-zinc-400">
-            未发现 server-reflexive 映射端点。UDP 出站可能被阻断，或配置的 STUN 服务均不可达。
-          </p>
+          <Alert tone="warning" title="未发现 server-reflexive 映射端点">
+            UDP 出站可能被阻断，或配置的 STUN 服务均不可达。换一个网络，或在高级设置里更换 STUN 服务后重新检测。
+          </Alert>
         ) : (
-          <div className="flex flex-col gap-2">
+          <div className="pub-endpoint-groups">
             {groups.map((group) => (
-              <div key={group.label} className="flex flex-wrap items-center gap-2">
-                <span className="w-10 shrink-0 text-tiny font-medium text-zinc-500 dark:text-zinc-400">
-                  {group.label}
-                </span>
-                {group.endpoints.map((endpoint) => (
-                  <button
-                    key={endpoint}
-                    type="button"
-                    onClick={() => void copyEndpoint(endpoint)}
-                    className="group/copy flex items-center gap-1.5 rounded-md border border-emerald-500/25 bg-emerald-500/10 px-3 py-1.5 font-mono text-small text-emerald-700 transition-colors hover:border-emerald-500/45 hover:bg-emerald-500/20 dark:border-emerald-300/30 dark:bg-emerald-300/10 dark:text-emerald-100 dark:hover:border-emerald-300/50 dark:hover:bg-emerald-300/20"
-                  >
-                    <span className="break-all text-left">{endpoint}</span>
-                    <CopyIcon className="h-3.5 w-3.5 shrink-0 opacity-50 transition-opacity group-hover/copy:opacity-100" />
-                  </button>
-                ))}
+              <div key={group.label} className="pub-endpoint-group">
+                <span className="pub-endpoint-family">{group.label}</span>
+                <div className="bd-row">
+                  {group.endpoints.map((endpoint) => (
+                    <button
+                      key={endpoint}
+                      type="button"
+                      onClick={() => void copyEndpoint(endpoint)}
+                      className="bd-btn bd-btn--secondary bd-btn--sm pub-endpoint"
+                    >
+                      <span>{endpoint}</span>
+                      <Icon name="copy" />
+                    </button>
+                  ))}
+                </div>
               </div>
             ))}
           </div>
         )}
-      </CardBody>
+      </div>
     </Card>
   );
 }
@@ -1644,82 +1505,78 @@ function StunProbesCard({ result }: { result: BrowserNatResult }) {
     && result.endpointChecks.every((check) => check.reachable);
   const sharedCandidateDeduplicated = result.mappingBehavior === "ENDPOINT_INDEPENDENT"
     && allTopologyEndpointsReachable;
-  const headDotClass = sharedCandidateDeduplicated
-    ? "text-emerald-500"
+  const summaryTone: Tone = sharedCandidateDeduplicated
+    ? "success"
     : respondedCount === 0
-      ? "text-rose-500"
+      ? "danger"
       : respondedCount < knownProbes.length
-        ? "text-amber-500"
-        : "text-emerald-500";
+        ? "warning"
+        : "success";
 
   return (
-    <Card shadow="none" className="rounded-xl border glass glass-border">
-      <CardBody className="gap-3 p-5">
-        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-          <span className="flex items-center gap-2">
-            <DotIcon className={headDotClass} />
-            <h2 className="text-base font-semibold">共享 ICE 映射归属</h2>
-          </span>
-          <span className="text-tiny text-zinc-500 dark:text-zinc-400">
-            浏览器可能合并多个端点返回的相同公网候选
-          </span>
+    <section className="pub-subsection">
+      <div className="pub-subsection-head">
+        <div className="min-w-0">
+          <h3>共享 ICE 映射归属</h3>
+          <p>浏览器可能合并多个端点返回的相同公网候选</p>
         </div>
-        {sharedCandidateDeduplicated && (
-          <p className="rounded-lg border border-emerald-500/20 bg-emerald-500/[0.07] px-3 py-2 text-tiny text-emerald-800 dark:border-emerald-300/20 dark:bg-emerald-300/[0.08] dark:text-emerald-100">
-            四端点均已通过独立预检。共享 ICE 只暴露一个相同公网映射，其余端点标记为候选去重，不代表服务不可达。
-          </p>
-        )}
-        <div className="flex flex-col gap-2">
-          {result.probes.map((probe) => {
-            const preflightCheck = result.endpointChecks.find(
-              (check) => normalizeStunUrl(check.endpoint.url).toLowerCase()
-                === normalizeStunUrl(probe.server).toLowerCase(),
-            );
-            const candidateDeduplicated = sharedCandidateDeduplicated
-              && Boolean(preflightCheck?.reachable)
-              && !probe.candidates.some((candidate) => candidate.type === "srflx");
-            const status = probeStatus(probe, candidateDeduplicated);
-            const endpoints = Array.from(
-              new Set(
-                probe.candidates
-                  .filter((candidate) => candidate.type === "srflx")
-                  .map(endpointOf),
-              ),
-            );
-            return (
-              <div
-                key={probe.server}
-                className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-lg border glass-chip glass-border px-3 py-2"
-              >
-                <Chip size="sm" variant="flat" color={status.color} className="shrink-0">
-                  {status.label}
-                </Chip>
-                <code className="break-all font-mono text-tiny text-zinc-800 dark:text-zinc-200">
-                  {probe.server}
-                </code>
-                {endpoints.length > 0 && (
-                  <span className="flex flex-wrap items-center gap-1.5 sm:ml-auto">
-                    {endpoints.map((endpoint) => (
-                      <code
-                        key={endpoint}
-                        className="rounded-sm border border-black/10 bg-black/[0.03] px-1.5 py-0.5 font-mono text-tiny text-zinc-600 dark:border-white/10 dark:bg-white/[0.06] dark:text-zinc-300"
-                      >
-                        {endpoint}
-                      </code>
-                    ))}
-                  </span>
-                )}
-                {probe.error && !candidateDeduplicated && (
-                  <p className={`w-full text-tiny ${probe.sourceKnown ? "text-danger" : "text-zinc-500 dark:text-zinc-400"}`}>
-                    {probe.error}
-                  </p>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      </CardBody>
-    </Card>
+        <Tag tone={summaryTone} className="bd-num">{respondedCount}/{knownProbes.length} 已返回映射</Tag>
+      </div>
+      {sharedCandidateDeduplicated && (
+        <Alert tone="success" title="四端点均已通过独立预检">
+          共享 ICE 只暴露一个相同公网映射，其余端点标记为候选去重，不代表服务不可达。
+        </Alert>
+      )}
+      <div className="bd-table-wrap">
+        <table className="bd-table jd-stack pub-nat-table">
+          <thead>
+            <tr>
+              <th scope="col">STUN 服务</th>
+              <th scope="col">状态</th>
+              <th scope="col">公网映射</th>
+            </tr>
+          </thead>
+          <tbody>
+            {result.probes.map((probe) => {
+              const preflightCheck = result.endpointChecks.find(
+                (check) => normalizeStunUrl(check.endpoint.url).toLowerCase()
+                  === normalizeStunUrl(probe.server).toLowerCase(),
+              );
+              const candidateDeduplicated = sharedCandidateDeduplicated
+                && Boolean(preflightCheck?.reachable)
+                && !probe.candidates.some((candidate) => candidate.type === "srflx");
+              const status = probeStatus(probe, candidateDeduplicated);
+              const endpoints = Array.from(
+                new Set(
+                  probe.candidates
+                    .filter((candidate) => candidate.type === "srflx")
+                    .map(endpointOf),
+                ),
+              );
+              const showError = Boolean(probe.error) && !candidateDeduplicated;
+              return (
+                <tr key={probe.server}>
+                  <td className="jd-cell-full">
+                    <code className="pub-mono">{probe.server}</code>
+                    {showError && (
+                      <span className={`pub-probe-error${probe.sourceKnown ? " is-danger" : ""}`}>{probe.error}</span>
+                    )}
+                  </td>
+                  <td><Tag tone={tagTone(status.color)}>{status.label}</Tag></td>
+                  <td className={endpoints.length ? undefined : "is-empty"}>
+                    {endpoints.length ? (
+                      <span className="pub-mono-list">
+                        {endpoints.map((endpoint) => <code key={endpoint} className="pub-mono">{endpoint}</code>)}
+                      </span>
+                    ) : null}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </section>
   );
 }
 
@@ -1750,7 +1607,7 @@ async function copyEndpoint(endpoint: string) {
     await navigator.clipboard.writeText(endpoint);
     notify(`已复制 ${endpoint}`);
   } catch {
-    notify("复制失败，当前浏览器环境不允许自动写入剪贴板，请手动选择文本复制", "error");
+    notify("没有复制：当前浏览器不允许自动写入剪贴板，手动选中端点文字复制", "error");
   }
 }
 
@@ -1768,33 +1625,25 @@ function CandidateTableCard({ result }: { result: BrowserNatResult }) {
   );
 
   return (
-    <details className="group rounded-xl border glass glass-border transition-colors open:border-black/15 dark:open:border-white/15">
-      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 p-5 text-base font-semibold">
-        <span className="flex items-center gap-2">
-          <ChevronIcon className="h-4 w-4 transition-transform group-open:rotate-90" />
-          ICE Candidate 明细
-          <span className="ml-1 text-small font-normal text-zinc-500 dark:text-zinc-400">
-            ({candidates.length})
-          </span>
-        </span>
-        <span className="text-tiny font-normal text-zinc-500 dark:text-zinc-400">
-          <span className="group-open:hidden">点击展开</span>
-          <span className="hidden group-open:inline">点击收起</span>
-        </span>
+    <details className="pub-collapse pub-subcollapse">
+      <summary>
+        <Icon name="chevron-right" className="pub-collapse-chevron" />
+        <span>ICE Candidate 明细</span>
+        <span className="pub-collapse-meta bd-num">{candidates.length} 个</span>
       </summary>
-      <div className="border-t border-black/5 px-5 pb-5 pt-3 dark:border-white/5">
+      <div className="pub-subcollapse-body">
         {candidates.length === 0 ? (
-          <p className="text-small text-zinc-500 dark:text-zinc-400">未收集到 ICE candidate。</p>
+          <p className="pub-muted-note">未收集到 ICE candidate。</p>
         ) : (
-          <div className="-mx-1 overflow-x-auto">
-            <table className="w-full min-w-[640px] border-separate border-spacing-0 text-small">
+          <div className="bd-table-wrap">
+            <table className="bd-table bd-table--compact jd-stack pub-nat-table">
               <thead>
-                <tr className="text-tiny text-zinc-500 dark:text-zinc-400">
-                  <th className="px-2 py-1.5 text-left font-medium">STUN</th>
-                  <th className="px-2 py-1.5 text-left font-medium">类型</th>
-                  <th className="px-2 py-1.5 text-left font-medium">协议</th>
-                  <th className="px-2 py-1.5 text-left font-medium">地址</th>
-                  <th className="px-2 py-1.5 text-left font-medium">
+                <tr>
+                  <th scope="col">STUN</th>
+                  <th scope="col">类型</th>
+                  <th scope="col">协议</th>
+                  <th scope="col">地址</th>
+                  <th scope="col">
                     <Tooltip
                       placement="top"
                       content={
@@ -1803,9 +1652,9 @@ function CandidateTableCard({ result }: { result: BrowserNatResult }) {
                         </div>
                       }
                     >
-                      <span className="inline-flex cursor-help items-center gap-1">
+                      <span className="pub-th-hint" tabIndex={0}>
                         关联地址
-                        <InfoIcon className="h-3 w-3 opacity-60" />
+                        <Icon name="info" size={12} />
                       </span>
                     </Tooltip>
                   </th>
@@ -1813,37 +1662,24 @@ function CandidateTableCard({ result }: { result: BrowserNatResult }) {
               </thead>
               <tbody>
                 {candidates.map((item) => (
-                  <tr
-                    key={item.id}
-                    className="text-zinc-800 dark:text-zinc-200 [&>td]:border-t [&>td]:border-black/5 dark:[&>td]:border-white/5"
-                  >
-                    <td className="px-2 py-2 align-top">
-                      <div className="flex max-w-56 flex-col break-all text-tiny">
-                        <span>{item.probe.server}</span>
-                        {item.probe.error ? <span className="text-danger">{item.probe.error}</span> : null}
-                      </div>
+                  <tr key={item.id}>
+                    <td className="jd-cell-full">
+                      <span className="pub-mono pub-wrap">{item.probe.server}</span>
+                      {item.probe.error ? <span className="pub-probe-error is-danger">{item.probe.error}</span> : null}
                     </td>
-                    <td className="px-2 py-2 align-top">
+                    <td>
                       <Tooltip
                         placement="top"
                         content={<div className="max-w-60 py-0.5 text-tiny">{candidateTypeHint(item.candidate.type)}</div>}
                       >
-                        <Chip size="sm" color={candidateColor(item.candidate.type)} variant="flat" className="cursor-help">
-                          {item.candidate.type}
-                        </Chip>
+                        <span tabIndex={0} className="pub-tag-hint">
+                          <Tag tone={tagTone(candidateColor(item.candidate.type))}>{item.candidate.type}</Tag>
+                        </span>
                       </Tooltip>
                     </td>
-                    <td className="px-2 py-2 align-top text-tiny uppercase text-zinc-500 dark:text-zinc-400">
-                      {item.candidate.protocol}
-                    </td>
-                    <td className="px-2 py-2 align-top">
-                      <span className="break-all font-mono text-tiny">{endpointOf(item.candidate)}</span>
-                    </td>
-                    <td className="px-2 py-2 align-top">
-                      <span className="break-all font-mono text-tiny text-zinc-500 dark:text-zinc-400">
-                        {relatedEndpointOf(item.candidate)}
-                      </span>
-                    </td>
+                    <td data-label="协议" className="pub-upper">{item.candidate.protocol}</td>
+                    <td data-label="地址"><span className="pub-mono pub-wrap">{endpointOf(item.candidate)}</span></td>
+                    <td data-label="关联地址"><span className="pub-mono pub-wrap pub-muted">{relatedEndpointOf(item.candidate)}</span></td>
                   </tr>
                 ))}
               </tbody>
@@ -1855,7 +1691,15 @@ function CandidateTableCard({ result }: { result: BrowserNatResult }) {
   );
 }
 
-const NAT_LEVEL_GUIDE = [
+const NAT_LEVEL_GUIDE: Array<{
+  level: BrowserNatLevel;
+  title: string;
+  modern: string;
+  signal: string;
+  detail: string;
+  impact: string;
+  tone: NatTone;
+}> = [
   {
     level: 1,
     title: "公网直连型",
@@ -1863,8 +1707,7 @@ const NAT_LEVEL_GUIDE = [
     signal: "公网候选地址和端口与本地 UDP 基址一致。",
     detail: "这通常表示设备直接持有公网地址，但不代表入站一定开放；本机防火墙、云安全组或运营商策略仍可能拦截数据。",
     impact: "直连条件最好，仍应通过 ICE 连通性检查确认真实路径。",
-    tone: "border-emerald-500/35 text-emerald-700 dark:border-emerald-300/35 dark:text-emerald-200",
-    badge: "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:border-emerald-300/30 dark:bg-emerald-300/10 dark:text-emerald-200",
+    tone: "success",
   },
   {
     level: 2,
@@ -1873,8 +1716,7 @@ const NAT_LEVEL_GUIDE = [
     signal: "四端点共享映射稳定，公网端口与本地源端口相同。",
     detail: "端口保持是端口分配特征，不是独立的 cone 类型。它让对端更容易预测候选端口，但过滤策略仍可能很严格。",
     impact: "通常利于 UDP 打洞，遇到严格过滤或目标相关映射对端时仍可能中继。",
-    tone: "border-blue-500/35 text-blue-700 dark:border-blue-300/35 dark:text-blue-200",
-    badge: "border-blue-500/30 bg-blue-500/10 text-blue-700 dark:border-blue-300/30 dark:bg-blue-300/10 dark:text-blue-200",
+    tone: "primary",
   },
   {
     level: 3,
@@ -1883,8 +1725,7 @@ const NAT_LEVEL_GUIDE = [
     signal: "访问 A1/A2、P1/P2 时公网映射不变，但端口发生转换。",
     detail: "它可能对应旧称 Full Cone、Restricted Cone 或 Port Restricted Cone；三者的差别在过滤轴，浏览器页面不能用 ICE candidate 完整区分。",
     impact: "映射侧对直连友好，实际成功率取决于双方过滤行为和防火墙。",
-    tone: "border-amber-500/40 text-amber-800 dark:border-amber-300/40 dark:text-amber-100",
-    badge: "border-amber-500/30 bg-amber-500/10 text-amber-800 dark:border-amber-300/30 dark:bg-amber-300/10 dark:text-amber-100",
+    tone: "warning",
   },
   {
     level: 4,
@@ -1893,10 +1734,9 @@ const NAT_LEVEL_GUIDE = [
     signal: "同一 UDP 基址因目标 IP 或端口不同而获得不同公网映射。",
     detail: "ADM 依赖目标地址，APDM 同时依赖目标地址和端口。对端难以通过一次 STUN 结果预测后续目标可用的公网端点。",
     impact: "直连可预测性最低，应并行尝试候选并快速准备 TURN / Relay。",
-    tone: "border-rose-500/40 text-rose-700 dark:border-rose-300/40 dark:text-rose-200",
-    badge: "border-rose-500/30 bg-rose-500/10 text-rose-700 dark:border-rose-300/30 dark:bg-rose-300/10 dark:text-rose-200",
+    tone: "danger",
   },
-] as const;
+];
 
 /**
  * 分级徽章里的拱洞：拱顶的数字是基石，拱券立在渠床上，
@@ -1920,7 +1760,6 @@ function NatLevelArchGlyph({ level }: { level: BrowserNatLevel }) {
           strokeLinecap="round"
           strokeDasharray="3 2.4"
           opacity={level === 3 ? 0.6 : 0.9}
-          className="specus-water-march"
         />
       )}
       {/* 收窄的副拱 / 半掩的闸板 / 封死的闸 */}
@@ -1937,6 +1776,12 @@ function NatLevelArchGlyph({ level }: { level: BrowserNatLevel }) {
   );
 }
 
+const VERIFICATION_CHAIN = [
+  { title: "端点预检", detail: "逐一确认 A1/A2、P1/P2 四个 STUN 端点可达" },
+  { title: "同一 ICE socket 比对映射", detail: "浏览器用共享 socket 访问四端点，观察映射是否随目标变化" },
+  { title: "原生客户端补全过滤行为", detail: "发送 CHANGE-REQUEST 区分 EIF / ADF / APDF" },
+];
+
 function NatTypeGuide({
   probeConfig,
   compact = false,
@@ -1944,112 +1789,109 @@ function NatTypeGuide({
 }: {
   probeConfig: PublicNatProbeConfig | null;
   compact?: boolean;
-  /** 本次检测结果命中的分级，对应卡片会高亮标注 */
+  /** 本次检测结果命中的分级，对应条目会高亮标注 */
   currentLevel?: BrowserNatLevel | null;
 }) {
   const topologyAvailable = rfc5780ProbeEndpoints(probeConfig).length === 4;
   const capabilities = probeConfig?.capabilities;
 
   return (
-    <section className={compact ? "mt-4" : "mt-12"} aria-labelledby="nat-type-guide-title">
-      <div className="flex flex-wrap items-end justify-between gap-3 border-b border-black/10 pb-4 dark:border-white/10">
-        <div className="max-w-3xl">
-          <p className="text-tiny font-semibold text-zinc-500 dark:text-zinc-400">NAT1-4 直连难度分级</p>
-          <h2 id="nat-type-guide-title" className="mt-1 text-xl font-semibold text-zinc-950 dark:text-white sm:text-2xl">
-            映射决定端点是否可预测，过滤决定谁能回包
-          </h2>
-          <p className="mt-2 text-small text-zinc-600 dark:text-zinc-300">
-            NAT1-4 是本页面为了直观展示而使用的分级，不是 IETF 标准类型。现代诊断应把映射行为和过滤行为分开记录。
+    <section className="jd-section pub-nat-guide" aria-labelledby="nat-type-guide-title">
+      <div className="jd-section-head">
+        <div className="min-w-0">
+          <h2 id="nat-type-guide-title">NAT1-4 直连难度分级</h2>
+          <p>
+            映射决定端点是否可预测，过滤决定谁能回包。NAT1-4 是本页面为了直观展示而使用的分级，不是 IETF 标准类型；现代诊断应把映射行为和过滤行为分开记录。
           </p>
         </div>
-        <Chip size="sm" radius="sm" variant="flat" color={topologyAvailable ? "success" : "warning"}>
+        <Tag tone={topologyAvailable ? "success" : "warning"}>
           {topologyAvailable ? "RFC 5780 拓扑已下发" : "基础 STUN 兼容模式"}
-        </Chip>
+        </Tag>
       </div>
 
-      <div className="grid border-b border-black/10 dark:border-white/10 md:grid-cols-2">
-        <div className="py-4 pr-0 md:pr-6">
-          <p className="text-small font-semibold text-zinc-900 dark:text-white">映射行为 Mapping</p>
-          <p className="mt-1 text-small text-zinc-600 dark:text-zinc-400">
-            EIM 不随目标变化；ADM 随目标 IP 变化；APDM 同时随目标 IP 和端口变化。本页面用共享 ICE socket 对四端点进行这一轴的观察。
-          </p>
-        </div>
-        <div className="border-t border-black/10 py-4 md:border-l md:border-t-0 md:pl-6 dark:border-white/10">
-          <p className="text-small font-semibold text-zinc-900 dark:text-white">过滤行为 Filtering</p>
-          <p className="mt-1 text-small text-zinc-600 dark:text-zinc-400">
-            EIF 接受任意来源；ADF 要求先联系过来源 IP；APDF 要求先联系过来源 IP:Port。完整判断需要原生客户端发送 CHANGE-REQUEST。
-          </p>
-        </div>
+      <div className="pub-axis-grid">
+        <Card className="pub-axis">
+          <h3 className="bd-card-title">映射行为 Mapping</h3>
+          <p>EIM 不随目标变化；ADM 随目标 IP 变化；APDM 同时随目标 IP 和端口变化。本页面用共享 ICE socket 对四端点进行这一轴的观察。</p>
+        </Card>
+        <Card className="pub-axis">
+          <h3 className="bd-card-title">过滤行为 Filtering</h3>
+          <p>EIF 接受任意来源；ADF 要求先联系过来源 IP；APDF 要求先联系过来源 IP:Port。完整判断需要原生客户端发送 CHANGE-REQUEST。</p>
+        </Card>
       </div>
 
-      <div className="mt-4 grid gap-3 sm:grid-cols-2">
-        {NAT_LEVEL_GUIDE.map((item) => {
-          const isCurrent = currentLevel === item.level;
-          return (
-            <article
-              key={item.level}
-              className={`relative rounded-lg border-l-4 border-y border-r border-black/10 bg-white/45 p-4 transition duration-200 hover:-translate-y-0.5 hover:shadow-md motion-reduce:transform-none motion-reduce:transition-none dark:border-y-white/10 dark:border-r-white/10 dark:bg-white/[0.025] dark:hover:shadow-black/40 ${item.tone} ${
-                isCurrent ? "ring-2 ring-current/40 shadow-md" : ""
-              }`}
-            >
-              {isCurrent && (
-                <span className="absolute right-3 top-3 rounded-md bg-current/10 px-2 py-0.5 text-tiny font-semibold">
-                  本次结果
-                </span>
-              )}
-              <div className="flex items-start gap-3">
-                <span className={`nat-level-badge font-mono ${item.badge}`}>
+      <Card className="pub-level-card">
+        <ol className="pub-stages pub-level-scale" aria-label="直连难度从易到难">
+          {NAT_LEVEL_GUIDE.map((item) => {
+            const isCurrent = currentLevel === item.level;
+            return (
+              <li key={item.level} className="pub-stage pub-level" data-tone={item.tone} data-current={isCurrent || undefined}>
+                <span className="pub-level-badge">
                   <NatLevelArchGlyph level={item.level} />
-                  <span className="nat-level-badge-num">{item.level}</span>
+                  <span className="pub-level-badge-num bd-num">{item.level}</span>
                 </span>
-                <div className="min-w-0">
-                  <h3 className="text-base font-semibold text-zinc-950 dark:text-white">{item.title}</h3>
-                  <p className="mt-0.5 font-mono text-tiny font-medium">{item.modern}</p>
+                <div className="pub-stage-body">
+                  <div className="pub-level-title">
+                    <h3>{item.title}</h3>
+                    <code>{item.modern}</code>
+                    {isCurrent && <Tag tone="info">本次结果</Tag>}
+                  </div>
+                  <dl className="pub-level-facts">
+                    <div><dt>判断依据</dt><dd>{item.signal}</dd></div>
+                    <div><dt>含义</dt><dd>{item.detail}</dd></div>
+                    <div><dt>直连影响</dt><dd>{item.impact}</dd></div>
+                  </dl>
                 </div>
-              </div>
-              <dl className="mt-3 grid gap-2 text-small">
-                <div><dt className="inline font-semibold text-zinc-800 dark:text-zinc-200">判断依据：</dt><dd className="inline text-zinc-600 dark:text-zinc-400">{item.signal}</dd></div>
-                <div><dt className="inline font-semibold text-zinc-800 dark:text-zinc-200">含义：</dt><dd className="inline text-zinc-600 dark:text-zinc-400">{item.detail}</dd></div>
-                <div><dt className="inline font-semibold text-zinc-800 dark:text-zinc-200">直连影响：</dt><dd className="inline text-zinc-600 dark:text-zinc-400">{item.impact}</dd></div>
-              </dl>
-            </article>
-          );
-        })}
-      </div>
+              </li>
+            );
+          })}
+        </ol>
+      </Card>
 
       {!compact && (
-        <div className="mt-6 border-y border-black/10 py-4 dark:border-white/10">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <h3 className="text-base font-semibold text-zinc-950 dark:text-white">当前验证链路</h3>
-              <p className="mt-1 text-small text-zinc-600 dark:text-zinc-400">
-                端点预检 → 同一 ICE socket 比对映射 → 原生客户端 CHANGE-REQUEST 补全过滤行为。
-              </p>
-            </div>
-            <div className="flex flex-wrap gap-1.5">
-              {[
-                ["Binding", capabilities?.binding],
-                ["CHANGE-REQUEST", capabilities?.changeRequest],
-                ["RESPONSE-ORIGIN", capabilities?.responseOrigin],
-                ["OTHER-ADDRESS", capabilities?.otherAddress],
-                ["RESPONSE-PORT", capabilities?.responsePort],
-                ["PADDING", capabilities?.padding],
-              ].map(([label, enabled]) => (
-                <Chip key={String(label)} size="sm" radius="sm" variant="flat" color={enabled ? "success" : "default"}>
-                  {label}
-                </Chip>
+        <Card className="pub-chain">
+          <CardHeader
+            title="当前验证链路"
+            description="端点预检 → 同一 ICE socket 比对映射 → 原生客户端 CHANGE-REQUEST 补全过滤行为"
+          />
+          <div className="bd-card-body pub-chain-body">
+            <ol className="pub-stages pub-chain-steps">
+              {VERIFICATION_CHAIN.map((step, index) => (
+                <li key={step.title} className="pub-stage">
+                  <span className="pub-stage-dot bd-num">{index + 1}</span>
+                  <div className="pub-stage-body">
+                    <b>{step.title}</b>
+                    <span>{step.detail}</span>
+                  </div>
+                </li>
               ))}
+            </ol>
+            <div className="pub-chain-caps">
+              <p className="pub-chain-caps-label">STUN 服务支持的属性</p>
+              <div className="bd-row">
+                {[
+                  ["Binding", capabilities?.binding],
+                  ["CHANGE-REQUEST", capabilities?.changeRequest],
+                  ["RESPONSE-ORIGIN", capabilities?.responseOrigin],
+                  ["OTHER-ADDRESS", capabilities?.otherAddress],
+                  ["RESPONSE-PORT", capabilities?.responsePort],
+                  ["PADDING", capabilities?.padding],
+                ].map(([label, enabled]) => (
+                  <Tag key={String(label)} tone={enabled ? "success" : "neutral"} plain={!enabled}>
+                    {label}
+                  </Tag>
+                ))}
+              </div>
             </div>
           </div>
-        </div>
+        </Card>
       )}
     </section>
   );
 }
 
 /**
- * 页脚说明：三条使用须知压成一行一条的紧凑列表 + 标准文档链接。
- * 原来是三张卡片 + 一条通栏，视觉重量超过其信息价值。
+ * 页脚说明：三条使用须知 + 标准文档链接。
  */
 function NatFooterNote({ probeConfig }: { probeConfig: PublicNatProbeConfig | null }) {
   const tips = [
@@ -2059,166 +1901,36 @@ function NatFooterNote({ probeConfig }: { probeConfig: PublicNatProbeConfig | nu
   ];
 
   return (
-    <footer className="mt-10 rounded-xl border glass glass-border p-5">
-      <ul className="grid gap-3 sm:grid-cols-3">
+    <section className="jd-section" aria-labelledby="nat-notes-title">
+      <div className="jd-section-head">
+        <div className="min-w-0">
+          <h2 id="nat-notes-title">使用须知</h2>
+          <p>当前接口：{probeConfig?.protocol ?? "RFC8489"} / {probeConfig?.discoveryMethod ?? "BASIC_STUN"}。标准原文和实践说明可用于核对术语边界。</p>
+        </div>
+        <div className="bd-row">
+          <a className="bd-btn bd-btn--ghost bd-btn--sm" href="https://www.rfc-editor.org/rfc/rfc5780" rel="noreferrer" target="_blank">
+            <span>RFC 5780</span>
+            <Icon name="external" />
+          </a>
+          <a className="bd-btn bd-btn--ghost bd-btn--sm" href="https://www.rfc-editor.org/rfc/rfc8489" rel="noreferrer" target="_blank">
+            <span>RFC 8489</span>
+            <Icon name="external" />
+          </a>
+          <a className="bd-btn bd-btn--ghost bd-btn--sm" href={NAT_TRAVERSAL_REFERENCE.url} rel="noreferrer" target="_blank">
+            <span>NAT traversal</span>
+            <Icon name="external" />
+          </a>
+        </div>
+      </div>
+      <ul className="pub-tips">
         {tips.map((tip) => (
-          <li key={tip.title} className="text-small">
-            <span className="font-semibold text-zinc-900 dark:text-white">{tip.title}</span>
-            <span className="text-zinc-500 dark:text-zinc-400"> — </span>
-            <span className="text-zinc-600 dark:text-zinc-400">{tip.text}</span>
+          <li key={tip.title} className="bd-card">
+            <b>{tip.title}</b>
+            <p>{tip.text}</p>
           </li>
         ))}
       </ul>
-      <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-black/5 pt-4 dark:border-white/5">
-        <div className="text-tiny text-zinc-500 dark:text-zinc-400">
-          当前接口：{probeConfig?.protocol ?? "RFC8489"} / {probeConfig?.discoveryMethod ?? "BASIC_STUN"}。标准原文和实践说明可用于核对术语边界。
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <Button as="a" href="https://www.rfc-editor.org/rfc/rfc5780" rel="noreferrer" target="_blank" size="sm" radius="sm" variant="light">RFC 5780</Button>
-          <Button as="a" href="https://www.rfc-editor.org/rfc/rfc8489" rel="noreferrer" target="_blank" size="sm" radius="sm" variant="light">RFC 8489</Button>
-          <Button as="a" href={NAT_TRAVERSAL_REFERENCE.url} rel="noreferrer" target="_blank" size="sm" radius="sm" variant="light">NAT traversal</Button>
-        </div>
-      </div>
-    </footer>
-  );
-}
-
-const ACCENTS: Record<
-  "default" | "primary" | "success" | "warning" | "danger",
-  {
-    border: string;
-    bg: string;
-    chipBg: string;
-    chipText: string;
-    chipBorder: string;
-  }
-> = {
-  default: {
-    border: "border-black/10 dark:border-white/10",
-    bg: "bg-white/60 dark:bg-white/[0.03]",
-    chipBg: "bg-zinc-200/70 dark:bg-white/10",
-    chipText: "text-zinc-700 dark:text-zinc-200",
-    chipBorder: "border-zinc-300/60 dark:border-white/10",
-  },
-  primary: {
-    border: "border-primary-500/25 dark:border-primary-300/25",
-    bg: "bg-primary-500/[0.04] dark:bg-primary-400/[0.06]",
-    chipBg: "bg-primary-500/15 dark:bg-primary-400/15",
-    chipText: "text-primary-700 dark:text-primary-300",
-    chipBorder: "border-primary-500/30 dark:border-primary-300/30",
-  },
-  success: {
-    border: "border-emerald-500/25 dark:border-emerald-300/25",
-    bg: "bg-emerald-500/[0.04] dark:bg-emerald-400/[0.06]",
-    chipBg: "bg-emerald-500/15 dark:bg-emerald-400/15",
-    chipText: "text-emerald-700 dark:text-emerald-100",
-    chipBorder: "border-emerald-500/30 dark:border-emerald-300/30",
-  },
-  warning: {
-    border: "border-amber-500/25 dark:border-amber-300/25",
-    bg: "bg-amber-500/[0.04] dark:bg-amber-400/[0.06]",
-    chipBg: "bg-amber-500/15 dark:bg-amber-400/15",
-    chipText: "text-amber-700 dark:text-amber-100",
-    chipBorder: "border-amber-500/30 dark:border-amber-300/30",
-  },
-  danger: {
-    border: "border-rose-500/25 dark:border-rose-300/25",
-    bg: "bg-rose-500/[0.04] dark:bg-rose-400/[0.06]",
-    chipBg: "bg-rose-500/15 dark:bg-rose-400/15",
-    chipText: "text-rose-700 dark:text-rose-100",
-    chipBorder: "border-rose-500/30 dark:border-rose-300/30",
-  },
-};
-
-function ChevronIcon({ className = "h-4 w-4" }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <polyline points="9 18 15 12 9 6" />
-    </svg>
-  );
-}
-
-function InfoIcon({ className = "h-3.5 w-3.5" }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="12" cy="12" r="9" />
-      <line x1="12" y1="11" x2="12" y2="16" />
-      <circle cx="12" cy="8" r="0.5" fill="currentColor" />
-    </svg>
-  );
-}
-
-function CopyIcon({ className = "h-3.5 w-3.5" }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <rect x="9" y="9" width="11" height="11" rx="2" />
-      <path d="M5 15V6a2 2 0 0 1 2-2h9" />
-    </svg>
-  );
-}
-
-// 结果徽章上的状态图标：成功打勾、警告感叹号、失败打叉、检测中呼吸点。
-function StatusGlyph({
-  color,
-  className = "",
-}: {
-  color: "default" | "primary" | "success" | "warning" | "danger";
-  className?: string;
-}) {
-  const base = `h-3.5 w-3.5 shrink-0 ${className}`;
-  switch (color) {
-    case "success":
-      return (
-        <svg className={base} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-          <circle cx="12" cy="12" r="9" strokeWidth="2" />
-          <polyline points="8.5 12.5 11 15 15.5 9.5" />
-        </svg>
-      );
-    case "warning":
-      return (
-        <svg className={base} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <circle cx="12" cy="12" r="9" />
-          <line x1="12" y1="7.5" x2="12" y2="13" />
-          <circle cx="12" cy="16.5" r="0.5" fill="currentColor" />
-        </svg>
-      );
-    case "danger":
-      return (
-        <svg className={base} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <circle cx="12" cy="12" r="9" />
-          <line x1="9" y1="9" x2="15" y2="15" />
-          <line x1="15" y1="9" x2="9" y2="15" />
-        </svg>
-      );
-    case "primary":
-      return (
-        <span className={`relative flex h-2.5 w-2.5 shrink-0 items-center justify-center ${className}`}>
-          <span className="absolute h-full w-full animate-ping rounded-full bg-current opacity-50" />
-          <span className="h-1.5 w-1.5 rounded-full bg-current" />
-        </span>
-      );
-    default:
-      return <DotIcon className={`shrink-0 ${className}`} />;
-  }
-}
-
-// 置信度三格量表：高亮格数对应高/中/低。
-function ConfidenceBars({ confidence }: { confidence: BrowserNatConfidence }) {
-  const filled = confidence === "high" ? 3 : confidence === "medium" ? 2 : 1;
-  const heights = ["h-1.5", "h-2", "h-2.5"];
-  return (
-    <span aria-hidden="true" className="flex items-end gap-0.5">
-      {heights.map((height, index) => (
-        <span
-          key={height}
-          className={`w-1 rounded-xs ${height} ${
-            index < filled
-              ? "bg-primary-500 dark:bg-primary-300"
-              : "bg-zinc-300/80 dark:bg-white/15"
-          }`}
-        />
-      ))}
-    </span>
+    </section>
   );
 }
 
@@ -2234,29 +1946,6 @@ function candidateTypeHint(type: string): string {
       return "peer-reflexive：连接检查阶段由对端观察到的地址。";
     default:
       return "浏览器上报的其他 candidate 类型。";
-  }
-}
-
-function DotIcon({ className = "" }: { className?: string }) {
-  return (
-    <svg className={`h-2.5 w-2.5 ${className}`} viewBox="0 0 12 12" fill="currentColor">
-      <circle cx="6" cy="6" r="4" />
-    </svg>
-  );
-}
-
-function natToneBg(tone: "default" | "primary" | "success" | "warning" | "danger"): string {
-  switch (tone) {
-    case "success":
-      return "bg-emerald-500";
-    case "primary":
-      return "bg-primary-500";
-    case "warning":
-      return "bg-amber-500";
-    case "danger":
-      return "bg-rose-500";
-    default:
-      return "bg-zinc-400 dark:bg-zinc-500";
   }
 }
 
@@ -2749,32 +2438,29 @@ function groupComparableSrflxMappings(
 }
 
 function Rfc5780EndpointCard({ checks }: { checks: StunEndpointCheck[] }) {
+  const reachable = checks.filter((check) => check.reachable).length;
   return (
-    <section className="rounded-xl border glass glass-border p-5">
-      <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div>
-          <h2 className="text-base font-semibold">RFC 5780 四端点预检</h2>
-          <p className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
-            A1/A2 是两个公网地址，P1/P2 是两个 UDP 端口。预检只确认端点可达，不跨不同浏览器 socket 比较映射。
-          </p>
+    <section className="pub-subsection">
+      <div className="pub-subsection-head">
+        <div className="min-w-0">
+          <h3>RFC 5780 四端点预检</h3>
+          <p>A1/A2 是两个公网地址，P1/P2 是两个 UDP 端口。预检只确认端点可达，不跨不同浏览器 socket 比较映射。</p>
         </div>
-        <Chip size="sm" variant="flat" color={checks.every((check) => check.reachable) ? "success" : "warning"}>
-          {checks.filter((check) => check.reachable).length}/{checks.length} 可达
-        </Chip>
+        <Tag tone={reachable === checks.length ? "success" : "warning"} className="bd-num">
+          {reachable}/{checks.length} 可达
+        </Tag>
       </div>
-      <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="pub-endpoint-checks">
         {checks.map((check) => (
-          <div key={check.endpoint.id} className="min-w-0 rounded-lg border glass-chip glass-border p-3">
-            <div className="flex items-center justify-between gap-2">
-              <span className="font-mono text-small font-semibold">{check.endpoint.id}</span>
-              <span className={`h-2 w-2 rounded-full ${check.reachable ? "bg-emerald-500" : "bg-rose-500"}`} aria-hidden="true" />
+          <div key={check.endpoint.id} className="pub-endpoint-check">
+            <div className="pub-endpoint-check-head">
+              <b className="pub-mono">{check.endpoint.id}</b>
+              <Tag tone={check.reachable ? "success" : "danger"}>{check.reachable ? "可达" : "不可达"}</Tag>
             </div>
-            <code className="mt-2 block break-all font-mono text-[11px] leading-5 text-zinc-600 dark:text-zinc-300">
-              {check.endpoint.url}
-            </code>
-            <p className="mt-1 truncate text-tiny text-zinc-500 dark:text-zinc-400" title={check.mappedEndpoint ?? check.error ?? ""}>
-              {check.mappedEndpoint ?? check.error ?? "未返回映射"} · {check.elapsedMs} ms
-            </p>
+            <code className="pub-mono pub-wrap">{check.endpoint.url}</code>
+            <span className="pub-endpoint-check-meta" title={check.mappedEndpoint ?? check.error ?? ""}>
+              {check.mappedEndpoint ?? check.error ?? "未返回映射"} · <span className="bd-num">{check.elapsedMs} ms</span>
+            </span>
           </div>
         ))}
       </div>

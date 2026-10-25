@@ -1,11 +1,16 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { fetchPublicClientDownloads } from "../api/client";
 import type { ClientArch, ClientDownloadLink, ClientPlatform } from "../api/types";
-import { AppLogo } from "../components/AppLogo";
-import { MacosInstallGuide } from "../components/MacosInstallGuide";
-import { PublicToolsMenu } from "../components/PublicToolsMenu";
-import { UserMenuButton } from "../components/UserMenuButton";
-import { SPECUS_HOMEBREW_TAP_URL } from "../lib/macosInstall";
+import { PublicPage } from "../components/PublicTopBar";
+import { Glyph } from "../components/PublicGlyph";
+import { copyTextToClipboard } from "../lib/clipboard";
+import { formatBytes } from "../lib/format";
+import {
+  MACOS_CLIENT_START_COMMAND,
+  MACOS_HOMEBREW_INSTALL_COMMAND,
+  MACOS_HOMEBREW_UPGRADE_COMMAND,
+  SPECUS_HOMEBREW_TAP_URL,
+} from "../lib/macosInstall";
 import {
   detectVisitorDevice,
   recommendClientDownload,
@@ -45,6 +50,12 @@ const DOWNLOAD_GROUPS: Array<{
   { key: "linux", title: "Linux", description: "x86_64 与 ARM64 静态单文件客户端" },
   { key: "android", title: "Android", description: "通用 APK，安装时由 Android 确认应用来源与权限" },
   { key: "any", title: "跨平台 · 需要运行时", description: "适合已有 Java 或 .NET 运行环境的设备" },
+];
+
+const SETUP_STEPS = [
+  { title: "安装客户端", description: "使用上方推荐方式，或在完整列表选择实现。" },
+  { title: "准备配置", description: "将服务端地址与凭证写入 client.jsonc。" },
+  { title: "启动连接", description: "运行客户端，让内网服务接入 specus。" },
 ];
 
 export function PublicDownloadPage() {
@@ -168,113 +179,94 @@ export function PublicDownloadPage() {
   };
 
   return (
-    <main className="app-apple landing-shell landing-apple download-page min-h-screen text-zinc-950 dark:text-white">
-      <section className="download-hero relative overflow-hidden pb-14 pt-5 sm:pb-20">
-        <div className="download-channel-lines" aria-hidden="true" />
-        <header className="landing-apple-header relative z-40 mx-auto flex w-full max-w-[1120px] items-center justify-between gap-3 px-5 sm:px-8">
-          <a className="rounded-md focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary" href="/" aria-label="返回 specus 首页">
-            <AppLogo className="min-w-0" label="specus" subtitle="客户端下载" />
-          </a>
-          <div className="public-header-actions flex shrink-0 items-center gap-2">
-            <PublicToolsMenu active="download" />
-            <UserMenuButton className="public-header-theme-button" />
+    <PublicPage active="download">
+      <div className="pub-container pub-container--narrow pub-download">
+        <header className="bd-page-header pub-page-header">
+          <div className="min-w-0">
+            <p className="pub-eyebrow">Specus Client</p>
+            <h1 className="bd-page-title">下载客户端</h1>
+            <p className="bd-page-desc">识别这台设备的系统与处理器，先给出最合适的安装方式；其他平台和实现在下方完整列表里。</p>
           </div>
         </header>
 
-        <div className="relative z-10 mx-auto mt-14 w-full max-w-[1120px] px-5 sm:mt-20 sm:px-8">
-          <div className="mx-auto max-w-3xl text-center">
-            <span className="landing-apple-eyebrow text-small font-semibold">SPECUS CLIENT</span>
+        <section className="bd-card pub-recommend" aria-labelledby="recommended-download-title">
+          <div className="pub-recommend-head">
+            <span className="pub-device-mark" aria-hidden="true"><Glyph name="monitor" size={20} /></span>
+            <div className="min-w-0 flex-1">
+              <p className="pub-recommend-kicker">{manualDevice ? "手动选择" : "检测到这台设备"}</p>
+              <h2 id="recommended-download-title" className="pub-recommend-device">
+                {visitorDeviceDisplayName(device)}
+              </h2>
+            </div>
+            <button
+              ref={changeDeviceButtonRef}
+              aria-expanded={chooserOpen}
+              className="bd-btn bd-btn--secondary bd-btn--sm"
+              type="button"
+              onClick={() => setChooserOpen((value) => !value)}
+            >
+              <Glyph name="edit" />
+              <span>不是你的设备？更改</span>
+            </button>
           </div>
 
-          <section className="download-recommendation mx-auto mt-5 max-w-4xl" aria-labelledby="recommended-download-title">
-            <div className="download-recommendation-head flex flex-col gap-4 px-5 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
-              <div className="flex min-w-0 items-center gap-3">
-                <span className="download-device-mark" aria-hidden="true"><DeviceIcon device={device} /></span>
-                <div className="min-w-0">
-                  <p className="text-tiny font-semibold uppercase tracking-[0.14em] text-zinc-500 dark:text-zinc-400">
-                    {manualDevice ? "手动选择" : "检测到这台设备"}
-                  </p>
-                  <h2 id="recommended-download-title" className="mt-0.5 truncate text-lg font-semibold">
-                    {visitorDeviceDisplayName(device)}
-                  </h2>
-                </div>
-              </div>
-              <button
-                ref={changeDeviceButtonRef}
-                aria-expanded={chooserOpen}
-                className="download-change-device"
-                type="button"
-                onClick={() => setChooserOpen((value) => !value)}
-              >
-                不是你的设备？更改
-              </button>
-            </div>
+          {chooserOpen && (
+            <DeviceChooser
+              containerRef={deviceChooserRef}
+              current={device}
+              detected={detectedDevice}
+              manual={manualDevice !== null}
+              onChoose={chooseDevice}
+              onReset={() => {
+                setManualDevice(null);
+                setChooserOpen(false);
+                restoreChangeDeviceFocus();
+              }}
+            />
+          )}
 
-            {chooserOpen && (
-              <DeviceChooser
-                containerRef={deviceChooserRef}
-                current={device}
-                detected={detectedDevice}
-                manual={manualDevice !== null}
-                onChoose={chooseDevice}
-                onReset={() => {
-                  setManualDevice(null);
-                  setChooserOpen(false);
-                  restoreChangeDeviceFocus();
-                }}
-              />
-            )}
-
-            <div className="download-recommendation-body p-5 sm:p-6" aria-live="polite">
-              <RecommendedInstall
-                device={device}
-                detectingDevice={deviceDetectionPending && manualDevice === null}
-                loading={loading}
-                loadError={loadError}
-                recommendation={recommendation}
-                onChoose={chooseDevice}
-                onRetry={() => void loadDownloads(true)}
-                onOpenChooser={openDeviceChooser}
-                onShowAll={revealAllDownloads}
-              />
-            </div>
-          </section>
-
-          <div className="download-steps mx-auto mt-5 grid max-w-4xl sm:grid-cols-3">
-            {[
-              ["01", "安装客户端", "使用上方推荐方式，或在完整列表选择实现。"],
-              ["02", "准备配置", "将服务端地址与凭证写入 client.jsonc。"],
-              ["03", "启动连接", "运行客户端，让内网服务接入 specus。"],
-            ].map(([number, title, description]) => (
-              <div key={number} className="download-step px-5 py-4">
-                <span className="font-mono text-tiny text-primary">{number}</span>
-                <strong className="ml-3 text-small font-semibold">{title}</strong>
-                <p className="mt-2 text-tiny text-zinc-600 dark:text-zinc-400">{description}</p>
-              </div>
-            ))}
+          <div className="pub-recommend-body" aria-live="polite">
+            <RecommendedInstall
+              device={device}
+              detectingDevice={deviceDetectionPending && manualDevice === null}
+              loading={loading}
+              loadError={loadError}
+              recommendation={recommendation}
+              onChoose={chooseDevice}
+              onRetry={() => void loadDownloads(true)}
+              onOpenChooser={openDeviceChooser}
+              onShowAll={revealAllDownloads}
+            />
           </div>
-        </div>
-      </section>
+        </section>
 
-      <section className="landing-apple-content px-5 py-14 sm:px-8 sm:py-20">
-        <div className="mx-auto max-w-[1120px]">
-          <div className="flex flex-col gap-5 sm:flex-row sm:items-end sm:justify-between">
-            <div className="max-w-2xl">
-              <span className="landing-apple-kicker text-tiny font-semibold">ALL OPTIONS</span>
-              <h2 className="mt-2">需要其他安装方式？</h2>
-              <p className="mt-2 text-small text-zinc-600 dark:text-zinc-400">
-                展开后可按 macOS、Windows、Linux 与跨平台运行时查看全部可用客户端产物。
-              </p>
+        <ol className="pub-setup-steps" aria-label="接入步骤">
+          {SETUP_STEPS.map((step, index) => (
+            <li key={step.title}>
+              <span className="pub-stage-dot bd-num" aria-hidden="true">{index + 1}</span>
+              <div className="min-w-0">
+                <b>{step.title}</b>
+                <p>{step.description}</p>
+              </div>
+            </li>
+          ))}
+        </ol>
+
+        <section className="jd-section pub-all-downloads" aria-labelledby="all-downloads-title">
+          <div className="jd-section-head">
+            <div className="min-w-0">
+              <h2 id="all-downloads-title">需要其他安装方式？</h2>
+              <p>展开后可按 macOS、Windows、Linux 与跨平台运行时查看全部可用客户端产物、SHA-256 校验值与下载地址。</p>
             </div>
             <button
               aria-controls="all-download-methods"
               aria-expanded={showAll}
-              className="landing-secondary-button shrink-0 px-6"
+              className="bd-btn bd-btn--secondary"
               type="button"
               onClick={() => setShowAll((value) => !value)}
             >
-              {showAll ? "收起全部下载方式" : "查看全部平台与安装方式"}
-              <ChevronIcon expanded={showAll} />
+              <span>{showAll ? "收起全部下载方式" : "查看全部平台与安装方式"}</span>
+              <Glyph name="chevron-down" className={`pub-chevron${showAll ? " is-open" : ""}`} />
             </button>
           </div>
 
@@ -282,34 +274,44 @@ export function PublicDownloadPage() {
             <div
               ref={allDownloadsRef}
               id="all-download-methods"
-              className="download-all mt-8 scroll-mt-6 focus:outline-hidden"
+              className="pub-download-groups"
               tabIndex={-1}
             >
               {loadError && (
-                <div className="download-inline-alert mb-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" role="alert">
-                  <span>下载列表暂时无法更新；macOS Homebrew 仍可使用，也可以直接打开 GitHub Releases。</span>
-                  <span className="flex flex-wrap gap-3">
-                    <button className="font-medium text-primary hover:underline" type="button" onClick={() => void loadDownloads(true)}>重试</button>
-                    <a className="font-medium text-primary hover:underline" href={GITHUB_RELEASES_URL} target="_blank" rel="noopener noreferrer">GitHub Releases ↗</a>
-                  </span>
-                </div>
+                <Alert
+                  tone="warning"
+                  role="alert"
+                  title="下载列表暂时无法更新"
+                  actions={
+                    <>
+                      <button className="bd-btn bd-btn--secondary bd-btn--sm" type="button" onClick={() => void loadDownloads(true)}>
+                        <Glyph name="refresh" />
+                        <span>重试</span>
+                      </button>
+                      <a className="bd-btn bd-btn--ghost bd-btn--sm" href={GITHUB_RELEASES_URL} target="_blank" rel="noopener noreferrer">
+                        <span>GitHub Releases</span>
+                        <Glyph name="external" />
+                      </a>
+                    </>
+                  }
+                >
+                  macOS Homebrew 仍可使用，也可以直接打开 GitHub Releases。
+                </Alert>
               )}
 
-              <div className="grid gap-5 lg:grid-cols-2">
-                {groups.map((group) => (
-                  <DownloadGroup
-                    key={group.key}
-                    group={group}
-                    links={downloads.filter((link) => link.platform === group.key)}
-                    loading={loading}
-                  />
-                ))}
-              </div>
+              {groups.map((group) => (
+                <DownloadGroup
+                  key={group.key}
+                  group={group}
+                  links={downloads.filter((link) => link.platform === group.key)}
+                  loading={loading}
+                />
+              ))}
             </div>
           )}
-        </div>
-      </section>
-    </main>
+        </section>
+      </div>
+    </PublicPage>
   );
 }
 
@@ -335,7 +337,7 @@ function RecommendedInstall({
   onShowAll: () => void;
 }) {
   if (recommendation.kind === "homebrew") {
-    return <MacosInstallGuide landing />;
+    return <HomebrewGuide />;
   }
 
   if (device.platform === "android") {
@@ -344,24 +346,14 @@ function RecommendedInstall({
     }
     if (recommendation.kind === "download") {
       return (
-        <div className="grid gap-6 md:grid-cols-[1fr_auto] md:items-end">
-          <div>
-            <span className="download-match-badge">Android 最佳匹配</span>
-            <h3 className="mt-3 text-2xl font-semibold">{recommendation.link.displayName}</h3>
-            <p className="mt-2 max-w-2xl text-small text-zinc-600 dark:text-zinc-400">
-              下载通用 APK 后，Android 会再次确认安装。后续版本可由客户端主动提示。
-            </p>
-            <div className="mt-4 flex flex-wrap gap-2 text-tiny text-zinc-600 dark:text-zinc-400">
-              <span className="download-meta-chip">Android 8.0+</span>
-              {recommendation.link.version ? <span className="download-meta-chip">v{recommendation.link.version}</span> : null}
-              <span className="download-meta-chip">APK</span>
-            </div>
-          </div>
-          <a className="landing-primary-button px-6" href={recommendation.link.downloadUrl} rel="noopener noreferrer">
-            下载 Android 版
-            <DownloadArrowIcon />
-          </a>
-        </div>
+        <RecommendedDownload
+          badge="Android 最佳匹配"
+          link={recommendation.link}
+          description="下载通用 APK 后，Android 会再次确认安装。后续版本可由客户端主动提示。"
+          tags={["Android 8.0+", "APK"]}
+          action="下载 Android 版"
+          newTab={false}
+        />
       );
     }
     return <DownloadUnavailable networkError={loadError} onRetry={onRetry} onShowAll={onShowAll} />;
@@ -373,17 +365,17 @@ function RecommendedInstall({
         return <DeviceDetectionLoading />;
       }
       return (
-        <div>
-          <span className="download-match-badge">还差一步</span>
-          <h3 className="mt-3 text-xl font-semibold">选择这台设备的处理器架构</h3>
-          <p className="mt-2 text-small text-zinc-600 dark:text-zinc-400">
-            浏览器没有提供可靠的架构信息。请在系统设置中确认，避免下载无法运行的版本。
+        <div className="pub-recommend-block">
+          <Tag tone="warning">还差一步</Tag>
+          <h3 className="pub-recommend-title">选择这台设备的处理器架构</h3>
+          <p className="pub-recommend-desc">
+            浏览器没有提供可靠的架构信息。在系统设置里确认处理器类型，避免下载无法运行的版本。
           </p>
-          <div className="mt-5 grid gap-3 sm:grid-cols-2">
+          <div className="pub-choice-grid pub-choice-grid--two">
             {(["x64", "arm64"] as const).map((arch) => (
               <button
                 key={arch}
-                className="download-arch-choice"
+                className="pub-choice"
                 type="button"
                 onClick={() => onChoose({ platform: device.platform as "windows" | "linux", arch })}
               >
@@ -403,31 +395,16 @@ function RecommendedInstall({
     if (recommendation.kind === "download") {
       const desktop = recommendation.reason === "windows-desktop";
       return (
-        <div className="grid gap-6 md:grid-cols-[1fr_auto] md:items-end">
-          <div>
-            <span className="download-match-badge">最佳匹配</span>
-            <h3 className="mt-3 text-2xl font-semibold">{recommendation.link.displayName}</h3>
-            <p className="mt-2 max-w-2xl text-small text-zinc-600 dark:text-zinc-400">
-              {desktop
-                ? "自包含的 Windows 图形客户端，无需另外安装 .NET Runtime。下载压缩包并解压后即可使用。"
-                : recommendation.link.description || "对应当前系统与处理器的静态单文件客户端，无需额外安装运行时。"}
-            </p>
-            <div className="mt-4 flex flex-wrap gap-2 text-tiny text-zinc-600 dark:text-zinc-400">
-              <span className="download-meta-chip">{implementationLabel(recommendation.link)}</span>
-              <span className="download-meta-chip">{archLabel(recommendation.link.arch)}</span>
-              <span className="download-meta-chip">发布包</span>
-            </div>
-          </div>
-          <a
-            className="landing-primary-button px-6"
-            href={recommendation.link.downloadUrl}
-            rel="noopener noreferrer"
-            target="_blank"
-          >
-            下载最佳匹配
-            <DownloadArrowIcon />
-          </a>
-        </div>
+        <RecommendedDownload
+          badge="最佳匹配"
+          link={recommendation.link}
+          description={desktop
+            ? "自包含的 Windows 图形客户端，无需另外安装 .NET Runtime。下载压缩包并解压后即可使用。"
+            : recommendation.link.description || "对应当前系统与处理器的静态单文件客户端，无需额外安装运行时。"}
+          tags={[implementationLabel(recommendation.link), archLabel(recommendation.link.arch), "发布包"]}
+          action="下载最佳匹配"
+          newTab
+        />
       );
     }
 
@@ -442,31 +419,171 @@ function RecommendedInstall({
 
   if (device.platform === "unsupported") {
     return (
-      <div>
-        <span className="download-match-badge download-match-badge-neutral">桌面客户端</span>
-        <h3 className="mt-3 text-xl font-semibold">请在电脑上打开下载页</h3>
-        <p className="mt-2 text-small text-zinc-600 dark:text-zinc-400">
-          当前暂未提供 iOS、iPadOS 或 ChromeOS 安装包。请使用 Android、macOS、Windows 或 Linux 设备下载客户端。
+      <div className="pub-recommend-block">
+        <Tag plain>桌面客户端</Tag>
+        <h3 className="pub-recommend-title">在电脑上打开下载页</h3>
+        <p className="pub-recommend-desc">
+          当前暂未提供 iOS、iPadOS 或 ChromeOS 安装包。用 Android、macOS、Windows 或 Linux 设备下载客户端。
         </p>
-        <button className="mt-5 font-medium text-primary hover:underline" type="button" onClick={onShowAll}>
-          仍然查看全部桌面平台 →
-        </button>
+        <div className="bd-row pub-recommend-actions">
+          <button className="bd-btn bd-btn--secondary" type="button" onClick={onShowAll}>
+            <span>查看全部桌面平台</span>
+            <Glyph name="arrow-right" />
+          </button>
+        </div>
       </div>
     );
   }
 
   return (
-    <div>
-      <span className="download-match-badge download-match-badge-neutral">未识别设备</span>
-      <h3 className="mt-3 text-xl font-semibold">选择你的系统与处理器</h3>
-      <p className="mt-2 text-small text-zinc-600 dark:text-zinc-400">
-        浏览器没有提供可确认的平台信息。请使用上方设备选择器，或展开全部安装方式。
+    <div className="pub-recommend-block">
+      <Tag plain>未识别设备</Tag>
+      <h3 className="pub-recommend-title">选择你的系统与处理器</h3>
+      <p className="pub-recommend-desc">
+        浏览器没有提供可确认的平台信息。用上方的设备选择器选定设备，或展开全部安装方式。
       </p>
-      <div className="mt-5 flex flex-wrap gap-4 text-small">
-        <button className="font-medium text-primary hover:underline" type="button" onClick={onOpenChooser}>选择设备</button>
-        <button className="font-medium text-primary hover:underline" type="button" onClick={onShowAll}>查看全部平台与安装方式 →</button>
+      <div className="bd-row pub-recommend-actions">
+        <button className="bd-btn bd-btn--primary" type="button" onClick={onOpenChooser}>
+          <Glyph name="monitor" />
+          <span>选择设备</span>
+        </button>
+        <button className="bd-btn bd-btn--secondary" type="button" onClick={onShowAll}>
+          <span>查看全部平台与安装方式</span>
+          <Glyph name="arrow-right" />
+        </button>
       </div>
     </div>
+  );
+}
+
+function RecommendedDownload({
+  action,
+  badge,
+  description,
+  link,
+  newTab,
+  tags,
+}: {
+  action: string;
+  badge: string;
+  description: string;
+  link: ClientDownloadLink;
+  newTab: boolean;
+  tags: string[];
+}) {
+  const facts = [
+    ...tags,
+    link.version ? `v${link.version.replace(/^v/i, "")}` : null,
+    link.fileSize ? formatBytes(link.fileSize) : null,
+  ].filter((value): value is string => Boolean(value));
+  return (
+    <div className="pub-match">
+      <div className="pub-recommend-block min-w-0">
+        <Tag tone="success">{badge}</Tag>
+        <h3 className="pub-recommend-title">{link.displayName}</h3>
+        <p className="pub-recommend-desc">{description}</p>
+        <div className="bd-row">
+          {facts.map((fact) => <Tag key={fact} plain className="bd-num">{fact}</Tag>)}
+        </div>
+        {link.sha256 ? <Checksum value={link.sha256} name={link.displayName} /> : null}
+      </div>
+      <a
+        className="bd-btn bd-btn--primary bd-btn--lg pub-match-action"
+        href={link.downloadUrl}
+        rel="noopener noreferrer"
+        target={newTab ? "_blank" : undefined}
+      >
+        <Glyph name="download" />
+        <span>{action}</span>
+      </a>
+    </div>
+  );
+}
+
+/** The macOS install guide as a code card: the Homebrew commands with copy buttons. */
+function HomebrewGuide() {
+  return (
+    <section className="pub-recommend-block" aria-label="macOS Homebrew 安装说明">
+      <div className="bd-row">
+        <Tag tone="info">macOS</Tag>
+        <Tag tone="success">推荐安装方式</Tag>
+        <a className="jd-link pub-inline-link" href={SPECUS_HOMEBREW_TAP_URL} rel="noopener noreferrer" target="_blank">
+          <span>查看 Cask</span>
+          <Glyph name="external" size={14} />
+        </a>
+      </div>
+      <h3 className="pub-recommend-title">通过 Homebrew 安装 Specus Client</h3>
+      <p className="pub-recommend-desc">同一条命令自动选择 Apple Silicon 或 Intel 版本，并可通过 Homebrew 直接升级。</p>
+      <div className="pub-code-card">
+        <CommandRow command={MACOS_HOMEBREW_INSTALL_COMMAND} label="安装" />
+        <CommandRow command={MACOS_CLIENT_START_COMMAND} label="运行" />
+      </div>
+      <p className="pub-recommend-note">
+        将运行命令中的配置路径替换为你的 <code>client.jsonc</code>；后续执行 <code>{MACOS_HOMEBREW_UPGRADE_COMMAND}</code> 即可升级。
+        也可以使用 GitHub Release 中对应架构的 macOS 压缩包手动安装。
+      </p>
+    </section>
+  );
+}
+
+function useCopyStatus() {
+  const [status, setStatus] = useState<"idle" | "success" | "error">("idle");
+  const resetTimer = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (resetTimer.current !== null) globalThis.clearTimeout(resetTimer.current);
+  }, []);
+  const copy = async (text: string) => {
+    const copied = await copyTextToClipboard(text);
+    setStatus(copied ? "success" : "error");
+    if (resetTimer.current !== null) globalThis.clearTimeout(resetTimer.current);
+    resetTimer.current = globalThis.setTimeout(() => setStatus("idle"), 2_500);
+  };
+  return { status, copy };
+}
+
+function CommandRow({ command, label }: { command: string; label: string }) {
+  const { status, copy } = useCopyStatus();
+  return (
+    <div className="pub-code">
+      <span className="pub-code-label">{label}</span>
+      <code><span className="pub-code-prompt" aria-hidden="true">$ </span>{command}</code>
+      <button
+        aria-label={`复制${label}命令`}
+        className="bd-btn bd-btn--ghost bd-btn--sm"
+        type="button"
+        onClick={() => void copy(command)}
+      >
+        <Glyph name={status === "success" ? "check" : "copy"} />
+        <span>{status === "success" ? "已复制" : status === "error" ? "复制失败" : "复制"}</span>
+      </button>
+      <span aria-live="polite" className="jd-sr-only">
+        {status === "success" ? `${label}命令已复制` : status === "error" ? "复制失败，手动选中文本复制" : ""}
+      </span>
+    </div>
+  );
+}
+
+/** A SHA-256 value, shortened on screen with the full value on hover, and a copy button. */
+function Checksum({ value, name, compact = false }: { value: string; name: string; compact?: boolean }) {
+  const { status, copy } = useCopyStatus();
+  return (
+    <span className={`pub-checksum${compact ? " pub-checksum--compact" : ""}`}>
+      {compact ? null : <span className="pub-checksum-label">SHA-256</span>}
+      <code title={value}>{compact ? `${value.slice(0, 10)}…` : `${value.slice(0, 16)}…${value.slice(-8)}`}</code>
+      <button
+        type="button"
+        className="bd-btn bd-btn--ghost bd-btn--sm pub-checksum-copy"
+        aria-label={`复制 ${name} 的 SHA-256`}
+        title={status === "success" ? "已复制" : status === "error" ? "复制失败" : "复制 SHA-256"}
+        onClick={() => void copy(value)}
+      >
+        <Glyph name={status === "success" ? "check" : "copy"} />
+        <span />
+      </button>
+      <span aria-live="polite" className="jd-sr-only">
+        {status === "success" ? `${name} 的 SHA-256 已复制` : status === "error" ? "复制失败，手动选中文本复制" : ""}
+      </span>
+    </span>
   );
 }
 
@@ -486,16 +603,16 @@ function DeviceChooser({
   onReset: () => void;
 }) {
   return (
-    <div ref={containerRef} className="download-device-chooser border-y border-default-200 px-5 py-4 sm:px-6">
-      <p className="text-tiny font-medium text-zinc-600 dark:text-zinc-400">选择要下载到的设备</p>
-      <div className="mt-3 flex flex-wrap gap-2">
+    <div ref={containerRef} className="pub-device-chooser">
+      <p className="pub-recommend-kicker">选择要下载到的设备</p>
+      <div className="pub-choice-grid">
         {MANUAL_DEVICES.map((option) => {
           const selected = current.platform === option.device.platform && current.arch === option.device.arch;
           return (
             <button
               key={`${option.device.platform}-${option.device.arch}`}
               aria-pressed={selected}
-              className="download-device-choice"
+              className="pub-choice"
               type="button"
               onClick={() => onChoose(option.device)}
             >
@@ -504,12 +621,13 @@ function DeviceChooser({
             </button>
           );
         })}
-        {manual && (
-          <button className="download-device-reset" type="button" onClick={onReset}>
-            恢复自动识别 · {visitorDeviceDisplayName(detected)}
-          </button>
-        )}
       </div>
+      {manual && (
+        <button className="bd-btn bd-btn--ghost bd-btn--sm pub-device-reset" type="button" onClick={onReset}>
+          <Glyph name="refresh" />
+          <span>恢复自动识别 · {visitorDeviceDisplayName(detected)}</span>
+        </button>
+      )}
     </div>
   );
 }
@@ -524,37 +642,47 @@ function DownloadUnavailable({
   onShowAll: () => void;
 }) {
   return (
-    <div role={networkError ? "alert" : "status"}>
-      <span className="download-match-badge download-match-badge-neutral">暂未匹配</span>
-      <h3 className="mt-3 text-xl font-semibold">
-        {networkError ? "暂时无法获取下载链接" : "当前发布暂无匹配原生包"}
-      </h3>
-      <p className="mt-2 text-small text-zinc-600 dark:text-zinc-400">
-        我们不会自动改用其他处理器架构，以免下载后无法运行。
-      </p>
-      <div className="mt-5 flex flex-wrap gap-4 text-small">
-        {networkError && <button className="font-medium text-primary hover:underline" type="button" onClick={onRetry}>重新获取</button>}
-        <button className="font-medium text-primary hover:underline" type="button" onClick={onShowAll}>查看全部方式</button>
-        <a className="font-medium text-primary hover:underline" href={GITHUB_RELEASES_URL} target="_blank" rel="noopener noreferrer">GitHub Releases ↗</a>
-      </div>
-    </div>
+    <Alert
+      tone={networkError ? "danger" : "warning"}
+      role={networkError ? "alert" : "status"}
+      title={networkError ? "暂时无法获取下载链接" : "当前发布暂无匹配原生包"}
+      className="pub-unavailable"
+    >
+      <span className="block">我们不会自动改用其他处理器架构，以免下载后无法运行。</span>
+      <span className="bd-row pub-unavailable-actions">
+        {networkError && (
+          <button className="bd-btn bd-btn--secondary bd-btn--sm" type="button" onClick={onRetry}>
+            <Glyph name="refresh" />
+            <span>重新获取</span>
+          </button>
+        )}
+        <button className="bd-btn bd-btn--secondary bd-btn--sm" type="button" onClick={onShowAll}>
+          <Glyph name="list" />
+          <span>查看全部方式</span>
+        </button>
+        <a className="bd-btn bd-btn--ghost bd-btn--sm" href={GITHUB_RELEASES_URL} target="_blank" rel="noopener noreferrer">
+          <span>GitHub Releases</span>
+          <Glyph name="external" />
+        </a>
+      </span>
+    </Alert>
   );
 }
 
 function DownloadLoading() {
   return (
-    <div className="flex items-center gap-3 py-8" role="status">
-      <span className="h-5 w-5 animate-spin rounded-full border-2 border-default-300 border-t-primary" />
-      <span className="text-small text-zinc-600 dark:text-zinc-400">正在为这台设备查找最新客户端…</span>
+    <div className="pub-loading" role="status">
+      <Glyph name="loader" size={18} className="animate-spin" />
+      <span>正在为这台设备查找最新客户端…</span>
     </div>
   );
 }
 
 function DeviceDetectionLoading() {
   return (
-    <div className="flex items-center gap-3 py-8" role="status">
-      <span className="h-5 w-5 animate-spin rounded-full border-2 border-default-300 border-t-primary" />
-      <span className="text-small text-zinc-600 dark:text-zinc-400">正在确认这台设备的处理器架构…</span>
+    <div className="pub-loading" role="status">
+      <Glyph name="loader" size={18} className="animate-spin" />
+      <span>正在确认这台设备的处理器架构…</span>
     </div>
   );
 }
@@ -571,50 +699,97 @@ function DownloadGroup({
   const sorted = [...links]
     .filter((link) => link.enabled)
     .sort((left, right) => left.displayOrder - right.displayOrder || left.id - right.id);
+  const count = sorted.length + (group.key === "macos" ? 1 : 0);
   return (
-    <section className="download-group app-apple-landing-surface overflow-hidden" aria-labelledby={`download-group-${group.key}`}>
-      <div className="border-b border-default-200 px-5 py-4">
-        <h3 id={`download-group-${group.key}`} className="text-lg font-semibold">{group.title}</h3>
-        <p className="mt-1 text-tiny text-zinc-600 dark:text-zinc-400">{group.description}</p>
+    <section className="bd-card pub-download-group" aria-labelledby={`download-group-${group.key}`}>
+      <div className="bd-card-header">
+        <div className="min-w-0">
+          <h3 id={`download-group-${group.key}`} className="bd-card-title">{group.title}</h3>
+          <p className="app-card-desc">{group.description}</p>
+        </div>
+        {count > 0 ? <Tag plain className="bd-num">{count} 个</Tag> : null}
       </div>
-      <div className="grid gap-2 p-3">
-        {group.key === "macos" && <HomebrewDownloadRow />}
-        {sorted.map((link) => <ReleaseDownloadRow key={`${link.implementation}-${link.platform}-${link.arch}-${link.id}`} link={link} />)}
-        {sorted.length === 0 && group.key !== "macos" && (
-          <p className="px-2 py-5 text-small text-zinc-600 dark:text-zinc-400" role={loading ? "status" : undefined}>
-            {loading ? "正在加载可用产物…" : "当前发布暂未提供此分组的产物。"}
-          </p>
-        )}
-      </div>
+      {count === 0 ? (
+        <p className="pub-download-empty" role={loading ? "status" : undefined}>
+          {loading ? "正在加载可用产物…" : "当前发布暂未提供此分组的产物。"}
+        </p>
+      ) : (
+        <table className="bd-table jd-stack pub-download-table">
+          <thead>
+            <tr>
+              <th scope="col">安装包</th>
+              <th scope="col">架构</th>
+              <th scope="col">版本</th>
+              <th scope="col" className="bd-col-num">大小</th>
+              <th scope="col">SHA-256</th>
+              <th scope="col"><span className="jd-sr-only">操作</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            {group.key === "macos" && <HomebrewDownloadRow />}
+            {sorted.map((link) => <ReleaseDownloadRow key={`${link.implementation}-${link.platform}-${link.arch}-${link.id}`} link={link} />)}
+          </tbody>
+        </table>
+      )}
     </section>
   );
 }
 
 function HomebrewDownloadRow() {
   return (
-    <a className="download-release-row" href={SPECUS_HOMEBREW_TAP_URL} rel="noopener noreferrer" target="_blank">
-      <span className="download-release-icon" aria-hidden="true"><PackageIcon /></span>
-      <span className="min-w-0 flex-1">
-        <strong className="block text-small font-semibold">Homebrew Cask</strong>
-        <span className="mt-1 block text-tiny text-zinc-600 dark:text-zinc-400">推荐 · 自动选择 Apple Silicon 或 Intel，并支持直接升级</span>
-      </span>
-      <span className="text-small text-primary" aria-hidden="true">↗</span>
-    </a>
+    <tr>
+      <td>
+        <div className="pub-download-name">
+          <b>Homebrew Cask</b>
+          <span>推荐 · 自动选择 Apple Silicon 或 Intel，并支持直接升级</span>
+        </div>
+      </td>
+      <td data-label="架构">自动选择</td>
+      <td className="is-empty" />
+      <td className="bd-col-num is-empty" />
+      <td className="is-empty" />
+      <td className="jd-cell-actions">
+        <a className="bd-btn bd-btn--secondary bd-btn--sm" href={SPECUS_HOMEBREW_TAP_URL} rel="noopener noreferrer" target="_blank">
+          <span>查看 Cask</span>
+          <Glyph name="external" />
+        </a>
+      </td>
+    </tr>
   );
 }
 
 function ReleaseDownloadRow({ link }: { link: ClientDownloadLink }) {
   return (
-    <a className="download-release-row" href={link.downloadUrl} rel="noopener noreferrer" target="_blank">
-      <span className="download-release-icon" aria-hidden="true"><PackageIcon /></span>
-      <span className="min-w-0 flex-1">
-        <strong className="block text-small font-semibold">{link.displayName}</strong>
-        <span className="mt-1 block text-tiny text-zinc-600 dark:text-zinc-400">
-          {implementationLabel(link)} · {archLabel(link.arch)}{link.description ? ` · ${link.description}` : ""}
-        </span>
-      </span>
-      <DownloadArrowIcon />
-    </a>
+    <tr>
+      <td>
+        <div className="pub-download-name">
+          <b>{link.displayName}</b>
+          <span>{implementationLabel(link)}{link.description ? ` · ${link.description}` : ""}</span>
+        </div>
+      </td>
+      <td data-label="架构">{archLabel(link.arch)}</td>
+      <td data-label="版本" className={`bd-num${link.version ? "" : " is-empty"}`}>
+        {link.version ? `v${link.version.replace(/^v/i, "")}` : null}
+      </td>
+      <td data-label="大小" className={`bd-col-num${link.fileSize ? "" : " is-empty"}`}>
+        {link.fileSize ? formatBytes(link.fileSize) : null}
+      </td>
+      <td className={link.sha256 ? "" : "is-empty"}>
+        {link.sha256 ? <Checksum value={link.sha256} name={link.displayName} compact /> : null}
+      </td>
+      <td className="jd-cell-actions">
+        <a
+          className="bd-btn bd-btn--secondary bd-btn--sm"
+          href={link.downloadUrl}
+          rel="noopener noreferrer"
+          target="_blank"
+          aria-label={`下载 ${link.displayName}`}
+        >
+          <Glyph name="download" />
+          <span>下载</span>
+        </a>
+      </td>
+    </tr>
   );
 }
 
@@ -679,29 +854,29 @@ function archLabel(arch: ClientArch): string {
   return "跨架构";
 }
 
-function DeviceIcon({ device }: { device: VisitorDevice }) {
-  if (device.platform === "unsupported" || device.platform === "android") {
-    return <svg viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2.5" /><path d="M10.5 18.5h3" /></svg>;
-  }
-  return <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8M12 16v4" /></svg>;
-}
-
-function PackageIcon() {
-  return <svg viewBox="0 0 24 24"><path d="m4 7 8-4 8 4-8 4-8-4Z" /><path d="M4 7v10l8 4 8-4V7M12 11v10" /></svg>;
-}
-
-function DownloadArrowIcon() {
+// Tag and Alert of the design, written out here rather than imported from components/ui: that
+// module pulls in the full icon set, which would push this route over its static budget.
+function Tag({ tone, plain, className, children }: {
+  tone?: "success" | "info" | "warning"; plain?: boolean; className?: string; children: ReactNode;
+}) {
   return (
-    <svg aria-hidden="true" className="ml-2 h-4 w-4 shrink-0" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" viewBox="0 0 24 24">
-      <path d="M12 3v12M8.5 11.5 12 15l3.5-3.5M5 20h14" />
-    </svg>
+    <span className={["bd-tag", tone && `bd-tag--${tone}`, plain && "bd-tag--plain", className].filter(Boolean).join(" ")}>
+      {children}
+    </span>
   );
 }
 
-function ChevronIcon({ expanded }: { expanded: boolean }) {
+function Alert({ tone, role, title, actions, className, children }: {
+  tone: "warning" | "danger"; role: "alert" | "status"; title: ReactNode; actions?: ReactNode; className?: string; children?: ReactNode;
+}) {
   return (
-    <svg aria-hidden="true" className={`ml-2 h-4 w-4 transition-transform ${expanded ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" viewBox="0 0 20 20">
-      <path d="m5 7.5 5 5 5-5" />
-    </svg>
+    <div className={["bd-alert", `bd-alert--${tone}`, className].filter(Boolean).join(" ")} role={role}>
+      <Glyph name={tone === "danger" ? "circle-alert" : "alert"} />
+      <div className="min-w-0 flex-1">
+        <div className="bd-alert-title">{title}</div>
+        {children ? <div className="bd-alert-body">{children}</div> : null}
+      </div>
+      {actions ? <div className="flex flex-none flex-wrap items-center gap-2 self-center">{actions}</div> : null}
+    </div>
   );
 }

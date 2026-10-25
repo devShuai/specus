@@ -1,16 +1,14 @@
-import { type CSSProperties, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { useAuth } from "../auth/AuthContext";
-import { AppLogo } from "../components/AppLogo";
+import { PublicPage } from "../components/PublicTopBar";
 import { SpecusAqueduct } from "../components/SpecusAqueduct";
-import { PublicToolsMenu } from "../components/PublicToolsMenu";
-import { UserMenuButton } from "../components/UserMenuButton";
+import { Card, Icon, Section, Tag, type IconName } from "../components/ui";
 import { usePageSeo } from "../lib/seo";
 
-const metrics = [
-  { value: "TCP", label: "公网端口映射" },
-  { value: "HTTP", label: "域名路由转发" },
-  { value: "Peer", label: "客户端互联" },
-  { value: "观测", label: "连接与流量审计" },
+const capabilities: Array<{ value: string; label: string; icon: IconName }> = [
+  { value: "TCP", label: "公网端口映射", icon: "server" },
+  { value: "HTTP", label: "域名路由转发", icon: "globe" },
+  { value: "Peer", label: "客户端互联", icon: "share" },
+  { value: "观测", label: "连接与流量审计", icon: "activity" },
 ];
 
 const featureCards = [
@@ -46,23 +44,23 @@ const featureCards = [
   },
 ];
 
-const flowNodes = ["公网入口", "控制面鉴权", "策略编排", "内网服务"];
+type FlowNode = { eyebrow: string; title: string; meta: string };
 
-const httpRouteNodes = [
+const httpRouteNodes: FlowNode[] = [
   { eyebrow: "公网用户", title: "app.example.com", meta: "GET /api/orders" },
   { eyebrow: "Server", title: "HTTP 网关", meta: "解析 Host / Path" },
   { eyebrow: "路由规则", title: "Route: app", meta: "命中 Demo client" },
   { eyebrow: "内网服务", title: "127.0.0.1:8080", meta: "客户端回连转发" },
 ];
 
-const portMappingNodes = [
+const portMappingNodes: FlowNode[] = [
   { eyebrow: "公网用户", title: "server:9000", meta: "TCP stream" },
   { eyebrow: "Server", title: "监听 9000", meta: "端口规则匹配" },
   { eyebrow: "隧道连接", title: "Demo client", meta: "复用已登录长连接" },
   { eyebrow: "内网目标", title: "127.0.0.1:22", meta: "转发到真实服务" },
 ];
 
-const peerNodes = [
+const peerNodes: FlowNode[] = [
   { eyebrow: "发起方", title: "客户端 A", meta: "X25519 公钥已登记" },
   { eyebrow: "控制面", title: "PEER_CONTROL 通道", meta: "ACL 校验 + 信令转发" },
   { eyebrow: "协商", title: "设备清单 + 会话凭证", meta: "iceUsername / iceCredential" },
@@ -111,554 +109,354 @@ function LoginPageContent() {
   );
 
   return (
-    <main className="app-apple landing-shell landing-apple min-h-screen text-zinc-950 dark:text-white">
-      <section className="landing-apple-hero relative z-10 flex w-full flex-col pb-10 pt-5 lg:min-h-[88vh]">
-        <div className="mx-auto w-full max-w-[1440px] px-5 sm:px-8">
-          <header className="landing-apple-header flex items-center justify-between gap-3">
-            <AppLogo className="min-w-0 flex-1" label="specus" subtitle="内网服务接入控制面" />
-            <div className="public-header-actions flex shrink-0 items-center gap-2">
-              <PublicToolsMenu />
-              <UserMenuButton className="public-header-theme-button" />
-            </div>
-          </header>
+    <PublicPage className="pub-landing">
+      <section className="pub-hero" aria-labelledby="landing-title">
+        <div className="pub-hero-copy">
+          <p className="pub-eyebrow">specus · 拉丁语「地道 / 引水渠」</p>
+          <h1 id="landing-title" className="pub-hero-title">specus</h1>
+          <p className="pub-hero-tagline">
+            <b>引水渠</b>
+            <span aria-hidden="true">·</span>
+            <b>打洞</b>
+            <span aria-hidden="true">·</span>
+            <b>观测</b>
+          </p>
+          <p className="pub-hero-lead">
+            古人架渠引水跨越山谷，把远处的水送到城里。specus 做同一件事：为内网服务架一条可控的渠，
+            在 NAT 之间打通洞口，并让每一段水流都看得见。
+          </p>
         </div>
 
-        <div className="landing-apple-hero-layout grid flex-1 items-center gap-10 py-10">
-          <div className="landing-apple-copy flex min-w-0 flex-col items-center gap-8 text-center">
-            <div className="mx-auto flex w-full max-w-[1440px] flex-col items-center gap-8 px-5 sm:px-8">
-              <span className="landing-apple-eyebrow w-fit text-small font-semibold">
-                specus · 拉丁语「地道 / 引水渠」
+        {/* 通栏主视觉：横贯整个视口且天然居中（无 100vw 滚动条偏移） */}
+        <div className="specus-aqueduct-bleed pub-hero-art">
+          <SpecusAqueduct />
+        </div>
+
+        <div className="pub-hero-actions">
+          <button type="button" className="bd-btn bd-btn--primary bd-btn--lg" onClick={() => openLogin()}>
+            <Icon name="lock" />
+            <span>登录管理台</span>
+          </button>
+          <a className="bd-btn bd-btn--secondary bd-btn--lg" href="/download">
+            <Icon name="download" />
+            <span>下载客户端</span>
+          </a>
+          {(certusRegistrationEnabled || registrationEnabled) && (
+            <button
+              type="button"
+              className="bd-btn bd-btn--ghost bd-btn--lg"
+              onClick={() => certusRegistrationEnabled
+                ? void startOidcRegistration()
+                : openLogin("register")}
+            >
+              <Icon name="user" />
+              <span>{certusRegistrationEnabled ? "注册 Certus 账号" : "注册账号"}</span>
+            </button>
+          )}
+        </div>
+
+        <ul className="pub-capabilities" aria-label="核心能力">
+          {capabilities.map((item) => (
+            <li key={item.label}>
+              <span className="pub-capability-icon" aria-hidden="true"><Icon name={item.icon} /></span>
+              <span className="min-w-0">
+                <b>{item.value}</b>
+                <span>{item.label}</span>
               </span>
-
-              <div className="max-w-3xl">
-                <h1 className="landing-apple-title mx-auto font-semibold text-zinc-950 dark:text-white">specus</h1>
-                <p className="specus-tagline mt-4">
-                  <b>引水渠</b>
-                  <span aria-hidden="true">·</span>
-                  <b>打洞</b>
-                  <span aria-hidden="true">·</span>
-                  <b>观测</b>
-                </p>
-                <p className="landing-apple-lead mx-auto mt-5 max-w-2xl text-zinc-700 dark:text-zinc-300">
-                  古人架渠引水跨越山谷，把远处的水送到城里。specus 做同一件事：为内网服务架一条可控的渠，
-                  在 NAT 之间打通洞口，并让每一段水流都看得见。
-                </p>
-              </div>
-            </div>
-
-            {/* 通栏主视觉：不占内容列宽，横贯整个视口且天然居中（无 100vw 滚动条偏移） */}
-            <div className="specus-aqueduct-bleed">
-              <SpecusAqueduct />
-            </div>
-
-            <div className="mx-auto flex w-full max-w-[1440px] flex-col items-center gap-8 px-5 sm:px-8">
-              <div className="flex flex-wrap items-center justify-center gap-3">
-                <button type="button" className="landing-primary-button" onClick={() => openLogin()}>
-                  登录管理台
-                </button>
-                <a className="landing-secondary-button" href="/download">
-                  下载客户端
-                </a>
-                {(certusRegistrationEnabled || registrationEnabled) && (
-                  <button
-                    type="button"
-                    className="landing-secondary-button"
-                    onClick={() => certusRegistrationEnabled
-                      ? void startOidcRegistration()
-                      : openLogin("register")}
-                  >
-                    {certusRegistrationEnabled ? "注册 Certus 账号" : "注册账号"}
-                  </button>
-                )}
-              </div>
-
-              <div className="landing-apple-metrics mx-auto grid w-full max-w-3xl grid-cols-2 sm:grid-cols-4">
-                {metrics.map((item) => (
-                  <div key={item.label} className="landing-apple-metric py-3">
-                    <p className="text-xl font-semibold text-zinc-950 dark:text-white">{item.value}</p>
-                    <p className="mt-1 text-tiny text-zinc-600 dark:text-zinc-400">{item.label}</p>
-                  </div>
-                ))}
-              </div>
-
-              <div className="landing-apple-flow mx-auto flex w-full max-w-3xl flex-col gap-3 p-4 sm:flex-row sm:items-center">
-                {flowNodes.map((node, index) => (
-                  <div key={node} className="flex min-w-0 flex-1 items-center gap-3">
-                    <span className="landing-apple-step flex h-8 w-8 shrink-0 items-center justify-center text-small">
-                      {index + 1}
-                    </span>
-                    <span className="truncate text-small text-zinc-700 dark:text-zinc-200">{node}</span>
-                    {index < flowNodes.length - 1 && <span className="landing-route-line hidden h-px flex-1 sm:block" />}
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-
-        </div>
+            </li>
+          ))}
+        </ul>
       </section>
 
-      <section className="landing-apple-content relative z-10 px-5 py-16 sm:px-8">
-        <div className="mx-auto max-w-[1440px]">
-          <div className="mb-6 max-w-2xl">
-            <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">一水两路 · 组网形态</h2>
-            <p className="mt-2 text-small text-zinc-600 dark:text-zinc-400">
-              一套控制面承担两类流量：公网用户经 Server 中继访问内网服务，受控客户端之间在控制面协调下走对端互联通道。
-            </p>
-          </div>
+      <div className="pub-container pub-landing-sections">
+        <Section
+          title="一水两路 · 组网形态"
+          description="一套控制面承担两类流量：公网用户经 Server 中继访问内网服务，受控客户端之间在控制面协调下走对端互联通道。"
+        >
           <TopologyDiagram />
+        </Section>
 
-          <div className="mb-6 mt-12 max-w-2xl">
-            <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">
-              架渠与打洞
-            </h2>
-            <div className="mt-4 flex flex-col gap-2.5">
-              <p className="landing-motif-line">
-                <span className="landing-motif-chip landing-motif-chip-blue" aria-hidden="true">渠</span>
-                <span>
-                  <b>HTTP 路由与端口映射</b>：流量沿既定渠道，从公网流进内网。
-                </span>
-              </p>
-              <p className="landing-motif-line">
-                <span className="landing-motif-chip landing-motif-chip-emerald" aria-hidden="true">洞</span>
-                <span>
-                  <b>客户端互联</b>：控制面撮合信令，加密 frame 走 UDP 直连；打不通时回退 TURN。
-                </span>
-              </p>
-            </div>
-          </div>
-
-          <div className="mb-10 grid gap-4 lg:grid-cols-2 2xl:grid-cols-3">
+        <Section title="架渠与打洞" description="三条产品链路对应主视觉的三连拱：渠送水，洞通流。">
+          <ul className="pub-motifs">
+            <li>
+              <span className="pub-motif" aria-hidden="true">渠</span>
+              <span><b>HTTP 路由与端口映射</b>：流量沿既定渠道，从公网流进内网。</span>
+            </li>
+            <li>
+              <span className="pub-motif" aria-hidden="true">洞</span>
+              <span><b>客户端互联</b>：控制面撮合信令，加密 frame 走 UDP 直连；打不通时回退 TURN。</span>
+            </li>
+          </ul>
+          <div className="pub-principles">
             <PrincipleCard
               badge="HTTP route"
-              index="01"
               motif="渠"
               title="HTTP 路由：按 Host 与 Path 进入内网 Web 服务"
               description="请求先进 Server 的 HTTP 网关，管理端配置决定命中哪个租户、客户端和目标地址，再把请求沿客户端长连接送回内网。"
-              accent="blue"
-            >
-              <FlowDiagram nodes={httpRouteNodes} variant="http" />
-              <div className="principle-note">
-                <span>Host: app.example.com</span>
-                <span>Route: /api → Demo / 127.0.0.1:8080</span>
-              </div>
-            </PrincipleCard>
-
+              nodes={httpRouteNodes}
+              notes={["Host: app.example.com", "Route: /api → Demo / 127.0.0.1:8080"]}
+              flowLabel="HTTP 路由转发流程"
+            />
             <PrincipleCard
               badge="Port mapping"
-              className="2xl:mt-12"
-              index="02"
               motif="引"
               title="公网端口映射：按监听端口进入内网 TCP 服务"
               description="Server 先占用公网端口，外部连接到来后查找端口映射，把字节流封装进客户端隧道，再落到指定内网 IP 和端口。"
-              accent="amber"
-            >
-              <FlowDiagram nodes={portMappingNodes} variant="port" />
-              <div className="principle-note">
-                <span>Listen: 0.0.0.0:9000</span>
-                <span>Target: Demo → 127.0.0.1:22</span>
-              </div>
-            </PrincipleCard>
-
+              nodes={portMappingNodes}
+              notes={["Listen: 0.0.0.0:9000", "Target: Demo → 127.0.0.1:22"]}
+              flowLabel="端口映射转发流程"
+            />
             <PrincipleCard
               badge="Peer mesh"
-              index="03"
               motif="洞"
               title="客户端互联：受控对端之间的直连通道"
               description="客户端登录时上报 X25519 公钥并接收 roster；控制面校验 ACL 后撮合两端通过 PEER_CONTROL 通道协商身份与会话凭证。"
-              accent="emerald"
-            >
-              <FlowDiagram nodes={peerNodes} variant="peer" />
-              <div className="principle-note">
-                <span>Specus CIDR: 100.96.0.0/11</span>
-                <span>Identity: X25519 公钥 + iceCredential</span>
-              </div>
-            </PrincipleCard>
+              nodes={peerNodes}
+              notes={["Specus CIDR: 100.96.0.0/11", "Identity: X25519 公钥 + iceCredential"]}
+              flowLabel="客户端互联协商流程"
+            />
           </div>
+        </Section>
 
-          <div className="mb-6 mt-12 max-w-2xl">
-            <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">平台特性</h2>
-            <p className="mt-2 text-small text-zinc-600 dark:text-zinc-400">
-              从协议字节级兼容到部署形态，specus 把传统反向隧道工具缺失的工程化关切补齐。
-            </p>
-          </div>
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+        <Section
+          title="平台特性"
+          description="从协议字节级兼容到部署形态，specus 把传统反向隧道工具缺失的工程化关切补齐。"
+        >
+          <div className="pub-feature-grid">
             {featureCards.map((feature) => (
-              <article
-                key={feature.title}
-                className="app-apple-landing-surface landing-apple-feature text-zinc-950 dark:text-white"
-              >
-                <div className="grid gap-3 p-4">
-                  <span className="landing-apple-kicker w-fit text-tiny font-semibold">
-                    {feature.label}
-                  </span>
-                  <h3 className="text-base font-semibold text-zinc-950 dark:text-white">{feature.title}</h3>
-                  <p className="text-small text-zinc-600 dark:text-zinc-400">{feature.description}</p>
-                </div>
-              </article>
+              <Card key={feature.title} className="pub-feature">
+                <Tag plain>{feature.label}</Tag>
+                <h3 className="bd-card-title">{feature.title}</h3>
+                <p>{feature.description}</p>
+              </Card>
             ))}
           </div>
 
-          <div className="app-apple-landing-surface landing-apple-protocol mt-12 flex flex-col gap-3 p-5">
-            <div className="flex flex-wrap items-center gap-3">
-              <span className="text-base font-semibold text-zinc-950 dark:text-white">四种实现 · 一份协议</span>
-              <span className="rounded-md border border-emerald-500/25 bg-emerald-300/15 px-2 py-0.5 text-tiny text-emerald-700 dark:border-emerald-300/25 dark:bg-emerald-300/10 dark:text-emerald-100">
-                字节级兼容
-              </span>
+          <Card className="pub-protocol">
+            <div className="pub-protocol-head">
+              <h3 className="bd-card-title">四种实现 · 一份协议</h3>
+              <Tag tone="success">字节级兼容</Tag>
             </div>
-            <div className="flex flex-wrap gap-2">
+            <ul className="pub-impl-list">
               {implementationChips.map((chip) => (
-                <span
-                  key={chip.name}
-                  className="glass-chip glass-border inline-flex items-baseline gap-1.5 rounded-md border px-3 py-1.5 text-tiny text-zinc-700 dark:text-zinc-300"
-                >
-                  <span className="font-semibold text-primary-700 dark:text-primary-400">{chip.name}</span>
-                  <span className="text-zinc-500 dark:text-zinc-500">·</span>
+                <li key={chip.name}>
+                  <b>{chip.name}</b>
                   <span>{chip.note}</span>
-                </span>
+                </li>
               ))}
-            </div>
-            <p className="text-tiny text-zinc-600 dark:text-zinc-400">
+            </ul>
+            <p className="pub-protocol-note">
               控制连接 11 字节定长包头（magic / version / serializer / command / length）+ 紧凑二进制载荷。
               不同语言客户端登录到同一台 Server，无须任何字段适配。
             </p>
-          </div>
+          </Card>
+        </Section>
 
-          <ClientDownloadEntry />
-        </div>
-      </section>
-
-    </main>
+        <ClientDownloadEntry />
+      </div>
+    </PublicPage>
   );
 }
+
 /**
  * 拓扑总览图：左 公网用户 / 中 Server 控制面 / 右上 客户端 A / 右下 客户端 B。
- *
- * 视觉约定：
- *  - 水蓝渐变实线：经 Server 中继的反向隧道（HTTP/TCP 主路径），与主视觉的渠水同源。
- *  - emerald 虚线：客户端互联（信令 + 加密 frame 直连 / TURN 回退）。
- *
- * 暗色协调：节点 fill/stroke 走 CSS class `.topo-card-fill / .topo-card-stroke`，
- * 由 index.css 通过 .light/.dark 切换，避免硬编码白底在暗色下扎眼。
- * 文字一律 fill="currentColor" 跟随主题。
+ * 实线（accent）是经 Server 中继的反向隧道；虚线（success）是客户端互联。颜色全部来自设计令牌，
+ * 由 public-pages.css 的 .pub-topo-* 类给出，两套主题自动切换。
  */
 function TopologyDiagram() {
   return (
-    <div className="topology-panel glass glass-border rounded-md border p-5">
+    <Card className="pub-topology">
       <MobileTopologyDiagram />
       <svg
-        className="topology-svg hidden sm:block"
-        viewBox="0 0 1080 440"
+        className="pub-topology-svg"
+        viewBox="0 64 1080 312"
         xmlns="http://www.w3.org/2000/svg"
         role="img"
         aria-label="组网形态：公网用户经 Server 中继到客户端 A 内网服务，客户端 A 与客户端 B 之间走对端直连通道"
       >
         <defs>
-          <marker id="topo-arrow-blue" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="8" markerHeight="8" orient="auto">
-            <path d="M0,0 L12,6 L0,12 z" fill="var(--landing-action)" />
+          <marker id="topo-arrow-relay" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="8" markerHeight="8" orient="auto">
+            <path d="M0,0 L12,6 L0,12 z" className="pub-topo-fill-relay" />
           </marker>
-          <marker id="topo-arrow-emerald" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="8" markerHeight="8" orient="auto">
-            <path d="M0,0 L12,6 L0,12 z" fill="rgb(16,185,129)" />
+          <marker id="topo-arrow-peer" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="8" markerHeight="8" orient="auto">
+            <path d="M0,0 L12,6 L0,12 z" className="pub-topo-fill-peer" />
           </marker>
-          {/* 中继路径 = 渠：描边从动作蓝渐到水蓝，与主视觉的槽中活水同源 */}
-          <linearGradient id="topo-water" x1="0" y1="0" x2="1" y2="0">
-            <stop offset="0" stopColor="var(--landing-action)" />
-            <stop offset="1" stopColor="var(--specus-water)" />
-          </linearGradient>
         </defs>
 
-        {/* 左节点：公网用户 (x: 30-230, y 居中于 220 附近) */}
         <g>
-          <rect className="topo-card" x="30" y="170" width="200" height="100" rx="10" />
-          <text x="130" y="208" textAnchor="middle" fontSize="14" fill="currentColor" fontWeight="600">公网用户 / API</text>
-          <text x="130" y="232" textAnchor="middle" fontSize="11.5" fill="currentColor" opacity="0.72">浏览器 · curl · SSH 等</text>
-          <text x="130" y="252" textAnchor="middle" fontSize="11.5" fill="currentColor" opacity="0.55">无须感知隧道存在</text>
+          <rect className="pub-topo-node" x="30" y="170" width="200" height="100" rx="14" />
+          <text x="130" y="208" textAnchor="middle" fontSize="14" className="pub-topo-text" fontWeight="600">公网用户 / API</text>
+          <text x="130" y="232" textAnchor="middle" fontSize="12" className="pub-topo-muted">浏览器 · curl · SSH 等</text>
+          <text x="130" y="252" textAnchor="middle" fontSize="12" className="pub-topo-subtle">无须感知隧道存在</text>
         </g>
 
-        {/* 中节点：Server 控制面 (x: 420-660, y: 80-360, 宽 240, 高 280) */}
         <g>
-          <rect className="topo-server" x="420" y="80" width="240" height="280" rx="12" fill="var(--landing-action)" />
-          <text x="540" y="122" textAnchor="middle" fontSize="15" fill="#ffffff" fontWeight="700">Server 控制面</text>
-          <line x1="450" y1="138" x2="630" y2="138" stroke="rgba(255,255,255,0.35)" strokeWidth="1" />
-          <text x="540" y="166" textAnchor="middle" fontSize="12" fill="#ffffff" opacity="0.92">7010 控制连接</text>
-          <text x="540" y="186" textAnchor="middle" fontSize="12" fill="#ffffff" opacity="0.92">8088 管理 / HTTP 网关</text>
-          <line x1="450" y1="206" x2="630" y2="206" stroke="rgba(255,255,255,0.22)" strokeWidth="1" />
-          <text x="540" y="232" textAnchor="middle" fontSize="12" fill="#ffffff" opacity="0.92">TCP 端口映射</text>
-          <text x="540" y="252" textAnchor="middle" fontSize="12" fill="#ffffff" opacity="0.92">租户 · ACL · 路由</text>
-          <text x="540" y="272" textAnchor="middle" fontSize="12" fill="#ffffff" opacity="0.92">PEER_CONTROL 信令</text>
-          <line x1="450" y1="292" x2="630" y2="292" stroke="rgba(255,255,255,0.22)" strokeWidth="1" />
-          <text x="540" y="318" textAnchor="middle" fontSize="12" fill="#ffffff" opacity="0.86">STUN / TURN</text>
-          <text x="540" y="338" textAnchor="middle" fontSize="12" fill="#ffffff" opacity="0.86">实时观测 · 流量审计</text>
+          <rect className="pub-topo-server" x="420" y="80" width="240" height="280" rx="16" />
+          <text x="540" y="122" textAnchor="middle" fontSize="15" className="pub-topo-on-server" fontWeight="700">Server 控制面</text>
+          <line x1="450" y1="138" x2="630" y2="138" className="pub-topo-server-rule" />
+          <text x="540" y="166" textAnchor="middle" fontSize="12" className="pub-topo-on-server">7010 控制连接</text>
+          <text x="540" y="186" textAnchor="middle" fontSize="12" className="pub-topo-on-server">8088 管理 / HTTP 网关</text>
+          <line x1="450" y1="206" x2="630" y2="206" className="pub-topo-server-rule" />
+          <text x="540" y="232" textAnchor="middle" fontSize="12" className="pub-topo-on-server">TCP 端口映射</text>
+          <text x="540" y="252" textAnchor="middle" fontSize="12" className="pub-topo-on-server">租户 · ACL · 路由</text>
+          <text x="540" y="272" textAnchor="middle" fontSize="12" className="pub-topo-on-server">PEER_CONTROL 信令</text>
+          <line x1="450" y1="292" x2="630" y2="292" className="pub-topo-server-rule" />
+          <text x="540" y="318" textAnchor="middle" fontSize="12" className="pub-topo-on-server">STUN / TURN</text>
+          <text x="540" y="338" textAnchor="middle" fontSize="12" className="pub-topo-on-server">实时观测 · 流量审计</text>
         </g>
 
-        {/* 右上节点：客户端 A (x: 850-1050, y: 90-200) */}
         <g>
-          <rect className="topo-card" x="850" y="90" width="200" height="110" rx="10" />
-          <text x="950" y="128" textAnchor="middle" fontSize="14" fill="currentColor" fontWeight="600">客户端 A</text>
-          <text x="950" y="152" textAnchor="middle" fontSize="11.5" fill="currentColor" opacity="0.72">内网服务 · 反向隧道</text>
-          <text x="950" y="172" textAnchor="middle" fontSize="11.5" fill="currentColor" opacity="0.55">127.0.0.1:8080 等</text>
+          <rect className="pub-topo-node" x="850" y="90" width="200" height="110" rx="14" />
+          <text x="950" y="128" textAnchor="middle" fontSize="14" className="pub-topo-text" fontWeight="600">客户端 A</text>
+          <text x="950" y="152" textAnchor="middle" fontSize="12" className="pub-topo-muted">内网服务 · 反向隧道</text>
+          <text x="950" y="172" textAnchor="middle" fontSize="12" className="pub-topo-subtle">127.0.0.1:8080 等</text>
         </g>
 
-        {/* 右下节点：客户端 B (x: 850-1050, y: 240-360) */}
         <g>
-          <rect className="topo-card-peer" x="850" y="240" width="200" height="120" rx="10" />
-          <text x="950" y="278" textAnchor="middle" fontSize="14" fill="currentColor" fontWeight="600">客户端 B</text>
-          <text x="950" y="302" textAnchor="middle" fontSize="11.5" fill="rgb(5,150,105)" fontWeight="600" className="dark:opacity-[0.95]" opacity="0.95">对端互联</text>
-          <text x="950" y="322" textAnchor="middle" fontSize="11.5" fill="currentColor" opacity="0.62">virtualIp 100.96.0.0/11</text>
-          <text x="950" y="342" textAnchor="middle" fontSize="11.5" fill="currentColor" opacity="0.5">UDP 直连 / TURN 回退</text>
+          <rect className="pub-topo-node pub-topo-node-peer" x="850" y="240" width="200" height="120" rx="14" />
+          <text x="950" y="278" textAnchor="middle" fontSize="14" className="pub-topo-text" fontWeight="600">客户端 B</text>
+          <text x="950" y="302" textAnchor="middle" fontSize="12" className="pub-topo-peer-text" fontWeight="600">对端互联</text>
+          <text x="950" y="322" textAnchor="middle" fontSize="12" className="pub-topo-muted">virtualIp 100.96.0.0/11</text>
+          <text x="950" y="342" textAnchor="middle" fontSize="12" className="pub-topo-subtle">UDP 直连 / TURN 回退</text>
         </g>
 
-        {/* === 中继路径：公网用户 ↔ Server （上下分开，避免重合） === */}
-        {/* 公网请求：左下 → Server 左上 */}
-        <line x1="232" y1="205" x2="418" y2="170" stroke="url(#topo-water)" strokeWidth="2" markerEnd="url(#topo-arrow-blue)" className="topology-relay-flow" />
-        <text x="320" y="178" textAnchor="middle" fontSize="11.5" fill="var(--landing-action)" fontWeight="600">公网请求</text>
-        {/* 响应：Server 左下 → 公网用户右下 */}
-        <line x1="418" y1="270" x2="232" y2="240" stroke="url(#topo-water)" strokeWidth="2" markerEnd="url(#topo-arrow-blue)" className="topology-relay-flow" opacity="0.6" />
-        <text x="320" y="270" textAnchor="middle" fontSize="11.5" fill="var(--landing-action)" opacity="0.78" fontWeight="600">响应</text>
+        <line x1="232" y1="205" x2="418" y2="170" className="pub-topo-relay" markerEnd="url(#topo-arrow-relay)" />
+        <text x="320" y="178" textAnchor="middle" fontSize="12" className="pub-topo-relay-text" fontWeight="600">公网请求</text>
+        <line x1="418" y1="270" x2="232" y2="240" className="pub-topo-relay pub-topo-back" markerEnd="url(#topo-arrow-relay)" />
+        <text x="320" y="272" textAnchor="middle" fontSize="12" className="pub-topo-relay-text" fontWeight="600">响应</text>
 
-        {/* === 中继路径：Server ↔ 客户端 A === */}
-        <line x1="662" y1="160" x2="848" y2="130" stroke="url(#topo-water)" strokeWidth="2" markerEnd="url(#topo-arrow-blue)" className="topology-relay-flow" />
-        <text x="755" y="135" textAnchor="middle" fontSize="11.5" fill="var(--landing-action)" fontWeight="600">下发 / 转发</text>
-        <line x1="848" y1="180" x2="662" y2="195" stroke="url(#topo-water)" strokeWidth="2" markerEnd="url(#topo-arrow-blue)" className="topology-relay-flow" opacity="0.6" />
-        <text x="755" y="205" textAnchor="middle" fontSize="11.5" fill="var(--landing-action)" opacity="0.78" fontWeight="600">上行字节</text>
+        <line x1="662" y1="160" x2="848" y2="130" className="pub-topo-relay" markerEnd="url(#topo-arrow-relay)" />
+        <text x="755" y="135" textAnchor="middle" fontSize="12" className="pub-topo-relay-text" fontWeight="600">下发 / 转发</text>
+        <line x1="848" y1="180" x2="662" y2="195" className="pub-topo-relay pub-topo-back" markerEnd="url(#topo-arrow-relay)" />
+        <text x="755" y="207" textAnchor="middle" fontSize="12" className="pub-topo-relay-text" fontWeight="600">上行字节</text>
 
-        {/* === 信令路径：Server ↔ 客户端 B（emerald 虚线，label 放线上方留白处） === */}
-        <line x1="662" y1="290" x2="848" y2="280" stroke="rgb(16,185,129)" strokeWidth="2" strokeDasharray="6 5" markerEnd="url(#topo-arrow-emerald)" className="topology-peer-flow" />
-        <text x="755" y="270" textAnchor="middle" fontSize="11.5" fill="rgb(5,150,105)" fontWeight="700">信令 · ACL</text>
-        <line x1="848" y1="320" x2="662" y2="330" stroke="rgb(16,185,129)" strokeWidth="2" strokeDasharray="6 5" markerEnd="url(#topo-arrow-emerald)" className="topology-peer-flow" opacity="0.6" />
-        <text x="755" y="350" textAnchor="middle" fontSize="11.5" fill="rgb(5,150,105)" opacity="0.78" fontWeight="600">心跳 · 设备上报</text>
+        <line x1="662" y1="290" x2="848" y2="280" className="pub-topo-peer" markerEnd="url(#topo-arrow-peer)" />
+        <text x="755" y="270" textAnchor="middle" fontSize="12" className="pub-topo-peer-text" fontWeight="600">信令 · ACL</text>
+        <line x1="848" y1="320" x2="662" y2="330" className="pub-topo-peer pub-topo-back" markerEnd="url(#topo-arrow-peer)" />
+        <text x="755" y="350" textAnchor="middle" fontSize="12" className="pub-topo-peer-text" fontWeight="600">心跳 · 设备上报</text>
 
-        {/* === Peer 直连：客户端 A ↔ 客户端 B（垂直方向，靠右走，远离 Server 边） === */}
-        <path
-          d="M 1010 200 C 1080 215, 1080 235, 1010 250"
-          fill="none"
-          stroke="rgb(16,185,129)"
-          strokeWidth="2"
-          strokeDasharray="5 6"
-          markerEnd="url(#topo-arrow-emerald)"
-          className="topology-peer-flow"
-        />
-        <path
-          d="M 890 250 C 870 235, 870 215, 890 200"
-          fill="none"
-          stroke="rgb(16,185,129)"
-          strokeWidth="2"
-          strokeDasharray="5 6"
-          markerEnd="url(#topo-arrow-emerald)"
-          className="topology-peer-flow"
-          opacity="0.7"
-        />
-        <text x="950" y="226" textAnchor="middle" fontSize="11.5" fill="rgb(5,150,105)" fontWeight="700">Peer 直连</text>
+        <path d="M 1010 200 C 1080 215, 1080 235, 1010 250" className="pub-topo-peer" fill="none" markerEnd="url(#topo-arrow-peer)" />
+        <path d="M 890 250 C 870 235, 870 215, 890 200" className="pub-topo-peer pub-topo-back" fill="none" markerEnd="url(#topo-arrow-peer)" />
+        <text x="950" y="226" textAnchor="middle" fontSize="12" className="pub-topo-peer-text" fontWeight="700">Peer 直连</text>
       </svg>
-      <p className="mt-3 text-tiny text-zinc-600 dark:text-zinc-400">
-        实线（蓝）= 经 Server 中继的反向隧道，HTTP 路由与 TCP 端口映射走这条主路径；
-        虚线（绿）= 客户端互联，控制面下发设备清单与会话凭证后，两端在 UDP 直连或 TURN 回退上跑加密 frame 数据面。
-      </p>
-    </div>
+      <div className="pub-topology-legend">
+        <span><i className="pub-legend-relay" aria-hidden="true" />实线 = 经 Server 中继的反向隧道，HTTP 路由与 TCP 端口映射走这条主路径</span>
+        <span><i className="pub-legend-peer" aria-hidden="true" />虚线 = 客户端互联，控制面下发设备清单与会话凭证后，两端在 UDP 直连或 TURN 回退上跑加密 frame 数据面</span>
+      </div>
+    </Card>
   );
 }
 
 function MobileTopologyDiagram() {
   return (
     <div
-      className="topology-mobile grid sm:hidden"
+      className="pub-topo-mobile"
       role="img"
-      aria-label="组网形态移动端动画：公网用户经 Server 中继到客户端 A 内网服务，客户端 A 与客户端 B 之间走对端直连或 TURN 回退"
+      aria-label="组网形态：公网用户经 Server 中继到客户端 A 内网服务，客户端 A 与客户端 B 之间走对端直连或 TURN 回退"
     >
-      <div className="topology-mobile-section topology-mobile-section-relay">
-        <div className="topology-mobile-heading">
+      <div className="pub-topo-m-section">
+        <div className="pub-topo-m-head">
           <span>公网访问路径</span>
-          <strong>Relay</strong>
+          <Tag tone="info">Relay</Tag>
         </div>
-        <div className="topology-mobile-chain">
+        <ol className="pub-stages">
           <MobileTopologyNode title="公网用户 / API" meta="浏览器、curl、SSH 等" />
-          <MobileTopologyEdge label="公网请求 / 响应" tone="relay" />
-          <MobileTopologyNode title="Server" meta="HTTP 网关 · TCP 映射 · 租户 ACL" tone="server" />
-          <MobileTopologyEdge label="反向隧道" tone="relay" />
-          <MobileTopologyNode title="客户端 A" meta="访问内网服务 127.0.0.1:8080" />
-        </div>
+          <MobileTopologyNode title="Server" meta="HTTP 网关 · TCP 映射 · 租户 ACL" via="公网请求 / 响应" />
+          <MobileTopologyNode title="客户端 A" meta="访问内网服务 127.0.0.1:8080" via="反向隧道" />
+        </ol>
       </div>
 
-      <div className="topology-mobile-section topology-mobile-section-peer">
-        <div className="topology-mobile-heading">
+      <div className="pub-topo-m-section">
+        <div className="pub-topo-m-head">
           <span>客户端互联路径</span>
-          <strong>Peer / TURN</strong>
+          <Tag tone="success">Peer / TURN</Tag>
         </div>
-        <div className="topology-mobile-signal">Server 只负责 ACL 校验、设备清单与 PEER_CONTROL 信令</div>
-        <div className="topology-mobile-peer-row">
-          <MobileTopologyNode title="客户端 A" meta="100.96.0.0/11" compact />
-          <div className="topology-mobile-peer-link" aria-hidden="true">
-            <span>直连</span>
-            <span>TURN 回退</span>
-          </div>
-          <MobileTopologyNode title="客户端 B" meta="加密 frame 数据面" tone="peer" compact />
-        </div>
-      </div>
-
-      <div className="topology-mobile-note">
-        蓝色表示公网访问经 Server 中继；绿色表示客户端之间的数据面直连，失败后回退 TURN。
+        <p className="pub-topo-m-note">Server 只负责 ACL 校验、设备清单与 PEER_CONTROL 信令</p>
+        <ol className="pub-stages">
+          <MobileTopologyNode title="客户端 A" meta="100.96.0.0/11" />
+          <MobileTopologyNode title="客户端 B" meta="加密 frame 数据面" via="直连 · TURN 回退" />
+        </ol>
       </div>
     </div>
   );
 }
 
-function MobileTopologyNode({
-  compact = false,
-  meta,
-  title,
-  tone = "default",
-}: {
-  compact?: boolean;
-  meta: string;
-  title: string;
-  tone?: "default" | "peer" | "server";
-}) {
+function MobileTopologyNode({ title, meta, via }: { title: string; meta: string; via?: string }) {
   return (
-    <div className={`topology-mobile-node topology-mobile-node-${tone} ${compact ? "topology-mobile-node-compact" : ""}`}>
-      <strong>{title}</strong>
-      <span>{meta}</span>
-    </div>
-  );
-}
-
-function MobileTopologyEdge({ label, tone }: { label: string; tone: "peer" | "relay" }) {
-  return (
-    <div className={`topology-mobile-edge topology-mobile-edge-${tone}`} aria-hidden="true">
-      <span>{label}</span>
-    </div>
+    <li className="pub-stage">
+      <span className="pub-stage-dot" />
+      <div className="pub-stage-body">
+        {via ? <span className="pub-stage-via">{via}</span> : null}
+        <b>{title}</b>
+        <span>{meta}</span>
+      </div>
+    </li>
   );
 }
 
 function ClientDownloadEntry() {
   return (
-    <section className="app-apple-landing-surface landing-download-entry mt-10 overflow-hidden p-5 sm:p-7">
-      <div className="flex flex-col gap-6 sm:flex-row sm:items-center sm:justify-between">
-        <div className="max-w-2xl">
-          <span className="landing-apple-kicker text-tiny font-semibold">CLIENT DOWNLOAD</span>
-          <h2 className="mt-2 text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">为这台设备选择客户端</h2>
-          <p className="mt-2 text-small text-zinc-600 dark:text-zinc-400">
+    <section className="jd-section" aria-labelledby="landing-download-title">
+      <Card className="pub-download-entry">
+        <span className="pub-download-entry-icon" aria-hidden="true"><Icon name="download" size={22} /></span>
+        <div className="min-w-0 flex-1">
+          <h2 id="landing-download-title" className="bd-card-title">为这台设备选择客户端</h2>
+          <p>
             独立下载页会识别 macOS、Windows 或 Linux 与处理器架构，优先给出最合适的安装方式；也可展开查看全部平台与实现。
           </p>
         </div>
-        <a className="landing-primary-button shrink-0 px-6" href="/download">
-          打开下载页
-          <span aria-hidden="true" className="ml-2">→</span>
+        <a className="bd-btn bd-btn--primary" href="/download">
+          <span>打开下载页</span>
+          <Icon name="arrow-right" />
         </a>
-      </div>
+      </Card>
     </section>
   );
 }
 
 function PrincipleCard({
-  accent,
   badge,
-  children,
-  className = "",
   description,
-  index,
+  flowLabel,
   motif,
-  preview,
+  nodes,
+  notes,
   title,
 }: {
-  accent: "amber" | "blue" | "emerald";
   badge: string;
-  children: ReactNode;
-  className?: string;
   description: string;
-  index: string;
+  flowLabel: string;
   /** 意象小章：渠 / 引 / 洞，与主视觉三连拱一一对应 */
-  motif?: string;
-  preview?: boolean;
+  motif: string;
+  nodes: FlowNode[];
+  notes: string[];
   title: string;
 }) {
-  const handleMouseMove = (event: ReactMouseEvent<HTMLElement>) => {
-    const rect = event.currentTarget.getBoundingClientRect();
-    event.currentTarget.style.setProperty("--spotlight-x", `${event.clientX - rect.left}px`);
-    event.currentTarget.style.setProperty("--spotlight-y", `${event.clientY - rect.top}px`);
-  };
-
   return (
-    <article
-      className={`principle-card principle-card-${accent} glass glass-border rounded-md border text-zinc-950 shadow-xs dark:text-white dark:shadow-none ${className}`}
-      onMouseMove={handleMouseMove}
-    >
-      <span className="principle-card-accent" aria-hidden="true" />
-      <span className="principle-card-index" aria-hidden="true">{index}</span>
-      <div className="principle-card-body grid gap-5 p-5">
-        <div className="flex flex-col gap-2">
-          <div className="flex flex-wrap items-center gap-2">
-            {motif && <span className="principle-motif" aria-hidden="true">{motif}</span>}
-            <span className="principle-badge w-fit rounded-md px-2 py-1 text-tiny">{badge}</span>
-            {preview && <span className="preview-badge">Preview</span>}
-          </div>
-          <h3 className="text-lg font-semibold text-zinc-950 dark:text-white">{title}</h3>
-          <p className="text-small text-zinc-600 dark:text-zinc-400">{description}</p>
+    <article className="bd-card pub-principle">
+      <div className="pub-principle-head">
+        <div className="bd-row">
+          <span className="pub-motif" aria-hidden="true">{motif}</span>
+          <Tag plain>{badge}</Tag>
         </div>
-        {children}
+        <h3 className="bd-card-title">{title}</h3>
+        <p>{description}</p>
+      </div>
+      <ol className="pub-stages pub-principle-flow" aria-label={flowLabel}>
+        {nodes.map((node, index) => (
+          <li key={node.title} className="pub-stage">
+            <span className="pub-stage-dot bd-num">{index + 1}</span>
+            <div className="pub-stage-body">
+              <span className="pub-stage-via">{node.eyebrow}</span>
+              <b>{node.title}</b>
+              <span>{node.meta}</span>
+            </div>
+          </li>
+        ))}
+      </ol>
+      <div className="pub-principle-notes">
+        {notes.map((note) => <code key={note}>{note}</code>)}
       </div>
     </article>
-  );
-}
-
-function FlowDiagram({
-  nodes,
-  variant,
-}: {
-  nodes: Array<{ eyebrow: string; title: string; meta: string }>;
-  variant: "http" | "port" | "peer";
-}) {
-  return (
-    <div className={`principle-flowgrid principle-flowgrid-${variant}`} aria-label={`${variant} 转发流程`}>
-      {nodes.map((node, index) => (
-        <FlowStep
-          key={node.title}
-          index={index}
-          isFirst={index === 0}
-          isLast={index === nodes.length - 1}
-          node={node}
-          showEdge={index < nodes.length - 1}
-        />
-      ))}
-    </div>
-  );
-}
-
-function FlowStep({
-  index,
-  isFirst,
-  isLast,
-  node,
-  showEdge,
-}: {
-  index: number;
-  isFirst: boolean;
-  isLast: boolean;
-  node: { eyebrow: string; title: string; meta: string };
-  showEdge: boolean;
-}) {
-  const nodeStyle = { "--node-delay": `${index * 1.55}s` } as CSSProperties;
-  const edgeStyle = { "--edge-delay": `${index * 1.55 + 0.55}s` } as CSSProperties;
-  const nodeClass = `principle-node${isFirst ? " principle-node-first" : ""}${isLast ? " principle-node-last" : ""}`;
-
-  return (
-    <>
-      <div className={nodeClass} style={nodeStyle}>
-        <span className="principle-node-android-glow" aria-hidden="true" />
-        <span className="principle-node-index">{index + 1}</span>
-        <span className="principle-node-eyebrow">{node.eyebrow}</span>
-        <strong>{node.title}</strong>
-        <span className="principle-node-meta">{node.meta}</span>
-      </div>
-      {showEdge && (
-        <div
-          className="principle-edge"
-          style={edgeStyle}
-          aria-hidden="true"
-        >
-          <span className="principle-edge-android-packet" />
-          <span className="principle-edge-android-beam" />
-        </div>
-      )}
-    </>
   );
 }
