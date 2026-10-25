@@ -430,8 +430,8 @@ body {
 }
 
 /* Fields (Input component of the design): field-bg, field-border, accent border and a 3px soft
- * ring on focus. */
-.app-apple:not(.landing-shell) :where([data-slot="input-wrapper"], [data-slot="trigger"]) {
+ * ring on focus. Dialogs render outside .app-apple (HeroUI portals), so they are named too. */
+:is(.app-apple, [role="dialog"]) :where([data-slot="input-wrapper"], [data-slot="trigger"]) {
   border: 1px solid var(--field-border) !important;
   background: var(--field-bg) !important;
   box-shadow: none !important;
@@ -440,33 +440,38 @@ body {
     box-shadow 0.15s ease !important;
 }
 
-.app-apple:not(.landing-shell) :where([data-slot="input-wrapper"], [data-slot="trigger"]):hover,
-.app-apple:not(.landing-shell) :where([data-slot="input-wrapper"], [data-slot="trigger"])[data-hover="true"] {
+:is(.app-apple, [role="dialog"]) :where([data-slot="input-wrapper"], [data-slot="trigger"]):hover,
+:is(.app-apple, [role="dialog"]) :where([data-slot="input-wrapper"], [data-slot="trigger"])[data-hover="true"] {
   border-color: var(--border-strong) !important;
 }
 
-.app-apple:not(.landing-shell) :where([data-slot="input-wrapper"], [data-slot="trigger"]):focus-within,
-.app-apple:not(.landing-shell) :where([data-slot="input-wrapper"], [data-slot="trigger"])[data-focus="true"],
-.app-apple:not(.landing-shell) :where([data-slot="trigger"])[data-open="true"] {
+:is(.app-apple, [role="dialog"]) :where([data-slot="input-wrapper"], [data-slot="trigger"]):focus-within,
+:is(.app-apple, [role="dialog"]) :where([data-slot="input-wrapper"], [data-slot="trigger"])[data-focus="true"],
+:is(.app-apple, [role="dialog"]) :where([data-slot="trigger"])[data-open="true"] {
   border-color: var(--accent) !important;
   box-shadow: 0 0 0 3px var(--accent-soft) !important;
 }
 
-.app-apple:not(.landing-shell) :where([data-invalid="true"]) :where([data-slot="input-wrapper"], [data-slot="trigger"]) {
+:is(.app-apple, [role="dialog"]) :where([data-invalid="true"]) :where([data-slot="input-wrapper"], [data-slot="trigger"]) {
   border-color: var(--danger) !important;
 }
 
-.app-apple:not(.landing-shell) :where([data-slot="label"]) {
+:is(.app-apple, [role="dialog"]) :where([data-slot="label"]) {
   color: var(--text) !important;
   font-weight: 500;
 }
 
-.app-apple:not(.landing-shell) :where([data-slot="description"]) {
+:is(.app-apple, [role="dialog"]) :where([data-slot="description"]) {
   color: var(--text-muted);
 }
 
-.app-apple:not(.landing-shell) :where([data-slot="error-message"]) {
+:is(.app-apple, [role="dialog"]) :where([data-slot="error-message"]) {
   color: var(--danger);
+}
+
+/* The wrapper draws the focus ring; the input's own outline would be a second ring inside it. */
+[data-slot="input-wrapper"] :is(input, textarea):focus-visible {
+  outline: none !important;
 }
 
 /* Dashboard controls follow the design's Button component: radius-md (radius-sm when small),
