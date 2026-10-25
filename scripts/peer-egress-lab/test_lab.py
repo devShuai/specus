@@ -3,6 +3,7 @@ import json
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 import unittest
@@ -47,6 +48,31 @@ class RoleCommandTests(unittest.TestCase):
         proc.log_since = Mock(return_value="[peer-egress] policy applied enabled=True revision=2")
         proc.lab = types.SimpleNamespace(wait_for=lambda _, predicate, timeout: (predicate(), 0))
         self.assertIsNotNone(proc.wait_log(r"policy applied enabled=true", 1))
+
+
+class HeldFlowSynTests(unittest.TestCase):
+    def lab(self, log):
+        instance = Lab.__new__(Lab)
+        instance.work = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        if log is not None:
+            (instance.work / "egress.log").write_text(log, encoding="utf-8")
+        return instance
+
+    def test_counts_by_state_across_the_three_spellings(self):
+        log = "\n".join([
+            "=== egress started ===",
+            "[peer-egress] new SYN met an existing flow consumer=7 state=TIME_WAIT lingering=true age=3.797s",
+            "info: [peer-egress] new SYN met an existing flow consumer=7 state=TimeWait lingering=True age=8335ms",
+            "[peer-egress] new SYN met an existing flow consumer=7 state=ESTABLISHED lingering=false age=2s",
+            "[peer-egress] policy applied enabled=true revision=2",
+        ])
+        self.assertEqual({"TIMEWAIT": 2, "ESTABLISHED": 1}, self.lab(log).held_flow_syns())
+
+    def test_a_log_without_such_lines_counts_nothing(self):
+        self.assertEqual({}, self.lab("[peer-egress] policy applied enabled=true revision=2\n").held_flow_syns())
+
+    def test_no_egress_log_is_not_a_count(self):
+        self.assertIsNone(self.lab(None).held_flow_syns())
 
 
 class OfflineDiagnosticsTests(unittest.TestCase):
