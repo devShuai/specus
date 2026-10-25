@@ -10,6 +10,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -305,6 +306,11 @@ func encodeNatMetadata(metadata map[string]any) ([]byte, error) {
 func decodeNatMetadata(encoded []byte) (map[string]any, error) {
 	if len(encoded) == 0 {
 		return map[string]any{}, nil
+	}
+	// encoding/json already refuses comments, trailing commas and anything after the value, but
+	// replaces invalid UTF-8 with U+FFFD; the metadata must be UTF-8 (control-protocol.md).
+	if !utf8.Valid(encoded) {
+		return nil, errors.New("NAT metadata is not UTF-8")
 	}
 	metadata := make(map[string]any)
 	if err := json.Unmarshal(encoded, &metadata); err != nil {

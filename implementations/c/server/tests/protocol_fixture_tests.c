@@ -514,6 +514,120 @@ static int test_java_encode_fixtures(void)
     return 0;
 }
 
+/* The NAT body header: type, flags, metadata length, stream id, value and data length. */
+#define NAT_BODY_HEADER 16U
+
+static int hex_digit(char ch)
+{
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    return -1;
+}
+
+/* A NAT OPEN body on stream 1 whose metadata is the case's metadataHex. */
+static uint8_t *metadata_open_body(const char *item, size_t *body_len)
+{
+    char *hex = st_json_get_string(item, "metadataHex");
+    size_t hex_len = hex == NULL ? 0U : strlen(hex);
+    uint8_t *body = hex == NULL || hex_len % 2U != 0U ? NULL : (uint8_t *)calloc(1U, NAT_BODY_HEADER + hex_len / 2U);
+    if (body == NULL) {
+        free(hex);
+        return NULL;
+    }
+    size_t meta_len = hex_len / 2U;
+    for (size_t i = 0U; i < meta_len; ++i) {
+        int high = hex_digit(hex[2U * i]);
+        int low = hex_digit(hex[2U * i + 1U]);
+        if (high < 0 || low < 0) {
+            free(hex);
+            free(body);
+            return NULL;
+        }
+        body[NAT_BODY_HEADER + i] = (uint8_t)((high << 4) | low);
+    }
+    free(hex);
+    body[0] = ST_NAT_OPEN;
+    body[2] = (uint8_t)(meta_len >> 8);
+    body[3] = (uint8_t)meta_len;
+    body[7] = 1U;
+    *body_len = NAT_BODY_HEADER + meta_len;
+    return body;
+}
+
+/*
+ * protocol/test-vectors/nat-metadata-json-v1.json: NAT metadata is one UTF-8 JSON object read
+ * strictly by RFC 8259, through decode and through the validation of refused frames alike.
+ */
+static int test_nat_metadata_vector(void)
+{
+    uint8_t *raw = NULL;
+    size_t raw_len = 0U;
+    if (st_test_read_fixture("../../nat-metadata-json-v1.json", &raw, &raw_len) != 0) {
+        return 1;
+    }
+    char *json = (char *)realloc(raw, raw_len + 1U);
+    if (json == NULL) {
+        free(raw);
+        return 1;
+    }
+    json[raw_len] = '\0';
+    int failed = 0;
+    const char *sections[] = {"accepted", "rejected"};
+    size_t counts[2] = {0U, 0U};
+    for (int section = 0; section < 2; ++section) {
+        char **items = NULL;
+        size_t items_len = 0U;
+        if (st_json_get_raw_array(json, sections[section], &items, &items_len) != 0) {
+            fprintf(stderr, "nat metadata vector: no %s list\n", sections[section]);
+            free(json);
+            return 1;
+        }
+        counts[section] = items_len;
+        for (size_t i = 0U; i < items_len; ++i) {
+            char *name = st_json_get_string(items[i], "name");
+            size_t body_len = 0U;
+            uint8_t *body = metadata_open_body(items[i], &body_len);
+            if (body == NULL) {
+                fprintf(stderr, "nat metadata vector: bad case %s\n", name == NULL ? "?" : name);
+                failed = 1;
+                free(name);
+                continue;
+            }
+            st_nat_message message;
+            int decoded = st_protocol_decode_nat_message(body, body_len, &message);
+            st_protocol_rejection decode_reason = st_protocol_last_rejection();
+            if (decoded == 0) {
+                st_nat_message_free(&message);
+            }
+            int validated = st_protocol_validate_body(ST_CMD_NAT_MESSAGE, body, body_len);
+            st_protocol_rejection validate_reason = st_protocol_last_rejection();
+            int ok = section == 0
+                ? decoded == 0 && validated == 0
+                : decoded != 0 && validated != 0
+                    && decode_reason == ST_PROTOCOL_REJECTION_MALFORMED_BODY
+                    && validate_reason == ST_PROTOCOL_REJECTION_MALFORMED_BODY;
+            if (!ok) {
+                fprintf(stderr, "nat metadata vector: %s case \"%s\": decode %d, validate %d\n",
+                        sections[section], name == NULL ? "?" : name, decoded, validated);
+                failed = 1;
+            }
+            free(body);
+            free(name);
+        }
+        st_json_free_string_array(items, items_len);
+    }
+    free(json);
+    if (counts[0] != 8U || counts[1] != 34U) {
+        fprintf(stderr, "nat metadata vector: %zu accepted and %zu rejected cases, want 8 and 34\n",
+                counts[0], counts[1]);
+        failed = 1;
+    }
+    if (!failed) {
+        printf("nat metadata: %zu accepted and %zu rejected RFC 8259 cases passed\n", counts[0], counts[1]);
+    }
+    return failed;
+}
+
 int main(void)
 {
     return test_login_request_decode() != 0
@@ -523,6 +637,7 @@ int main(void)
         || test_valid_fixtures_validate() != 0
         || test_frame_limit_includes_header() != 0
         || test_nat_decode() != 0
+        || test_nat_metadata_vector() != 0
         || test_malformed_frames_are_rejected() != 0
         || test_login_null_role() != 0
         || test_message_null_type() != 0

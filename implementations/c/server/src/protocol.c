@@ -496,6 +496,16 @@ static int check_nat_body(const uint8_t *body, size_t body_len, st_nat_message *
         || body_len != ST_NAT_HEADER_SIZE + *meta_len + *data_len) {
         return protocol_reject(ST_PROTOCOL_REJECTION_INVALID_LENGTH);
     }
+    /* Java PacketCodec reads the metadata as one UTF-8 JSON object, strictly by RFC 8259. */
+    if (*meta_len > 0U) {
+        int metadata = st_json_is_valid_object_bytes(body + ST_NAT_HEADER_SIZE, *meta_len);
+        if (metadata < 0) {
+            return -1;
+        }
+        if (metadata == 0) {
+            return protocol_reject(ST_PROTOCOL_REJECTION_MALFORMED_BODY);
+        }
+    }
     if (validate_nat_semantics(message->type, message->flags, message->stream_id,
                                message->value, *meta_len, *data_len) != 0) {
         return protocol_reject(ST_PROTOCOL_REJECTION_MALFORMED_BODY);
@@ -541,7 +551,8 @@ int st_protocol_decode_nat_message(const uint8_t *body, size_t body_len, st_nat_
 
 /*
  * Java PacketCodec.decode after the header: the command's CompactBinary schema, or the NAT body. It
- * only reads past the fields, copying nothing, for a frame that is about to be refused anyway.
+ * only reads past the fields, for a frame that is about to be refused anyway; the one copy is of a
+ * NAT frame's metadata, which the JSON check reads NUL-terminated.
  */
 int st_protocol_validate_body(int8_t command, const uint8_t *body, size_t body_len)
 {
