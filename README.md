@@ -261,7 +261,7 @@ dotnet specus-client.dll ui --config ./client.jsonc
 
 Android 客户端位于 `implementations/android/client`，提供运行控制台、配置摘要、JSONC 编辑器、启动/停止按钮和运行事件流；保存的配置兼容 `client.jsonc`，内置 `VpnService` 权限流程。其 control/data 通道支持登录响应驱动的 TLS，TCP 数据面使用 v2 `OPEN/DATA/FIN/RST/WINDOW_UPDATE`、严格半关闭、有界建连缓存与最近关闭流 tombstone；HTTP route 使用支持 request/response trailers、带 body 任意 method 和 early response 的 Netty 流。WebSocket route 按 Java 规则保留 continuation/FIN/RSV/close/ping/pong 语义；单个上游 data frame 可达 16 MiB，超过单个 NAT DATA 容量时规范化拆成连续的 SWS2 continuation envelopes，控制帧不拆分。配置非 `noop` 虚拟设备时 Android 会先申请 VPN 权限；只有服务端也开启 Peer Mesh 才会创建系统 VPN 接口。`noop` 不申请权限、不阻塞 TCP/HTTP，同时仍可运行 Peer Mesh 控制面和 UDP 探测。Peer Mesh 已接入 direct UDP、全 A/AAAA STUN、TURN relay、同 nonce burst、自适应端口预测、UPnP/NAT-PMP/PCP 显式映射、session 刷新、direct-stale fallback 以及链路/流量/设备上报；真实跨 NAT 真机矩阵仍需部署环境验收。
 
-从源码运行 Go 客户端（客户端与服务端均要求 Go 1.27.2 或更新的已修补版本；
+从源码运行 Go 客户端（客户端与服务端均要求 Go 1.27.3 或更新的已修补版本；
 模块文件强制最低版本，安装包附实际二进制的 `go-build-info.txt`）：
 
 ```bash
