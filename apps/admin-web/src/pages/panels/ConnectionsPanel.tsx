@@ -1,42 +1,17 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import {
-  Button,
-  Card,
-  CardBody,
-  Chip,
-  Dropdown,
-  DropdownItem,
-  DropdownMenu,
-  DropdownTrigger,
-  Input,
-  Pagination,
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-  Select,
-  SelectItem,
-  Table,
-  TableBody,
-  TableCell,
-  TableColumn,
-  TableHeader,
-  TableRow,
-} from "@heroui/react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Button } from "@heroui/react";
 import { adminApi } from "../../api/client";
 import type { ConnectionRecord, LiveConnectionEvent } from "../../api/types";
-import { formatDateTime, formatDuration } from "../../lib/format";
+import { formatElapsed } from "../../lib/format";
 import { notifyError } from "../../components/toast";
 import { useConnectionsFeed } from "../../hooks/useConnectionsFeed";
 import { useNowTick } from "../../hooks/useNowTick";
 import { useAuth } from "../../auth/AuthContext";
-import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
-import { EmptyState } from "../../components/EmptyState";
 import { PageHeader } from "../../components/PageHeader";
+import { Empty, FilterBar, Icon, RelativeTime, TableWrap, Tag } from "../../components/ui";
+import { Pagination, TableEmptyRow, TableLoadingRow, rangeText } from "./opsUi";
 
 const PAGE_SIZE = 50;
-const FILTER_POPOVER_CLASS_NAMES = {
-  content: "border border-default-200 bg-content1 text-foreground shadow-large",
-} as const;
 
 export function ConnectionsPanel() {
   const { expireSession } = useAuth();
@@ -218,8 +193,6 @@ export function ConnectionsPanel() {
     resetConnectionPage();
   };
 
-  const rangeStart = total === 0 ? 0 : page * PAGE_SIZE + 1;
-  const rangeEnd = Math.min(total, (page + 1) * PAGE_SIZE);
   const tableScopeKey = useMemo(
     () => `${page}:${PAGE_SIZE}:${clientId}:${result}:${fromDate}:${toDate}`,
     [clientId, fromDate, page, result, toDate],
@@ -232,384 +205,140 @@ export function ConnectionsPanel() {
       })),
     [items, tableScopeKey],
   );
-  const tableCollectionKey = useMemo(() => {
-    const first = items[0];
-    const last = items[items.length - 1];
-    return [
-      tableScopeKey,
-      items.length,
-      first ? `${first.id}:${first.connectedAt}` : "empty",
-      last ? `${last.id}:${last.connectedAt}` : "empty",
-    ].join("|");
-  }, [items, tableScopeKey]);
   const activeFilterCount = [clientId, result, fromDate, toDate].filter(Boolean).length;
   const hasActiveFilters = activeFilterCount > 0;
 
   return (
-    <div className="flex min-w-0 flex-col gap-4">
+    <div className="ops-page">
       <PageHeader
         title="连接记录"
-        meta={<Chip size="sm" variant="flat">{total} 条</Chip>}
         description="客户端连接结果、来源地址与在线时长。"
         actions={
-          <Button
-            className="w-full shrink-0 sm:w-auto"
-            color="primary"
-            isLoading={loading}
-            radius="sm"
-            variant="flat"
-            onPress={() => void load()}
-          >
+          <Button variant="flat" isLoading={loading} startContent={loading ? null : <Icon name="refresh" />} onPress={() => void load()}>
             刷新记录
           </Button>
         }
       />
 
-      {/* mobile: 卡片堆叠 */}
-      <div className="xl:hidden">
-        <div className="mb-3 rounded-lg border border-default-200 bg-content1 p-3 sm:p-4">
-          <div className="mb-3 flex items-center justify-between gap-3">
-            <div className="min-w-0">
-              <div className="text-small font-semibold text-foreground">筛选条件</div>
-              <div className="mt-0.5 truncate text-tiny text-default-500">
-                {hasActiveFilters ? `已启用 ${activeFilterCount} 项筛选` : "按客户端、结果和时间范围筛选"}
-              </div>
-            </div>
-            <Button
-              className="shrink-0"
-              isDisabled={!hasActiveFilters}
-              radius="sm"
-              size="sm"
-              variant="light"
-              onPress={reset}
-            >
-              重置筛选
-            </Button>
-          </div>
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            <Select className="w-full" label="客户端" items={[{ id: "", clientName: "全部" }, ...clients.map((c) => ({ id: String(c.id), clientName: c.clientName }))]} selectedKeys={clientId ? [clientId] : [""]} onChange={(event) => changeClientId(event.target.value)}>
-              {(item) => <SelectItem key={item.id}>{item.clientName}</SelectItem>}
-            </Select>
-            <Select className="w-full" label="结果" selectedKeys={result ? [result] : [""]} onChange={(event) => changeResult(event.target.value)}>
-              <SelectItem key="">全部</SelectItem>
-              <SelectItem key="true">成功</SelectItem>
-              <SelectItem key="false">失败</SelectItem>
-            </Select>
-            <Input className="w-full" type="date" label="开始日期" value={fromDate} onValueChange={changeFromDate} />
-            <Input className="w-full" type="date" label="结束日期" value={toDate} onValueChange={changeToDate} />
-          </div>
-        </div>
-        <MobileListCardList
-          items={tableRows}
-          isLoading={loading}
-          emptyContent={<EmptyState icon="connections" title="暂无连接记录" description="调整筛选条件或等待客户端接入" />}
-          renderCard={(raw) => {
-            const record = raw as (typeof tableRows)[number];
-            const reason = record.success
-              ? record.disconnectReasonText || "-"
-              : record.failureReason || record.disconnectReasonText || "登录失败";
-            return (
-              <MobileListCard
-                key={record.tableKey}
-                title={
-                  <div className="flex items-center gap-2">
-                    <span className="break-all">{record.clientName}</span>
-                    <span className="text-tiny font-normal text-default-400">#{record.id}</span>
-                  </div>
-                }
-                badges={
-                  <Chip size="sm" variant="flat" color={record.success ? "success" : "danger"}>
-                    {record.success ? "成功" : "失败"}
-                  </Chip>
-                }
-                fields={[
-                  { label: "远端地址", value: record.remoteAddress || "-" },
-                  { label: "连接时间", value: formatDateTime(record.connectedAt) },
-                  { label: "断开时间", value: record.disconnectedAt ? formatDateTime(record.disconnectedAt) : "-" },
-                  { label: "持续时长", value: formatDuration(record.connectedAt, record.disconnectedAt, now) },
-                  { label: "原因", value: reason },
-                ]}
-              />
-            );
-          }}
-        />
-      </div>
+      <FilterBar
+        className="ops-filterbar"
+        end={<>
+          <Button size="sm" variant="light" isDisabled={!hasActiveFilters} onPress={reset}>重置筛选</Button>
+          <span className="ops-count">{hasActiveFilters ? `已启用 ${activeFilterCount} 项筛选 · ` : ""}共 {total} 条</span>
+        </>}
+      >
+        <label className="ops-filter-field">
+          <span className="ops-filter-label">客户端</span>
+          <select className="bd-select" value={clientId} onChange={(event) => changeClientId(event.target.value)}>
+            <option value="">全部客户端</option>
+            {clients.map((client) => <option key={client.id} value={String(client.id)}>{client.clientName}</option>)}
+          </select>
+        </label>
+        <label className="ops-filter-field">
+          <span className="ops-filter-label">结果</span>
+          <select className="bd-select" value={result} onChange={(event) => changeResult(event.target.value)}>
+            <option value="">全部结果</option>
+            <option value="true">成功</option>
+            <option value="false">失败</option>
+          </select>
+        </label>
+        <label className="ops-filter-field">
+          <span className="ops-filter-label">开始日期</span>
+          <input className="bd-input jd-filter-date" type="date" value={fromDate} max={toDate || undefined}
+            onChange={(event) => changeFromDate(event.target.value)} />
+        </label>
+        <label className="ops-filter-field">
+          <span className="ops-filter-label">结束日期</span>
+          <input className="bd-input jd-filter-date" type="date" value={toDate} min={fromDate || undefined}
+            onChange={(event) => changeToDate(event.target.value)} />
+        </label>
+      </FilterBar>
 
-      {/* desktop: 表格 + 搜索条件在表头 */}
-      <div className="hidden min-w-0 xl:block">
-      <Card shadow="none" className="overflow-visible rounded-lg border border-default-200 bg-content1">
-        <CardBody className="p-3">
-        <div className="mb-3 flex min-h-9 items-center justify-between gap-3">
-          <div className="flex min-w-0 items-center gap-2 text-tiny text-default-500">
-            <span className="truncate">点击列标题旁的筛选图标缩小记录范围</span>
-            {hasActiveFilters ? (
-              <Chip color="primary" radius="sm" size="sm" variant="flat">
-                {activeFilterCount} 项筛选
-              </Chip>
+      <TableWrap className="ops-table-wrap">
+        <table className="bd-table jd-stack" aria-label="连接记录">
+          <thead>
+            <tr>
+              <th>客户端</th>
+              <th>结果</th>
+              <th>远端地址</th>
+              <th>连接时间</th>
+              <th>断开时间</th>
+              <th className="bd-col-num">持续时长</th>
+              <th>原因</th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading && tableRows.length === 0 ? <TableLoadingRow colSpan={7} /> : null}
+            {!loading && tableRows.length === 0 ? (
+              <TableEmptyRow colSpan={7}>
+                <Empty
+                  icon="history"
+                  title="暂无连接记录"
+                  description={hasActiveFilters ? "当前筛选没有匹配的记录；放宽条件或重置筛选。" : "客户端接入后，每次连接都会记在这里。"}
+                  actions={hasActiveFilters ? <Button size="sm" variant="flat" onPress={reset}>重置筛选</Button> : null}
+                />
+              </TableEmptyRow>
             ) : null}
-          </div>
-          <Button
-            className="h-9 shrink-0"
-            isDisabled={!hasActiveFilters}
-            radius="sm"
-            size="sm"
-            variant="light"
-            onPress={reset}
-          >
-            重置筛选
-          </Button>
-        </div>
-        <Table
-          key={tableCollectionKey}
-          aria-label="连接记录"
-          classNames={{
-            table: "w-full table-fixed",
-            th: "h-10 bg-content2 px-2 text-tiny font-semibold text-default-600",
-            td: "border-b border-divider/70 px-2 py-2.5 align-middle text-small text-default-700",
-          }}
-          isHeaderSticky
-          removeWrapper
-        >
-        <TableHeader>
-          <TableColumn className="w-[6%]">ID</TableColumn>
-          <TableColumn className="w-[16%]">
-            <ConnectionClientFilterHeader clients={clients} selectedClientId={clientId} onSelect={changeClientId} />
-          </TableColumn>
-          <TableColumn className="w-[10%]">
-            <ConnectionResultFilterHeader selectedResult={result} onSelect={changeResult} />
-          </TableColumn>
-          <TableColumn className="w-[15%]">远端地址</TableColumn>
-          <TableColumn className="w-[15%]">
-            <ConnectionDateFilterHeader fromDate={fromDate} toDate={toDate} onFromChange={changeFromDate} onToChange={changeToDate} />
-          </TableColumn>
-          <TableColumn className="w-[15%]">断开时间</TableColumn>
-          <TableColumn className="w-[11%]">持续时长</TableColumn>
-          <TableColumn>原因</TableColumn>
-        </TableHeader>
-        <TableBody key={tableCollectionKey} items={tableRows} isLoading={loading} emptyContent={<EmptyState icon="connections" title="暂无连接记录" description="调整筛选条件或等待客户端接入" />}>
-          {(record) => (
-            <TableRow key={record.tableKey}>
-              <TableCell>{record.id}</TableCell>
-              <TableCell>
-                <span className="block truncate" title={record.clientName}>
-                  {record.clientName}
-                </span>
-              </TableCell>
-              <TableCell>
-                <Chip size="sm" variant="flat" color={record.success ? "success" : "danger"}>
-                  {record.success ? "成功" : "失败"}
-                </Chip>
-              </TableCell>
-              <TableCell>
-                <span className="block truncate" title={record.remoteAddress || "-"}>
-                  {record.remoteAddress || "-"}
-                </span>
-              </TableCell>
-              <TableCell>
-                <span className="block truncate" title={formatDateTime(record.connectedAt)}>
-                  {formatDateTime(record.connectedAt)}
-                </span>
-              </TableCell>
-              <TableCell>
-                <span className="block truncate" title={record.disconnectedAt ? formatDateTime(record.disconnectedAt) : "-"}>
-                  {record.disconnectedAt ? formatDateTime(record.disconnectedAt) : "-"}
-                </span>
-              </TableCell>
-              <TableCell>{formatDuration(record.connectedAt, record.disconnectedAt, now)}</TableCell>
-              <TableCell>
-                <span className="block truncate" title={record.success
-                  ? record.disconnectReasonText || "-"
-                  : record.failureReason || record.disconnectReasonText || "登录失败"}>
-                {record.success
-                  ? record.disconnectReasonText || "-"
-                  : record.failureReason || record.disconnectReasonText || "登录失败"}
-                </span>
-              </TableCell>
-            </TableRow>
-          )}
-        </TableBody>
-      </Table>
-        </CardBody>
-      </Card>
-      </div>
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="text-small text-default-600">
-          {total === 0 ? "共 0 条" : `第 ${rangeStart}-${rangeEnd} 条，共 ${total} 条`}
-        </span>
-        {totalPages > 1 ? (
-          <Pagination
-            showControls
-            page={page + 1}
-            total={totalPages}
-            onChange={(value) => changePage(value - 1)}
-          />
-        ) : null}
-      </div>
+            {tableRows.map((record) => {
+              const reason = connectionReason(record);
+              const active = record.success && !record.disconnectedAt;
+              const seconds = elapsedSeconds(record, now);
+              return (
+                <tr key={record.tableKey}>
+                  <td>
+                    <span className="inline-flex min-w-0 items-baseline gap-2">
+                      <span className="jd-strong [overflow-wrap:anywhere]">{record.clientName}</span>
+                      <span className="bd-num text-[12px] text-[var(--text-subtle)]">#{record.id}</span>
+                    </span>
+                  </td>
+                  <td data-label="结果"><Tag tone={record.success ? "success" : "danger"}>{record.success ? "成功" : "失败"}</Tag></td>
+                  <td data-label="远端地址" className={record.remoteAddress ? "bd-num" : "bd-num ops-subtle"}>{record.remoteAddress || "—"}</td>
+                  <td data-label="连接时间"><RelativeTime value={record.connectedAt} /></td>
+                  <td data-label="断开时间">
+                    {record.disconnectedAt ? <RelativeTime value={record.disconnectedAt} />
+                      : <span className="ops-subtle">{active ? "未断开" : "—"}</span>}
+                  </td>
+                  <td data-label="持续时长" className="bd-col-num">
+                    {seconds == null ? <span className="ops-subtle">—</span> : formatElapsed(seconds)}
+                  </td>
+                  <td data-label="原因" className="jd-wrap">
+                    <span className={`ops-reason${reason ? "" : " ops-subtle"}`} title={reason || undefined}>{reason || "—"}</span>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </TableWrap>
+      <Pagination
+        page={page}
+        totalPages={totalPages}
+        total={rangeText(page, PAGE_SIZE, total)}
+        disabled={loading}
+        onChange={changePage}
+        label="连接记录分页"
+      />
     </div>
   );
 }
 
-function ConnectionClientFilterHeader({
-  clients,
-  onSelect,
-  selectedClientId,
-}: {
-  clients: Array<{ id: number; clientName: string }>;
-  onSelect: (clientId: string) => void;
-  selectedClientId: string;
-}) {
-  const activeClient = clients.find((client) => String(client.id) === selectedClientId);
-  const label = activeClient ? `客户端: ${activeClient.clientName}` : "客户端";
-  const filterItems = [
-    { key: "", label: "全部客户端" },
-    ...clients.map((client) => ({ key: String(client.id), label: client.clientName })),
-  ];
-
-  return (
-    <TableFilterHeader label={label} active={Boolean(selectedClientId)} title="筛选客户端">
-      <Dropdown classNames={FILTER_POPOVER_CLASS_NAMES} placement="bottom-start" shouldBlockScroll={false}>
-        <DropdownTrigger>
-          <Button
-            isIconOnly
-            aria-label="筛选客户端"
-            className="h-7 min-w-7 text-default-500"
-            color={selectedClientId ? "primary" : "default"}
-            size="sm"
-            title="筛选客户端"
-            variant={selectedClientId ? "flat" : "light"}
-          >
-            <FilterIcon />
-          </Button>
-        </DropdownTrigger>
-        <DropdownMenu
-          aria-label="筛选连接记录客户端"
-          items={filterItems}
-          selectedKeys={[selectedClientId || ""]}
-          selectionMode="single"
-          onAction={(key) => onSelect(String(key))}
-        >
-          {(item) => <DropdownItem key={item.key}>{item.label}</DropdownItem>}
-        </DropdownMenu>
-      </Dropdown>
-    </TableFilterHeader>
-  );
+/** Why a connection ended or failed, as the record says it; nothing for a connection still open. */
+function connectionReason(record: ConnectionRecord): string {
+  return record.success
+    ? record.disconnectReasonText || ""
+    : record.failureReason || record.disconnectReasonText || "登录失败";
 }
 
-function ConnectionResultFilterHeader({
-  onSelect,
-  selectedResult,
-}: {
-  onSelect: (result: string) => void;
-  selectedResult: string;
-}) {
-  const label = selectedResult === "true" ? "结果: 成功" : selectedResult === "false" ? "结果: 失败" : "结果";
-  const filterItems = [
-    { key: "", label: "全部结果" },
-    { key: "true", label: "成功" },
-    { key: "false", label: "失败" },
-  ];
-
-  return (
-    <TableFilterHeader label={label} active={Boolean(selectedResult)} title="筛选结果">
-      <Dropdown classNames={FILTER_POPOVER_CLASS_NAMES} placement="bottom-start" shouldBlockScroll={false}>
-        <DropdownTrigger>
-          <Button
-            isIconOnly
-            aria-label="筛选结果"
-            className="h-7 min-w-7 text-default-500"
-            color={selectedResult ? "primary" : "default"}
-            size="sm"
-            title="筛选结果"
-            variant={selectedResult ? "flat" : "light"}
-          >
-            <FilterIcon />
-          </Button>
-        </DropdownTrigger>
-        <DropdownMenu
-          aria-label="筛选连接记录结果"
-          items={filterItems}
-          selectedKeys={[selectedResult || ""]}
-          selectionMode="single"
-          onAction={(key) => onSelect(String(key))}
-        >
-          {(item) => <DropdownItem key={item.key}>{item.label}</DropdownItem>}
-        </DropdownMenu>
-      </Dropdown>
-    </TableFilterHeader>
-  );
-}
-
-function ConnectionDateFilterHeader({
-  fromDate,
-  onFromChange,
-  onToChange,
-  toDate,
-}: {
-  fromDate: string;
-  onFromChange: (value: string) => void;
-  onToChange: (value: string) => void;
-  toDate: string;
-}) {
-  const active = Boolean(fromDate || toDate);
-  const label = active ? "连接时间: 已筛选" : "连接时间";
-
-  return (
-    <TableFilterHeader label={label} active={active} title="筛选连接时间">
-      <Popover classNames={FILTER_POPOVER_CLASS_NAMES} placement="bottom-start" shouldBlockScroll={false}>
-        <PopoverTrigger>
-          <Button
-            isIconOnly
-            aria-label="筛选连接时间"
-            className="h-7 min-w-7 text-default-500"
-            color={active ? "primary" : "default"}
-            size="sm"
-            title="筛选连接时间"
-            variant={active ? "flat" : "light"}
-          >
-            <FilterIcon />
-          </Button>
-        </PopoverTrigger>
-        <PopoverContent className="w-64 p-3">
-          <div className="flex w-full flex-col gap-3">
-            <div className="text-small font-semibold text-foreground">连接时间范围</div>
-            <Input label="开始日期" size="sm" type="date" value={fromDate} onValueChange={onFromChange} />
-            <Input label="结束日期" size="sm" type="date" value={toDate} onValueChange={onToChange} />
-            <Button size="sm" variant="flat" onPress={() => { onFromChange(""); onToChange(""); }}>
-              清空时间筛选
-            </Button>
-          </div>
-        </PopoverContent>
-      </Popover>
-    </TableFilterHeader>
-  );
-}
-
-function TableFilterHeader({
-  active,
-  children,
-  label,
-  title,
-}: {
-  active: boolean;
-  children: ReactNode;
-  label: string;
-  title: string;
-}) {
-  return (
-    <div className="flex min-w-0 items-center gap-1">
-      <span className={`truncate ${active ? "text-foreground" : "text-default-600"}`} title={label}>
-        {label}
-      </span>
-      <span title={title}>{children}</span>
-      {active ? <span className="h-1.5 w-1.5 rounded-full bg-primary" aria-hidden /> : null}
-    </div>
-  );
-}
-
-function FilterIcon() {
-  return (
-    <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" viewBox="0 0 24 24">
-      <path d="M4 5h16l-6 7v5l-4 2v-7L4 5z" />
-    </svg>
-  );
+/**
+ * How long a connection lasted, or has lasted while still open. A failed login has no duration
+ * unless the record carries a disconnect time.
+ */
+function elapsedSeconds(record: ConnectionRecord, now: number): number | null {
+  const start = new Date(record.connectedAt).getTime();
+  if (Number.isNaN(start)) return null;
+  if (record.disconnectedAt) {
+    const end = new Date(record.disconnectedAt).getTime();
+    return Number.isNaN(end) ? null : Math.max(0, (end - start) / 1000);
+  }
+  return record.success ? Math.max(0, (now - start) / 1000) : null;
 }
