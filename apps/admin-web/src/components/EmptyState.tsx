@@ -9,11 +9,11 @@ export interface EmptyStateProps {
 
 export function EmptyState({ icon = "generic", title, description, actionLabel, onAction, className = "" }: EmptyStateProps) {
   return (
-    <div className={`app-empty ${className}`}>
-      <div className="app-empty-icon">{Ill(icon)}</div>
-      <h3 className="app-empty-title">{title}</h3>
-      {description && <p className="app-empty-desc">{description}</p>}
-      {actionLabel && onAction && <Button className="mt-3" color="primary" size="sm" onPress={onAction}>{actionLabel}</Button>}
+    <div className={`bd-empty ${className}`}>
+      <div className="bd-empty-icon">{Ill(icon)}</div>
+      <h3 className="bd-empty-title">{title}</h3>
+      {description && <p className="bd-empty-desc">{description}</p>}
+      {actionLabel && onAction && <div className="bd-row"><Button color="primary" size="sm" onPress={onAction}>{actionLabel}</Button></div>}
     </div>
   );
 }

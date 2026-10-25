@@ -1833,6 +1833,15 @@ body {
   letter-spacing: 0 !important;
 }
 
+/* The design's titles keep their tight tracking (same layer, so it outranks the reset above). */
+.app-apple :is(.bd-page-title, .bd-stat-value) {
+  letter-spacing: -0.02em !important;
+}
+
+.app-apple :is(.jd-section-head h2, .bd-dialog-title, .bd-sidebar-brand) {
+  letter-spacing: -0.01em !important;
+}
+
 /* The page canvas is the design's bg with its soft color glows (bd-root). */
 .app-apple:not(.landing-shell) > main,
 .app-apple:not(.landing-shell) .app-apple-dashboard {
@@ -1861,92 +1870,6 @@ body {
   display: none !important;
 }
 
-/* Navigation floats on a glass panel over the canvas (Sidebar component of the design). */
-.app-apple-sidebar {
-  border: 1px solid var(--glass-border);
-  border-radius: var(--radius-2xl);
-  background: var(--glass-sheen), var(--glass) !important;
-  box-shadow: var(--shadow-glass), var(--glass-edge) !important;
-  -webkit-backdrop-filter: var(--blur);
-  backdrop-filter: var(--blur);
-}
-
-/* The drawer covers page content, so it takes the stronger glass to stay legible. */
-.app-apple-sidebar-drawer {
-  background: var(--glass-sheen), var(--glass-strong) !important;
-  box-shadow: var(--shadow-lg), var(--glass-edge) !important;
-}
-
-.app-apple-nav-brand {
-  padding-inline: 8px 6px;
-}
-
-.app-apple-nav-scroll {
-  scrollbar-width: none;
-  /* Items scrolled under the footer fade out instead of being cut. */
-  mask-image: linear-gradient(to bottom, #000 calc(100% - 20px), transparent);
-}
-
-.app-apple-nav-scroll::-webkit-scrollbar {
-  display: none;
-}
-
-.app-apple-nav-group + .app-apple-nav-group {
-  padding-top: 2px;
-}
-
-.app-apple-mobile-header {
-  border-bottom: 1px solid var(--glass-border);
-  background: var(--glass-sheen), var(--glass-strong) !important;
-  box-shadow: var(--shadow-glass);
-  -webkit-backdrop-filter: var(--blur);
-  backdrop-filter: var(--blur);
-}
-
-.app-apple-nav-heading {
-  padding-top: 10px;
-  color: var(--text-subtle) !important;
-  font-size: 12px !important;
-  font-weight: 400 !important;
-  line-height: 18px;
-  text-transform: none;
-}
-
-.app-apple-nav-group:first-child .app-apple-nav-heading {
-  padding-top: 0;
-}
-
-.app-apple-nav-item {
-  min-height: 36px;
-  gap: 10px;
-  padding-inline: 10px;
-  border: 0;
-  border-radius: var(--radius-md);
-  color: var(--text-muted) !important;
-  background: transparent;
-  font-size: 14px !important;
-  line-height: 20px;
-  outline: none;
-  transition:
-    background-color 0.15s ease,
-    color 0.15s ease;
-}
-
-/* E-9: 移动端抽屉里的导航项提升到 44px 触控目标（桌面断点保持紧凑密度）。 */
-@media (max-width: 1023.98px) {
-  .app-apple-nav-item {
-    min-height: 44px;
-  }
-}
-
-/* E-1: 会离开控制台的外链导航项，尾部加外链图标与普通面板切换项区分。 */
-.app-apple-nav-external {
-  display: inline-flex;
-  flex: none;
-  color: var(--text-subtle);
-  opacity: 0.75;
-}
-
 /* E-13: "跳到主内容"链接，仅键盘聚焦时可见。 */
 .app-skip-link {
   position: fixed;
@@ -1968,88 +1891,6 @@ body {
   transform: none;
   outline: none;
   box-shadow: 0 0 0 3px var(--focus-ring);
-}
-
-.app-apple-nav-item:hover {
-  color: var(--text) !important;
-  background: rgba(127, 127, 127, 0.1) !important;
-}
-
-/* The current page is a raised glass chip in the text color, not an accent fill. */
-.app-apple-nav-item-active,
-.app-apple-nav-item-active:hover {
-  color: var(--text) !important;
-  background: var(--glass-pick) !important;
-  box-shadow:
-    var(--glass-edge),
-    0 2px 8px rgba(0, 0, 0, 0.06);
-  font-weight: 600;
-}
-
-.app-apple-nav-item:focus-visible {
-  box-shadow: 0 0 0 3px var(--focus-ring);
-}
-
-.app-apple-nav-icon {
-  display: inline-flex;
-  width: 18px;
-  height: 18px;
-  flex: 0 0 18px;
-  align-items: center;
-  justify-content: center;
-  color: var(--text-subtle);
-}
-
-.app-apple-nav-icon svg {
-  width: 18px;
-  height: 18px;
-}
-
-.app-apple-nav-item:hover .app-apple-nav-icon,
-.app-apple-nav-item-active .app-apple-nav-icon {
-  color: var(--text);
-}
-
-/* Page header (PageHeader component of the design): one 30px title per page, a short line under
- * it. */
-.app-page-header {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: var(--space-4);
-  margin-bottom: var(--space-2);
-}
-
-.app-apple .app-page-title {
-  margin: 0;
-  color: var(--text);
-  font-size: 30px;
-  font-weight: 700;
-  line-height: 38px;
-  letter-spacing: -0.02em !important;
-}
-
-.app-page-actions {
-  display: flex;
-  flex: none;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-}
-
-.app-page-desc {
-  margin: var(--space-1) 0 0;
-  color: var(--text-muted);
-  font-size: 14px;
-  line-height: 22px;
-}
-
-@media (max-width: 767.98px) {
-  .app-apple .app-page-title {
-    font-size: 26px;
-    line-height: 34px;
-  }
 }
 
 /* Solid surfaces: cards, tables and panels are surface + hairline + shadow-sm (no shadow in dark). */
@@ -2458,101 +2299,6 @@ body {
   :where(button, a, input, textarea, select):where(.outline-hidden, .focus\:outline-hidden, .focus-visible\:outline-hidden):focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
-}
-
-/* Tag component of the design: a 22px pill with a dot; status tones are tint + colored text. */
-.app-tag {
-  display: inline-flex;
-  height: 22px;
-  flex: none;
-  align-items: center;
-  gap: 5px;
-  padding: 0 9px;
-  border-radius: var(--radius-full);
-  color: var(--text-muted);
-  background: var(--surface-muted);
-  font-size: 12px;
-  font-weight: 500;
-  line-height: 18px;
-  white-space: nowrap;
-}
-
-.dark .app-tag {
-  background: rgba(255, 255, 255, 0.08);
-}
-
-.app-tag::before {
-  width: 6px;
-  height: 6px;
-  flex: none;
-  border-radius: var(--radius-full);
-  background: currentColor;
-  content: "";
-}
-
-.app-tag--plain::before {
-  display: none;
-}
-
-.app-tag--success {
-  color: var(--success);
-  background: var(--success-bg) !important;
-}
-
-.app-tag--warning {
-  color: var(--warning);
-  background: var(--warning-bg) !important;
-}
-
-.app-tag--danger {
-  color: var(--danger);
-  background: var(--danger-bg) !important;
-}
-
-.app-tag--info {
-  color: var(--info);
-  background: var(--info-bg) !important;
-}
-
-/* EmptyState component of the design. */
-.app-empty {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-12) var(--space-6);
-  text-align: center;
-}
-
-.app-empty-icon {
-  display: grid;
-  width: 56px;
-  height: 56px;
-  margin-bottom: var(--space-2);
-  place-items: center;
-  border-radius: var(--radius-full);
-  color: var(--text-muted);
-  background: var(--surface-muted);
-}
-
-.dark .app-empty-icon {
-  background: rgba(255, 255, 255, 0.07);
-}
-
-.app-empty-title {
-  margin: 0;
-  color: var(--text);
-  font-size: 17px;
-  font-weight: 600;
-  line-height: 24px;
-}
-
-.app-empty-desc {
-  max-width: 420px;
-  margin: 0;
-  color: var(--text-muted);
-  font-size: 14px;
-  line-height: 22px;
 }
 
 /* The dimmed backdrop behind drawers and dialogs. */
